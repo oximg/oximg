@@ -87,7 +87,31 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
-## Reproduction of the imgproxy benchmark gist
+## imgproxy's official benchmark harness (JPEG category)
+
+[imgproxy's current benchmark](https://imgproxy.net/blog/image-processing-servers-benchmark/)
+([harness](https://github.com/imgproxy/image-servers-benchmark)) replaces
+the gist below: 100 DIV2K photographs served by nginx over HTTP, fit into
+512x512 at quality 80, k6 with 2 VUs for 5 minutes, everything in Docker.
+Run here on the Ryzen 7 8745HS with all services pinned to 2 cores
+(`cpuset: "0-1"`) to approximate the 2-vCPU c7i.large used in their
+published results; oximg added via
+[bench/image-servers-benchmark.patch](bench/image-servers-benchmark.patch)
+(a compose service and a k6 URL case) and fetching sources from nginx
+like every other contender (`OXIMG_SOURCE_BASE_URL`).
+
+| Server | req/s | p95 latency | checks |
+|---|---|---|---|
+| oximg (defaults) | **167.6** | **105 ms** | 100% |
+| imgproxy | 155.8 | 121 ms | 100% |
+| imagor 1.9.2 | 143.1 | 169 ms | 100% |
+| thumbor 7.x | 106.8 | 188 ms | 100% |
+
+The relative order of the other three matches imgproxy's published
+c7i.large results. Output quality at these settings is measured in
+[bench/quality/QUALITY.md](bench/quality/QUALITY.md).
+
+## Reproduction of the imgproxy benchmark gist (superseded)
 
 Methodology from
 [DarthSim's benchmark gist](https://gist.github.com/DarthSim/9d971d2859f3714a29cf8ce094b3fc55):

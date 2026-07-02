@@ -1,0 +1,81 @@
+diff --git i/docker-compose.yml w/docker-compose.yml
+index 2e9bdba..082c1ec 100644
+--- i/docker-compose.yml
++++ w/docker-compose.yml
+@@ -2,6 +2,7 @@ version: "3"
+ 
+ services:
+   nginx:
++    cpuset: "0-1"
+     container_name: nginx_benchmark
+     image: nginx:latest
+     restart: unless-stopped
+@@ -18,12 +19,14 @@ services:
+ 
+   k6:
+     image: grafana/k6:latest
++    cpuset: "0-1"
+     container_name: k6
+     volumes:
+       - ${PWD}:/bench:ro
+     working_dir: /bench
+ 
+   imgproxy:
++    cpuset: "0-1"
+     container_name: imgproxy_benchmark
+     image: darthsim/imgproxy:latest
+     restart: unless-stopped
+@@ -45,6 +48,7 @@ services:
+       start_period: 10s
+ 
+   thumbor:
++    cpuset: "0-1"
+     container_name: thumbor_benchmark
+     build: ${PWD}/thumbor
+     restart: unless-stopped
+@@ -63,6 +67,7 @@ services:
+       start_period: 10s
+ 
+   imagor:
++    cpuset: "0-1"
+     container_name: imagor_benchmark
+     image: ghcr.io/cshum/imagor:latest
+     restart: unless-stopped
+@@ -83,3 +88,23 @@ services:
+       timeout: 5s
+       start_period: 10s
+ 
++
++  oximg:
++    cpuset: "0-1"
++    container_name: oximg_benchmark
++    image: oximg:bench
++    restart: unless-stopped
++    tty: true
++    ports:
++      - 9005:80
++    environment:
++      PORT: "80"
++      OXIMG_SOURCE_BASE_URL: "http://nginx"
++    depends_on:
++      nginx:
++        condition: service_healthy
++    healthcheck:
++      test: ["CMD-SHELL", "timeout 5s bash -c ':> /dev/tcp/127.0.0.1/80' || exit 1"]
++      interval: 5s
++      timeout: 5s
++      start_period: 10s
+diff --git i/k6.js w/k6.js
+index 73e99d5..270814e 100644
+--- i/k6.js
++++ w/k6.js
+@@ -47,6 +47,9 @@ const getFormat = (filename) => {
+ 
+ const formatUrl = (format, quality, filename) => {
+   switch (scenario.tool) {
++    case 'oximg':
++      return `http://${scenario.tool}/resize/${scenario.width}/${scenario.height}/${filename}`;
++
+     case 'imgproxy':
+       return `http://${scenario.tool}/unsafe/rs:fit:${scenario.width}:${scenario.height}/f:${format}/q:${quality}/plain/http://nginx/${filename}`;
+ 
