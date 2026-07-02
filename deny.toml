@@ -1,0 +1,52 @@
+# cargo-deny policy gate. Runs in CI (`cargo deny check`).
+# Guards three things: no copyleft (AGPL/GPL) sneaks in, no known-vulnerable
+# crates, and dependency-tree hygiene. License *attribution* (the shipped
+# THIRD-PARTY-LICENSES bundle) is cargo-about's job, not this file's.
+
+[graph]
+all-features = true
+
+[advisories]
+# RUSTSEC advisory-db. Default action for vulnerabilities is "deny".
+# Add IDs here (with a reason) only to consciously accept a specific finding.
+ignore = []
+
+[licenses]
+# Permissive allow-list. Anything outside this — notably AGPL/GPL/LGPL — fails
+# the build. jpegli/libjxl is BSD-3-Clause, highway is Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+# IJG is an uncommon license carried only by the mozjpeg (libjpeg-turbo)
+# decode path. Scope it to those crates instead of allowing it globally, so a
+# future IJG-licensed dependency still trips the gate for review.
+[[licenses.exceptions]]
+crate = "mozjpeg"
+allow = ["IJG"]
+
+[[licenses.exceptions]]
+crate = "mozjpeg-sys"
+allow = ["IJG"]
+
+[bans]
+# Duplicate versions bloat the binary and the audit surface. "warn" to start —
+# tighten to "deny" once the tree is deduplicated.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

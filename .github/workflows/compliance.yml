@@ -1,0 +1,26 @@
+name: License Compliance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-about
+      # Policy gate: no copyleft, no known-vulnerable crates, source hygiene.
+      - name: cargo deny
+        run: cargo deny check
+      # Attribution bundle must stay in sync with the dependency tree.
+      - name: THIRD-PARTY-LICENSES up to date
+        run: |
+          cargo about generate about.hbs -o /tmp/THIRD-PARTY-LICENSES.md
+          if ! diff -u THIRD-PARTY-LICENSES.md /tmp/THIRD-PARTY-LICENSES.md; then
+            echo "::error::THIRD-PARTY-LICENSES.md is stale. Run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md"
+            exit 1
+          fi

@@ -1,0 +1,32 @@
+# Third-Party Licenses
+
+`oximg` statically links the open-source dependencies listed below. Each is
+reproduced with its license text and copyright notice as required by its terms.
+
+This file is generated — do not edit by hand. Regenerate with:
+
+    cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+
+## Summary
+
+{{#each overview}}
+- **{{name}}** — {{count}} crate(s)
+{{/each}}
+
+---
+
+{{#each licenses}}
+## {{name}}
+
+Used by:
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{{text}}}
+```
+
+---
+
+{{/each}}
