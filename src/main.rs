@@ -27,7 +27,7 @@ struct App {
     images_dir: Arc<PathBuf>,
     cpu_slots: Arc<Semaphore>,
     quality: f32,
-    fast_preset: bool,
+    encoder: pipeline::Encoder,
     resize_threads: usize,
     // Singleflight: concurrent identical requests are processed once and
     // share the result, absorbing cache stampedes on hot images.
@@ -62,7 +62,9 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         images_dir: Arc::new(images_dir.clone()),
         cpu_slots: Arc::new(Semaphore::new(workers)),
         quality: env_or("QUALITY", 80.0),
-        fast_preset: std::env::var("PRESET").as_deref() != Ok("small"),
+        encoder: pipeline::Encoder::from_preset(
+            std::env::var("PRESET").as_deref().unwrap_or("jpegli"),
+        ),
         resize_threads: env_or("OXIMG_PAR", 1),
         inflight: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -179,7 +181,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         max_width: *w,
         max_height: *h,
         quality: app.quality,
-        fast_preset: app.fast_preset,
+        encoder: app.encoder,
         // The resize stage may briefly fan out into row bands without
         // taking semaphore slots — resize is only ~1/4 of request time, so
         // average oversubscription stays <30% in exchange for lower

@@ -40,12 +40,34 @@ fn back_lut() -> &'static [u8; 65536] {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Encoder {
+    /// jpegli: trellis-class compression at roughly half the CPU of
+    /// mozjpeg's trellis path. The default.
+    Jpegli,
+    /// mozjpeg fastest profile + optimized Huffman: libjpeg-turbo-class
+    /// output at the lowest encode cost.
+    MozFast,
+    /// mozjpeg trellis + progressive: smallest mozjpeg output.
+    MozSmall,
+}
+
+impl Encoder {
+    /// Parse the PRESET env value; unknown values fall back to the default.
+    pub fn from_preset(preset: &str) -> Self {
+        match preset {
+            "fast" => Encoder::MozFast,
+            "small" => Encoder::MozSmall,
+            _ => Encoder::Jpegli,
+        }
+    }
+}
+
 pub struct Params {
     pub max_width: u32,
     pub max_height: u32,
     pub quality: f32,
-    /// true = libjpeg-turbo baseline (fast); false = mozjpeg trellis+progressive (small)
-    pub fast_preset: bool,
+    pub encoder: Encoder,
     /// Thread count for the resize stage (1 = single-threaded). Band threads
     /// are short bursts that deliberately bypass the CPU semaphore; they
     /// trade mild transient oversubscription for lower latency at light
@@ -338,8 +360,11 @@ fn linear_light() -> bool {
 }
 
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
+    if p.encoder == Encoder::Jpegli {
+        return encode_jpegli(rgb, w, h, p.quality);
+    }
     let mut comp = Compress::new(ColorSpace::JCS_RGB);
-    if p.fast_preset {
+    if p.encoder == Encoder::MozFast {
         comp.set_fastest_defaults();
         // The fastest profile disables even Huffman optimization, making
         // output ~2% larger than plain turbo; turning it back on costs one
@@ -348,6 +373,20 @@ pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
     }
     comp.set_size(w, h);
     comp.set_quality(p.quality);
+    let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
+    started.write_scanlines(rgb)?;
+    Ok(started.finish()?)
+}
+
+/// jpegli encode via its libjpeg-compatible API (symbols are
+/// `jpegli_`-prefixed, so it links alongside mozjpeg without conflicts).
+fn encode_jpegli(rgb: &[u8], w: usize, h: usize, quality: f32) -> Result<Vec<u8>> {
+    let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
+    comp.set_size(w, h);
+    comp.set_quality(quality);
+    // cjpegli emits progressive by default; the libjpeg-compat layer does
+    // not. Progressive is worth several percent at these sizes.
+    comp.set_progressive_mode();
     let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
     started.write_scanlines(rgb)?;
     Ok(started.finish()?)

@@ -50,7 +50,7 @@ fn params(quality: f32, preset: &str) -> pipeline::Params {
         max_width: 0,
         max_height: 0,
         quality,
-        fast_preset: preset != "small",
+        encoder: pipeline::Encoder::from_preset(preset),
         parallel: 1,
     }
 }
