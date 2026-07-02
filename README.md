@@ -43,7 +43,10 @@ docker build -t oximg .
 docker run -p 8081:8081 -v $PWD/images:/images:ro oximg
 ```
 
-Environment variables: `PORT` (8081), `IMAGES_DIR` (./images), `QUALITY`
+Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
+`OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
+instead of the local filesystem; streaming decode overlaps the
+download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (80), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
