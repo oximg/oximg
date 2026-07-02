@@ -43,14 +43,15 @@ diverse, 12.5 ms CPU/req.
 
 | Server | medium c=8 | medium c=16 | large c=8 | large c=16 | peak RSS (medium / large) |
 |---|---|---|---|---|---|
-| oximg (defaults) | 544 | 722 | 80.8 | 117 | 198 / 194 MB |
+| oximg (defaults) | 555 | 1101 | 88.9 | 174 | **21 / 19 MB** |
 | imgproxy 4.0.11 | 655 | 817 | 70.7 | 108 | 82 / 271 MB |
 | imagor 1.9.2 | 668 | 1275 | 71.0 | 139 | 167 / 209 MB |
-| oximg speed mode | 795 | 1117 | 82.6 | 120 | 69 / 120 MB |
 
-Note: this matrix predates oximg's request coalescing and uses a single
-URL; for imagor (which coalesces) the same-URL columns overstate
-pipeline throughput relative to the diverse numbers above.
+Note: oximg and imagor coalesce concurrent identical requests, so their
+same-URL columns reflect duplicate-traffic handling rather than pipeline
+throughput (see the diverse tables above for the latter); it also keeps
+their same-URL peak RSS low. Peak RSS under 16-way diverse load: oximg
+172 MB, imagor 167-177 MB.
 
 ## macOS (Apple M2 Max, 12 cores), native installs
 
@@ -99,7 +100,7 @@ distinct widths so request coalescing cannot serve duplicates).
 
 | Server | req/s | mean | peak memory | output | diverse req/s |
 |---|---|---|---|---|---|
-| oximg (defaults) | **23.9** | **167 ms** | **39 MB** | 47 KB | **23** |
+| oximg (defaults) | **24.1** | **166 ms** | **17 MB** | 47 KB | **23** |
 | thumbor 7.x | 21.7 | 185 ms | 648 MB | 44 KB | 20 |
 | imgproxy 4.0.11 | 19.3 | 208 ms | 430 MB | 44 KB | 19 |
 | imagor 1.9.2 | 18.6 | 215 ms | 276 MB | 88 KB | 17 |
