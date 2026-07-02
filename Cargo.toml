@@ -1,0 +1,24 @@
+[package]
+name = "oximg"
+version = "0.0.0"
+edition = "2024"
+description = "High-performance image compression: library, CLI, and self-hostable server (PoC)."
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/oximg/oximg"
+keywords = ["image", "jpeg", "resize", "compression", "server"]
+categories = ["multimedia::images", "web-programming::http-server"]
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "fs"] }
+mozjpeg = "0.10"
+fast_image_resize = "5"
+anyhow = "1"
+mimalloc = "0.1.52"
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Note: panic = "abort" must NOT be set; the mozjpeg crate relies on
+# unwinding to handle libjpeg errors.
