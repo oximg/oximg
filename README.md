@@ -1,5 +1,10 @@
 # oximg
 
+[![Crates.io](https://img.shields.io/crates/v/oximg.svg)](https://crates.io/crates/oximg)
+[![Docs.rs](https://docs.rs/oximg/badge.svg)](https://docs.rs/oximg)
+[![CI](https://github.com/oximg/oximg/actions/workflows/ci.yml/badge.svg)](https://github.com/oximg/oximg/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 High-performance image compression in Rust: a library, a CLI, and a
 self-hostable HTTP server. Currently a JPEG resize/compression PoC.
 
