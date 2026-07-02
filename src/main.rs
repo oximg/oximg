@@ -26,6 +26,11 @@ type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>
 #[derive(Clone)]
 struct App {
     images_dir: Arc<PathBuf>,
+    // When set (OXIMG_SOURCE_BASE_URL), sources are fetched from
+    // `<base>/<file>` over HTTP instead of the local filesystem. The base
+    // is operator-configured, so user input never chooses the host (no
+    // SSRF surface).
+    source_base: Option<Arc<str>>,
     cpu_slots: Arc<Semaphore>,
     quality: f32,
     encoder: pipeline::Encoder,
@@ -61,6 +66,9 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
 
     let app = App {
         images_dir: Arc::new(images_dir.clone()),
+        source_base: std::env::var("OXIMG_SOURCE_BASE_URL")
+            .ok()
+            .map(|s| Arc::from(s.trim_end_matches('/'))),
         cpu_slots: Arc::new(Semaphore::new(workers)),
         quality: env_or("QUALITY", 80.0),
         encoder: pipeline::Encoder::from_preset(
@@ -189,11 +197,19 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         // light-load latency.
         parallel: app.resize_threads,
     };
+    let source_url = app
+        .source_base
+        .as_ref()
+        .map(|base| format!("{base}/{file}"));
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit; // hold the CPU slot for the whole processing
-        // Streaming decode: never buffers the whole source file on the heap
-        // (saves concurrency x file-size for large sources under load).
-        pipeline::process_path(&path, &params)
+        // Streaming decode: the source is never buffered whole on the heap
+        // (saves concurrency x file-size for large sources under load);
+        // for remote sources decoding overlaps the download.
+        match source_url {
+            Some(url) => pipeline::process_url(&url, &params),
+            None => pipeline::process_path(&path, &params),
+        }
     })
     .await
     .map_err(|_| {

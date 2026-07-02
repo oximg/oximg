@@ -139,6 +139,47 @@ pub fn process_path(path: &std::path::Path, p: &Params) -> Result<Vec<u8>> {
     })
 }
 
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into()
+    })
+}
+
+fn max_source_bytes() -> u64 {
+    std::env::var("OXIMG_MAX_SOURCE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64 * 1024 * 1024)
+}
+
+/// Remote-source variant: stream the HTTP response body straight into the
+/// decoder — decoding overlaps the download and the source is never
+/// buffered whole, same as the file path.
+pub fn process_url(url: &str, p: &Params) -> Result<Vec<u8>> {
+    let resp = http_agent().get(url).call().map_err(|e| match e {
+        // Preserve source 404s so the HTTP layer can pass them through.
+        ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "source returned 404",
+        )),
+        other => anyhow::Error::new(other).context("fetch source"),
+    })?;
+    let reader = std::io::BufReader::new(std::io::Read::take(
+        resp.into_body().into_reader(),
+        max_source_bytes(),
+    ));
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        let dec = Decompress::new_reader(reader).context("parse JPEG")?;
+        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
+        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+    })
+}
+
 thread_local! {
     // Per-blocking-pool-thread reusable work buffers: at 600 RPS this
     // removes ~4GB/s of malloc/free traffic (decode buffer, u16
