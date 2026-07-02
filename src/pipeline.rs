@@ -117,8 +117,12 @@ fn dct_margin() -> f64 {
 }
 
 pub fn process(jpeg: &[u8], p: &Params) -> Result<Vec<u8>> {
-    let (pixels, dst_w, dst_h) = decode_and_resize(jpeg, p.max_width, p.max_height, p.parallel)?;
-    encode(&pixels, dst_w, dst_h, p)
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
+        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
+        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+    })
 }
 
 /// Streaming variant: decode straight from the file instead of buffering
@@ -127,17 +131,12 @@ pub fn process(jpeg: &[u8], p: &Params) -> Result<Vec<u8>> {
 /// entropy decoding is a sequential read anyway, so the page cache
 /// serves it fine.
 pub fn process_path(path: &std::path::Path, p: &Params) -> Result<Vec<u8>> {
-    let dec = Decompress::new_path(path).context("open/parse JPEG")?;
-    let (pixels, dst_w, dst_h) = SCRATCH.with(|s| {
-        decode_resize(
-            &mut s.borrow_mut(),
-            dec,
-            p.max_width,
-            p.max_height,
-            p.parallel,
-        )
-    })?;
-    encode(&pixels, dst_w, dst_h, p)
+    SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        let dec = Decompress::new_path(path).context("open/parse JPEG")?;
+        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
+        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+    })
 }
 
 thread_local! {
@@ -152,6 +151,10 @@ struct Scratch {
     chunk8: Vec<u8>,
     src16: Vec<u16>,
     dst16: Vec<u16>,
+    // Final RGB pixels also live in scratch: output sizes vary per request
+    // (every distinct target width is a distinct allocation size), and that
+    // churn is what the allocator retains across thread heaps.
+    out8: Vec<u8>,
     resizer: Option<Resizer>,
 }
 
@@ -171,8 +174,10 @@ pub fn decode_and_resize(
     parallel: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
     SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        decode_resize(&mut s.borrow_mut(), dec, max_w, max_h, parallel)
+        let (dst_w, dst_h) = decode_resize(s, dec, max_w, max_h, parallel)?;
+        Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
     })
 }
 
@@ -237,7 +242,7 @@ fn decode_resize<R: std::io::BufRead>(
     max_w: u32,
     max_h: u32,
     parallel: usize,
-) -> Result<(Vec<u8>, usize, usize)> {
+) -> Result<(usize, usize)> {
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
 
@@ -254,9 +259,9 @@ fn decode_resize<R: std::io::BufRead>(
     if (dec_w, dec_h) == (dst_w, dst_h) {
         // Decoded size is already the target size: output directly; a
         // linear round-trip would be pure loss.
-        let mut out = vec![0u8; dec_w * dec_h * 3];
+        s.out8.resize(dec_w * dec_h * 3, 0);
         started
-            .read_scanlines_into(&mut out)
+            .read_scanlines_into(&mut s.out8)
             .context("decode failed")?;
         started.finish().context("decode finish failed")?;
         if timing {
@@ -265,7 +270,7 @@ fn decode_resize<R: std::io::BufRead>(
                 t0.elapsed().as_secs_f64() * 1e3
             );
         }
-        return Ok((out, dst_w, dst_h));
+        return Ok((dst_w, dst_h));
     }
 
     if linear {
@@ -310,8 +315,8 @@ fn decode_resize<R: std::io::BufRead>(
         )?;
 
         let back = back_lut();
-        let mut out = vec![0u8; dst_w * dst_h * 3];
-        for (d, src) in out.iter_mut().zip(&s.dst16) {
+        s.out8.resize(dst_w * dst_h * 3, 0);
+        for (d, src) in s.out8.iter_mut().zip(&s.dst16) {
             *d = back[*src as usize];
         }
         if timing {
@@ -321,7 +326,7 @@ fn decode_resize<R: std::io::BufRead>(
                 t1.elapsed().as_secs_f64() * 1e3
             );
         }
-        Ok((out, dst_w, dst_h))
+        Ok((dst_w, dst_h))
     } else {
         // Resize directly in sRGB space (speed mode)
         s.chunk8.resize(dec_w * dec_h * 3, 0);
@@ -332,12 +337,12 @@ fn decode_resize<R: std::io::BufRead>(
         let t_decode = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        let mut out = vec![0u8; dst_w * dst_h * 3];
+        s.out8.resize(dst_w * dst_h * 3, 0);
         resize_bands(
             &s.chunk8,
             dec_w,
             dec_h,
-            &mut out,
+            &mut s.out8,
             dst_w,
             dst_h,
             PixelType::U8x3,
@@ -351,7 +356,7 @@ fn decode_resize<R: std::io::BufRead>(
                 t1.elapsed().as_secs_f64() * 1e3
             );
         }
-        Ok((out, dst_w, dst_h))
+        Ok((dst_w, dst_h))
     }
 }
 
