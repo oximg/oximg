@@ -86,14 +86,19 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
-## Encoder presets (Apple M2 Max, medium source, c=12, single URL with
-request coalescing active — relative values)
+## Encoder presets
 
-| PRESET | req/s | output (test-medium) |
-|---|---|---|
-| `jpegli` (default) | 685 | **20.1 KB** |
-| `fast` (mozjpeg baseline profile) | **751** | 22.9 KB |
-| `small` (mozjpeg trellis+progressive) | 456 | 18.6 KB |
+Linux x86_64 native (Ryzen 7 8745HS, `bench/native.sh`, c=16):
+
+| PRESET | medium diverse | medium single-URL | large diverse |
+|---|---|---|---|
+| `jpegli` (default) | 639 | 1073 | 121 |
+| `fast` (mozjpeg baseline profile) | **696** | **1157** | 121 |
+| `small` (mozjpeg trellis+progressive) | 445 | 753 | 114 |
+
+Apple M2 Max (c=12, single URL, coalescing active — relative values):
+`jpegli` 685 / `fast` 751 / `small` 456 req/s; output sizes for
+test-medium: 20.1 / 22.9 / 18.6 KB.
 
 Quality per byte for each encoder is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
