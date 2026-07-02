@@ -86,6 +86,24 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
+## Reproduction of the imgproxy benchmark gist
+
+Methodology from
+[DarthSim's benchmark gist](https://gist.github.com/DarthSim/9d971d2859f3714a29cf8ce094b3fc55):
+a real photograph of Wat Arun (JPEG, 7360x4912, 29MB —
+[the original image from Wikimedia Commons](https://commons.wikimedia.org/wiki/File:The_sculptures_of_two_mythical_giant_demons,_Thotsakan_and_Sahatsadecha,_guarding_the_eastern_gate_of_the_main_chapel_of_Wat_Arun,_Bangkok.jpg)),
+resized to fit 500x500, `ab -n 1000 -c 4`, default settings. Ryzen 7
+8745HS, all servers as Docker containers (thumbor run with
+`--processes=16` to use the machine; the diverse column requests 4
+distinct widths so request coalescing cannot serve duplicates).
+
+| Server | req/s | mean | peak memory | output | diverse req/s |
+|---|---|---|---|---|---|
+| oximg (defaults) | **23.9** | **167 ms** | **39 MB** | 47 KB | **23** |
+| thumbor 7.x | 21.7 | 185 ms | 648 MB | 44 KB | 20 |
+| imgproxy 4.0.11 | 19.3 | 208 ms | 430 MB | 44 KB | 19 |
+| imagor 1.9.2 | 18.6 | 215 ms | 276 MB | 88 KB | 17 |
+
 ## Encoder presets
 
 Linux x86_64 native (Ryzen 7 8745HS, `bench/native.sh`, c=16):
