@@ -86,8 +86,23 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
+## Encoder presets (Apple M2 Max, medium source, c=12, single URL with
+request coalescing active — relative values)
+
+| PRESET | req/s | output (test-medium) |
+|---|---|---|
+| `jpegli` (default) | 685 | **20.1 KB** |
+| `fast` (mozjpeg baseline profile) | **751** | 22.9 KB |
+| `small` (mozjpeg trellis+progressive) | 456 | 18.6 KB |
+
+Quality per byte for each encoder is measured in
+[bench/quality/QUALITY.md](bench/quality/QUALITY.md).
+
 ## Notes
 
+- Throughput tables above were measured with `PRESET=fast` as the
+  encoder, before jpegli became the default; the preset table shows the
+  relative cost of the current default.
 - oximg defaults resize in linear light with 1.7x DCT decode headroom;
   speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`) matches the
   competitors' processing approach. Output quality for both settings is

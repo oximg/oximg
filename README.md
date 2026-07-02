@@ -9,7 +9,7 @@ self-hostable HTTP server. Currently a JPEG resize/compression PoC.
 JPEG bytes
   → mozjpeg decode with DCT shrink-on-load (kept ≥ 1.7x target size)
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 (SIMD) → sRGB u8
-  → mozjpeg encode (fast preset; PRESET=small = trellis + progressive)
+  → jpegli encode (progressive; PRESET=fast / PRESET=small select mozjpeg profiles)
 ```
 
 Concurrent identical requests are coalesced and share one result.
@@ -39,8 +39,9 @@ docker run -p 8081:8081 -v $PWD/images:/images:ro oximg
 ```
 
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images), `QUALITY`
-(80), `PRESET=small` (mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb`
-(resize in sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
+(80), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
+`small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
+sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 `OXIMG_PAR` (resize threads, 1).
 
 ## Not yet implemented (out of PoC scope)

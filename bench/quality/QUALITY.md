@@ -33,25 +33,29 @@ relative to plain libjpeg-turbo:
 
 | Encoder | S=70 | S=80 |
 |---|---|---|
-| oximg `PRESET=small` (mozjpeg trellis+progressive) | **-12.7%** | **-10.0%** |
+| oximg default (jpegli, progressive) | **-11.0%** | **-12.4%** |
+| oximg `PRESET=small` (mozjpeg trellis+progressive) | -12.7% | -10.0% |
 | sharp `mozjpeg:true` | -12.8% | -10.1% |
-| oximg default (fast) | +0.1% | ~0% |
+| oximg `PRESET=fast` (mozjpeg fastest + optimized Huffman) | +0.1% | ~0% |
 | sharp default | -0.8% | -2.0% |
 | libjpeg-turbo (imgproxy's encoder) | baseline | baseline |
 
+At matched bytes-per-quality the jpegli encoder runs at roughly half the
+CPU of the mozjpeg trellis path (`PRESET=small`).
+
 ## Group B — end-to-end (q80, scored vs linear-light reference)
 
-| Source | oximg (defaults) | imgproxy default | imgproxy linear* | imagor 1.9.2 |
-|---|---|---|---|---|
-| Kodak 768px | **75.9** | 71.2 | 72.4 | 71.2 |
-| medium 2000px | **72.6** | 60.1 | 69.4 | 60.1 |
-| large 4000px | **68.3** | 49.7 | 49.7* | 51.6 |
+| Source | oximg (defaults, jpegli) | oximg `PRESET=fast` | imgproxy default | imgproxy linear* | imagor 1.9.2 |
+|---|---|---|---|---|---|
+| Kodak 768px | **77.5** | 75.9 | 71.2 | 72.4 | 71.2 |
+| medium 2000px | **72.2** | 72.6 | 60.1 | 69.4 | 60.1 |
+| large 4000px | **67.5** | 68.3 | 49.7 | 49.7* | 51.6 |
 
 \* imgproxy with `IMGPROXY_USE_LINEAR_COLORSPACE=1`. On the large-source
 group its output was byte-identical to the default configuration.
 
-At q80 oximg produces 35.4 KB (Kodak group mean); imgproxy reaches a
-comparable score at q90 with 63.8 KB.
+At q80 oximg produces 33.9 KB (Kodak group mean, jpegli default);
+imgproxy reaches a lower score (76.0) at q90 with 63.8 KB.
 
 Scores with oximg's speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`)
 are ~60 on the medium group — the same level as imgproxy's and imagor's
