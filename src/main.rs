@@ -6,6 +6,7 @@ use std::path::PathBuf;
 // glibc's per-thread arenas inflate RSS several-fold on Linux under a
 // multi-threaded allocation-heavy load; mimalloc returns memory promptly
 // and behaves consistently across threads.
+#[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::{Arc, Mutex};

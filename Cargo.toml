@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 mozjpeg = "0.10"
 fast_image_resize = "5"
 anyhow = "1"
-mimalloc = "0.1.52"
+mimalloc = { version = "0.1.52", optional = true }
 jpegli = "0.1.0"
 
 [profile.release]
@@ -23,3 +23,6 @@ lto = true
 codegen-units = 1
 # Note: panic = "abort" must NOT be set; the mozjpeg crate relies on
 # unwinding to handle libjpeg errors.
+
+[features]
+default = []
