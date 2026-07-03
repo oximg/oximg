@@ -82,6 +82,17 @@ fn serves_each_format_with_matching_content_type() {
     }
 }
 
+#[cfg(feature = "avif")]
+#[test]
+fn serves_avif_with_matching_content_type() {
+    let s = Server::start(47106, &[]);
+    let (status, ct, body) = s.get("/resize/100/100/photo.avif").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/avif");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+}
+
 #[test]
 fn error_mapping() {
     let s = Server::start(47102, &[]);

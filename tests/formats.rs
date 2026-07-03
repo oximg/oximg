@@ -121,6 +121,27 @@ fn garbage_and_truncation_error_instead_of_panicking() {
     }
 }
 
+#[cfg(feature = "avif")]
+#[test]
+fn avif_resizes_in_avif() {
+    let (out, fmt) = pipeline::process(&fixture("photo.avif"), &params(100)).unwrap();
+    assert_eq!(fmt, ImageFormat::Avif);
+    assert!(!out.is_empty());
+    assert_eq!(dims_of(&out), (100, 75));
+}
+
+#[cfg(feature = "avif")]
+#[test]
+fn avif_garbage_and_truncation_error_instead_of_panicking() {
+    let full = fixture("photo.avif");
+    for cut in [16, 64, full.len() / 2] {
+        assert!(
+            pipeline::process(&full[..cut], &params(100)).is_err(),
+            "avif truncated at {cut} should error"
+        );
+    }
+}
+
 #[test]
 fn jpeg_presets_all_produce_decodable_output() {
     for encoder in [Encoder::Jpegli, Encoder::MozFast, Encoder::MozSmall] {

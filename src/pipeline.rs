@@ -121,6 +121,7 @@ pub enum ImageFormat {
     Jpeg,
     Png,
     Webp,
+    Avif,
 }
 
 impl ImageFormat {
@@ -129,6 +130,7 @@ impl ImageFormat {
             ImageFormat::Jpeg => "image/jpeg",
             ImageFormat::Png => "image/png",
             ImageFormat::Webp => "image/webp",
+            ImageFormat::Avif => "image/avif",
         }
     }
 
@@ -140,6 +142,10 @@ impl ImageFormat {
             Some(ImageFormat::Png)
         } else if &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
             Some(ImageFormat::Webp)
+        } else if &header[4..8] == b"ftyp"
+            && (&header[8..12] == b"avif" || &header[8..12] == b"avis")
+        {
+            Some(ImageFormat::Avif)
         } else {
             None
         }
@@ -177,6 +183,13 @@ pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
             );
             Ok((format, features.width as usize, features.height as usize))
         },
+        #[cfg(feature = "avif")]
+        ImageFormat::Avif => {
+            let (w, h) = crate::avif::probe_avif(bytes)?;
+            Ok((format, w, h))
+        }
+        #[cfg(not(feature = "avif"))]
+        ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
     }
 }
 
@@ -207,6 +220,10 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
             }
             ImageFormat::Png => Ok((process_png(s, reader, p)?, ImageFormat::Png)),
             ImageFormat::Webp => Ok((process_webp(s, reader, p)?, ImageFormat::Webp)),
+            #[cfg(feature = "avif")]
+            ImageFormat::Avif => Ok((process_avif(s, reader, p)?, ImageFormat::Avif)),
+            #[cfg(not(feature = "avif"))]
+            ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
         }
     })
 }
@@ -683,6 +700,42 @@ fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
     Ok(out)
 }
 
+/// AVIF: decode via dav1d, resize, re-encode via SVT-AV1. AV1 has no
+/// reduced-resolution decode mode, so unlike JPEG/WebP the decode always
+/// runs at full source resolution.
+#[cfg(feature = "avif")]
+fn process_avif<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+    s.srcbuf.clear();
+    reader
+        .read_to_end(&mut s.srcbuf)
+        .context("read AVIF source")?;
+
+    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
+    let (src_w, src_h) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
+    let t_dec = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let (dst_w, dst_h) = resize_pixels(s, 3, src_w, src_h, p)?;
+    let t_resize = t1.elapsed();
+
+    let t2 = std::time::Instant::now();
+    let params = crate::avif::AvifParams {
+        quality: p.quality.clamp(0.0, 100.0) as u8,
+        ..Default::default()
+    };
+    let out = crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &params)?;
+    if timing {
+        eprintln!(
+            "timing avif decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
+            t_dec.as_secs_f64() * 1e3,
+            t_resize.as_secs_f64() * 1e3,
+            t2.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    Ok(out)
+}
+
 /// Decode `srcbuf` (WebP) into `chunk8`, scaling during decode down to
 /// margin x target when the source is much larger. Returns
 /// (src_w, src_h, channels, decoded_w, decoded_h).
@@ -1052,6 +1105,7 @@ mod tests {
         assert_eq!(ImageFormat::Jpeg.content_type(), "image/jpeg");
         assert_eq!(ImageFormat::Png.content_type(), "image/png");
         assert_eq!(ImageFormat::Webp.content_type(), "image/webp");
+        assert_eq!(ImageFormat::Avif.content_type(), "image/avif");
     }
 
     #[test]
@@ -1062,6 +1116,10 @@ mod tests {
         assert_eq!(ImageFormat::sniff(&png), Some(ImageFormat::Png));
         let webp = *b"RIFF\x00\x01\x00\x00WEBP";
         assert_eq!(ImageFormat::sniff(&webp), Some(ImageFormat::Webp));
+        assert_eq!(
+            ImageFormat::sniff(b"\x00\x00\x00\x1cftypavif"),
+            Some(ImageFormat::Avif)
+        );
         assert_eq!(ImageFormat::sniff(b"GIF89a\x00\x00\x00\x00\x00\x00"), None);
     }
 

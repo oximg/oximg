@@ -240,13 +240,20 @@ pub fn probe_avif(data: &[u8]) -> Result<(usize, usize)> {
 /// color ranges. Alpha AVIFs are rejected until the encode side can carry
 /// the alpha item through.
 pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+    let mut out = Vec::new();
+    let (w, h) = decode_avif_into(data, &mut out)?;
+    Ok((out, w, h))
+}
+
+/// Like [`decode_avif`], but reuses `out` as the pixel buffer.
+pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize)> {
     let avif =
         avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
     ensure!(avif.alpha_item.is_none(), "AVIF with alpha is unsupported");
-    decode_av1_to_rgb(&avif.primary_item)
+    decode_av1_to_rgb(&avif.primary_item, out)
 }
 
-fn decode_av1_to_rgb(av1: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+fn decode_av1_to_rgb(av1: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize)> {
     use dav1d_sys as d;
     unsafe {
         let mut settings: d::Dav1dSettings = std::mem::zeroed();
@@ -314,12 +321,12 @@ fn decode_av1_to_rgb(av1: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
         }
         let _pic_guard = Pic(&mut pic);
 
-        picture_to_rgb(&pic)
+        picture_to_rgb(&pic, out)
     }
 }
 
 /// Convert a decoded dav1d picture (planar YUV) to interleaved RGB8.
-fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture) -> Result<(Vec<u8>, usize, usize)> {
+fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(usize, usize)> {
     use dav1d_sys as d;
     let (w, h) = (pic.p.w as usize, pic.p.h as usize);
     let bpc = pic.p.bpc as u32;
@@ -394,7 +401,8 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture) -> Result<(Vec<u8>, usize, usiz
     let mut cb_row = vec![0f32; w];
     let mut cr_row = vec![0f32; w];
 
-    let mut rgb = vec![0u8; w * h * 3];
+    out.clear();
+    out.resize(w * h * 3, 0);
     for y in 0..h {
         if !monochrome {
             // Vertical pass at chroma horizontal resolution.
@@ -436,7 +444,7 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture) -> Result<(Vec<u8>, usize, usiz
             }
         }
 
-        let row = &mut rgb[y * w * 3..(y + 1) * w * 3];
+        let row = &mut out[y * w * 3..(y + 1) * w * 3];
         for (x, px) in row.chunks_exact_mut(3).enumerate() {
             let yf = (sample(0, x, y) - y_off) * y_mul;
             let (r, g, b) = if monochrome {
@@ -457,7 +465,7 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture) -> Result<(Vec<u8>, usize, usiz
             px[2] = (b + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
-    Ok((rgb, w, h))
+    Ok((w, h))
 }
 
 #[cfg(test)]
