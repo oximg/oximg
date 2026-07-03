@@ -36,3 +36,7 @@ pic-scale = "0.7"
 [features]
 default = []
 avif = ["dep:avif-serialize"]
+
+[[example]]
+name = "avif_parity"
+required-features = ["avif"]
