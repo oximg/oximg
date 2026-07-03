@@ -123,6 +123,23 @@ scores +12.1 SSIMULACRA2 over imgproxy; with `OXIMG_AVIF_QUALITY=55`
 its output is smaller than imgproxy's and still scores +6.7 while
 serving 34.3 req/s (p95 499 ms).
 
+### AVIF with alpha
+
+The DIV2K dataset has no alpha, so this variant re-encodes the same 99
+sources with a synthetic alpha ramp (`avifenc -s 8 -q 65`) and runs the
+identical 512x512-fit AVIF-out cell. oximg carries alpha as a second
+SVT-AV1 auxiliary-image encode plus a second dav1d decode:
+
+| Server | req/s (p95) |
+|---|---|
+| oximg (defaults) | **29.5** (578 ms) |
+| thumbor 7.x | 27.3 (738 ms) |
+| imagor 1.9.2 | 27.2 (720 ms) |
+| imgproxy | 26.2 (684 ms) |
+
+All runs 100% successful checks; every server's output carries the
+alpha item (verified with avifdec).
+
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
 Methodology from
