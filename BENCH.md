@@ -140,6 +140,42 @@ SVT-AV1 auxiliary-image encode plus a second dav1d decode:
 All runs 100% successful checks; every server's output carries the
 alpha item (verified with avifdec).
 
+## Official harness on real AWS hardware (c7i.large and c7g.large)
+
+The same harness run unmodified on the instance types imgproxy uses for
+its published results, deployed with the harness's own CloudFormation
+template (Ubuntu 24.04, Docker, k6 with 2 VUs for 5 minutes per cell,
+all defaults). req/s (p95); all runs 100% successful checks.
+
+c7i.large (x86-64, 2 vCPU = one SMT core):
+
+| Server | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg (defaults) | **81.8** (32 ms) | **32.9** (79 ms) | **31.0** (91 ms) | **16.0** (176 ms) |
+| imgproxy | 68.4 (40 ms) | 14.3 (187 ms) | 20.5 (137 ms) | 15.6 (185 ms) |
+| imagor 1.9.2 | 59.4 (43 ms) | 15.5 (174 ms) | 17.5 (153 ms) | 10.2 (283 ms) |
+| thumbor 7.x | 52.1 (48 ms) | 8.7 (304 ms) | 14.1 (185 ms) | 13.0 (210 ms) |
+
+c7g.large (Graviton3, 2 physical cores):
+
+| Server | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg (defaults) | 67.0 (37 ms) | **27.1** (93 ms) | **36.3** (77 ms) | 14.5 (182 ms) |
+| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.4 (139 ms) |
+| imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
+| thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
+
+Notes:
+
+- The c7i AVIF cell reflects the current defaults (two dav1d worker
+  threads, quality 55); the earlier one-thread/q65 build measured 13.9.
+- On Graviton the JPEG cell is within 2% of imgproxy and the AVIF cell
+  trails it. Two x86 advantages do not carry over yet: dav1d's
+  in-frame threading, which cuts decode ~40% on x86 and Apple Silicon,
+  yields no speedup on Graviton3 (verified with dav1d 1.5.1 and 1.5.3),
+  and the linear-light u16 resize stage costs 37 ms there vs 7 ms on
+  c7i. ARM-specific optimization is ongoing.
+
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
 Methodology from
