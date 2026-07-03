@@ -1029,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn luts_roundtrip_every_srgb_value() {
+        // back(fwd(v)) must be the identity for all 256 sRGB values, or
+        // unresized regions would shift colors through the linear path.
+        let (fwd, back) = (fwd_lut(), back_lut());
+        for v in 0..=255u8 {
+            assert_eq!(back[fwd[v as usize] as usize], v, "value {v}");
+        }
+    }
+
+    #[test]
+    fn preset_parsing_maps_and_defaults() {
+        assert_eq!(Encoder::from_preset("fast"), Encoder::MozFast);
+        assert_eq!(Encoder::from_preset("small"), Encoder::MozSmall);
+        assert_eq!(Encoder::from_preset("jpegli"), Encoder::Jpegli);
+        assert_eq!(Encoder::from_preset(""), Encoder::Jpegli);
+        assert_eq!(Encoder::from_preset("bogus"), Encoder::Jpegli);
+    }
+
+    #[test]
+    fn content_types_match_formats() {
+        assert_eq!(ImageFormat::Jpeg.content_type(), "image/jpeg");
+        assert_eq!(ImageFormat::Png.content_type(), "image/png");
+        assert_eq!(ImageFormat::Webp.content_type(), "image/webp");
+    }
+
+    #[test]
     fn sniff_detects_formats_by_magic_bytes() {
         let jpeg = *b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01";
         assert_eq!(ImageFormat::sniff(&jpeg), Some(ImageFormat::Jpeg));

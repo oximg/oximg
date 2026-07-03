@@ -334,3 +334,56 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let (bytes, format) = out;
     Ok((Bytes::from(bytes), format.content_type()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64url_decodes_known_vectors() {
+        assert_eq!(
+            base64url_decode("aGVsbG8").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert_eq!(
+            base64url_decode("aGVsbG8=").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        // '-' and '_' are the URL-safe substitutions for '+' and '/'
+        assert_eq!(
+            base64url_decode("-_8").as_deref(),
+            Some([0xfb, 0xff].as_slice())
+        );
+        assert_eq!(base64url_decode("bad!"), None);
+    }
+
+    fn test_signing() -> Signing {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        Signing {
+            key: hex(&"deadbeef".repeat(8)),
+            salt: hex(&"cafebabe".repeat(8)),
+        }
+    }
+
+    #[test]
+    fn signature_verifies_precomputed_vector() {
+        // vector computed independently with python hmac/hashlib
+        let sig = "lrio_2A_EDYOogJybA7hm-AfXAr5YhjYhXwJ7_K93-U";
+        assert!(test_signing().verify(sig, "/resize/100/100/x.jpg"));
+    }
+
+    #[test]
+    fn signature_rejects_wrong_path_and_garbage() {
+        let s = test_signing();
+        let sig = "lrio_2A_EDYOogJybA7hm-AfXAr5YhjYhXwJ7_K93-U";
+        assert!(!s.verify(sig, "/resize/100/101/x.jpg"));
+        assert!(!s.verify("AAAA", "/resize/100/100/x.jpg"));
+        assert!(!s.verify("!!!not-base64!!!", "/resize/100/100/x.jpg"));
+        assert!(!s.verify("", "/resize/100/100/x.jpg"));
+    }
+}
