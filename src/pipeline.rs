@@ -334,7 +334,13 @@ fn resize_bands(
     threads: usize,
     fallback: &mut Option<Resizer>,
 ) -> Result<()> {
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+    // The pipeline premultiplies before this call and unpremultiplies
+    // after, so fir's own alpha multiply/divide pass must stay off: with
+    // it, already-premultiplied colors get weighted by alpha a second
+    // time inside the convolution.
+    let opts = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
+        .use_alpha(false);
     let src_view =
         fast_image_resize::images::ImageRef::new(dec_w as u32, dec_h as u32, src_bytes, px)?;
 
