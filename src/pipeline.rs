@@ -450,6 +450,8 @@ fn linear_light() -> bool {
 }
 
 fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
     s.srcbuf.clear();
     reader
         .read_to_end(&mut s.srcbuf)
@@ -478,8 +480,21 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
         png::ColorType::Indexed => anyhow::bail!("unexpanded indexed PNG"),
     };
 
+    let t_decode = t0.elapsed();
+    let t1 = std::time::Instant::now();
     let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
-    encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)
+    let t_resize = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let out = encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels);
+    if timing {
+        eprintln!(
+            "timing png decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
+            t_decode.as_secs_f64() * 1e3,
+            t_resize.as_secs_f64() * 1e3,
+            t2.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    out
 }
 
 /// Expand grayscale(+alpha) pixels in `chunk8[..len]` to RGB(A) in place.
