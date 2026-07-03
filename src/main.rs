@@ -20,7 +20,7 @@ use axum::routing::get;
 use tokio::sync::{Semaphore, watch};
 
 type FlightKey = (u32, u32, String);
-type FlightResult = Result<Bytes, (StatusCode, String)>;
+type FlightResult = Result<(Bytes, &'static str), (StatusCode, String)>;
 type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>>;
 
 #[derive(Clone)]
@@ -103,10 +103,10 @@ async fn handle_resize(
         return Err((StatusCode::BAD_REQUEST, "invalid filename".into()));
     }
 
-    let out = singleflight(&app, (w, h, file)).await?;
+    let (out, content_type) = singleflight(&app, (w, h, file)).await?;
     Ok((
         [
-            (header::CONTENT_TYPE, "image/jpeg"),
+            (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "public, max-age=31536000"),
         ],
         out,
@@ -225,5 +225,6 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         _ => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
     })?;
 
-    Ok(Bytes::from(out))
+    let (bytes, format) = out;
+    Ok((Bytes::from(bytes), format.content_type()))
 }

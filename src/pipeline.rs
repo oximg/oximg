@@ -116,12 +116,64 @@ fn dct_margin() -> f64 {
         .unwrap_or(1.7)
 }
 
-pub fn process(jpeg: &[u8], p: &Params) -> Result<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageFormat {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+impl ImageFormat {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            ImageFormat::Jpeg => "image/jpeg",
+            ImageFormat::Png => "image/png",
+            ImageFormat::Webp => "image/webp",
+        }
+    }
+
+    /// Detect the format from the first bytes; extensions are not trusted.
+    fn sniff(header: &[u8; 12]) -> Option<ImageFormat> {
+        if header.starts_with(&[0xFF, 0xD8]) {
+            Some(ImageFormat::Jpeg)
+        } else if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(ImageFormat::Png)
+        } else if &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
+            Some(ImageFormat::Webp)
+        } else {
+            None
+        }
+    }
+}
+
+pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+    process_reader(std::io::Cursor::new(bytes), p)
+}
+
+/// Sniff the source format, then resize + re-encode in the same format.
+/// JPEG keeps its fully streaming decode path; PNG streams through the
+/// png crate; WebP requires the whole compressed source in memory
+/// (libwebp has no incremental one-shot API).
+fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+    let mut header = [0u8; 12];
+    std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
+    let format = ImageFormat::sniff(&header).context("unsupported image format")?;
+    let reader = std::io::BufReader::new(std::io::Read::chain(&header[..], reader));
+
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
-        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+        match format {
+            ImageFormat::Jpeg => {
+                let dec = Decompress::new_reader(reader).context("parse JPEG")?;
+                let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
+                Ok((
+                    encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)?,
+                    ImageFormat::Jpeg,
+                ))
+            }
+            ImageFormat::Png => Ok((process_png(s, reader, p)?, ImageFormat::Png)),
+            ImageFormat::Webp => Ok((process_webp(s, reader, p)?, ImageFormat::Webp)),
+        }
     })
 }
 
@@ -130,13 +182,9 @@ pub fn process(jpeg: &[u8], p: &Params) -> Result<Vec<u8>> {
 /// concurrency this saves concurrency x file-size of resident memory;
 /// entropy decoding is a sequential read anyway, so the page cache
 /// serves it fine.
-pub fn process_path(path: &std::path::Path, p: &Params) -> Result<Vec<u8>> {
-    SCRATCH.with(|s| {
-        let s = &mut *s.borrow_mut();
-        let dec = Decompress::new_path(path).context("open/parse JPEG")?;
-        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
-        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
-    })
+pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+    let file = std::fs::File::open(path).context("open source")?;
+    process_reader(file, p)
 }
 
 fn http_agent() -> &'static ureq::Agent {
@@ -159,7 +207,7 @@ fn max_source_bytes() -> u64 {
 /// Remote-source variant: stream the HTTP response body straight into the
 /// decoder — decoding overlaps the download and the source is never
 /// buffered whole, same as the file path.
-pub fn process_url(url: &str, p: &Params) -> Result<Vec<u8>> {
+pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     let resp = http_agent().get(url).call().map_err(|e| match e {
         // Preserve source 404s so the HTTP layer can pass them through.
         ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
@@ -168,16 +216,8 @@ pub fn process_url(url: &str, p: &Params) -> Result<Vec<u8>> {
         )),
         other => anyhow::Error::new(other).context("fetch source"),
     })?;
-    let reader = std::io::BufReader::new(std::io::Read::take(
-        resp.into_body().into_reader(),
-        max_source_bytes(),
-    ));
-    SCRATCH.with(|s| {
-        let s = &mut *s.borrow_mut();
-        let dec = Decompress::new_reader(reader).context("parse JPEG")?;
-        let (dst_w, dst_h) = decode_resize(s, dec, p.max_width, p.max_height, p.parallel)?;
-        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
-    })
+    let reader = std::io::Read::take(resp.into_body().into_reader(), max_source_bytes());
+    process_reader(reader, p)
 }
 
 thread_local! {
@@ -192,6 +232,10 @@ struct Scratch {
     chunk8: Vec<u8>,
     src16: Vec<u16>,
     dst16: Vec<u16>,
+    // Compressed source bytes for formats whose decoders need the whole
+    // buffer (png's Seek bound, libwebp's one-shot API). JPEG never uses
+    // this: it streams.
+    srcbuf: Vec<u8>,
     // Final RGB pixels also live in scratch: output sizes vary per request
     // (every distinct target width is a distinct allocation size), and that
     // churn is what the allocator retains across thread heaps.
@@ -405,6 +449,228 @@ fn linear_light() -> bool {
     std::env::var("OXIMG_RESIZE").as_deref() != Ok("srgb")
 }
 
+fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+    s.srcbuf.clear();
+    reader
+        .read_to_end(&mut s.srcbuf)
+        .context("read PNG source")?;
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(&s.srcbuf[..]));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut png_reader = decoder.read_info().context("parse PNG")?;
+    s.chunk8
+        .resize(png_reader.output_buffer_size().context("PNG too large")?, 0);
+    let info = png_reader.next_frame(&mut s.chunk8).context("decode PNG")?;
+    let (src_w, src_h) = (info.width as usize, info.height as usize);
+    let len = info.buffer_size();
+
+    // Normalize to RGB8/RGBA8 (EXPAND leaves grayscale as 1-2 channels).
+    let channels = match info.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Grayscale => {
+            gray_to_rgb(s, len, 1);
+            3
+        }
+        png::ColorType::GrayscaleAlpha => {
+            gray_to_rgb(s, len, 2);
+            4
+        }
+        png::ColorType::Indexed => anyhow::bail!("unexpanded indexed PNG"),
+    };
+
+    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
+    encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)
+}
+
+/// Expand grayscale(+alpha) pixels in `chunk8[..len]` to RGB(A) in place.
+fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
+    let out_ch = in_ch + 2;
+    let pixels = len / in_ch;
+    s.chunk8.resize(pixels * out_ch, 0);
+    for i in (0..pixels).rev() {
+        let g = s.chunk8[i * in_ch];
+        let a = if in_ch == 2 {
+            s.chunk8[i * in_ch + 1]
+        } else {
+            0
+        };
+        let o = i * out_ch;
+        s.chunk8[o] = g;
+        s.chunk8[o + 1] = g;
+        s.chunk8[o + 2] = g;
+        if in_ch == 2 {
+            s.chunk8[o + 3] = a;
+        }
+    }
+}
+
+fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+    s.srcbuf.clear();
+    reader
+        .read_to_end(&mut s.srcbuf)
+        .context("read WebP source")?;
+    let image = webp::Decoder::new(&s.srcbuf)
+        .decode()
+        .context("decode WebP (animated sources are unsupported)")?;
+    let (src_w, src_h) = (image.width() as usize, image.height() as usize);
+    let channels = if image.is_alpha() { 4 } else { 3 };
+
+    // Copy pixels into chunk8 so resize_pixels can consume them uniformly.
+    s.chunk8.clear();
+    s.chunk8.extend_from_slice(&image);
+    drop(image);
+
+    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
+    Ok(encode_webp(
+        &s.out8[..dst_w * dst_h * channels],
+        dst_w,
+        dst_h,
+        channels,
+    ))
+}
+
+/// Resize the fully decoded pixels in `chunk8` (3 or 4 channels) into
+/// `out8`, returning the output dimensions. RGB follows the same
+/// linear-light path as JPEG; alpha images are premultiplied before
+/// resampling and unpremultiplied after.
+fn resize_pixels(
+    s: &mut Scratch,
+    channels: usize,
+    src_w: usize,
+    src_h: usize,
+    p: &Params,
+) -> Result<(usize, usize)> {
+    let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+    let src_len = src_w * src_h * channels;
+    if (src_w, src_h) == (dst_w, dst_h) {
+        s.out8.resize(src_len, 0);
+        let (chunk8, out8) = (&s.chunk8, &mut s.out8);
+        out8.copy_from_slice(&chunk8[..src_len]);
+        return Ok((dst_w, dst_h));
+    }
+
+    if linear_light() {
+        let (fwd, back) = (fwd_lut(), back_lut());
+        s.src16.resize(src_len, 0);
+        if channels == 4 {
+            for (d, src) in s.src16.chunks_exact_mut(4).zip(s.chunk8.chunks_exact(4)) {
+                let a = src[3] as u32 * 257;
+                for c in 0..3 {
+                    // Premultiply in linear light so resampling never bleeds
+                    // color from fully transparent pixels.
+                    d[c] = ((fwd[src[c] as usize] as u32 * a) / 65535) as u16;
+                }
+                d[3] = a as u16;
+            }
+        } else {
+            for (d, src) in s.src16.iter_mut().zip(&s.chunk8[..src_len]) {
+                *d = fwd[*src as usize];
+            }
+        }
+        s.dst16.resize(dst_w * dst_h * channels, 0);
+        resize_bands(
+            u16_as_bytes(&s.src16),
+            src_w,
+            src_h,
+            u16_as_bytes_mut(&mut s.dst16),
+            dst_w,
+            dst_h,
+            if channels == 4 {
+                PixelType::U16x4
+            } else {
+                PixelType::U16x3
+            },
+            p.parallel,
+            &mut s.resizer,
+        )?;
+        s.out8.resize(dst_w * dst_h * channels, 0);
+        if channels == 4 {
+            for (d, src) in s.out8.chunks_exact_mut(4).zip(s.dst16.chunks_exact(4)) {
+                let a = src[3] as u32;
+                for (out, &pre) in d[..3].iter_mut().zip(&src[..3]) {
+                    let un = (pre as u32 * 65535)
+                        .checked_div(a)
+                        .map_or(0, |v| v.min(65535)) as u16;
+                    *out = back[un as usize];
+                }
+                d[3] = (a / 257) as u8;
+            }
+        } else {
+            for (d, src) in s.out8.iter_mut().zip(&s.dst16) {
+                *d = back[*src as usize];
+            }
+        }
+    } else {
+        if channels == 4 {
+            // Premultiply in place (u8 approximation for speed mode).
+            for px in s.chunk8[..src_len].chunks_exact_mut(4) {
+                let a = px[3] as u32;
+                for c in px[..3].iter_mut() {
+                    *c = ((*c as u32 * a + 127) / 255) as u8;
+                }
+            }
+        }
+        s.out8.resize(dst_w * dst_h * channels, 0);
+        let (chunk8, out8) = (&s.chunk8, &mut s.out8);
+        resize_bands(
+            &chunk8[..src_len],
+            src_w,
+            src_h,
+            out8,
+            dst_w,
+            dst_h,
+            if channels == 4 {
+                PixelType::U8x4
+            } else {
+                PixelType::U8x3
+            },
+            p.parallel,
+            &mut s.resizer,
+        )?;
+        if channels == 4 {
+            for px in s.out8.chunks_exact_mut(4) {
+                let a = px[3] as u32;
+                for c in px[..3].iter_mut() {
+                    *c = (*c as u32 * 255).checked_div(a).map_or(0, |v| v.min(255)) as u8;
+                }
+            }
+        }
+    }
+    Ok((dst_w, dst_h))
+}
+
+fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(64 * 1024);
+    let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+    enc.set_color(if channels == 4 {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
+    enc.set_depth(png::BitDepth::Eight);
+    enc.set_compression(png::Compression::Balanced);
+    let mut writer = enc.write_header().context("PNG header")?;
+    writer.write_image_data(pixels).context("PNG encode")?;
+    writer.finish().context("PNG finish")?;
+    Ok(out)
+}
+
+fn webp_quality() -> f32 {
+    std::env::var("OXIMG_WEBP_QUALITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(75.0)
+}
+
+fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Vec<u8> {
+    let enc = if channels == 4 {
+        webp::Encoder::from_rgba(pixels, w as u32, h as u32)
+    } else {
+        webp::Encoder::from_rgb(pixels, w as u32, h as u32)
+    };
+    enc.encode(webp_quality()).to_vec()
+}
+
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
     if p.encoder == Encoder::Jpegli {
         return encode_jpegli(rgb, w, h, p.quality);
@@ -488,6 +754,17 @@ mod tests {
             .unwrap();
             assert_eq!(single, banded, "threads={threads} output differs");
         }
+    }
+
+    #[test]
+    fn sniff_detects_formats_by_magic_bytes() {
+        let jpeg = *b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01";
+        assert_eq!(ImageFormat::sniff(&jpeg), Some(ImageFormat::Jpeg));
+        let png = *b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0D";
+        assert_eq!(ImageFormat::sniff(&png), Some(ImageFormat::Png));
+        let webp = *b"RIFF\x00\x01\x00\x00WEBP";
+        assert_eq!(ImageFormat::sniff(&webp), Some(ImageFormat::Webp));
+        assert_eq!(ImageFormat::sniff(b"GIF89a\x00\x00\x00\x00\x00\x00"), None);
     }
 
     #[test]
