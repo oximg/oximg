@@ -80,6 +80,27 @@ the source of its score; oximg decodes with quality headroom and
 resizes in linear light. Throughput and latency for these formats are
 measured under sustained load in [../../BENCH.md](../../BENCH.md).
 
+## AVIF (same-format in/out, fit 512x512, Ryzen harness outputs)
+
+First 10 DIV2K images of the harness dataset (AVIF sources produced by
+the harness itself with vips at Q=65), served by each Docker contender
+exactly as in the throughput run, scored against a linear-light Lanczos
+reference computed from the decoded source. Mean SSIM2 / total bytes
+for the 10 outputs:
+
+| Server | SSIM2 (linear ref) | total bytes |
+|---|---|---|
+| oximg q65 (default) | **79.6** | 409 KB |
+| oximg `OXIMG_AVIF_QUALITY=55` | **74.2** | **307 KB** |
+| thumbor 7.x (q65) | 68.5 | 317 KB |
+| imagor 1.9.2 (q65) | 68.4 | 306 KB |
+| imgproxy (q65) | 67.5 | 319 KB |
+
+The same nominal quality lands on very different rate/distortion
+points: oximg encodes 10-bit 4:2:0 with SVT-AV1 tune=ssim. At matched
+output size (q55 row) it stays +6.7 SSIM2 ahead of imgproxy; at the
+default it trades +28% bytes for +12.1.
+
 ## Notes
 
 - The linear-light reference is produced by ImageMagick (also a

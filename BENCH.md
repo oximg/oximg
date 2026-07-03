@@ -87,12 +87,12 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
-## imgproxy's official benchmark harness (JPEG, PNG, and WebP)
+## imgproxy's official benchmark harness (JPEG, PNG, WebP, and AVIF)
 
 [imgproxy's current benchmark](https://imgproxy.net/blog/image-processing-servers-benchmark/)
 ([harness](https://github.com/imgproxy/image-servers-benchmark)) replaces
 the gist below: 100 DIV2K photographs served by nginx over HTTP, fit into
-512x512 (JPEG q80, WebP q75, PNG default), k6 with 2 VUs for 5 minutes,
+512x512 (JPEG q80, WebP q75, AVIF q65, PNG default), k6 with 2 VUs for 5 minutes,
 everything in Docker. Run here on the Ryzen 7 8745HS with all services
 pinned to 2 cores (`cpuset: "0-1"`) to approximate the 2-vCPU c7i.large
 used in their published results; oximg added via
@@ -102,17 +102,26 @@ like every other contender (`OXIMG_SOURCE_BASE_URL`).
 
 req/s (p95 latency); all runs 100% successful checks:
 
-| Server | JPEG | PNG | WebP |
-|---|---|---|---|
-| oximg (defaults) | **190.8** (93 ms) | **72.7** (240 ms) | **70.6** (247 ms) |
-| imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) |
-| imagor 1.9.2 | 143.1 (169 ms) | 35.8 (670 ms) | 44.6 (493 ms) |
-| thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) |
+| Server | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg (defaults) | **190.8** (93 ms) | **72.7** (240 ms) | **70.6** (247 ms) | **33.7** (507 ms) |
+| imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) | 33.4 (545 ms) |
+| imagor 1.9.2 | 143.1 (169 ms) | 35.8 (670 ms) | 44.6 (493 ms) | 24.5 (920 ms) |
+| thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) | 30.8 (646 ms) |
 
 The relative order of the other three matches imgproxy's published
 c7i.large results. PNG output at these settings measures 448KB per
 image vs libvips' 482KB default. Output quality is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
+
+AVIF (oximg built with `--features avif`, SVT-AV1 4.1 encode / dav1d
+decode) is decode-bound for every server, which compresses the
+throughput spread. Output operating points differ substantially at the
+same nominal q65, so the quality table in QUALITY.md is the other half
+of this cell: at default settings oximg spends 28% more bytes and
+scores +12.1 SSIMULACRA2 over imgproxy; with `OXIMG_AVIF_QUALITY=55`
+its output is smaller than imgproxy's and still scores +6.7 while
+serving 34.3 req/s (p95 499 ms).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
