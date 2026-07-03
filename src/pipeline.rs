@@ -459,6 +459,66 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
     let mut decoder = png::Decoder::new(std::io::Cursor::new(&s.srcbuf[..]));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut png_reader = decoder.read_info().context("parse PNG")?;
+
+    // Hot path: plain RGB8, non-interlaced, linear-light mode. Rows are
+    // sRGB->linear LUT-mapped as they are decoded, so the pixels never
+    // take a second full-image pass (and never exist as a full u8 copy).
+    {
+        let (ct, bits) = png_reader.output_color_type();
+        let hdr = png_reader.info();
+        let (src_w, src_h) = (hdr.width as usize, hdr.height as usize);
+        let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        if ct == png::ColorType::Rgb
+            && bits == png::BitDepth::Eight
+            && !hdr.interlaced
+            && (src_w, src_h) != (dst_w, dst_h)
+            && linear_light()
+        {
+            let fwd = fwd_lut();
+            s.src16.resize(src_w * src_h * 3, 0);
+            let mut y = 0usize;
+            while let Some(row) = png_reader.next_row().context("decode PNG")? {
+                let dst = &mut s.src16[y * src_w * 3..(y + 1) * src_w * 3];
+                for (d, &b) in dst.iter_mut().zip(row.data()) {
+                    *d = fwd[b as usize];
+                }
+                y += 1;
+            }
+            anyhow::ensure!(y == src_h, "PNG row count mismatch");
+            let t_decode = t0.elapsed();
+            let t1 = std::time::Instant::now();
+            s.dst16.resize(dst_w * dst_h * 3, 0);
+            resize_bands(
+                u16_as_bytes(&s.src16),
+                src_w,
+                src_h,
+                u16_as_bytes_mut(&mut s.dst16),
+                dst_w,
+                dst_h,
+                PixelType::U16x3,
+                p.parallel,
+                &mut s.resizer,
+            )?;
+            let back = back_lut();
+            s.out8.resize(dst_w * dst_h * 3, 0);
+            for (d, &v) in s.out8.iter_mut().zip(&s.dst16) {
+                *d = back[v as usize];
+            }
+            let t_resize = t1.elapsed();
+            let t2 = std::time::Instant::now();
+            let out = encode_png(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3);
+            if timing {
+                eprintln!(
+                    "timing png(fused) decode+fwd({src_w}x{src_h})={:.1}ms resize+back={:.1}ms encode={:.1}ms",
+                    t_decode.as_secs_f64() * 1e3,
+                    t_resize.as_secs_f64() * 1e3,
+                    t2.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return out;
+        }
+    }
+
     s.chunk8
         .resize(png_reader.output_buffer_size().context("PNG too large")?, 0);
     let info = png_reader.next_frame(&mut s.chunk8).context("decode PNG")?;
