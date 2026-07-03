@@ -345,6 +345,18 @@ pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize,
     Ok((w, h, 4))
 }
 
+/// dav1d worker threads. Defaults to 2: like libwebp's two-thread decode
+/// (which libvips also ships), AV1 in-frame task threading briefly
+/// exceeds the CPU slot to cut wall latency; at saturation the scheduler
+/// amortizes it. Set OXIMG_AVIF_DECODE_THREADS=1 for strict one-slot
+/// decoding.
+fn dav1d_threads() -> std::os::raw::c_int {
+    std::env::var("OXIMG_AVIF_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
 /// Run one dav1d session over a single-frame AV1 stream and hand the
 /// decoded picture to `f`.
 fn with_decoded_picture<T>(
@@ -355,8 +367,7 @@ fn with_decoded_picture<T>(
     unsafe {
         let mut settings: d::Dav1dSettings = std::mem::zeroed();
         d::dav1d_default_settings(&mut settings);
-        // One request = one CPU slot, same as every other decoder here.
-        settings.n_threads = 1;
+        settings.n_threads = dav1d_threads();
         settings.max_frame_delay = 1;
 
         let mut ctx: *mut d::Dav1dContext = std::ptr::null_mut();
