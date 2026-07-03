@@ -14,6 +14,9 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY examples ./examples
+# Deployment-specific codegen tuning, e.g. --build-arg RUSTFLAGS="-C target-cpu=native".
+ARG RUSTFLAGS=""
+ENV RUSTFLAGS=${RUSTFLAGS}
 RUN cargo build --release --locked --features avif
 
 FROM debian:trixie-slim
