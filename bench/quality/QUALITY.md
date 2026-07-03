@@ -68,16 +68,17 @@ against a linear-light Lanczos reference of the same source, local
 Apple M2 Max, imgproxy 4.0.9. PNG output is lossless, so its score
 isolates pure resize quality.
 
-| Format | Server | SSIM2 (linear ref) | avg size | latency |
-|---|---|---|---|---|
-| PNG | oximg | **94.8** | 307.8 KB | **28.3 ms** |
-| PNG | imgproxy | 81.5 | 308.8 KB | 36.9 ms |
-| WebP (q75) | oximg | **71.9** | **29.7 KB** | 23.5 ms |
-| WebP (q75) | imgproxy | 61.7 | 33.1 KB | **10.4 ms** |
+| Format | Server | SSIM2 (linear ref) | avg size |
+|---|---|---|---|
+| PNG | oximg | **94.8** | 307.8 KB |
+| PNG | imgproxy | 81.5 | 308.8 KB |
+| WebP (q75) | oximg | **71.8** | **30.5 KB** |
+| WebP (q75) | imgproxy | 61.7 | 33.1 KB |
 
-WebP note: imgproxy resizes during WebP decode (libwebp's built-in
-scaler), which is faster but is also the source of its score; oximg
-decodes fully and resizes in linear light.
+WebP note: imgproxy resizes with libwebp's built-in scaler, which is
+the source of its score; oximg decodes with quality headroom and
+resizes in linear light. Throughput and latency for these formats are
+measured under sustained load in [../../BENCH.md](../../BENCH.md).
 
 ## Notes
 

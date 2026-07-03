@@ -87,28 +87,32 @@ servers restarted per scenario. Methodology after
 Fixed HTTP overhead is under 1% of image work on the resize path for
 both servers.
 
-## imgproxy's official benchmark harness (JPEG category)
+## imgproxy's official benchmark harness (JPEG, PNG, and WebP)
 
 [imgproxy's current benchmark](https://imgproxy.net/blog/image-processing-servers-benchmark/)
 ([harness](https://github.com/imgproxy/image-servers-benchmark)) replaces
 the gist below: 100 DIV2K photographs served by nginx over HTTP, fit into
-512x512 at quality 80, k6 with 2 VUs for 5 minutes, everything in Docker.
-Run here on the Ryzen 7 8745HS with all services pinned to 2 cores
-(`cpuset: "0-1"`) to approximate the 2-vCPU c7i.large used in their
-published results; oximg added via
+512x512 (JPEG q80, WebP q75, PNG default), k6 with 2 VUs for 5 minutes,
+everything in Docker. Run here on the Ryzen 7 8745HS with all services
+pinned to 2 cores (`cpuset: "0-1"`) to approximate the 2-vCPU c7i.large
+used in their published results; oximg added via
 [bench/image-servers-benchmark.patch](bench/image-servers-benchmark.patch)
 (a compose service and a k6 URL case) and fetching sources from nginx
 like every other contender (`OXIMG_SOURCE_BASE_URL`).
 
-| Server | req/s | p95 latency | checks |
+req/s (p95 latency); all runs 100% successful checks:
+
+| Server | JPEG | PNG | WebP |
 |---|---|---|---|
-| oximg (defaults) | **167.6** | **105 ms** | 100% |
-| imgproxy | 155.8 | 121 ms | 100% |
-| imagor 1.9.2 | 143.1 | 169 ms | 100% |
-| thumbor 7.x | 106.8 | 188 ms | 100% |
+| oximg (defaults) | **160.8** (109 ms) | 34.9 (494 ms) | **69.7** (253 ms) |
+| imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) |
+| imagor 1.9.2 | 143.1 (169 ms) | **35.8** (670 ms) | 44.6 (493 ms) |
+| thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) |
 
 The relative order of the other three matches imgproxy's published
-c7i.large results. Output quality at these settings is measured in
+c7i.large results. PNG throughput is within run-to-run variance of
+imagor (oximg's p95 is one third lower). Output quality at these
+settings is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
