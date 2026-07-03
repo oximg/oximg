@@ -736,6 +736,17 @@ fn resize_pixels(
     Ok((dst_w, dst_h))
 }
 
+fn png_compression() -> png::Compression {
+    match std::env::var("OXIMG_PNG_EFFORT").as_deref() {
+        Ok("fastest") => png::Compression::Fastest,
+        // Balanced spends ~15ms/request more than Fast to shave ~14% of
+        // the file; Fast still undercuts libvips' default output size.
+        Ok("balanced") => png::Compression::Balanced,
+        Ok("high") => png::Compression::High,
+        _ => png::Compression::Fast,
+    }
+}
+
 fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(64 * 1024);
     let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
@@ -745,7 +756,7 @@ fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<
         png::ColorType::Rgb
     });
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Balanced);
+    enc.set_compression(png_compression());
     let mut writer = enc.write_header().context("PNG header")?;
     writer.write_image_data(pixels).context("PNG encode")?;
     writer.finish().context("PNG finish")?;
