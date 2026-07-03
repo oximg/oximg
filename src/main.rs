@@ -38,6 +38,81 @@ struct App {
     // Singleflight: concurrent identical requests are processed once and
     // share the result, absorbing cache stampedes on hot images.
     inflight: Arc<FlightMap>,
+    signing: Option<Arc<Signing>>,
+}
+
+/// imgproxy-style URL signing: base64url(HMAC-SHA256(key, salt || path)),
+/// with key and salt supplied hex-encoded. When configured, only
+/// /{signature}/resize/... URLs are served.
+#[derive(Clone)]
+struct Signing {
+    key: Vec<u8>,
+    salt: Vec<u8>,
+}
+
+impl Signing {
+    fn from_env() -> Option<Self> {
+        let decode = |name: &str| -> Option<Vec<u8>> {
+            let v = std::env::var(name).ok()?;
+            let v = v.trim();
+            if v.is_empty() || v.len() % 2 != 0 {
+                return None;
+            }
+            (0..v.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&v[i..i + 2], 16).ok())
+                .collect()
+        };
+        match (decode("OXIMG_KEY"), decode("OXIMG_SALT")) {
+            (Some(key), Some(salt)) => Some(Signing { key, salt }),
+            (None, None) => None,
+            _ => {
+                eprintln!(
+                    "oximg: OXIMG_KEY and OXIMG_SALT must both be set (hex); signing disabled"
+                );
+                None
+            }
+        }
+    }
+
+    fn verify(&self, signature: &str, path: &str) -> bool {
+        use hmac::Mac;
+        use hmac::digest::KeyInit;
+        let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.key) else {
+            return false;
+        };
+        mac.update(&self.salt);
+        mac.update(path.as_bytes());
+        let Some(sig) = base64url_decode(signature) else {
+            return false;
+        };
+        mac.verify_slice(&sig).is_ok()
+    }
+}
+
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut rev = [255u8; 256];
+    for (i, &c) in ALPHABET.iter().enumerate() {
+        rev[c as usize] = i as u8;
+    }
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        let v = rev[c as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -76,11 +151,16 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         ),
         resize_threads: env_or("OXIMG_PAR", 1),
         inflight: Arc::new(Mutex::new(HashMap::new())),
+        signing: Signing::from_env().map(Arc::new),
     };
+    if app.signing.is_some() {
+        eprintln!("oximg: URL signing enabled");
+    }
 
     let router = Router::new()
         .route("/health", get(async || "ok"))
         .route("/resize/{w}/{h}/{file}", get(handle_resize))
+        .route("/{sig}/resize/{w}/{h}/{file}", get(handle_signed_resize))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -92,9 +172,35 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn handle_signed_resize(
+    State(app): State<App>,
+    Path((sig, w, h, file)): Path<(String, u32, u32, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Some(signing) = app.signing.as_ref() else {
+        return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
+    };
+    let path = format!("/resize/{w}/{h}/{file}");
+    if !signing.verify(&sig, &path) {
+        return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
+    }
+    serve_resize(app, w, h, file).await
+}
+
 async fn handle_resize(
     State(app): State<App>,
     Path((w, h, file)): Path<(u32, u32, String)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if app.signing.is_some() {
+        return Err((StatusCode::FORBIDDEN, "signature required".into()));
+    }
+    serve_resize(app, w, h, file).await
+}
+
+async fn serve_resize(
+    app: App,
+    w: u32,
+    h: u32,
+    file: String,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));

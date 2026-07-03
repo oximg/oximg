@@ -20,6 +20,8 @@ jpegli = "0.1.0"
 ureq = "3.3.0"
 png = "0.18.1"
 libwebp-sys = { version = "0.14", features = ["neon"] }
+hmac = "0.13.0"
+sha2 = "0.11.0"
 
 [profile.release]
 lto = true

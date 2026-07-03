@@ -50,6 +50,10 @@ docker build -t oximg .
 docker run -p 8081:8081 -v $PWD/images:/images:ro oximg
 ```
 
+URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
+require imgproxy-style signed URLs —
+`/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`.
+
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
