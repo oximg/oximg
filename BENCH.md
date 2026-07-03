@@ -104,15 +104,14 @@ req/s (p95 latency); all runs 100% successful checks:
 
 | Server | JPEG | PNG | WebP |
 |---|---|---|---|
-| oximg (defaults) | **160.8** (109 ms) | 34.9 (494 ms) | **69.7** (253 ms) |
+| oximg (defaults) | **160.8** (109 ms) | **62.1** (278 ms) | **69.7** (253 ms) |
 | imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) |
-| imagor 1.9.2 | 143.1 (169 ms) | **35.8** (670 ms) | 44.6 (493 ms) |
+| imagor 1.9.2 | 143.1 (169 ms) | 35.8 (670 ms) | 44.6 (493 ms) |
 | thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) |
 
 The relative order of the other three matches imgproxy's published
-c7i.large results. PNG throughput is within run-to-run variance of
-imagor (oximg's p95 is one third lower). Output quality at these
-settings is measured in
+c7i.large results. PNG output at these settings measures 448KB per
+image vs libvips' 482KB default. Output quality is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
