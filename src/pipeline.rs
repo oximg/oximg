@@ -347,10 +347,27 @@ fn resize_bands(
     if threads <= 1 || dst_h < 2 * threads {
         // x86-64: pic-scale's AVX-512/SSE u16 paths convolve ~2.4x faster
         // than fir at equal output quality (SSIMULACRA2-verified). Its
-        // aarch64 fixed-point path loses ~3 points, so ARM keeps fir.
+        // aarch64 fixed-point path loses ~3 points, so ARM instead uses
+        // the in-tree NEON f32 kernel (same window math, f64-verified,
+        // ~1.9x fir on the full-decode shape).
         #[cfg(target_arch = "x86_64")]
         if px == PixelType::U16x3 && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
             return resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h);
+        }
+        #[cfg(target_arch = "aarch64")]
+        if matches!(px, PixelType::U16x3 | PixelType::U16x4)
+            && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir")
+            && std::arch::is_aarch64_feature_detected!("neon")
+        {
+            return crate::resize_neon::resize_u16_neon(
+                src_bytes,
+                dec_w,
+                dec_h,
+                dst_bytes,
+                dst_w,
+                dst_h,
+                px.size() / 2,
+            );
         }
         let mut dst_view = Image::from_slice_u8(dst_w as u32, dst_h as u32, dst_bytes, px)?;
         let resizer = fallback.get_or_insert_with(Resizer::new);
