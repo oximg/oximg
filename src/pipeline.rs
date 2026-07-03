@@ -721,7 +721,7 @@ fn process_avif<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
 
     let t2 = std::time::Instant::now();
     let params = crate::avif::AvifParams {
-        quality: p.quality.clamp(0.0, 100.0) as u8,
+        quality: avif_quality(),
         ..Default::default()
     };
     let out = crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &params)?;
@@ -944,6 +944,17 @@ fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<
     writer.write_image_data(pixels).context("PNG encode")?;
     writer.finish().context("PNG finish")?;
     Ok(out)
+}
+
+/// AVIF quality (libavif semantics). Defaults to 65, the common
+/// serving default (imgproxy ships the same), since AVIF at q80 spends
+/// bytes well past the perceptual sweet spot.
+#[cfg(feature = "avif")]
+fn avif_quality() -> u8 {
+    std::env::var("OXIMG_AVIF_QUALITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65)
 }
 
 fn webp_quality() -> f32 {

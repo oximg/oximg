@@ -6,8 +6,9 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 High-performance image compression in Rust: a library, a CLI, and a
-self-hostable HTTP server (PoC). JPEG, PNG, and WebP in and out; sources
-are format-sniffed by magic bytes and re-encoded in their own format.
+self-hostable HTTP server (PoC). JPEG, PNG, WebP — and AVIF with the
+`avif` feature — in and out; sources are format-sniffed by magic bytes
+and re-encoded in their own format.
 
 ## Pipeline
 
@@ -17,11 +18,12 @@ source bytes (local file or HTTP origin)
       JPEG: mozjpeg streaming decode, DCT shrink-on-load (kept ≥ 1.7x target size)
       PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
       WebP: libwebp
+      AVIF: dav1d (8/10/12-bit, all subsamplings, bilinear chroma upsampling)
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 (SIMD) → sRGB u8
       (alpha is premultiplied before resampling, unpremultiplied after)
   → encode in the source format
       JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
-      PNG:  png crate | WebP: libwebp
+      PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
 ```
 
 Concurrent identical requests are coalesced and share one result.
@@ -43,6 +45,13 @@ IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg
 curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
+AVIF support is an opt-in feature with two system dependencies
+(SVT-AV1 >= 4.1 and dav1d, found via pkg-config):
+
+```sh
+cargo build --release --features avif
+```
+
 Or with Docker:
 
 ```sh
@@ -58,16 +67,18 @@ Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
-(80), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
+(JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
+(65), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 `OXIMG_PAR` (resize threads, 1).
 
 ## Not yet implemented (out of PoC scope)
 
-- Cross-format output and content negotiation (AVIF / JXL / `Accept`-driven)
+- Cross-format output and content negotiation (JXL / `Accept`-driven)
+- AVIF alpha and animated sources
 - EXIF orientation / ICC profile handling
-- S3 sources, URL signing, caching
+- Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
 
 ## Status
