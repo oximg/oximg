@@ -61,6 +61,24 @@ Scores with oximg's speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`)
 are ~60 on the medium group — the same level as imgproxy's and imagor's
 defaults. Throughput for both settings is in [../../BENCH.md](../../BENCH.md).
 
+## PNG and WebP (same-format in/out, fit 500x500)
+
+8 Kodak sources per format (PNG originals; WebP encoded at q90), scored
+against a linear-light Lanczos reference of the same source, local
+Apple M2 Max, imgproxy 4.0.9. PNG output is lossless, so its score
+isolates pure resize quality.
+
+| Format | Server | SSIM2 (linear ref) | avg size | latency |
+|---|---|---|---|---|
+| PNG | oximg | **94.8** | 307.8 KB | **28.3 ms** |
+| PNG | imgproxy | 81.5 | 308.8 KB | 36.9 ms |
+| WebP (q75) | oximg | **71.9** | **29.7 KB** | 23.5 ms |
+| WebP (q75) | imgproxy | 61.7 | 33.1 KB | **10.4 ms** |
+
+WebP note: imgproxy resizes during WebP decode (libwebp's built-in
+scaler), which is faster but is also the source of its score; oximg
+decodes fully and resizes in linear light.
+
 ## Notes
 
 - The linear-light reference is produced by ImageMagick (also a
