@@ -1,9 +1,10 @@
 //! AVIF encoding via SVT-AV1 (sync-path settings validated in the encoder
-//! study: preset 8, tune=3, 10-bit 4:2:0). The SVT session setup mirrors
-//! libavif's codec_svt.c so measurements against `avifenc -c svt` transfer.
+//! study: preset 8, tune=3, 10-bit 4:2:0) and decoding via dav1d. The SVT
+//! session setup mirrors libavif's codec_svt.c so measurements against
+//! `avifenc -c svt` transfer.
 
 use crate::svt::bindings as svt;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 /// libavif's quality -> quantizer mapping (codec_svt.c).
 fn quality_to_qp(quality: u8) -> u32 {
@@ -214,6 +215,251 @@ fn encode_svt(
     }
 }
 
+/// dav1d reports errors as negative errno values.
+#[cfg(target_os = "linux")]
+const EAGAIN: std::os::raw::c_int = 11;
+#[cfg(not(target_os = "linux"))]
+const EAGAIN: std::os::raw::c_int = 35;
+
+/// Container-level probe: dimensions from the primary item's AV1
+/// sequence header, no pixel decoding.
+pub fn probe_avif(data: &[u8]) -> Result<(usize, usize)> {
+    let avif =
+        avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
+    let meta = avif
+        .primary_item_metadata()
+        .context("parse AV1 sequence header")?;
+    Ok((
+        meta.max_frame_width.get() as usize,
+        meta.max_frame_height.get() as usize,
+    ))
+}
+
+/// Decode an AVIF file to RGB8 via dav1d. Handles 4:0:0/4:2:0/4:2:2/4:4:4
+/// at 8/10/12 bits, identity/BT.601/BT.709/BT.2020-NCL matrices, and both
+/// color ranges. Alpha AVIFs are rejected until the encode side can carry
+/// the alpha item through.
+pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+    let avif =
+        avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
+    ensure!(avif.alpha_item.is_none(), "AVIF with alpha is unsupported");
+    decode_av1_to_rgb(&avif.primary_item)
+}
+
+fn decode_av1_to_rgb(av1: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+    use dav1d_sys as d;
+    unsafe {
+        let mut settings: d::Dav1dSettings = std::mem::zeroed();
+        d::dav1d_default_settings(&mut settings);
+        // One request = one CPU slot, same as every other decoder here.
+        settings.n_threads = 1;
+        settings.max_frame_delay = 1;
+
+        let mut ctx: *mut d::Dav1dContext = std::ptr::null_mut();
+        ensure!(d::dav1d_open(&mut ctx, &settings) == 0, "dav1d_open");
+        struct Ctx(*mut d::Dav1dContext);
+        impl Drop for Ctx {
+            fn drop(&mut self) {
+                unsafe { d::dav1d_close(&mut self.0) }
+            }
+        }
+        let _ctx_guard = Ctx(ctx);
+
+        // Borrow the OBU buffer; it outlives the decoder, so the free
+        // callback (which dav1d requires to be non-null) is a no-op.
+        unsafe extern "C" fn no_free(_buf: *const u8, _cookie: *mut std::ffi::c_void) {}
+        let mut data: d::Dav1dData = std::mem::zeroed();
+        ensure!(
+            d::dav1d_data_wrap(
+                &mut data,
+                av1.as_ptr(),
+                av1.len(),
+                Some(no_free),
+                std::ptr::null_mut()
+            ) == 0,
+            "dav1d_data_wrap"
+        );
+        struct Data(*mut d::Dav1dData);
+        impl Drop for Data {
+            fn drop(&mut self) {
+                unsafe {
+                    if !(*self.0).data.is_null() {
+                        d::dav1d_data_unref(self.0);
+                    }
+                }
+            }
+        }
+        let _data_guard = Data(&mut data);
+
+        let mut pic: d::Dav1dPicture = std::mem::zeroed();
+        loop {
+            if data.sz > 0 {
+                let res = d::dav1d_send_data(ctx, &mut data);
+                ensure!(res == 0 || res == -EAGAIN, "dav1d_send_data: {res}");
+            }
+            let res = d::dav1d_get_picture(ctx, &mut pic);
+            if res == 0 {
+                break;
+            }
+            ensure!(
+                res == -EAGAIN && data.sz > 0,
+                "dav1d_get_picture: {res} (no picture in stream)"
+            );
+        }
+        struct Pic(*mut d::Dav1dPicture);
+        impl Drop for Pic {
+            fn drop(&mut self) {
+                unsafe { d::dav1d_picture_unref(self.0) }
+            }
+        }
+        let _pic_guard = Pic(&mut pic);
+
+        picture_to_rgb(&pic)
+    }
+}
+
+/// Convert a decoded dav1d picture (planar YUV) to interleaved RGB8.
+fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture) -> Result<(Vec<u8>, usize, usize)> {
+    use dav1d_sys as d;
+    let (w, h) = (pic.p.w as usize, pic.p.h as usize);
+    let bpc = pic.p.bpc as u32;
+    ensure!(matches!(bpc, 8 | 10 | 12), "unsupported bit depth {bpc}");
+    let seq = unsafe { &*pic.seq_hdr };
+    let full_range = seq.color_range != 0;
+    let monochrome = pic.p.layout == d::DAV1D_PIXEL_LAYOUT_I400;
+    let (sx, sy) = match pic.p.layout {
+        d::DAV1D_PIXEL_LAYOUT_I420 => (1u32, 1u32),
+        d::DAV1D_PIXEL_LAYOUT_I422 => (1, 0),
+        _ => (0, 0),
+    };
+
+    // Plane sampler: strides are in bytes; samples are u8 or little-endian
+    // u16 depending on bit depth.
+    let hbd = bpc > 8;
+    let sample = |plane: usize, x: usize, y: usize| -> f32 {
+        let (ptr, stride) = if plane == 0 {
+            (pic.data[0], pic.stride[0])
+        } else {
+            (pic.data[plane], pic.stride[1])
+        };
+        unsafe {
+            if hbd {
+                *(ptr as *const u16).add(y * (stride as usize / 2) + x) as f32
+            } else {
+                *(ptr as *const u8).add(y * stride as usize + x) as f32
+            }
+        }
+    };
+
+    let max = ((1u32 << bpc) - 1) as f32;
+    let center = ((1u32 << bpc) / 2) as f32;
+    let scale8 = (1u32 << (bpc - 8)) as f32;
+    // Normalize to the 0..255 scale: full range divides by the sample
+    // maximum; limited range maps 16..235 (luma) / 16..240 (chroma).
+    let (y_mul, y_off, c_mul) = if full_range {
+        (255.0 / max, 0.0, 255.0 / max)
+    } else {
+        (
+            255.0 / (219.0 * scale8),
+            16.0 * scale8,
+            255.0 / (224.0 * scale8),
+        )
+    };
+
+    // Matrix coefficients from the sequence header. Unspecified and exotic
+    // matrices fall back to BT.601 so a slightly mistagged file still
+    // serves a reasonable image instead of a 5xx.
+    let identity = seq.mtrx == 0 && !monochrome;
+    if identity {
+        ensure!(
+            pic.p.layout == d::DAV1D_PIXEL_LAYOUT_I444,
+            "identity matrix requires 4:4:4"
+        );
+    }
+    let (kr, kb) = match seq.mtrx {
+        1 => (0.2126, 0.0722),     // BT.709
+        9 => (0.2627, 0.0593),     // BT.2020 NCL
+        _ => (0.299f32, 0.114f32), // BT.601 and fallback
+    };
+    let kg = 1.0 - kr - kb;
+
+    // Subsampled chroma is upsampled with the separable center-sited
+    // bilinear kernel (9:3:3:1) that libyuv and libjpeg's "fancy
+    // upsampling" use, so output matches avifdec instead of showing
+    // nearest-neighbor chroma blocking.
+    let cw = if sx == 1 { w.div_ceil(2) } else { w };
+    let ch = if sy == 1 { h.div_ceil(2) } else { h };
+    let mut cb_mid = vec![0f32; cw];
+    let mut cr_mid = vec![0f32; cw];
+    let mut cb_row = vec![0f32; w];
+    let mut cr_row = vec![0f32; w];
+
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        if !monochrome {
+            // Vertical pass at chroma horizontal resolution.
+            let (near, other) = if sy == 1 {
+                let near = y >> 1;
+                let other = if y & 1 == 1 {
+                    (near + 1).min(ch - 1)
+                } else {
+                    near.saturating_sub(1)
+                };
+                (near, other)
+            } else {
+                (y, y)
+            };
+            for cx in 0..cw {
+                if sy == 1 {
+                    cb_mid[cx] = (3.0 * sample(1, cx, near) + sample(1, cx, other)) * 0.25;
+                    cr_mid[cx] = (3.0 * sample(2, cx, near) + sample(2, cx, other)) * 0.25;
+                } else {
+                    cb_mid[cx] = sample(1, cx, near);
+                    cr_mid[cx] = sample(2, cx, near);
+                }
+            }
+            // Horizontal pass to full resolution.
+            if sx == 1 {
+                for x in 0..w {
+                    let cx = x >> 1;
+                    let other = if x & 1 == 1 {
+                        (cx + 1).min(cw - 1)
+                    } else {
+                        cx.saturating_sub(1)
+                    };
+                    cb_row[x] = (3.0 * cb_mid[cx] + cb_mid[other]) * 0.25;
+                    cr_row[x] = (3.0 * cr_mid[cx] + cr_mid[other]) * 0.25;
+                }
+            } else {
+                cb_row.copy_from_slice(&cb_mid);
+                cr_row.copy_from_slice(&cr_mid);
+            }
+        }
+
+        let row = &mut rgb[y * w * 3..(y + 1) * w * 3];
+        for (x, px) in row.chunks_exact_mut(3).enumerate() {
+            let yf = (sample(0, x, y) - y_off) * y_mul;
+            let (r, g, b) = if monochrome {
+                (yf, yf, yf)
+            } else if identity {
+                // Identity: G=Y, B=U, R=V, chroma is not centered.
+                (cr_row[x] * y_mul, yf, cb_row[x] * y_mul)
+            } else {
+                let cb = (cb_row[x] - center) * c_mul;
+                let cr = (cr_row[x] - center) * c_mul;
+                let r = yf + 2.0 * (1.0 - kr) * cr;
+                let b = yf + 2.0 * (1.0 - kb) * cb;
+                let g = (yf - kr * r - kb * b) / kg;
+                (r, g, b)
+            };
+            px[0] = (r + 0.5).clamp(0.0, 255.0) as u8;
+            px[1] = (g + 0.5).clamp(0.0, 255.0) as u8;
+            px[2] = (b + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok((rgb, w, h))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +478,52 @@ mod tests {
         assert!(out.len() > 100, "suspiciously small: {}", out.len());
         // container sanity: ftyp avif brand near the start
         assert_eq!(&out[4..12], b"ftypavif", "not an avif container");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_preserves_the_image() {
+        let (w, h) = (160, 120);
+        // Smooth gradient: compresses well, so quality loss stays small
+        // and any plane/matrix/range mix-up shows up as a huge error.
+        let rgb: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let x = (i % w) as f32 / (w - 1) as f32;
+                let y = (i / w) as f32 / (h - 1) as f32;
+                [
+                    (x * 255.0) as u8,
+                    (y * 255.0) as u8,
+                    ((1.0 - x) * 200.0) as u8,
+                ]
+            })
+            .collect();
+        let params = AvifParams {
+            quality: 85,
+            ..AvifParams::default()
+        };
+        let encoded = encode_avif(&rgb, w, h, &params).unwrap();
+        let (decoded, dw, dh) = decode_avif(&encoded).unwrap();
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(decoded.len(), rgb.len());
+        let se: f64 = rgb
+            .iter()
+            .zip(&decoded)
+            .map(|(&a, &b)| ((a as f64) - (b as f64)).powi(2))
+            .sum();
+        let rmse = (se / rgb.len() as f64).sqrt();
+        assert!(rmse < 6.0, "roundtrip rmse too high: {rmse:.2}");
+    }
+
+    #[test]
+    fn probe_reports_dimensions_without_decoding() {
+        let rgb = vec![128u8; 96 * 64 * 3];
+        let encoded = encode_avif(&rgb, 96, 64, &AvifParams::default()).unwrap();
+        assert_eq!(probe_avif(&encoded).unwrap(), (96, 64));
+    }
+
+    #[test]
+    fn decode_rejects_garbage() {
+        assert!(decode_avif(b"not an avif at all").is_err());
+        assert!(decode_avif(&[]).is_err());
     }
 
     #[test]

@@ -10,7 +10,9 @@ keywords = ["image", "jpeg", "resize", "compression", "server"]
 categories = ["multimedia::images", "web-programming::http-server"]
 
 [dependencies]
+avif-parse = { version = "2", optional = true }
 avif-serialize = { version = "0.8", optional = true }
+dav1d-sys = { version = "0.8", optional = true }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "fs"] }
 mozjpeg = "0.10"
@@ -35,7 +37,7 @@ pic-scale = "0.7"
 
 [features]
 default = []
-avif = ["dep:avif-serialize"]
+avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
 
 [[example]]
 name = "avif_parity"

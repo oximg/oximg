@@ -1,9 +1,25 @@
-//! Parity probe: encode a PPM via our SVT path for comparison with
-//! `avifenc -c svt` at identical settings.
-//! Usage: avif_parity <in.ppm> <quality> <out.avif>
+//! Parity probe against the reference libavif tools at identical settings.
+//! Encode: avif_parity <in.ppm> <quality> <out.avif>   (compare with avifenc -c svt)
+//! Decode: avif_parity <in.avif> <out.ppm>             (compare with avifdec)
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let data = std::fs::read(&args[1])?;
+
+    if data.len() > 12 && &data[4..8] == b"ftyp" {
+        let t = std::time::Instant::now();
+        let (rgb, w, h) = oximg::avif::decode_avif(&data)?;
+        eprintln!(
+            "decoded {}x{} in {:.1}ms",
+            w,
+            h,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        out.extend_from_slice(&rgb);
+        std::fs::write(&args[2], out)?;
+        return Ok(());
+    }
+
     // minimal P6 parse (qcli-compatible)
     let mut parts = Vec::new();
     let mut pos = 0;
