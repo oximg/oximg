@@ -27,5 +27,8 @@ codegen-units = 1
 # Note: panic = "abort" must NOT be set; the mozjpeg crate relies on
 # unwinding to handle libjpeg errors.
 
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+pic-scale = "0.7"
+
 [features]
 default = []

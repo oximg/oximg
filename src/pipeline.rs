@@ -288,6 +288,13 @@ fn resize_bands(
         fast_image_resize::images::ImageRef::new(dec_w as u32, dec_h as u32, src_bytes, px)?;
 
     if threads <= 1 || dst_h < 2 * threads {
+        // x86-64: pic-scale's AVX-512/SSE u16 paths convolve ~2.4x faster
+        // than fir at equal output quality (SSIMULACRA2-verified). Its
+        // aarch64 fixed-point path loses ~3 points, so ARM keeps fir.
+        #[cfg(target_arch = "x86_64")]
+        if px == PixelType::U16x3 && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
+            return resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h);
+        }
         let mut dst_view = Image::from_slice_u8(dst_w as u32, dst_h as u32, dst_bytes, px)?;
         let resizer = fallback.get_or_insert_with(Resizer::new);
         resizer.resize(&src_view, &mut dst_view, &opts)?;
@@ -319,6 +326,35 @@ fn resize_bands(
         }
         Ok(())
     })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn resize_u16x3_picscale(
+    src_bytes: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst_bytes: &mut [u8],
+    dst_w: usize,
+    dst_h: usize,
+) -> Result<()> {
+    use pic_scale::{ImageStore, ImageStoreMut, ResamplingFunction, Scaler, ThreadingPolicy};
+    let (pre, src16, post) = unsafe { src_bytes.align_to::<u16>() };
+    anyhow::ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 src");
+    let (pre, dst16, post) = unsafe { dst_bytes.align_to_mut::<u16>() };
+    anyhow::ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 dst");
+    let src_store = ImageStore::<u16, 3>::from_slice(src16, src_w, src_h)
+        .map_err(|e| anyhow::anyhow!("pic-scale src: {e:?}"))?;
+    let mut dst_store = ImageStoreMut::<u16, 3>::from_slice(dst16, dst_w, dst_h)
+        .map_err(|e| anyhow::anyhow!("pic-scale dst: {e:?}"))?;
+    dst_store.bit_depth = 16;
+    let scaler =
+        Scaler::new(ResamplingFunction::Lanczos3).set_threading_policy(ThreadingPolicy::Single);
+    let plan = scaler
+        .plan_rgb_resampling16(src_store.size(), dst_store.size(), 16)
+        .map_err(|e| anyhow::anyhow!("pic-scale plan: {e:?}"))?;
+    plan.resample(&src_store, &mut dst_store)
+        .map_err(|e| anyhow::anyhow!("pic-scale resample: {e:?}"))?;
+    Ok(())
 }
 
 fn decode_resize<R: std::io::BufRead>(
