@@ -146,6 +146,40 @@ impl ImageFormat {
     }
 }
 
+/// Cheap header probe: format + source dimensions without decoding pixels.
+pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
+    let mut header = [0u8; 12];
+    anyhow::ensure!(bytes.len() >= 12, "source too short");
+    header.copy_from_slice(&bytes[..12]);
+    let format = ImageFormat::sniff(&header).context("unsupported image format")?;
+    match format {
+        ImageFormat::Jpeg => {
+            let dec = Decompress::new_mem(bytes).context("parse JPEG")?;
+            let (w, h) = dec.size();
+            Ok((format, w, h))
+        }
+        ImageFormat::Png => {
+            let mut r = png::Decoder::new(std::io::Cursor::new(bytes))
+                .read_info()
+                .context("parse PNG")?;
+            let info = r.info();
+            let dims = (info.width as usize, info.height as usize);
+            let _ = r.next_row();
+            Ok((format, dims.0, dims.1))
+        }
+        ImageFormat::Webp => unsafe {
+            use libwebp_sys as w;
+            let mut features: w::WebPBitstreamFeatures = std::mem::zeroed();
+            let status = w::WebPGetFeatures(bytes.as_ptr(), bytes.len(), &mut features);
+            anyhow::ensure!(
+                status == w::VP8StatusCode::VP8_STATUS_OK,
+                "parse WebP header"
+            );
+            Ok((format, features.width as usize, features.height as usize))
+        },
+    }
+}
+
 pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     process_reader(std::io::Cursor::new(bytes), p)
 }
