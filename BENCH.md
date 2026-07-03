@@ -104,7 +104,7 @@ req/s (p95 latency); all runs 100% successful checks:
 
 | Server | JPEG | PNG | WebP |
 |---|---|---|---|
-| oximg (defaults) | **160.8** (109 ms) | **62.1** (278 ms) | **69.7** (253 ms) |
+| oximg (defaults) | **190.8** (93 ms) | **72.7** (240 ms) | **70.6** (247 ms) |
 | imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) |
 | imagor 1.9.2 | 143.1 (169 ms) | 35.8 (670 ms) | 44.6 (493 ms) |
 | thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) |
