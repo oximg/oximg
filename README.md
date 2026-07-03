@@ -6,15 +6,22 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 High-performance image compression in Rust: a library, a CLI, and a
-self-hostable HTTP server. Currently a JPEG resize/compression PoC.
+self-hostable HTTP server (PoC). JPEG, PNG, and WebP in and out; sources
+are format-sniffed by magic bytes and re-encoded in their own format.
 
 ## Pipeline
 
 ```
-JPEG bytes
-  → mozjpeg decode with DCT shrink-on-load (kept ≥ 1.7x target size)
+source bytes (local file or HTTP origin)
+  → format sniff → decode
+      JPEG: mozjpeg streaming decode, DCT shrink-on-load (kept ≥ 1.7x target size)
+      PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
+      WebP: libwebp
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 (SIMD) → sRGB u8
-  → jpegli encode (progressive; PRESET=fast / PRESET=small select mozjpeg profiles)
+      (alpha is premultiplied before resampling, unpremultiplied after)
+  → encode in the source format
+      JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
+      PNG:  png crate | WebP: libwebp
 ```
 
 Concurrent identical requests are coalesced and share one result.
@@ -54,9 +61,9 @@ sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 
 ## Not yet implemented (out of PoC scope)
 
-- WebP / AVIF / JXL output and content negotiation
+- Cross-format output and content negotiation (AVIF / JXL / `Accept`-driven)
 - EXIF orientation / ICC profile handling
-- Remote sources (S3 / HTTP), URL signing, caching
+- S3 sources, URL signing, caching
 - Production-grade load testing
 
 ## Status
