@@ -954,15 +954,17 @@ fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<
     Ok(out)
 }
 
-/// AVIF quality (libavif semantics). Defaults to 65, the common
-/// serving default (imgproxy ships the same), since AVIF at q80 spends
-/// bytes well past the perceptual sweet spot.
+/// AVIF quality (libavif semantics). Nominal quality numbers are not
+/// comparable across encoders; this default is chosen by operating
+/// point: at 55, the 10-bit SVT-AV1 output is smaller than what the
+/// common imgproxy/libvips default (q65, 8-bit aom) produces and still
+/// scores several SSIMULACRA2 points higher (see bench/quality).
 #[cfg(feature = "avif")]
 fn avif_quality() -> u8 {
     std::env::var("OXIMG_AVIF_QUALITY")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(65)
+        .unwrap_or(55)
 }
 
 /// Alpha-item quality; defaults to the color quality.

@@ -68,7 +68,7 @@ Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
-(65), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
+(55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 `OXIMG_PAR` (resize threads, 1).
