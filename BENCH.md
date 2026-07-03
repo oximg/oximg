@@ -160,8 +160,8 @@ c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | 67.0 (37 ms) | **27.1** (93 ms) | **36.3** (77 ms) | 14.5 (182 ms) |
-| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.4 (139 ms) |
+| oximg (defaults) | **78.3** (32 ms) | **35.7** (72 ms) | **39.6** (72 ms) | 16.8 (163 ms) |
+| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.1 (141 ms) |
 | imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
 | thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
 
@@ -169,12 +169,13 @@ Notes:
 
 - The c7i AVIF cell reflects the current defaults (two dav1d worker
   threads, quality 55); the earlier one-thread/q65 build measured 13.9.
-- On Graviton the JPEG cell is within 2% of imgproxy and the AVIF cell
-  trails it. Two x86 advantages do not carry over yet: dav1d's
-  in-frame threading, which cuts decode ~40% on x86 and Apple Silicon,
-  yields no speedup on Graviton3 (verified with dav1d 1.5.1 and 1.5.3),
-  and the linear-light u16 resize stage costs 37 ms there vs 7 ms on
-  c7i. ARM-specific optimization is ongoing.
+- The c7g oximg cells were re-run after the aarch64 NEON resize kernel
+  landed (resize stage 37 -> 20 ms on the full-decode shape); the
+  imgproxy AVIF cell re-run on the same instance (20.1 vs 20.4) anchors
+  comparability with the other contenders' original runs.
+- The remaining c7g AVIF gap is decode-bound: dav1d's in-frame
+  threading, which cuts decode ~40% on x86 and Apple Silicon, yields no
+  speedup on Graviton3 (verified with dav1d 1.5.1 and 1.5.3).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 

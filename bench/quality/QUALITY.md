@@ -63,17 +63,23 @@ defaults. Throughput for both settings is in [../../BENCH.md](../../BENCH.md).
 
 ## PNG and WebP (same-format in/out, fit 500x500)
 
-8 Kodak sources per format (PNG originals; WebP encoded at q90), scored
-against a linear-light Lanczos reference of the same source, local
-Apple M2 Max, imgproxy 4.0.9. PNG output is lossless, so its score
-isolates pure resize quality.
+Kodak sources (PNG originals, all 24 for the PNG row; WebP encoded at
+q90), scored against a linear-light Lanczos reference of the same
+source, local Apple M2 Max, imgproxy 4.0.9. PNG output is lossless, so
+its score isolates pure resize quality.
 
 | Format | Server | SSIM2 (linear ref) | avg size |
 |---|---|---|---|
-| PNG | oximg | **94.8** | 307.8 KB |
-| PNG | imgproxy | 81.5 | 308.8 KB |
+| PNG | oximg | **97.6** | 307.8 KB |
+| PNG | imgproxy | 81.9 | 308.8 KB |
 | WebP (q75) | oximg | **71.8** | **30.5 KB** |
 | WebP (q75) | imgproxy | 61.7 | 33.1 KB |
+
+The PNG row reflects the aarch64 NEON resize kernel, which carries f32
+intermediate rows between the convolution passes; the earlier
+fast_image_resize backend (u16-quantized intermediate) measures 95.2 on
+the same corpus and remains available via OXIMG_RESIZE_BACKEND=fir.
+x86-64 uses pic-scale, separately verified at equal quality.
 
 WebP note: imgproxy resizes with libwebp's built-in scaler, which is
 the source of its score; oximg decodes with quality headroom and
