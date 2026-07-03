@@ -18,7 +18,7 @@ source bytes (local file or HTTP origin)
       JPEG: mozjpeg streaming decode, DCT shrink-on-load (kept ≥ 1.7x target size)
       PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
       WebP: libwebp
-      AVIF: dav1d (8/10/12-bit, all subsamplings, bilinear chroma upsampling)
+      AVIF: dav1d (8/10/12-bit, all subsamplings, alpha, bilinear chroma upsampling)
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 (SIMD) → sRGB u8
       (alpha is premultiplied before resampling, unpremultiplied after)
   → encode in the source format
@@ -68,7 +68,7 @@ Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
-(65), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
+(65), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 `OXIMG_PAR` (resize threads, 1).
@@ -76,7 +76,7 @@ sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
 ## Not yet implemented (out of PoC scope)
 
 - Cross-format output and content negotiation (JXL / `Accept`-driven)
-- AVIF alpha and animated sources
+- Animated AVIF sources
 - EXIF orientation / ICC profile handling
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing

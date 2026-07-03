@@ -712,19 +712,27 @@ fn process_avif<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
 
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    let (src_w, src_h) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
+    let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let (dst_w, dst_h) = resize_pixels(s, 3, src_w, src_h, p)?;
+    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
+    let quality = avif_quality();
     let params = crate::avif::AvifParams {
-        quality: avif_quality(),
+        quality,
+        alpha_quality: avif_alpha_quality(quality),
         ..Default::default()
     };
-    let out = crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &params)?;
+    let out = crate::avif::encode_avif(
+        &s.out8[..dst_w * dst_h * channels],
+        dst_w,
+        dst_h,
+        channels,
+        &params,
+    )?;
     if timing {
         eprintln!(
             "timing avif decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -955,6 +963,15 @@ fn avif_quality() -> u8 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(65)
+}
+
+/// Alpha-item quality; defaults to the color quality.
+#[cfg(feature = "avif")]
+fn avif_alpha_quality(color_quality: u8) -> u8 {
+    std::env::var("OXIMG_AVIF_ALPHA_QUALITY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(color_quality)
 }
 
 fn webp_quality() -> f32 {

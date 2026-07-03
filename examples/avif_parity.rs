@@ -7,7 +7,8 @@ fn main() -> anyhow::Result<()> {
 
     if data.len() > 12 && &data[4..8] == b"ftyp" {
         let t = std::time::Instant::now();
-        let (rgb, w, h) = oximg::avif::decode_avif(&data)?;
+        let (rgb, w, h, channels) = oximg::avif::decode_avif(&data)?;
+        anyhow::ensure!(channels == 3, "decode mode writes P6 (RGB) only");
         eprintln!(
             "decoded {}x{} in {:.1}ms",
             w,
@@ -47,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let t = std::time::Instant::now();
-    let out = oximg::avif::encode_avif(rgb, w, h, &p)?;
+    let out = oximg::avif::encode_avif(rgb, w, h, 3, &p)?;
     eprintln!(
         "{}x{} q{} -> {} bytes in {:.1}ms",
         w,

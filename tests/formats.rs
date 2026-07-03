@@ -132,6 +132,21 @@ fn avif_resizes_in_avif() {
 
 #[cfg(feature = "avif")]
 #[test]
+fn avif_alpha_survives_and_does_not_bleed() {
+    // alpha.avif is avifenc-encoded from rgba.png: alpha 0 at the left
+    // edge, ~255 at the right edge.
+    let (out, fmt) = pipeline::process(&fixture("alpha.avif"), &params(50)).unwrap();
+    assert_eq!(fmt, ImageFormat::Avif);
+    let (rgba, w, h, channels) = oximg::avif::decode_avif(&out).unwrap();
+    assert_eq!(channels, 4, "alpha must survive the round trip");
+    let mid = h / 2;
+    let px = |x: usize, y: usize| -> &[u8] { &rgba[(y * w + x) * 4..(y * w + x) * 4 + 4] };
+    assert!(px(1, mid)[3] < 24, "left edge should stay transparent");
+    assert!(px(w - 2, mid)[3] > 230, "right edge should stay opaque");
+}
+
+#[cfg(feature = "avif")]
+#[test]
 fn avif_garbage_and_truncation_error_instead_of_panicking() {
     let full = fixture("photo.avif");
     for cut in [16, 64, full.len() / 2] {

@@ -11,10 +11,16 @@ fn quality_to_qp(quality: u8) -> u32 {
     ((100 - quality as u32) * 63 + 50) / 100
 }
 
-/// RGB8 -> 10-bit 4:2:0 YUV, BT.601 matrix, full range (matching the
+/// RGB(A)8 -> 10-bit 4:2:0 YUV, BT.601 matrix, full range (matching the
 /// avifenc defaults used in the encoder study). Chroma is averaged over
-/// each 2x2 block.
-fn rgb_to_yuv420_10bit(rgb: &[u8], w: usize, h: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+/// each 2x2 block; an alpha channel, if present, is ignored here (it is
+/// encoded as a separate auxiliary image).
+fn rgb_to_yuv420_10bit(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     let mut y_plane = vec![0u16; w * h];
     let mut cb_plane = vec![0u16; cw * ch];
@@ -24,7 +30,7 @@ fn rgb_to_yuv420_10bit(rgb: &[u8], w: usize, h: usize) -> (Vec<u16>, Vec<u16>, V
     // Coefficients sum to 4096, so the pre-scale maximum is 4096*255 and the
     // rounding divide maps 255 -> exactly 1023 (never 1024: out-of-range
     // samples make SVT emit full-scale luma garbage in the affected blocks).
-    for (i, px) in rgb.chunks_exact(3).enumerate() {
+    for (i, px) in pixels.chunks_exact(channels).enumerate() {
         let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
         y_plane[i] = (((1225 * r + 2404 * g + 467 * b) * 1023 + 522_240) / 1_044_480) as u16;
     }
@@ -36,10 +42,10 @@ fn rgb_to_yuv420_10bit(rgb: &[u8], w: usize, h: usize) -> (Vec<u16>, Vec<u16>, V
                 for dx in 0..2 {
                     let (x, yy) = (cx * 2 + dx, cy * 2 + dy);
                     if x < w && yy < h {
-                        let p = (yy * w + x) * 3;
-                        rs += rgb[p] as u32;
-                        gs += rgb[p + 1] as u32;
-                        bs += rgb[p + 2] as u32;
+                        let p = (yy * w + x) * channels;
+                        rs += pixels[p] as u32;
+                        gs += pixels[p + 1] as u32;
+                        bs += pixels[p + 2] as u32;
                         n += 1;
                     }
                 }
@@ -62,6 +68,8 @@ fn rgb_to_yuv420_10bit(rgb: &[u8], w: usize, h: usize) -> (Vec<u16>, Vec<u16>, V
 pub struct AvifParams {
     /// 0-100, libavif semantics.
     pub quality: u8,
+    /// 0-100, quality for the alpha auxiliary image.
+    pub alpha_quality: u8,
     /// SVT preset (enc_mode); the sync-path setting is 8.
     pub speed: i8,
     /// SVT logical processors; 1 keeps the CPU-slot model honest.
@@ -72,29 +80,77 @@ impl Default for AvifParams {
     fn default() -> Self {
         AvifParams {
             quality: 60,
+            alpha_quality: 60,
             speed: 8,
             threads: 1,
         }
     }
 }
 
-pub fn encode_avif(rgb: &[u8], w: usize, h: usize, p: &AvifParams) -> Result<Vec<u8>> {
-    ensure!(rgb.len() >= w * h * 3, "pixel buffer too small");
-    let (y_plane, cb_plane, cr_plane) = rgb_to_yuv420_10bit(rgb, w, h);
-    let av1 = encode_svt(&y_plane, &cb_plane, &cr_plane, w, h, p)?;
+/// Encode interleaved RGB8 (`channels == 3`) or straight-alpha RGBA8
+/// (`channels == 4`) as AVIF. Alpha is carried as an auxiliary AV1 image:
+/// SVT-AV1 cannot encode 4:0:0, so — like libavif's codec_svt.c — the
+/// alpha plane is encoded as the luma of a 4:2:0 image with zeroed
+/// placeholder chroma, which flat-codes to almost nothing.
+pub fn encode_avif(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    p: &AvifParams,
+) -> Result<Vec<u8>> {
+    ensure!(
+        channels == 3 || channels == 4,
+        "unsupported channel count {channels}"
+    );
+    ensure!(pixels.len() >= w * h * channels, "pixel buffer too small");
+    let (y_plane, cb_plane, cr_plane) = rgb_to_yuv420_10bit(pixels, w, h, channels);
+    let color = encode_svt(
+        &y_plane,
+        &cb_plane,
+        &cr_plane,
+        w,
+        h,
+        quality_to_qp(p.quality),
+        false,
+        p,
+    )?;
+    let alpha = if channels == 4 {
+        let a_plane: Vec<u16> = pixels
+            .chunks_exact(4)
+            .map(|px| ((px[3] as u32 * 1023 + 128) / 255) as u16)
+            .collect();
+        // One zeroed buffer serves as both placeholder chroma planes.
+        let uv = vec![0u16; w.div_ceil(2) * h.div_ceil(2)];
+        Some(encode_svt(
+            &a_plane,
+            &uv,
+            &uv,
+            w,
+            h,
+            quality_to_qp(p.alpha_quality),
+            true,
+            p,
+        )?)
+    } else {
+        None
+    };
     let mut fy = avif_serialize::Aviffy::new();
     fy.matrix_coefficients(avif_serialize::constants::MatrixCoefficients::Bt601)
         .full_color_range(true)
         .set_chroma_subsampling((true, true));
-    Ok(fy.to_vec(&av1, None, w as u32, h as u32, 10))
+    Ok(fy.to_vec(&color, alpha.as_deref(), w as u32, h as u32, 10))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_svt(
     y_plane: &[u16],
     cb_plane: &[u16],
     cr_plane: &[u16],
     w: usize,
     h: usize,
+    qp: u32,
+    aux_alpha: bool,
     p: &AvifParams,
 ) -> Result<Vec<u8>> {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
@@ -122,9 +178,17 @@ fn encode_svt(
         // Mirrors libavif codec_svt.c for a single still image.
         config.encoder_color_format = svt::EbColorFormat::EB_YUV420;
         config.encoder_bit_depth = 10;
-        config.color_primaries = 1; // BT.709
-        config.transfer_characteristics = 13; // sRGB
-        config.matrix_coefficients = 6; // BT.601
+        if aux_alpha {
+            // CICP does not apply to the alpha auxiliary image
+            // (AV1-AVIF spec section 4); its color range shall be full.
+            config.color_primaries = 2; // unspecified
+            config.transfer_characteristics = 2; // unspecified
+            config.matrix_coefficients = 2; // unspecified
+        } else {
+            config.color_primaries = 1; // BT.709
+            config.transfer_characteristics = 13; // sRGB
+            config.matrix_coefficients = 6; // BT.601
+        }
         config.color_range = 1; // full
         config.source_width = w as u32;
         config.source_height = h as u32;
@@ -133,7 +197,7 @@ fn encode_svt(
         config.rate_control_mode = 0;
         config.min_qp_allowed = 0;
         config.max_qp_allowed = 63;
-        config.qp = quality_to_qp(p.quality);
+        config.qp = qp;
         config.enc_mode = p.speed;
         config.force_key_frames = true;
         config.avif = true;
@@ -235,25 +299,58 @@ pub fn probe_avif(data: &[u8]) -> Result<(usize, usize)> {
     ))
 }
 
-/// Decode an AVIF file to RGB8 via dav1d. Handles 4:0:0/4:2:0/4:2:2/4:4:4
-/// at 8/10/12 bits, identity/BT.601/BT.709/BT.2020-NCL matrices, and both
-/// color ranges. Alpha AVIFs are rejected until the encode side can carry
-/// the alpha item through.
-pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize)> {
+/// Decode an AVIF file via dav1d to interleaved RGB8 or, when the file
+/// carries an alpha auxiliary image, straight-alpha RGBA8. Handles
+/// 4:0:0/4:2:0/4:2:2/4:4:4 at 8/10/12 bits, identity/BT.601/BT.709/
+/// BT.2020-NCL matrices, and both color ranges; premultiplied alpha is
+/// converted to straight alpha. Returns (pixels, width, height, channels).
+pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize, usize)> {
     let mut out = Vec::new();
-    let (w, h) = decode_avif_into(data, &mut out)?;
-    Ok((out, w, h))
+    let (w, h, channels) = decode_avif_into(data, &mut out)?;
+    Ok((out, w, h, channels))
 }
 
 /// Like [`decode_avif`], but reuses `out` as the pixel buffer.
-pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize)> {
+pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize, usize)> {
     let avif =
         avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
-    ensure!(avif.alpha_item.is_none(), "AVIF with alpha is unsupported");
-    decode_av1_to_rgb(&avif.primary_item, out)
+    let (w, h) = with_decoded_picture(&avif.primary_item, |pic| picture_to_rgb(pic, out))?;
+    let Some(alpha_item) = avif.alpha_item.as_deref() else {
+        return Ok((w, h, 3));
+    };
+
+    let alpha = with_decoded_picture(alpha_item, |pic| picture_to_alpha(pic, w, h))
+        .context("decode alpha item")?;
+    // Expand RGB to RGBA in place, back to front (writes at i*4.. never
+    // overlap reads at j*3..j*3+3 for j < i).
+    out.resize(w * h * 4, 0);
+    for i in (0..w * h).rev() {
+        let (r, g, b) = (out[i * 3], out[i * 3 + 1], out[i * 3 + 2]);
+        let a = alpha[i];
+        let (r, g, b) = if avif.premultiplied_alpha && a != 255 {
+            if a == 0 {
+                (0, 0, 0)
+            } else {
+                let un = |c: u8| ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8;
+                (un(r), un(g), un(b))
+            }
+        } else {
+            (r, g, b)
+        };
+        out[i * 4] = r;
+        out[i * 4 + 1] = g;
+        out[i * 4 + 2] = b;
+        out[i * 4 + 3] = a;
+    }
+    Ok((w, h, 4))
 }
 
-fn decode_av1_to_rgb(av1: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize)> {
+/// Run one dav1d session over a single-frame AV1 stream and hand the
+/// decoded picture to `f`.
+fn with_decoded_picture<T>(
+    av1: &[u8],
+    f: impl FnOnce(&dav1d_sys::Dav1dPicture) -> Result<T>,
+) -> Result<T> {
     use dav1d_sys as d;
     unsafe {
         let mut settings: d::Dav1dSettings = std::mem::zeroed();
@@ -321,8 +418,53 @@ fn decode_av1_to_rgb(av1: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize)> {
         }
         let _pic_guard = Pic(&mut pic);
 
-        picture_to_rgb(&pic, out)
+        f(&pic)
     }
+}
+
+/// Extract the alpha plane (the luma of the auxiliary image) as u8.
+fn picture_to_alpha(pic: &dav1d_sys::Dav1dPicture, w: usize, h: usize) -> Result<Vec<u8>> {
+    ensure!(
+        (pic.p.w as usize, pic.p.h as usize) == (w, h),
+        "alpha dimensions do not match the color image"
+    );
+    let bpc = pic.p.bpc as u32;
+    ensure!(matches!(bpc, 8 | 10 | 12), "unsupported bit depth {bpc}");
+    let seq = unsafe { &*pic.seq_hdr };
+    // The spec requires full range for alpha; honor the flag regardless.
+    let max = ((1u32 << bpc) - 1) as f32;
+    let scale8 = (1u32 << (bpc - 8)) as f32;
+    let (a_mul, a_off) = if seq.color_range != 0 {
+        (255.0 / max, 0.0)
+    } else {
+        (255.0 / (219.0 * scale8), 16.0 * scale8)
+    };
+
+    let stride = pic.stride[0] as usize;
+    let mut alpha = vec![0u8; w * h];
+    for y in 0..h {
+        let row = &mut alpha[y * w..(y + 1) * w];
+        if bpc > 8 {
+            let src = unsafe {
+                std::slice::from_raw_parts((pic.data[0] as *const u16).add(y * (stride / 2)), w)
+            };
+            for (dst, &v) in row.iter_mut().zip(src) {
+                *dst = ((v as f32 - a_off) * a_mul + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        } else {
+            let src = unsafe {
+                std::slice::from_raw_parts((pic.data[0] as *const u8).add(y * stride), w)
+            };
+            if seq.color_range != 0 {
+                row.copy_from_slice(src);
+            } else {
+                for (dst, &v) in row.iter_mut().zip(src) {
+                    *dst = ((v as f32 - a_off) * a_mul + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    Ok(alpha)
 }
 
 /// Convert a decoded dav1d picture (planar YUV) to interleaved RGB8.
@@ -482,7 +624,7 @@ mod tests {
                 [x.wrapping_mul(2), y.wrapping_mul(2), x ^ y]
             })
             .collect();
-        let out = encode_avif(&rgb, w, h, &AvifParams::default()).unwrap();
+        let out = encode_avif(&rgb, w, h, 3, &AvifParams::default()).unwrap();
         assert!(out.len() > 100, "suspiciously small: {}", out.len());
         // container sanity: ftyp avif brand near the start
         assert_eq!(&out[4..12], b"ftypavif", "not an avif container");
@@ -508,9 +650,9 @@ mod tests {
             quality: 85,
             ..AvifParams::default()
         };
-        let encoded = encode_avif(&rgb, w, h, &params).unwrap();
-        let (decoded, dw, dh) = decode_avif(&encoded).unwrap();
-        assert_eq!((dw, dh), (w, h));
+        let encoded = encode_avif(&rgb, w, h, 3, &params).unwrap();
+        let (decoded, dw, dh, channels) = decode_avif(&encoded).unwrap();
+        assert_eq!((dw, dh, channels), (w, h, 3));
         assert_eq!(decoded.len(), rgb.len());
         let se: f64 = rgb
             .iter()
@@ -524,8 +666,54 @@ mod tests {
     #[test]
     fn probe_reports_dimensions_without_decoding() {
         let rgb = vec![128u8; 96 * 64 * 3];
-        let encoded = encode_avif(&rgb, 96, 64, &AvifParams::default()).unwrap();
+        let encoded = encode_avif(&rgb, 96, 64, 3, &AvifParams::default()).unwrap();
         assert_eq!(probe_avif(&encoded).unwrap(), (96, 64));
+    }
+
+    #[test]
+    fn rgba_roundtrip_preserves_color_and_alpha() {
+        let (w, h) = (160, 120);
+        // Color gradient with an alpha ramp: left edge transparent,
+        // right edge opaque.
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let x = (i % w) as f32 / (w - 1) as f32;
+                let y = (i / w) as f32 / (h - 1) as f32;
+                [
+                    (x * 255.0) as u8,
+                    (y * 255.0) as u8,
+                    ((1.0 - x) * 200.0) as u8,
+                    (x * 255.0) as u8,
+                ]
+            })
+            .collect();
+        let params = AvifParams {
+            quality: 85,
+            alpha_quality: 85,
+            ..AvifParams::default()
+        };
+        let encoded = encode_avif(&rgba, w, h, 4, &params).unwrap();
+        let (decoded, dw, dh, channels) = decode_avif(&encoded).unwrap();
+        assert_eq!((dw, dh, channels), (w, h, 4));
+        let a_se: f64 = rgba
+            .chunks_exact(4)
+            .zip(decoded.chunks_exact(4))
+            .map(|(s, d)| ((s[3] as f64) - (d[3] as f64)).powi(2))
+            .sum();
+        let a_rmse = (a_se / (w * h) as f64).sqrt();
+        assert!(a_rmse < 3.0, "alpha rmse too high: {a_rmse:.2}");
+        // Color must survive where alpha is meaningful.
+        let (mut c_se, mut n) = (0f64, 0u32);
+        for (s, d) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+            if s[3] > 128 {
+                for c in 0..3 {
+                    c_se += ((s[c] as f64) - (d[c] as f64)).powi(2);
+                }
+                n += 3;
+            }
+        }
+        let c_rmse = (c_se / n as f64).sqrt();
+        assert!(c_rmse < 8.0, "color rmse too high: {c_rmse:.2}");
     }
 
     #[test]
@@ -541,10 +729,11 @@ mod tests {
             &[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
             2,
             2,
+            3,
         );
         assert!(y.iter().all(|&v| v >= 1022), "{y:?}");
         assert_eq!((cb[0], cr[0]), (512, 512));
-        let (y, cb, cr) = rgb_to_yuv420_10bit(&[0; 12], 2, 2);
+        let (y, cb, cr) = rgb_to_yuv420_10bit(&[0; 12], 2, 2, 3);
         assert!(y.iter().all(|&v| v == 0));
         assert_eq!((cb[0], cr[0]), (512, 512));
     }
