@@ -509,24 +509,106 @@ fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
     reader
         .read_to_end(&mut s.srcbuf)
         .context("read WebP source")?;
-    let image = webp::Decoder::new(&s.srcbuf)
-        .decode()
-        .context("decode WebP (animated sources are unsupported)")?;
-    let (src_w, src_h) = (image.width() as usize, image.height() as usize);
-    let channels = if image.is_alpha() { 4 } else { 3 };
 
-    // Copy pixels into chunk8 so resize_pixels can consume them uniformly.
-    s.chunk8.clear();
-    s.chunk8.extend_from_slice(&image);
-    drop(image);
+    // Decode with libwebp's built-in scaler when we are shrinking well past
+    // the target, keeping the same quality headroom as the JPEG DCT path:
+    // decode at >= margin x target, then hand the remainder to linear-light
+    // Lanczos. libwebp's scaler alone (scale straight to target) is what
+    // costs other servers their score.
+    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let t0 = std::time::Instant::now();
+    let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, p)?;
+    let _ = (src_w, src_h);
+    let t_dec = t0.elapsed();
 
-    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
-    Ok(encode_webp(
-        &s.out8[..dst_w * dst_h * channels],
-        dst_w,
-        dst_h,
-        channels,
-    ))
+    let t1 = std::time::Instant::now();
+    let (dst_w, dst_h) = resize_pixels(s, channels, dec_w, dec_h, p)?;
+    let t_resize = t1.elapsed();
+
+    let t2 = std::time::Instant::now();
+    let out = encode_webp(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)?;
+    if timing {
+        eprintln!(
+            "timing webp decode({dec_w}x{dec_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
+            t_dec.as_secs_f64() * 1e3,
+            t_resize.as_secs_f64() * 1e3,
+            t2.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    Ok(out)
+}
+
+/// Decode `srcbuf` (WebP) into `chunk8`, scaling during decode down to
+/// margin x target when the source is much larger. Returns
+/// (src_w, src_h, channels, decoded_w, decoded_h).
+fn webp_decode_into_chunk8(
+    s: &mut Scratch,
+    p: &Params,
+) -> Result<(usize, usize, usize, usize, usize)> {
+    use libwebp_sys as w;
+    unsafe {
+        let mut config: w::WebPDecoderConfig = std::mem::zeroed();
+        anyhow::ensure!(
+            w::WebPInitDecoderConfig(&mut config),
+            "libwebp ABI mismatch"
+        );
+        let status = w::WebPGetFeatures(s.srcbuf.as_ptr(), s.srcbuf.len(), &mut config.input);
+        anyhow::ensure!(
+            status == w::VP8StatusCode::VP8_STATUS_OK,
+            "parse WebP header"
+        );
+        anyhow::ensure!(
+            config.input.has_animation == 0,
+            "animated WebP is unsupported"
+        );
+        let (src_w, src_h) = (config.input.width as usize, config.input.height as usize);
+        let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
+
+        let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        let need_w = ((dst_w as f64) * dct_margin()).ceil() as usize;
+        let (dec_w, dec_h) = if need_w < src_w {
+            let scale = need_w as f64 / src_w as f64;
+            (
+                need_w.max(dst_w),
+                (((src_h as f64) * scale).round() as usize).max(dst_h),
+            )
+        } else {
+            (src_w, src_h)
+        };
+        if (dec_w, dec_h) != (src_w, src_h) {
+            config.options.use_scaling = 1;
+            config.options.scaled_width = dec_w as i32;
+            config.options.scaled_height = dec_h as i32;
+        }
+        // libwebp's threaded decode pipelines entropy decoding and
+        // reconstruction across two threads (the same setting libvips
+        // ships); like band-parallel resize this briefly exceeds the CPU
+        // slot without oversubscribing on average.
+        if std::env::var("OXIMG_WEBP_DECODE_THREADS").as_deref() != Ok("0") {
+            config.options.use_threads = 1;
+        }
+        config.output.colorspace = if channels == 4 {
+            w::WEBP_CSP_MODE::MODE_RGBA
+        } else {
+            w::WEBP_CSP_MODE::MODE_RGB
+        };
+
+        let status = w::WebPDecode(s.srcbuf.as_ptr(), s.srcbuf.len(), &mut config);
+        if status != w::VP8StatusCode::VP8_STATUS_OK {
+            w::WebPFreeDecBuffer(&mut config.output);
+            anyhow::bail!("decode WebP: {status:?}");
+        }
+        let buf = &config.output.u.RGBA;
+        let stride = buf.stride as usize;
+        let row = dec_w * channels;
+        s.chunk8.resize(dec_h * row, 0);
+        for y in 0..dec_h {
+            let src_row = std::slice::from_raw_parts(buf.rgba.add(y * stride), row);
+            s.chunk8[y * row..(y + 1) * row].copy_from_slice(src_row);
+        }
+        w::WebPFreeDecBuffer(&mut config.output);
+        Ok((src_w, src_h, channels, dec_w, dec_h))
+    }
 }
 
 /// Resize the fully decoded pixels in `chunk8` (3 or 4 channels) into
@@ -662,13 +744,47 @@ fn webp_quality() -> f32 {
         .unwrap_or(75.0)
 }
 
-fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Vec<u8> {
-    let enc = if channels == 4 {
-        webp::Encoder::from_rgba(pixels, w as u32, h as u32)
-    } else {
-        webp::Encoder::from_rgb(pixels, w as u32, h as u32)
-    };
-    enc.encode(webp_quality()).to_vec()
+fn webp_effort() -> i32 {
+    std::env::var("OXIMG_WEBP_EFFORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
+fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
+    use libwebp_sys as wp;
+    unsafe {
+        let mut config: wp::WebPConfig = std::mem::zeroed();
+        anyhow::ensure!(wp::WebPInitConfig(&mut config), "libwebp ABI mismatch");
+        config.quality = webp_quality();
+        config.method = webp_effort().clamp(0, 6);
+
+        let mut pic: wp::WebPPicture = std::mem::zeroed();
+        anyhow::ensure!(wp::WebPPictureInit(&mut pic), "libwebp ABI mismatch");
+        pic.width = w as i32;
+        pic.height = h as i32;
+        let imported = if channels == 4 {
+            wp::WebPPictureImportRGBA(&mut pic, pixels.as_ptr(), (w * 4) as i32)
+        } else {
+            wp::WebPPictureImportRGB(&mut pic, pixels.as_ptr(), (w * 3) as i32)
+        };
+        anyhow::ensure!(imported != 0, "webp picture import");
+
+        let mut writer: wp::WebPMemoryWriter = std::mem::zeroed();
+        wp::WebPMemoryWriterInit(&mut writer);
+        pic.writer = Some(wp::WebPMemoryWrite);
+        pic.custom_ptr = (&mut writer) as *mut _ as *mut std::ffi::c_void;
+
+        let ok = wp::WebPEncode(&config, &mut pic);
+        wp::WebPPictureFree(&mut pic);
+        if ok == 0 {
+            wp::WebPMemoryWriterClear(&mut writer);
+            anyhow::bail!("webp encode failed (error {:?})", pic.error_code);
+        }
+        let out = std::slice::from_raw_parts(writer.mem, writer.size).to_vec();
+        wp::WebPMemoryWriterClear(&mut writer);
+        Ok(out)
+    }
 }
 
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
