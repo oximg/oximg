@@ -370,16 +370,19 @@ pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize,
     Ok((w, h, 4))
 }
 
-/// dav1d worker threads. Defaults to 2: like libwebp's two-thread decode
-/// (which libvips also ships), AV1 in-frame task threading briefly
-/// exceeds the CPU slot to cut wall latency; at saturation the scheduler
-/// amortizes it. Set OXIMG_AVIF_DECODE_THREADS=1 for strict one-slot
-/// decoding.
+/// dav1d worker threads. The default is architecture-aware: on x86-64,
+/// two threads ride the second SMT sibling of the request's core (the
+/// same rationale as libwebp's two-thread decode, which libvips also
+/// ships), improving both latency and saturated throughput. aarch64
+/// server cores have no SMT, so a second thread costs a full core:
+/// wall latency improves at light load but saturated throughput drops
+/// (measured -6% requests/s on Graviton3) — single-threaded decoding
+/// is the default there. OXIMG_AVIF_DECODE_THREADS overrides.
 fn dav1d_threads() -> std::os::raw::c_int {
     std::env::var("OXIMG_AVIF_DECODE_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
+        .unwrap_or(if cfg!(target_arch = "x86_64") { 2 } else { 1 })
 }
 
 /// Run one dav1d session over a single-frame AV1 stream and hand the
