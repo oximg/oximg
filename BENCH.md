@@ -69,33 +69,49 @@ unless stated otherwise). Methodology after
 | oximg speed mode | 72.2 | 107 ms | 111 ms | **130 MB** | 23.9 KB |
 | imgproxy | 60.7 | 127 ms | 138 ms | 317 MB | 22.9 KB |
 
-### Medium: 2000x1333 (0.9MB) → 500x500
+### Medium: 2000x1333 (0.9MB) → 500x500 (re-measured on Linux/Zen4)
 
-Re-measured 2026-07 at HEAD against imgproxy 4.0.11 (Homebrew) + vips.
-`wrk` cycling 48 distinct URLs (same source content) so oximg's request
-coalescing cannot inflate its numbers; five interleaved A/B rounds per
-concurrency, medians reported. Fresh plasma source (regenerated, so
-absolute values are not comparable with the historical tables around
-this one).
+**Methodology correction (2026-07).** An earlier revision of this
+table drove `wrk` with a URL-cycling counter per thread; every wrk
+thread's Lua VM starts at the same counter, so threads walk the same
+URL sequence in near-lockstep and concurrent duplicates hit oximg's
+request coalescing (imgproxy does not coalesce), inflating oximg's
+multi-connection numbers by up to 2x. Current numbers assign each
+thread a disjoint URL residue class, which makes coalescing
+impossible; a same-box A/B confirmed imgproxy's numbers do not move
+under either script. Same trap, different tool, as the k6 pigeonhole
+note below.
 
-| Server | c=8 req/s | c=12 req/s | c=1 latency | cpu-ms/req | peak RSS | output |
-|---|---|---|---|---|---|---|
-| oximg (defaults, jpegli) | **497** | **746** | 18.1 ms | 15.6 | 51 MB | 20.2 KB |
-| imgproxy | 455 | 499 | **12.0 ms** | **13.7** | 167 MB | 22.4 KB |
+The corrected reference matrix comes from a dedicated Linux box (AMD
+Zen4 8 cores/16 threads, Arch, oximg native, imgproxy 4.0.11 via
+host-network Docker — Docker overhead separately measured at ±3%),
+five interleaved A/B rounds per concurrency, medians; q92 4:4:4
+plasma source, identical 500x333 outputs:
 
-Single-run preset points for the same workload: `PRESET=fast` 522 /
-688 req/s (22.9 KB), `PRESET=small` 296 / 488 req/s (**18.6 KB**).
+| Server | c=1 latency | c=8 req/s | c=16 req/s | cpu-ms/req | output |
+|---|---|---|---|---|---|
+| oximg (default, serial) | 13.1 ms | 522 | 741 | 12.4 | **20.2 KB** |
+| oximg `OXIMG_OVERLAP=1` (fused) | 10.8 ms | 562 | 677 | ~12.8 | **20.2 KB** |
+| imgproxy | **10.4 ms** | **614** | **784** | **11.5** | 22.4 KB |
 
-An earlier revision of this table (measured pre-jpegli, pre-NEON-resize,
-single-URL `ab`, imgproxy 4.0.9) had imgproxy ahead at c=8 (590 vs 533).
-Two mechanisms, both visible in the columns above, explained that shape:
-imgproxy holds a lower single-request wall latency (it overlaps pipeline
-stages across threads, ~1.1 cores per request, and spends less CPU per
-request by not supersampling), so below saturation its throughput ceiling
-is reached early; oximg runs one request per core and scales linearly
-with concurrency, passing imgproxy before c=12. oximg's per-request cost
-has since dropped enough that it now leads at c=8 as well, while
-producing a smaller output at higher quality (jpegli; see QUALITY.md).
+This synthetic is the most imgproxy-favorable shape we know: a
+Huffman-heavy source (entropy decode is ~47% of oximg's request CPU
+and scale-invariant) resized 2:1, where imgproxy's shrink-on-load
+decodes at 1/4 resolution — skipping the 2x-supersampled Lanczos that
+buys oximg its resize-quality margin (QUALITY.md) — so its
+per-request CPU is lower, and per-request CPU is all that matters at
+SMT saturation. On the real-photo DIV2K harness below, oximg leads
+the same JPEG matchup on every box measured. The fused mode
+(`OXIMG_OVERLAP`, decode overlapped with resize+encode; see README)
+trades ~8% at c=16 for -18% single-request latency and +8% at c=8;
+it is opt-in on x86-64 and the default on aarch64, where it costs
+nothing (same kernel both paths) and cuts c=1 latency ~21% (M2:
+15.9 ms → 12.6 ms measured under controlled load).
+
+macOS numbers for this shape are withheld: the M2 box carries
+fluctuating background load that swamps a ±10% effect; the Zen4
+matrix above plus the M2 single-connection latency pair are the
+reproducible facts.
 
 ### Pure HTTP layer (`/health`, zero image work), N=20000/50000
 
