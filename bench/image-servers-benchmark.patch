@@ -1,7 +1,7 @@
-diff --git i/docker-compose.yml w/docker-compose.yml
+diff --git a/docker-compose.yml b/docker-compose.yml
 index 2e9bdba..082c1ec 100644
---- i/docker-compose.yml
-+++ w/docker-compose.yml
+--- a/docker-compose.yml
++++ b/docker-compose.yml
 @@ -2,6 +2,7 @@ version: "3"
  
  services:
@@ -65,17 +65,63 @@ index 2e9bdba..082c1ec 100644
 +      interval: 5s
 +      timeout: 5s
 +      start_period: 10s
-diff --git i/k6.js w/k6.js
-index 73e99d5..270814e 100644
---- i/k6.js
-+++ w/k6.js
-@@ -47,6 +47,9 @@ const getFormat = (filename) => {
+diff --git a/k6.js b/k6.js
+index 73e99d5..1191412 100644
+--- a/k6.js
++++ b/k6.js
+@@ -33,6 +33,37 @@ switch (scenario.format) {
+     throw `Unknown format ${scenario.format}`;
+ }
+ 
++// Cross-format cells (oximg extension): OUT_FORMAT overrides the output
++// format while FORMAT keeps selecting the source files. Quality follows
++// the output format, matching the same-format mapping above; unknown
++// values fail fast like FORMAT does (a typo must not silently benchmark
++// a different workload per server).
++let outFormat = (__ENV.OUT_FORMAT || '').toLowerCase();
++switch (outFormat) {
++  case '':
++    break;
++
++  case 'jpg':
++  case 'jpeg':
++    outFormat = 'jpg';
++    scenario.quality = 80;
++    break;
++
++  case 'png':
++    break;
++
++  case 'webp':
++    scenario.quality = 75;
++    break;
++
++  case 'avif':
++    scenario.quality = 65;
++    break;
++
++  default:
++    throw `Unknown output format ${outFormat}`;
++}
++
+ const getFilesList = (format) => {
+   const datasetDir = (__ENV.DATASET_DIR || './dataset');
+   const files = open(datasetDir+"/list.txt").split(/\r?\n/);
+@@ -47,12 +78,15 @@ const getFormat = (filename) => {
  
  const formatUrl = (format, quality, filename) => {
    switch (scenario.tool) {
 +    case 'oximg':
-+      return `http://${scenario.tool}/resize/${scenario.width}/${scenario.height}/${filename}`;
++      return `http://${scenario.tool}/resize/${scenario.width}/${scenario.height}/${filename}${outFormat && `@${outFormat}`}`;
 +
      case 'imgproxy':
-       return `http://${scenario.tool}/unsafe/rs:fit:${scenario.width}:${scenario.height}/f:${format}/q:${quality}/plain/http://nginx/${filename}`;
+-      return `http://${scenario.tool}/unsafe/rs:fit:${scenario.width}:${scenario.height}/f:${format}/q:${quality}/plain/http://nginx/${filename}`;
++      return `http://${scenario.tool}/unsafe/rs:fit:${scenario.width}:${scenario.height}/f:${outFormat || format}/q:${quality}/plain/http://nginx/${filename}`;
  
+     case 'thumbor':
+     case 'imagor':
+-      return `http://${scenario.tool}/unsafe/fit-in/${scenario.width}x${scenario.height}/filters:format(${format}):quality(${quality})/http://nginx/${filename}`;
++      return `http://${scenario.tool}/unsafe/fit-in/${scenario.width}x${scenario.height}/filters:format(${outFormat || format}):quality(${quality})/http://nginx/${filename}`;
+ 
+     default:
+       throw `Unknown tool ${tool}`;

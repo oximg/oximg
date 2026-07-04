@@ -202,6 +202,49 @@ SVT-AV1 auxiliary-image encode plus a second dav1d decode:
 All runs 100% successful checks; every server's output carries the
 alpha item (verified with avifdec).
 
+### Cross-format cells (our extension of the harness)
+
+The official harness only measures same-format cells: its single
+`FORMAT` variable both selects the source files (by extension) and
+names the output format, so every published cell is jpg→jpg, png→png,
+webp→webp, or avif→avif. Cross-format conversion is not covered
+upstream.
+
+Our patch adds an `OUT_FORMAT` variable: `FORMAT` keeps selecting the
+sources, `OUT_FORMAT` overrides the output for every contender using
+each server's native syntax (oximg `@{fmt}`, imgproxy `f:{fmt}`,
+imagor/thumbor `filters:format({fmt})`), and the quality follows the
+output format with the harness's own mapping (JPEG q80, WebP q75,
+AVIF q65) so cross-format cells stay comparable with the same-format
+cells above. Example: `FORMAT=jpg OUT_FORMAT=avif` measures
+JPEG-source → AVIF-output across all four servers.
+
+Cross-format cells have not been run on the AWS reference instances
+yet; until they are, treat local numbers as directional only. Two
+effects to expect: jpg→webp/avif swaps the expensive source decode for
+oximg's cheapest one (streaming mozjpeg with DCT shrink-on-load), and
+AVIF output dominates whatever the source format is.
+
+Directional local rows (`XFMT=1 FEATURES=avif bench/native.sh`, Apple
+M2 Max, 2000x1333 plasma JPEG → 500x500, ab c=8, diverse-URL rps /
+single-URL p50; "serial" is the pre-fuse cross-format path kept under
+`OXIMG_OVERLAP=0`, "fused" the default):
+
+| Output | serial req/s (p50) | fused req/s (p50) |
+|---|---|---|
+| JPEG (bare URL) | 609 (13 ms) | 604 (13 ms) |
+| JPEG (`@jpeg`) | 609 (13 ms) | 596 (13 ms) |
+| WebP (`@webp`) | 469 (18 ms) | 521 (16 ms) |
+| AVIF (`@avif`) | 385 (22 ms) | 399 (20 ms) |
+
+The `@jpeg` row matching the bare row is the no-regression check: an
+explicit same-format token takes the identical code path. Single-
+request medians (c=1, same box): JPEG→WebP 17.8→15.7 ms (-12%),
+JPEG→AVIF 22.3→20.1 ms (-10%) — cross-format requests overlap the
+mozjpeg decode with the SIMD resize on a second thread (the same
+`OXIMG_OVERLAP` gate as same-format JPEG), leaving only the one-shot
+target encode outside the decode wall.
+
 ## Official harness on real AWS hardware (c7i.large and c7g.large)
 
 The same harness run unmodified on the instance types imgproxy uses for

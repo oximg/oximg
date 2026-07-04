@@ -6,15 +6,18 @@
 # Usage: bench/native.sh            # defaults
 #        PRESET=fast bench/native.sh
 #        N=3200 C=8 bench/native.sh
+#        XFMT=1 FEATURES=avif bench/native.sh   # + cross-format rows
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N=${N:-1600}
-C=${C:-$(nproc)}
+C=${C:-$(getconf _NPROCESSORS_ONLN)}
 PORT=${PORT:-8091}
 PRESET=${PRESET:-jpegli}
+XFMT=${XFMT:-0}
+FEATURES=${FEATURES:-}
 
-cargo build --release
+cargo build --release ${FEATURES:+--features "$FEATURES"}
 
 mkdir -p images
 [ -f images/test-medium.jpg ] ||
@@ -55,3 +58,14 @@ run() { # label file n
 
 run medium test-medium.jpg "$N"
 run large test-large.jpg $((N / 5))
+
+# Cross-format rows: same JPEG sources, explicit @fmt output token. The
+# @jpeg row must match the bare row (same code path); webp/avif rows
+# price the target encoder against the cheap JPEG decode.
+if [ "$XFMT" = 1 ]; then
+  run medium-jpeg test-medium.jpg@jpeg "$N"
+  run medium-webp test-medium.jpg@webp "$N"
+  case ",$FEATURES," in
+    *,avif,*) run medium-avif test-medium.jpg@avif $((N / 5)) ;;
+  esac
+fi
