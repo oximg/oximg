@@ -110,13 +110,21 @@ impl Windows {
     }
 }
 
+/// Reusable work buffers: one staged source row (f32), the ring of
+/// horizontally-convolved rows, one accumulator row set, and the ring
+/// slot offsets of the current vertical window. Grow-only; every
+/// element is written before it is read, so stale contents are never
+/// observed.
+#[derive(Default)]
+struct Scratch {
+    stage: Vec<f32>,
+    ring: Vec<f32>,
+    acc: Vec<f32>,
+    offs: Vec<usize>,
+}
+
 thread_local! {
-    /// Reusable work buffers: one staged source row (f32), the ring of
-    /// horizontally-convolved rows, and one accumulator row set. Grow-only;
-    /// every element is written before it is read, so stale contents are
-    /// never observed.
-    static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
 fn grow(buf: &mut Vec<f32>, len: usize) {
@@ -177,11 +185,15 @@ fn run(
     cap: usize,
 ) {
     SCRATCH.with(|s| {
-        let (stage, ring, acc) = &mut *s.borrow_mut();
+        let s = &mut *s.borrow_mut();
+        let (stage, ring, acc, offs) = (&mut s.stage, &mut s.ring, &mut s.acc, &mut s.offs);
         grow(stage, src_w * channels);
         let plane = cap * dst_w;
         grow(ring, plane * channels);
         grow(acc, dst_w * channels);
+        if offs.len() < wv.window_size {
+            offs.resize(wv.window_size, 0);
+        }
 
         unsafe {
             let mut next_row = 0usize;
@@ -211,12 +223,21 @@ fn run(
                     next_row += 1;
                 }
                 let coeffs = &wv.coeffs[oy * wv.window_size..oy * wv.window_size + size];
+                // Ring slot offsets for this window, one wrap-increment per
+                // tap instead of a modulo in the accumulation inner loop.
+                let mut slot = start % cap;
+                for o in offs[..size].iter_mut() {
+                    *o = slot * dst_w;
+                    slot += 1;
+                    if slot == cap {
+                        slot = 0;
+                    }
+                }
                 for c in 0..channels {
                     vert_accumulate(
                         &ring[c * plane..(c + 1) * plane],
                         coeffs,
-                        start,
-                        cap,
+                        &offs[..size],
                         dst_w,
                         &mut acc[c * dst_w..(c + 1) * dst_w],
                     );
@@ -234,27 +255,42 @@ fn run(
 
 /// Deinterleave one u16 RGB row into three planar f32 rows
 /// (stage[0..w], stage[w..2w], stage[2w..3w]). Exact conversion, so the
-/// convolution below sees the same operand values as widening on the fly.
+/// convolution below sees the same operand values as widening on the
+/// fly. Deinterleaving uses three-register table lookups instead of
+/// LD3: on Neoverse cores LD3 is a slow multi-uop structure load (it
+/// showed up as ~25% of kernel time in perf annotate), while TBL on a
+/// three-register table is cheap.
 #[target_feature(enable = "neon")]
 unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
     unsafe {
         use std::arch::aarch64::*;
+        // Byte indices of each channel's eight u16 samples within a
+        // 48-byte (eight-pixel) RGB group.
+        const IDX_R: [u8; 16] = [0, 1, 6, 7, 12, 13, 18, 19, 24, 25, 30, 31, 36, 37, 42, 43];
+        const IDX_G: [u8; 16] = [2, 3, 8, 9, 14, 15, 20, 21, 26, 27, 32, 33, 38, 39, 44, 45];
+        const IDX_B: [u8; 16] = [4, 5, 10, 11, 16, 17, 22, 23, 28, 29, 34, 35, 40, 41, 46, 47];
+        let idx_r = vld1q_u8(IDX_R.as_ptr());
+        let idx_g = vld1q_u8(IDX_G.as_ptr());
+        let idx_b = vld1q_u8(IDX_B.as_ptr());
+
         let (r_out, rest) = stage.split_at_mut(w);
         let (g_out, b_out) = rest.split_at_mut(w);
         let mut x = 0usize;
         while x + 8 <= w {
-            let px = vld3q_u16(row.as_ptr().add(x * 3));
+            let p = row.as_ptr().add(x * 3) as *const u8;
+            let tbl = uint8x16x3_t(vld1q_u8(p), vld1q_u8(p.add(16)), vld1q_u8(p.add(32)));
             macro_rules! ch {
-                ($i:tt, $out:expr) => {{
-                    let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(px.$i)));
-                    let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(px.$i)));
+                ($idx:expr, $out:expr) => {{
+                    let v = vreinterpretq_u16_u8(vqtbl3q_u8(tbl, $idx));
+                    let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(v)));
+                    let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(v)));
                     vst1q_f32($out.as_mut_ptr().add(x), lo);
                     vst1q_f32($out.as_mut_ptr().add(x + 4), hi);
                 }};
             }
-            ch!(0, r_out);
-            ch!(1, g_out);
-            ch!(2, b_out);
+            ch!(idx_r, r_out);
+            ch!(idx_g, g_out);
+            ch!(idx_b, b_out);
             x += 8;
         }
         while x < w {
@@ -399,15 +435,15 @@ unsafe fn horiz_row_x4(
 }
 
 /// acc[x] = sum over taps of coeff * ring_row[x], taps applied in
-/// ascending order. Accumulators stay in registers for a whole
-/// 16-column tile across every tap (the tap-order additions per element
-/// are unchanged from a per-tap memory accumulator).
+/// ascending order (`offs[k]` is the precomputed ring offset of tap k's
+/// row). Accumulators stay in registers for a whole 16-column tile
+/// across every tap (the tap-order additions per element are unchanged
+/// from a per-tap memory accumulator).
 #[target_feature(enable = "neon")]
 unsafe fn vert_accumulate(
     plane: &[f32],
     coeffs: &[f32],
-    start: usize,
-    cap: usize,
+    offs: &[usize],
     dst_w: usize,
     acc: &mut [f32],
 ) {
@@ -419,8 +455,8 @@ unsafe fn vert_accumulate(
             let mut a1 = vdupq_n_f32(0.0);
             let mut a2 = vdupq_n_f32(0.0);
             let mut a3 = vdupq_n_f32(0.0);
-            for (k, &c) in coeffs.iter().enumerate() {
-                let row = plane.as_ptr().add(((start + k) % cap) * dst_w + x);
+            for (&off, &c) in offs.iter().zip(coeffs) {
+                let row = plane.as_ptr().add(off + x);
                 let cv = vdupq_n_f32(c);
                 a0 = vfmaq_f32(a0, vld1q_f32(row), cv);
                 a1 = vfmaq_f32(a1, vld1q_f32(row.add(4)), cv);
@@ -435,17 +471,16 @@ unsafe fn vert_accumulate(
         }
         while x + 4 <= dst_w {
             let mut a = vdupq_n_f32(0.0);
-            for (k, &c) in coeffs.iter().enumerate() {
-                let row = plane.as_ptr().add(((start + k) % cap) * dst_w + x);
-                a = vfmaq_f32(a, vld1q_f32(row), vdupq_n_f32(c));
+            for (&off, &c) in offs.iter().zip(coeffs) {
+                a = vfmaq_f32(a, vld1q_f32(plane.as_ptr().add(off + x)), vdupq_n_f32(c));
             }
             vst1q_f32(acc.as_mut_ptr().add(x), a);
             x += 4;
         }
         while x < dst_w {
             let mut a = 0f32;
-            for (k, &c) in coeffs.iter().enumerate() {
-                a += plane[((start + k) % cap) * dst_w + x] * c;
+            for (&off, &c) in offs.iter().zip(coeffs) {
+                a += plane[off + x] * c;
             }
             acc[x] = a;
             x += 1;
