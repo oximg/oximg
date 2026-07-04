@@ -18,7 +18,7 @@
 //! tests per arch).
 
 use anyhow::{Result, ensure};
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) fn lanczos3(x: f64) -> f64 {
     fn sinc(x: f64) -> f64 {
@@ -107,21 +107,21 @@ thread_local! {
     /// Windows are pure functions of (in_size, out_size); servers hit a
     /// handful of shapes over and over, and recomputing one costs ~20K
     /// f64 sin() calls. Bounded: reset when it grows past 64 shapes.
-    static WINDOWS: std::cell::RefCell<std::collections::HashMap<(usize, usize), Rc<Windows>>> =
+    static WINDOWS: std::cell::RefCell<std::collections::HashMap<(usize, usize), Arc<Windows>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     /// Reusable work buffers, pooled per thread so both the full-frame
     /// path and per-request streaming resizers avoid reallocation.
     static SCRATCH_POOL: std::cell::RefCell<Vec<Scratch>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-pub(crate) fn cached_windows(in_size: usize, out_size: usize) -> Rc<Windows> {
+pub(crate) fn cached_windows(in_size: usize, out_size: usize) -> Arc<Windows> {
     WINDOWS.with(|w| {
         let mut w = w.borrow_mut();
         if w.len() > 64 {
             w.clear();
         }
         w.entry((in_size, out_size))
-            .or_insert_with(|| Rc::new(Windows::new(in_size, out_size)))
+            .or_insert_with(|| Arc::new(Windows::new(in_size, out_size)))
             .clone()
     })
 }
@@ -194,8 +194,8 @@ pub(crate) fn clamp_u16(v: f32) -> u16 {
 /// `window_size * dst_w * channels` f32s instead of a full intermediate
 /// image, exactly like the strip-mined full-frame driver.
 pub(crate) struct StreamResize<K: RowKernel> {
-    wh: Rc<Windows>,
-    wv: Rc<Windows>,
+    wh: Arc<Windows>,
+    wv: Arc<Windows>,
     channels: usize,
     src_w: usize,
     dst_w: usize,
