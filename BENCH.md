@@ -88,11 +88,22 @@ host-network Docker — Docker overhead separately measured at ±3%),
 five interleaved A/B rounds per concurrency, medians; q92 4:4:4
 plasma source, identical 500x333 outputs:
 
-| Server | c=1 latency | c=8 req/s | c=16 req/s | cpu-ms/req | output |
-|---|---|---|---|---|---|
-| oximg (default, serial) | 13.1 ms | 522 | 741 | 12.4 | **20.2 KB** |
-| oximg `OXIMG_OVERLAP=1` (fused) | 10.8 ms | 562 | 677 | ~12.8 | **20.2 KB** |
-| imgproxy | **10.4 ms** | **614** | **784** | **11.5** | 22.4 KB |
+| Server | c=1 latency | c=8 req/s | c=16 req/s | output |
+|---|---|---|---|---|
+| oximg (default, serial) | 13.1 ms | 522 | 741 | **20.2 KB** |
+| oximg `OXIMG_OVERLAP=1` (fused) | 10.8 ms | 562 | 677 | **20.2 KB** |
+| oximg speed profile, fused | **9.4 ms** | **648** | 761 | 22.5 KB |
+| oximg speed profile, serial | 11.7 ms | 581 | **810** | 22.5 KB |
+| imgproxy | 10.4 ms | 614 | 784 | 22.4 KB |
+
+The speed profile is `OXIMG_JPEG_PROGRESSIVE=0` (baseline jpegli:
+entropy coding no longer sits on the latency tail at `finish`, and
+per-request CPU drops ~1.2 ms) — output lands at libjpeg-turbo size
+for this source while keeping jpegli's quality-per-byte edge. Adding
+`OXIMG_OVERLAP=auto` composes the two lines: fused below saturation,
+serial at saturation — ahead of imgproxy at every concurrency in this
+table. The default profile instead keeps the 10% smaller progressive
+output and leads on the real-photo harness.
 
 This synthetic is the most imgproxy-favorable shape we know: a
 Huffman-heavy source (entropy decode is ~47% of oximg's request CPU

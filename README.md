@@ -107,7 +107,13 @@ second thread, cutting single-request latency ~20%; `auto` fuses while
 `2 x active requests <= visible CPUs` and falls back to one core per
 request under contention. Default `auto` on aarch64, where output
 bytes are identical either way; default off on x86-64 — set `1` to
-force fusing every request there).
+force fusing every request there), `OXIMG_JPEG_PROGRESSIVE` (`0`
+selects baseline jpegli: a few percent larger JPEG output — still at
+or below libjpeg-turbo size for the same input, at higher quality —
+in exchange for moving jpegli's entropy pass off the latency tail:
+combined with `OXIMG_OVERLAP` this is the speed profile, ~-13%
+single-request latency and ~+9% saturated throughput over the
+default).
 
 ## Not yet implemented (out of PoC scope)
 

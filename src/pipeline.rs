@@ -595,12 +595,14 @@ fn decode_resize<R: std::io::BufRead>(
 
     if let Some(quality) = fuse_quality
         && linear
-        && let Some(out) = fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality)?
+        && let Some((out, decode_ms)) =
+            fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality)?
     {
         if timing {
+            let total = t0.elapsed().as_secs_f64() * 1e3;
             eprintln!(
-                "timing fused({dec_w}x{dec_h}->{dst_w}x{dst_h}) total={:.1}ms",
-                t0.elapsed().as_secs_f64() * 1e3
+                "timing fused({dec_w}x{dec_h}->{dst_w}x{dst_h}) decode={decode_ms:.1}ms tail={:.1}ms total={total:.1}ms",
+                total - decode_ms
             );
         }
         started.finish().context("decode finish failed")?;
@@ -719,6 +721,8 @@ type FuseKernel = crate::resize_avx2::Avx2;
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     allow(unused_variables)
 )]
+/// On success returns the encoded bytes and the wall milliseconds the
+/// decode loop took on this thread (the fused pipeline's floor).
 fn fused_resize_encode<R: std::io::BufRead>(
     started: &mut mozjpeg::decompress::DecompressStarted<R>,
     dec_w: usize,
@@ -726,7 +730,7 @@ fn fused_resize_encode<R: std::io::BufRead>(
     dst_w: usize,
     dst_h: usize,
     quality: f32,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, f64)>> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         Ok(None)
@@ -762,9 +766,10 @@ fn fused_resize_encode<R: std::io::BufRead>(
                 let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
                 comp.set_size(dst_w, dst_h);
                 comp.set_quality(quality);
-                // Mirrors encode_jpegli: progressive is worth several
-                // percent at these sizes.
-                comp.set_progressive_mode();
+                // Mirrors encode_jpegli (including the progressive knob).
+                if jpegli_progressive() {
+                    comp.set_progressive_mode();
+                }
                 let mut enc = comp.start_compress(Vec::with_capacity(64 * 1024))?;
 
                 while let Ok((buf, rows)) = chunk_rx.recv() {
@@ -799,6 +804,7 @@ fn fused_resize_encode<R: std::io::BufRead>(
 
         // Decode loop on the request thread: read a chunk, hand it to the
         // worker, reuse buffers the worker has drained.
+        let t_decode = std::time::Instant::now();
         let decode_result = (|| -> Result<()> {
             let mut remaining = dec_h;
             while remaining > 0 {
@@ -824,6 +830,7 @@ fn fused_resize_encode<R: std::io::BufRead>(
             }
             Ok(())
         })();
+        let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
         drop(chunk_tx);
 
         let encoded = worker
@@ -832,7 +839,7 @@ fn fused_resize_encode<R: std::io::BufRead>(
         // A decode error is the root cause; report it over the worker's
         // consequent "incomplete image" error.
         decode_result?;
-        Ok(Some(encoded?))
+        Ok(Some((encoded?, decode_ms)))
     }
 }
 
@@ -1366,13 +1373,23 @@ pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
 
 /// jpegli encode via its libjpeg-compatible API (symbols are
 /// `jpegli_`-prefixed, so it links alongside mozjpeg without conflicts).
+/// OXIMG_JPEG_PROGRESSIVE=0 selects baseline jpegli: a few percent
+/// larger output, but the entropy pass at finish_compress shrinks,
+/// which is the fused path's only serial tail.
+fn jpegli_progressive() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("OXIMG_JPEG_PROGRESSIVE").as_deref() != Ok("0"))
+}
+
 fn encode_jpegli(rgb: &[u8], w: usize, h: usize, quality: f32) -> Result<Vec<u8>> {
     let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
     comp.set_size(w, h);
     comp.set_quality(quality);
     // cjpegli emits progressive by default; the libjpeg-compat layer does
     // not. Progressive is worth several percent at these sizes.
-    comp.set_progressive_mode();
+    if jpegli_progressive() {
+        comp.set_progressive_mode();
+    }
     let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
     started.write_scanlines(rgb)?;
     Ok(started.finish()?)
