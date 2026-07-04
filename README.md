@@ -52,10 +52,13 @@ numbers — req/s, higher is better, p95 in parentheses:
 | oximg | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **23.1** (126 ms) |
 | best of imgproxy/imagor/thumbor | 68.4 | 22.0 | 25.4 | 20.1 |
 
-At the same time, output quality is higher, not traded away: pure
-resize quality (lossless PNG path) scores 97.6 SSIMULACRA2 vs
-imgproxy's 81.9 on the 24-image Kodak corpus, and the AVIF default
-produces smaller files than imgproxy's default at +6.7 SSIMULACRA2.
+At the same time, output quality is higher, not traded away:
+end-to-end JPEG at the same q80 scores +6 to +18 SSIMULACRA2 over
+imgproxy (77.5 vs 71.2 on the Kodak corpus, the gap widening with
+source size — and imgproxy at q90 with twice the bytes still scores
+lower), pure resize quality (lossless PNG path) scores 97.6 vs 81.9,
+and the AVIF default produces smaller files than imgproxy's default
+at +6.7 SSIMULACRA2.
 
 - [BENCH.md](BENCH.md) — full methodology and tables: official harness
   (local and AWS), sustained-load and memory measurements, presets.

@@ -88,11 +88,23 @@ host-network Docker — Docker overhead separately measured at ±3%),
 five interleaved A/B rounds per concurrency, medians; q92 4:4:4
 plasma source, identical 500x333 outputs:
 
-| Server | c=1 latency | c=8 req/s | c=16 req/s | output |
-|---|---|---|---|---|
-| oximg (default) | 10.8 ms | 583 | 740 | **20.2 KB** |
-| oximg speed profile | **9.4 ms** | **659** | **810** | 22.5 KB |
-| imgproxy | 10.4 ms | 614 | 784 | 22.4 KB |
+| Server | SSIM2 | c=1 latency | c=8 req/s | c=16 req/s | output |
+|---|---|---|---|---|---|
+| oximg (default) | **76.1** | 10.8 ms | 583 | 740 | **20.2 KB** |
+| oximg speed profile | **76.1** | **9.4 ms** | **659** | **810** | 22.5 KB |
+| imgproxy | 74.6 | 10.4 ms | 614 | 784 | 22.4 KB |
+
+SSIM2 scores this table's own outputs against a linear-light Lanczos
+reference of the plasma source (differences above ~2 points are
+generally perceptible; both oximg profiles decode to identical pixels
+— baseline vs progressive jpegli differ only in entropy layout).
+Smooth synthetic noise is the content where oximg's supersampled
+linear-light resize matters least; on the real-photo corpus the same
+q80 comparison is **77.5 / 72.1 / 67.3 vs imgproxy's 71.2 / 60.1 /
+49.7** for 768px/2000px/4000px sources — +6 to +18 points, with
+imgproxy unable to close it at any byte cost (63.8 KB at q90 still
+scores 76.0 vs oximg's 77.5 from 34.0 KB). Full protocol and sweeps
+in [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
 Both oximg rows are the auto overlap gate composing one pipeline:
 decode fused with resize+encode on a second thread below saturation,
@@ -100,16 +112,15 @@ one core per request at saturation — serial and fused stream through
 the same SIMD row kernel, so a URL's bytes never depend on load. The
 speed profile is `OXIMG_JPEG_PROGRESSIVE=0` (baseline jpegli: entropy
 coding leaves the latency tail and per-request CPU drops ~1.2 ms):
-output lands at libjpeg-turbo size for this source, keeps jpegli's
-quality-per-byte edge, and is ahead of imgproxy at every concurrency
-in this table.
+output lands at libjpeg-turbo size for this source at unchanged
+quality, ahead of imgproxy at every concurrency in this table.
 
 The default keeps the 10% smaller progressive output and leads the
 real-photo DIV2K harness (196-197 req/s on this box's 2-cpu pinned
-replica); its residual gap here — 4% at c=1, 5-6% at saturation on
-this one synthetic — is the deliberate quality work itself
-(2x-supersampled Lanczos, progressive jpegli), not overhead: the
-resize kernels, staging, and IDCT were each profiled to their
+replica); its residual throughput gap here — 4% at c=1, 5-6% at
+saturation on this one synthetic — is the deliberate quality work
+itself (2x-supersampled Lanczos, progressive jpegli), not overhead:
+the resize kernels, staging, and IDCT were each profiled to their
 practical floors (a prototyped AVX2 4x4 IDCT measured +3% over
 mozjpeg's SSE2 assembly, which already sustains ~4 IPC on Zen4 —
 left alone deliberately).
@@ -117,16 +128,11 @@ left alone deliberately).
 This synthetic is the most imgproxy-favorable shape we know: a
 Huffman-heavy source (entropy decode is ~47% of oximg's request CPU
 and scale-invariant) resized 2:1, where imgproxy's shrink-on-load
-decodes at 1/4 resolution — skipping the 2x-supersampled Lanczos that
-buys oximg its resize-quality margin (QUALITY.md) — so its
-per-request CPU is lower, and per-request CPU is all that matters at
-SMT saturation. On the real-photo DIV2K harness below, oximg leads
-the same JPEG matchup on every box measured. The fused mode
-(`OXIMG_OVERLAP`, decode overlapped with resize+encode; see README)
-trades ~8% at c=16 for -18% single-request latency and +8% at c=8;
-it is opt-in on x86-64 and the default on aarch64, where it costs
-nothing (same kernel both paths) and cuts c=1 latency ~21% (M2:
-15.9 ms → 12.6 ms measured under controlled load).
+decodes at 1/4 resolution — skipping the supersampling that buys the
+quality column above — so its per-request CPU is lower, and
+per-request CPU is all that matters at SMT saturation. On the
+real-photo DIV2K harness below, oximg leads the same JPEG matchup on
+every box measured.
 
 macOS numbers for this shape are withheld: the M2 box carries
 fluctuating background load that swamps a ±10% effect; the Zen4
