@@ -21,11 +21,23 @@ fn rgb_to_yuv420_10bit(
     w: usize,
     h: usize,
     channels: usize,
-) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+    y_plane: &mut Vec<u16>,
+    cb_plane: &mut Vec<u16>,
+    cr_plane: &mut Vec<u16>,
+) {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    let mut y_plane = vec![0u16; w * h];
-    let mut cb_plane = vec![0u16; cw * ch];
-    let mut cr_plane = vec![0u16; cw * ch];
+    // Grow-only scratch; every element of all three planes is written by
+    // the loops below.
+    for (plane, len) in [
+        (&mut *y_plane, w * h),
+        (&mut *cb_plane, cw * ch),
+        (&mut *cr_plane, cw * ch),
+    ] {
+        if plane.len() < len {
+            plane.resize(len, 0);
+        }
+        plane.truncate(len);
+    }
 
     // Luma: Y10 = (0.299 R + 0.587 G + 0.114 B) * 1023/255, fixed point.
     // Coefficients sum to 4096, so the pre-scale maximum is 4096*255 and the
@@ -63,7 +75,12 @@ fn rgb_to_yuv420_10bit(
             cr_plane[cy * cw + cx] = (cr.round() as i32).clamp(0, 1023) as u16;
         }
     }
-    (y_plane, cb_plane, cr_plane)
+}
+
+thread_local! {
+    /// Encode-side plane scratch, reused across requests.
+    static ENC_SCRATCH: std::cell::RefCell<(Vec<u16>, Vec<u16>, Vec<u16>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 pub struct AvifParams {
@@ -105,17 +122,20 @@ pub fn encode_avif(
         "unsupported channel count {channels}"
     );
     ensure!(pixels.len() >= w * h * channels, "pixel buffer too small");
-    let (y_plane, cb_plane, cr_plane) = rgb_to_yuv420_10bit(pixels, w, h, channels);
-    let color = encode_svt(
-        &y_plane,
-        &cb_plane,
-        &cr_plane,
-        w,
-        h,
-        quality_to_qp(p.quality),
-        false,
-        p,
-    )?;
+    let color = ENC_SCRATCH.with(|s| {
+        let (y_plane, cb_plane, cr_plane) = &mut *s.borrow_mut();
+        rgb_to_yuv420_10bit(pixels, w, h, channels, y_plane, cb_plane, cr_plane);
+        encode_svt(
+            y_plane,
+            cb_plane,
+            cr_plane,
+            w,
+            h,
+            quality_to_qp(p.quality),
+            false,
+            p,
+        )
+    })?;
     let alpha = if channels == 4 {
         let a_plane: Vec<u16> = pixels
             .chunks_exact(4)
@@ -323,8 +343,12 @@ pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize,
     let alpha = with_decoded_picture(alpha_item, |pic| picture_to_alpha(pic, w, h))
         .context("decode alpha item")?;
     // Expand RGB to RGBA in place, back to front (writes at i*4.. never
-    // overlap reads at j*3..j*3+3 for j < i).
-    out.resize(w * h * 4, 0);
+    // overlap reads at j*3..j*3+3 for j < i); every output position is
+    // written, so growth does not need to re-zero.
+    if out.len() < w * h * 4 {
+        out.resize(w * h * 4, 0);
+    }
+    out.truncate(w * h * 4);
     for i in (0..w * h).rev() {
         let (r, g, b) = (out[i * 3], out[i * 3 + 1], out[i * 3 + 2]);
         let a = alpha[i];
@@ -618,6 +642,7 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
             px[2] = (b + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
+    out.truncate(w * h * 3);
     Ok((w, h))
 }
 
@@ -736,15 +761,20 @@ mod tests {
     #[test]
     fn yuv_conversion_hits_known_anchors() {
         // white -> Y=1023, Cb=Cr=512; black -> Y=0, Cb=Cr=512
-        let (y, cb, cr) = rgb_to_yuv420_10bit(
+        let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        rgb_to_yuv420_10bit(
             &[255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255],
             2,
             2,
             3,
+            &mut y,
+            &mut cb,
+            &mut cr,
         );
         assert!(y.iter().all(|&v| v >= 1022), "{y:?}");
         assert_eq!((cb[0], cr[0]), (512, 512));
-        let (y, cb, cr) = rgb_to_yuv420_10bit(&[0; 12], 2, 2, 3);
+        let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+        rgb_to_yuv420_10bit(&[0; 12], 2, 2, 3, &mut y, &mut cb, &mut cr);
         assert!(y.iter().all(|&v| v == 0));
         assert_eq!((cb[0], cr[0]), (512, 512));
     }

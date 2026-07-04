@@ -125,6 +125,23 @@ struct Scratch {
 
 thread_local! {
     static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+    /// Windows are pure functions of (in_size, out_size); servers hit a
+    /// handful of shapes over and over, and recomputing one costs ~20K
+    /// f64 sin() calls. Bounded: reset when it grows past 64 shapes.
+    static WINDOWS: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<Windows>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn cached_windows(in_size: usize, out_size: usize) -> std::rc::Rc<Windows> {
+    WINDOWS.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.len() > 64 {
+            w.clear();
+        }
+        w.entry((in_size, out_size))
+            .or_insert_with(|| std::rc::Rc::new(Windows::new(in_size, out_size)))
+            .clone()
+    })
 }
 
 fn grow(buf: &mut Vec<f32>, len: usize) {
@@ -156,8 +173,8 @@ pub fn resize_u16_neon(
     ensure!(src.len() >= src_w * src_h * channels, "src too small");
     ensure!(dst.len() >= dst_w * dst_h * channels, "dst too small");
 
-    let wh = Windows::new(src_w, dst_w);
-    let wv = Windows::new(src_h, dst_h);
+    let wh = cached_windows(src_w, dst_w);
+    let wv = cached_windows(src_h, dst_h);
     // Ring capacity: every vertical window's span is <= window_size (the
     // raw span ceil(c+r)-floor(c-r) < 2r+2 <= window_size+1, and clamping
     // or zero-trimming only shrinks it), and window ends are

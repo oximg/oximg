@@ -294,6 +294,25 @@ struct Scratch {
     resizer: Option<Resizer>,
 }
 
+/// Grow-only scratch access: ensures length without re-zeroing retained
+/// bytes (a full-size memset per request on multi-megabyte buffers) and
+/// returns the exactly-sized view. Callers must fully overwrite the
+/// returned slice before reading it.
+fn scratch_u16(buf: &mut Vec<u16>, len: usize) -> &mut [u16] {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    &mut buf[..len]
+}
+
+/// See [`scratch_u16`].
+fn scratch_u8(buf: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    &mut buf[..len]
+}
+
 fn u16_as_bytes(buf: &[u16]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 2) }
 }
@@ -454,10 +473,8 @@ fn decode_resize<R: std::io::BufRead>(
     if (dec_w, dec_h) == (dst_w, dst_h) {
         // Decoded size is already the target size: output directly; a
         // linear round-trip would be pure loss.
-        s.out8.resize(dec_w * dec_h * 3, 0);
-        started
-            .read_scanlines_into(&mut s.out8)
-            .context("decode failed")?;
+        let out = scratch_u8(&mut s.out8, dec_w * dec_h * 3);
+        started.read_scanlines_into(out).context("decode failed")?;
         started.finish().context("decode finish failed")?;
         if timing {
             eprintln!(
@@ -473,9 +490,11 @@ fn decode_resize<R: std::io::BufRead>(
         // fly: each chunk stays in L2, saving a second full-image memory
         // pass.
         let fwd = fwd_lut();
-        s.src16.resize(dec_w * dec_h * 3, 0);
+        // Fully filled by the chunked LUT loop below (filled reaches
+        // dec_w*dec_h*3 or the decode errors out).
+        scratch_u16(&mut s.src16, dec_w * dec_h * 3);
         let chunk_rows = (256 * 1024 / row_bytes).clamp(1, dec_h);
-        s.chunk8.resize(chunk_rows * row_bytes, 0);
+        scratch_u8(&mut s.chunk8, chunk_rows * row_bytes);
         let mut filled = 0usize; // number of u16 components filled so far
         while filled < dec_w * dec_h * 3 {
             let want = (dec_h * row_bytes - filled).min(chunk_rows * row_bytes);
@@ -496,12 +515,12 @@ fn decode_resize<R: std::io::BufRead>(
         let t_decode = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        s.dst16.resize(dst_w * dst_h * 3, 0);
+        scratch_u16(&mut s.dst16, dst_w * dst_h * 3);
         resize_bands(
-            u16_as_bytes(&s.src16),
+            u16_as_bytes(&s.src16[..dec_w * dec_h * 3]),
             dec_w,
             dec_h,
-            u16_as_bytes_mut(&mut s.dst16),
+            u16_as_bytes_mut(&mut s.dst16[..dst_w * dst_h * 3]),
             dst_w,
             dst_h,
             PixelType::U16x3,
@@ -510,8 +529,8 @@ fn decode_resize<R: std::io::BufRead>(
         )?;
 
         let back = back_lut();
-        s.out8.resize(dst_w * dst_h * 3, 0);
-        for (d, src) in s.out8.iter_mut().zip(&s.dst16) {
+        let out = scratch_u8(&mut s.out8, dst_w * dst_h * 3);
+        for (d, src) in out.iter_mut().zip(&s.dst16[..dst_w * dst_h * 3]) {
             *d = back[*src as usize];
         }
         if timing {
@@ -524,20 +543,20 @@ fn decode_resize<R: std::io::BufRead>(
         Ok((dst_w, dst_h))
     } else {
         // Resize directly in sRGB space (speed mode)
-        s.chunk8.resize(dec_w * dec_h * 3, 0);
+        scratch_u8(&mut s.chunk8, dec_w * dec_h * 3);
         started
-            .read_scanlines_into(&mut s.chunk8)
+            .read_scanlines_into(&mut s.chunk8[..dec_w * dec_h * 3])
             .context("decode failed")?;
         started.finish().context("decode finish failed")?;
         let t_decode = t0.elapsed();
 
         let t1 = std::time::Instant::now();
-        s.out8.resize(dst_w * dst_h * 3, 0);
+        scratch_u8(&mut s.out8, dst_w * dst_h * 3);
         resize_bands(
-            &s.chunk8,
+            &s.chunk8[..dec_w * dec_h * 3],
             dec_w,
             dec_h,
-            &mut s.out8,
+            &mut s.out8[..dst_w * dst_h * 3],
             dst_w,
             dst_h,
             PixelType::U8x3,
@@ -585,7 +604,9 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
             && linear_light()
         {
             let fwd = fwd_lut();
-            s.src16.resize(src_w * src_h * 3, 0);
+            // Fully filled row by row; the row-count check below rejects
+            // truncated streams before the buffer is consumed.
+            scratch_u16(&mut s.src16, src_w * src_h * 3);
             let mut y = 0usize;
             while let Some(row) = png_reader.next_row().context("decode PNG")? {
                 let dst = &mut s.src16[y * src_w * 3..(y + 1) * src_w * 3];
@@ -597,12 +618,12 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
             anyhow::ensure!(y == src_h, "PNG row count mismatch");
             let t_decode = t0.elapsed();
             let t1 = std::time::Instant::now();
-            s.dst16.resize(dst_w * dst_h * 3, 0);
+            scratch_u16(&mut s.dst16, dst_w * dst_h * 3);
             resize_bands(
-                u16_as_bytes(&s.src16),
+                u16_as_bytes(&s.src16[..src_w * src_h * 3]),
                 src_w,
                 src_h,
-                u16_as_bytes_mut(&mut s.dst16),
+                u16_as_bytes_mut(&mut s.dst16[..dst_w * dst_h * 3]),
                 dst_w,
                 dst_h,
                 PixelType::U16x3,
@@ -610,8 +631,8 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
                 &mut s.resizer,
             )?;
             let back = back_lut();
-            s.out8.resize(dst_w * dst_h * 3, 0);
-            for (d, &v) in s.out8.iter_mut().zip(&s.dst16) {
+            let out = scratch_u8(&mut s.out8, dst_w * dst_h * 3);
+            for (d, &v) in out.iter_mut().zip(&s.dst16[..dst_w * dst_h * 3]) {
                 *d = back[v as usize];
             }
             let t_resize = t1.elapsed();
@@ -629,9 +650,11 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
         }
     }
 
-    s.chunk8
-        .resize(png_reader.output_buffer_size().context("PNG too large")?, 0);
-    let info = png_reader.next_frame(&mut s.chunk8).context("decode PNG")?;
+    let buf_len = png_reader.output_buffer_size().context("PNG too large")?;
+    scratch_u8(&mut s.chunk8, buf_len);
+    let info = png_reader
+        .next_frame(&mut s.chunk8[..buf_len])
+        .context("decode PNG")?;
     let (src_w, src_h) = (info.width as usize, info.height as usize);
     let len = info.buffer_size();
 
@@ -671,7 +694,8 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
 fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
     let out_ch = in_ch + 2;
     let pixels = len / in_ch;
-    s.chunk8.resize(pixels * out_ch, 0);
+    // The reverse loop below writes every output position.
+    scratch_u8(&mut s.chunk8, pixels * out_ch);
     for i in (0..pixels).rev() {
         let g = s.chunk8[i * in_ch];
         let a = if in_ch == 2 {
@@ -830,7 +854,8 @@ fn webp_decode_into_chunk8(
         let buf = &config.output.u.RGBA;
         let stride = buf.stride as usize;
         let row = dec_w * channels;
-        s.chunk8.resize(dec_h * row, 0);
+        // Every row is copied below before the buffer is read.
+        scratch_u8(&mut s.chunk8, dec_h * row);
         for y in 0..dec_h {
             let src_row = std::slice::from_raw_parts(buf.rgba.add(y * stride), row);
             s.chunk8[y * row..(y + 1) * row].copy_from_slice(src_row);
@@ -854,17 +879,21 @@ fn resize_pixels(
     let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
     let src_len = src_w * src_h * channels;
     if (src_w, src_h) == (dst_w, dst_h) {
-        s.out8.resize(src_len, 0);
+        scratch_u8(&mut s.out8, src_len);
         let (chunk8, out8) = (&s.chunk8, &mut s.out8);
-        out8.copy_from_slice(&chunk8[..src_len]);
+        out8[..src_len].copy_from_slice(&chunk8[..src_len]);
         return Ok((dst_w, dst_h));
     }
 
     if linear_light() {
         let (fwd, back) = (fwd_lut(), back_lut());
-        s.src16.resize(src_len, 0);
+        // Fully overwritten by the LUT/premultiply loops just below.
+        scratch_u16(&mut s.src16, src_len);
         if channels == 4 {
-            for (d, src) in s.src16.chunks_exact_mut(4).zip(s.chunk8.chunks_exact(4)) {
+            for (d, src) in s.src16[..src_len]
+                .chunks_exact_mut(4)
+                .zip(s.chunk8[..src_len].chunks_exact(4))
+            {
                 let a = src[3] as u32 * 257;
                 for c in 0..3 {
                     // Premultiply in linear light so resampling never bleeds
@@ -874,16 +903,17 @@ fn resize_pixels(
                 d[3] = a as u16;
             }
         } else {
-            for (d, src) in s.src16.iter_mut().zip(&s.chunk8[..src_len]) {
+            for (d, src) in s.src16[..src_len].iter_mut().zip(&s.chunk8[..src_len]) {
                 *d = fwd[*src as usize];
             }
         }
-        s.dst16.resize(dst_w * dst_h * channels, 0);
+        let dst_len = dst_w * dst_h * channels;
+        scratch_u16(&mut s.dst16, dst_len);
         resize_bands(
-            u16_as_bytes(&s.src16),
+            u16_as_bytes(&s.src16[..src_len]),
             src_w,
             src_h,
-            u16_as_bytes_mut(&mut s.dst16),
+            u16_as_bytes_mut(&mut s.dst16[..dst_len]),
             dst_w,
             dst_h,
             if channels == 4 {
@@ -894,9 +924,12 @@ fn resize_pixels(
             p.parallel,
             &mut s.resizer,
         )?;
-        s.out8.resize(dst_w * dst_h * channels, 0);
+        scratch_u8(&mut s.out8, dst_len);
         if channels == 4 {
-            for (d, src) in s.out8.chunks_exact_mut(4).zip(s.dst16.chunks_exact(4)) {
+            for (d, src) in s.out8[..dst_len]
+                .chunks_exact_mut(4)
+                .zip(s.dst16[..dst_len].chunks_exact(4))
+            {
                 let a = src[3] as u32;
                 for (out, &pre) in d[..3].iter_mut().zip(&src[..3]) {
                     let un = (pre as u32 * 65535)
@@ -907,7 +940,7 @@ fn resize_pixels(
                 d[3] = (a / 257) as u8;
             }
         } else {
-            for (d, src) in s.out8.iter_mut().zip(&s.dst16) {
+            for (d, src) in s.out8[..dst_len].iter_mut().zip(&s.dst16[..dst_len]) {
                 *d = back[*src as usize];
             }
         }
@@ -921,13 +954,14 @@ fn resize_pixels(
                 }
             }
         }
-        s.out8.resize(dst_w * dst_h * channels, 0);
+        let dst_len = dst_w * dst_h * channels;
+        scratch_u8(&mut s.out8, dst_len);
         let (chunk8, out8) = (&s.chunk8, &mut s.out8);
         resize_bands(
             &chunk8[..src_len],
             src_w,
             src_h,
-            out8,
+            &mut out8[..dst_len],
             dst_w,
             dst_h,
             if channels == 4 {
@@ -939,7 +973,7 @@ fn resize_pixels(
             &mut s.resizer,
         )?;
         if channels == 4 {
-            for px in s.out8.chunks_exact_mut(4) {
+            for px in s.out8[..dst_len].chunks_exact_mut(4) {
                 let a = px[3] as u32;
                 for c in px[..3].iter_mut() {
                     *c = (*c as u32 * 255).checked_div(a).map_or(0, |v| v.min(255)) as u8;
