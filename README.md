@@ -14,6 +14,49 @@ results, oximg leads every format cell on both x86-64 and Graviton
 while resizing in linear light at measurably higher output quality
 (see [Benchmarks](#benchmarks)).
 
+## Features
+
+- **HTTP resize service**: `GET /resize/{w}/{h}/{file}` fits the source
+  within `w x h` (never enlarges) and re-encodes it in its own format.
+  Sources come from a local directory or any HTTP(S) origin
+  (`OXIMG_SOURCE_BASE_URL`), where decoding overlaps the download.
+  Optional imgproxy-style HMAC URL signing.
+- **Quality-first processing**: resizing happens in linear light on
+  16-bit samples with Lanczos3, JPEG sources are decoded supersampled
+  (DCT shrink-on-load kept ≥ 1.7x the target), and alpha is
+  premultiplied across the resample — the properties behind the
+  SSIMULACRA2 scores in [Benchmarks](#benchmarks).
+- **Performance as architecture, not flags**: per-arch row-streaming
+  SIMD resize kernels (AVX2 on x86-64, NEON on aarch64, both verified
+  against an f64 reference), JPEG decode fused with resize+encode on a
+  second thread under low load, request coalescing for concurrent
+  identical URLs, and CPU concurrency pinned to the core count. Peak
+  memory stays at a fraction of imgproxy's under identical load
+  ([BENCH.md](BENCH.md)).
+- **Tunable profiles**: the default maximizes quality per byte
+  (progressive jpegli); one env flip (`OXIMG_JPEG_PROGRESSIVE=0`)
+  trades ~10% output size for the lowest latency at unchanged pixels.
+  `PRESET=fast|small` selects mozjpeg profiles instead.
+- **Self-contained deploys**: multi-arch Docker images
+  (linux/amd64 + linux/arm64) on Docker Hub (`oximg/oximg`) and GHCR
+  (`ghcr.io/oximg/oximg`); a single static-leaning binary otherwise.
+
+### Supported formats
+
+Sources are identified by magic bytes (extensions are never trusted)
+and re-encoded in their own format:
+
+| Format | Decode | Encode |
+|---|---|---|
+| JPEG | baseline & progressive, grayscale; streaming, DCT shrink-on-load | jpegli progressive (default), mozjpeg profiles via `PRESET` |
+| PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A) |
+| WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha |
+| AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
+
+Cross-format output (JPEG in → WebP/AVIF out, `Accept` negotiation) is
+not implemented yet — see
+[Not yet implemented](#not-yet-implemented-out-of-poc-scope).
+
 ## Pipeline
 
 ```
@@ -25,8 +68,11 @@ source bytes (local file or HTTP origin)
       AVIF: dav1d (8/10/12-bit, all subsamplings, alpha, bilinear chroma upsampling)
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 → sRGB u8
       (alpha is premultiplied before resampling, unpremultiplied after;
-       x86-64 convolves via pic-scale AVX-512, aarch64 via an in-tree
-       ring-scheduled NEON f32 kernel verified against an f64 reference)
+       JPEG rows stream through in-tree ring-scheduled f32 row kernels —
+       AVX2 on x86-64, NEON on aarch64, both verified against an f64
+       reference — optionally fused with the decode on a second thread;
+       other formats resize full-frame: pic-scale on x86-64, the same
+       in-tree kernel on aarch64)
   → encode in the source format
       JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
@@ -67,26 +113,49 @@ at +6.7 SSIMULACRA2.
 
 ## Usage
 
+**Docker** (recommended — multi-arch linux/amd64 + linux/arm64, AVIF
+included; GHCR rebuilds on every `main` push, the Docker Hub mirror
+updates on releases):
+
 ```sh
-cargo build --release
-IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg
+docker run -p 8081:8081 -v $PWD/images:/images:ro ghcr.io/oximg/oximg:latest
+# or: docker.io/oximg/oximg:latest
 curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
-AVIF support is an opt-in feature with two system dependencies
-(SVT-AV1 >= 4.1 and dav1d, found via pkg-config; the Docker image
-builds a pinned post-4.1 SVT-AV1 revision that carries the aarch64
-kernels for the still-image path):
+**Homebrew** (builds v0.1.0 from source; JPEG/PNG/WebP, no AVIF):
 
 ```sh
-cargo build --release --features avif
+brew install oximg/tap/oximg
 ```
 
-Or with Docker:
+**Cargo** (crates.io, v0.1.0; add `--features avif` if SVT-AV1 >= 4.1
+and dav1d are installed and visible to pkg-config):
+
+```sh
+cargo install oximg
+```
+
+Note the release channels lag `main`: crates.io and the brew formula
+ship the last tagged release, while the Docker images rebuild on every
+`main` push. The npm package
+[`@oximg/oximg`](https://www.npmjs.com/package/@oximg/oximg) is a name
+reservation that points here.
+
+**From source**:
+
+```sh
+cargo build --release            # JPEG, PNG, WebP
+cargo build --release --features avif   # + AVIF (needs SVT-AV1 >= 4.1, dav1d)
+IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg
+```
+
+The Docker build needs no system dependencies — it compiles a pinned
+post-4.1 SVT-AV1 revision that carries the aarch64 kernels for the
+still-image path:
 
 ```sh
 docker build -t oximg .
-docker run -p 8081:8081 -v $PWD/images:/images:ro oximg
 ```
 
 URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
