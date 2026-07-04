@@ -39,6 +39,7 @@ impl Avx2 {
 }
 
 impl RowKernel for Avx2 {
+    const STAGE3_FLOATS_PER_PIXEL: usize = 4;
     fn detect() -> bool {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
@@ -104,74 +105,39 @@ unsafe fn widen8(p: *const u16) -> std::arch::x86_64::__m256 {
     }
 }
 
-/// Deinterleave one u16 RGB row into three planar f32 rows
-/// (stage[0..w], stage[w..2w], stage[2w..3w]). Exact conversion, so the
-/// convolution below sees the same operand values as widening on the
-/// fly. Per eight-pixel (48-byte) group, three 128-bit loads widen to
-/// three f32x8 vectors holding the interleaved samples; each plane is
-/// then assembled by gathering that plane's samples from each vector to
-/// their output lanes with a cross-lane permute and merging the three
-/// with blends (the classic AVX2 float RGB deinterleave).
+/// Stage one u16 RGB row as interleaved f32 RGBX (a zero fourth lane
+/// per pixel). Each pixel becomes one f32x4 lane group, which lets the
+/// horizontal pass use broadcast-FMA accumulation with no horizontal
+/// lane reductions at all — the planar layout's three per-pixel lane
+/// sums (hsum) cost more than its FMAs on this shape. Conversion is
+/// exact (u16 < 2^24), so the convolution sees the same operand values
+/// as widening on the fly.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
     unsafe {
         use std::arch::x86_64::*;
-        // Widened vectors of an eight-pixel group:
-        //   f0 = [r0 g0 b0 r1 g1 b1 r2 g2]
-        //   f1 = [b2 r3 g3 b3 r4 g4 b4 r5]
-        //   f2 = [g5 b5 r6 g6 b6 r7 g7 b7]
-        // Index vectors map output lane j to the source lane holding
-        // that plane's sample (lanes discarded by the blends are 0).
-        let idx_r0 = _mm256_setr_epi32(0, 3, 6, 0, 0, 0, 0, 0);
-        let idx_r1 = _mm256_setr_epi32(0, 0, 0, 1, 4, 7, 0, 0);
-        let idx_r2 = _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 2, 5);
-        let idx_g0 = _mm256_setr_epi32(1, 4, 7, 0, 0, 0, 0, 0);
-        let idx_g1 = _mm256_setr_epi32(0, 0, 0, 2, 5, 0, 0, 0);
-        let idx_g2 = _mm256_setr_epi32(0, 0, 0, 0, 0, 0, 3, 6);
-        let idx_b0 = _mm256_setr_epi32(2, 5, 0, 0, 0, 0, 0, 0);
-        let idx_b1 = _mm256_setr_epi32(0, 0, 0, 3, 6, 0, 0, 0);
-        let idx_b2 = _mm256_setr_epi32(0, 0, 0, 0, 0, 1, 4, 7);
-
-        let (r_out, rest) = stage.split_at_mut(w);
-        let (g_out, b_out) = rest.split_at_mut(w);
+        // Two RGB pixels (12 bytes) -> [r g b 0 | r g b 0] u16 lanes;
+        // 0x80 zeroes the pad lanes.
+        #[rustfmt::skip]
+        let expand = _mm_setr_epi8(
+            0, 1, 2, 3, 4, 5, -128, -128,
+            6, 7, 8, 9, 10, 11, -128, -128,
+        );
         let mut x = 0usize;
-        while x + 8 <= w {
-            let p = row.as_ptr().add(x * 3);
-            let f0 = widen8(p);
-            let f1 = widen8(p.add(8));
-            let f2 = widen8(p.add(16));
-            // R at lanes 0-2 / 3-5 / 6-7 of the three permutes; G at
-            // 0-2 / 3-4 / 5-7; B at 0-1 / 2-4 / 5-7.
-            let r = _mm256_blend_ps::<0b1100_0000>(
-                _mm256_blend_ps::<0b0011_1000>(
-                    _mm256_permutevar8x32_ps(f0, idx_r0),
-                    _mm256_permutevar8x32_ps(f1, idx_r1),
-                ),
-                _mm256_permutevar8x32_ps(f2, idx_r2),
-            );
-            let g = _mm256_blend_ps::<0b1110_0000>(
-                _mm256_blend_ps::<0b0001_1000>(
-                    _mm256_permutevar8x32_ps(f0, idx_g0),
-                    _mm256_permutevar8x32_ps(f1, idx_g1),
-                ),
-                _mm256_permutevar8x32_ps(f2, idx_g2),
-            );
-            let b = _mm256_blend_ps::<0b1110_0000>(
-                _mm256_blend_ps::<0b0001_1100>(
-                    _mm256_permutevar8x32_ps(f0, idx_b0),
-                    _mm256_permutevar8x32_ps(f1, idx_b1),
-                ),
-                _mm256_permutevar8x32_ps(f2, idx_b2),
-            );
-            _mm256_storeu_ps(r_out.as_mut_ptr().add(x), r);
-            _mm256_storeu_ps(g_out.as_mut_ptr().add(x), g);
-            _mm256_storeu_ps(b_out.as_mut_ptr().add(x), b);
-            x += 8;
+        // One 16-byte load covers two pixels plus two spare u16s, so
+        // stop while a third pixel guarantees the tail is in bounds.
+        while x + 3 <= w {
+            let raw = _mm_loadu_si128(row.as_ptr().add(x * 3).cast());
+            let rgbx = _mm_shuffle_epi8(raw, expand);
+            let f = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(rgbx));
+            _mm256_storeu_ps(stage.as_mut_ptr().add(x * 4), f);
+            x += 2;
         }
         while x < w {
-            r_out[x] = row[x * 3] as f32;
-            g_out[x] = row[x * 3 + 1] as f32;
-            b_out[x] = row[x * 3 + 2] as f32;
+            stage[x * 4] = row[x * 3] as f32;
+            stage[x * 4 + 1] = row[x * 3 + 1] as f32;
+            stage[x * 4 + 2] = row[x * 3 + 2] as f32;
+            stage[x * 4 + 3] = 0.0;
             x += 1;
         }
     }
@@ -196,26 +162,16 @@ unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
     }
 }
 
-/// Sum the eight lanes of `v` (extract-high + three shuffled adds).
-/// Safe to call from `avx2,fma` contexts: value-only intrinsics.
-#[inline]
-#[target_feature(enable = "avx2,fma")]
-fn hsum(v: std::arch::x86_64::__m256) -> f32 {
-    use std::arch::x86_64::*;
-    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps::<1>(v));
-    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    let s = _mm_add_ss(s, _mm_movehdup_ps(s));
-    _mm_cvtss_f32(s)
-}
-
-/// One horizontal row, 3 channels, reading planar f32 staged rows:
-/// per output pixel, 8-tap blocks accumulate each channel in a f32x8
-/// register, followed by a lane reduction and NEON-identical scalar
-/// tail taps.
+/// One horizontal row, 3 channels, over the RGBX staged row: identical
+/// accumulation scheme to the 4-channel path (one 256-bit load covers
+/// two pixels; each FMA applies a lanewise coefficient-pair broadcast;
+/// two accumulator streams cover four zero-padded taps per iteration),
+/// with only the three color lanes stored to the ring. `src_w` is
+/// unused: the RGBX layout is self-describing.
 #[target_feature(enable = "avx2,fma")]
 unsafe fn horiz_row_x3(
     stage: &[f32],
-    src_w: usize,
+    _src_w: usize,
     w: &Windows,
     ring: &mut [f32],
     plane: usize,
@@ -224,34 +180,41 @@ unsafe fn horiz_row_x3(
 ) {
     unsafe {
         use std::arch::x86_64::*;
-        let r_in = stage.as_ptr();
-        let g_in = stage.as_ptr().add(src_w);
-        let b_in = stage.as_ptr().add(2 * src_w);
+        let idx01 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+        let idx23 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
         for ox in 0..dst_w {
             let start = w.starts[ox];
-            let size = w.sizes[ox];
-            let coeffs = &w.coeffs[ox * w.window_size..ox * w.window_size + size];
+            // Whole 4-tap blocks over the zero-padded coefficients.
+            let padded = w.sizes[ox].div_ceil(4) * 4;
+            let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
-            let mut acc = [_mm256_setzero_ps(); 3];
+            let mut acc_a = _mm256_setzero_ps();
+            let mut acc_b = _mm256_setzero_ps();
             let mut k = 0usize;
-            while k + 8 <= size {
-                let cv = _mm256_loadu_ps(coeffs.as_ptr().add(k));
-                acc[0] = _mm256_fmadd_ps(_mm256_loadu_ps(r_in.add(start + k)), cv, acc[0]);
-                acc[1] = _mm256_fmadd_ps(_mm256_loadu_ps(g_in.add(start + k)), cv, acc[1]);
-                acc[2] = _mm256_fmadd_ps(_mm256_loadu_ps(b_in.add(start + k)), cv, acc[2]);
-                k += 8;
+            while k < padded {
+                let c4 = _mm_loadu_ps(coeffs.as_ptr().add(k));
+                let cv = _mm256_set_m128(c4, c4);
+                let p01 = _mm256_loadu_ps(stage.as_ptr().add((start + k) * 4));
+                let p23 = _mm256_loadu_ps(stage.as_ptr().add((start + k + 2) * 4));
+                acc_a = _mm256_fmadd_ps(p01, _mm256_permutevar8x32_ps(cv, idx01), acc_a);
+                acc_b = _mm256_fmadd_ps(p23, _mm256_permutevar8x32_ps(cv, idx23), acc_b);
+                k += 4;
             }
-            let mut sums = [hsum(acc[0]), hsum(acc[1]), hsum(acc[2])];
-            while k < size {
-                let c = coeffs[k];
-                sums[0] += *r_in.add(start + k) * c;
-                sums[1] += *g_in.add(start + k) * c;
-                sums[2] += *b_in.add(start + k) * c;
-                k += 1;
-            }
-            ring[slot + ox] = sums[0];
-            ring[plane + slot + ox] = sums[1];
-            ring[2 * plane + slot + ox] = sums[2];
+            let acc = _mm_add_ps(
+                _mm_add_ps(
+                    _mm256_castps256_ps128(acc_a),
+                    _mm256_extractf128_ps::<1>(acc_a),
+                ),
+                _mm_add_ps(
+                    _mm256_castps256_ps128(acc_b),
+                    _mm256_extractf128_ps::<1>(acc_b),
+                ),
+            );
+            let mut out = [0f32; 4];
+            _mm_storeu_ps(out.as_mut_ptr(), acc);
+            ring[slot + ox] = out[0];
+            ring[plane + slot + ox] = out[1];
+            ring[2 * plane + slot + ox] = out[2];
         }
     }
 }
@@ -280,13 +243,14 @@ unsafe fn horiz_row_x4(
         let idx23 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
         for ox in 0..dst_w {
             let start = w.starts[ox];
-            let size = w.sizes[ox];
-            let coeffs = &w.coeffs[ox * w.window_size..ox * w.window_size + size];
+            // Whole 4-tap blocks over the zero-padded coefficients.
+            let padded = w.sizes[ox].div_ceil(4) * 4;
+            let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
             let mut acc_a = _mm256_setzero_ps();
             let mut acc_b = _mm256_setzero_ps();
             let mut k = 0usize;
-            while k + 4 <= size {
+            while k < padded {
                 let c4 = _mm_loadu_ps(coeffs.as_ptr().add(k));
                 let cv = _mm256_set_m128(c4, c4);
                 let p01 = _mm256_loadu_ps(stage.as_ptr().add((start + k) * 4));
@@ -295,7 +259,7 @@ unsafe fn horiz_row_x4(
                 acc_b = _mm256_fmadd_ps(p23, _mm256_permutevar8x32_ps(cv, idx23), acc_b);
                 k += 4;
             }
-            let mut acc = _mm_add_ps(
+            let acc = _mm_add_ps(
                 _mm_add_ps(
                     _mm256_castps256_ps128(acc_a),
                     _mm256_extractf128_ps::<1>(acc_a),
@@ -305,11 +269,6 @@ unsafe fn horiz_row_x4(
                     _mm256_extractf128_ps::<1>(acc_b),
                 ),
             );
-            while k < size {
-                let p = _mm_loadu_ps(stage.as_ptr().add((start + k) * 4));
-                acc = _mm_fmadd_ps(p, _mm_set1_ps(coeffs[k]), acc);
-                k += 1;
-            }
             let mut out = [0f32; 4];
             _mm_storeu_ps(out.as_mut_ptr(), acc);
             for (c, v) in out.iter().enumerate() {

@@ -40,12 +40,19 @@ pub(crate) fn lanczos3(x: f64) -> f64 {
 /// `precompute_coefficients` with no crop box.
 pub(crate) struct Windows {
     pub(crate) window_size: usize,
+    /// Coefficient row stride: `window_size` rounded up to a multiple
+    /// of 8, so horizontal kernels can run whole SIMD tap-blocks over
+    /// the zero padding instead of a scalar tail. A zero coefficient
+    /// times any finite staged value contributes exactly +0.0, so the
+    /// padded blocks change no output value (staged data is converted
+    /// from u16 and therefore always finite).
+    pub(crate) stride: usize,
     /// First source index of each output pixel's window.
     pub(crate) starts: Vec<usize>,
     /// Tap count of each window.
     pub(crate) sizes: Vec<usize>,
-    /// f32 coefficients, `window_size` stride per output pixel,
-    /// zero-padded past each window's size.
+    /// f32 coefficients, `stride` apart per output pixel, zero-padded
+    /// past each window's size.
     pub(crate) coeffs: Vec<f32>,
 }
 
@@ -55,11 +62,12 @@ impl Windows {
         let filter_scale = scale.max(1.0);
         let filter_radius = 3.0 * filter_scale;
         let window_size = filter_radius.ceil() as usize * 2 + 1;
+        let stride = window_size.next_multiple_of(8);
         let recip = 1.0 / filter_scale;
 
         let mut starts = Vec::with_capacity(out_size);
         let mut sizes = Vec::with_capacity(out_size);
-        let mut coeffs = vec![0f32; window_size * out_size];
+        let mut coeffs = vec![0f32; stride * out_size];
         let mut window = vec![0f64; window_size];
 
         for out_x in 0..out_size {
@@ -85,7 +93,7 @@ impl Windows {
             while n > 1 && window[n - 1] == 0.0 {
                 n -= 1; // trim trailing zero taps
             }
-            let dst = &mut coeffs[out_x * window_size..(out_x + 1) * window_size];
+            let dst = &mut coeffs[out_x * stride..(out_x + 1) * stride];
             if ww != 0.0 {
                 for (d, w) in dst.iter_mut().zip(&window[..n]) {
                     *d = (*w / ww) as f32;
@@ -96,6 +104,7 @@ impl Windows {
         }
         Windows {
             window_size,
+            stride,
             starts,
             sizes,
             coeffs,
@@ -151,9 +160,14 @@ fn grow(buf: &mut Vec<f32>, len: usize) {
 /// [`StreamResize`] checks [`RowKernel::detect`] once, which makes the
 /// internal calls sound.
 pub(crate) trait RowKernel {
+    /// f32s per pixel in the 3-channel staged layout: 3 for planar
+    /// (NEON), 4 for interleaved RGBX (AVX2, which pays one zero lane
+    /// to keep each pixel a broadcast-FMA lane group and skip the
+    /// horizontal lane reductions entirely).
+    const STAGE3_FLOATS_PER_PIXEL: usize = 3;
     /// Runtime CPU feature check for this kernel.
     fn detect() -> bool;
-    /// Deinterleave one u16 RGB row into three planar f32 rows.
+    /// Stage one u16 RGB row as f32 in this kernel's 3-channel layout.
     unsafe fn stage_x3(row: &[u16], stage: &mut [f32], w: usize);
     /// Convert one u16 RGBA row to f32, keeping the interleaved layout.
     unsafe fn stage_x4(row: &[u16], stage: &mut [f32]);
@@ -243,7 +257,16 @@ impl<K: RowKernel> StreamResize<K> {
         let mut scratch = SCRATCH_POOL
             .with(|p| p.borrow_mut().pop())
             .unwrap_or_default();
-        grow(&mut scratch.stage, src_w * channels);
+        // The extra `stride` per channel lets horizontal kernels read
+        // whole tap-blocks past a window's real size: those lanes meet
+        // zero coefficients, and the slack only ever holds finite
+        // values (fresh zeros or staged u16 data from earlier use).
+        let stage_px = if channels == 3 {
+            K::STAGE3_FLOATS_PER_PIXEL
+        } else {
+            channels
+        };
+        grow(&mut scratch.stage, (src_w + wh.stride) * stage_px);
         grow(&mut scratch.ring, plane * channels);
         grow(&mut scratch.acc, dst_w * channels);
         if scratch.offs.len() < wv.window_size {
@@ -301,9 +324,12 @@ impl<K: RowKernel> StreamResize<K> {
         // the constructor.
         unsafe {
             if self.channels == 3 {
-                K::stage_x3(row, &mut s.stage[..self.src_w * 3], self.src_w);
+                let px = K::STAGE3_FLOATS_PER_PIXEL;
+                K::stage_x3(row, &mut s.stage[..self.src_w * px], self.src_w);
+                // Slice length includes the zero-coefficient slack the
+                // padded tap-blocks may read.
                 K::horiz_x3(
-                    &s.stage[..self.src_w * 3],
+                    &s.stage[..(self.src_w + self.wh.stride) * px],
                     self.src_w,
                     &self.wh,
                     &mut s.ring[..],
@@ -314,7 +340,7 @@ impl<K: RowKernel> StreamResize<K> {
             } else {
                 K::stage_x4(&row[..self.src_w * 4], &mut s.stage[..self.src_w * 4]);
                 K::horiz_x4(
-                    &s.stage[..self.src_w * 4],
+                    &s.stage[..(self.src_w + self.wh.stride) * 4],
                     &self.wh,
                     &mut s.ring[..],
                     self.plane,
@@ -333,7 +359,7 @@ impl<K: RowKernel> StreamResize<K> {
             if start + size > self.next_row {
                 break;
             }
-            let coeffs = &self.wv.coeffs[self.oy * self.wv.window_size..][..size];
+            let coeffs = &self.wv.coeffs[self.oy * self.wv.stride..][..size];
             // Ring slot offsets for this window, one wrap-increment per
             // tap instead of a modulo in the accumulation inner loop.
             let mut slot = start % self.cap;
@@ -726,15 +752,20 @@ mod tests {
     fn windows_are_normalized_and_in_bounds() {
         for (in_s, out_s) in [(2040, 512), (100, 99), (7, 3), (3, 7)] {
             let w = Windows::new(in_s, out_s);
+            assert_eq!(w.stride % 8, 0, "{in_s}->{out_s}: unpadded stride");
+            assert!(w.stride >= w.window_size);
             for i in 0..out_s {
                 assert!(w.starts[i] + w.sizes[i] <= in_s, "{in_s}->{out_s} px {i}");
-                let sum: f64 = w.coeffs[i * w.window_size..i * w.window_size + w.sizes[i]]
-                    .iter()
-                    .map(|&c| c as f64)
-                    .sum();
+                let row = &w.coeffs[i * w.stride..(i + 1) * w.stride];
+                let sum: f64 = row[..w.sizes[i]].iter().map(|&c| c as f64).sum();
                 assert!(
                     (sum - 1.0).abs() < 1e-4,
                     "{in_s}->{out_s} px {i}: sum={sum}"
+                );
+                // The padding the SIMD tap-blocks run over must be zero.
+                assert!(
+                    row[w.sizes[i]..].iter().all(|&c| c == 0.0),
+                    "{in_s}->{out_s} px {i}: nonzero padding"
                 );
             }
         }

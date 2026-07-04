@@ -170,12 +170,15 @@ unsafe fn horiz_row_x3(
         let b_in = stage.as_ptr().add(2 * src_w);
         for ox in 0..dst_w {
             let start = w.starts[ox];
-            let size = w.sizes[ox];
-            let coeffs = &w.coeffs[ox * w.window_size..ox * w.window_size + size];
+            // Whole 8-tap blocks over the zero-padded coefficients: no
+            // scalar tail, no per-tap branch (padding contributes
+            // exactly +0.0 against the finite staged slack).
+            let padded = w.sizes[ox].div_ceil(8) * 8;
+            let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
             let mut acc = [vdupq_n_f32(0.0); 3];
             let mut k = 0usize;
-            while k + 8 <= size {
+            while k < padded {
                 let c_lo = vld1q_f32(coeffs.as_ptr().add(k));
                 let c_hi = vld1q_f32(coeffs.as_ptr().add(k + 4));
                 macro_rules! ch {
@@ -191,17 +194,9 @@ unsafe fn horiz_row_x3(
                 ch!(2, b_in);
                 k += 8;
             }
-            let mut sums = [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2])];
-            while k < size {
-                let c = coeffs[k];
-                sums[0] += *r_in.add(start + k) * c;
-                sums[1] += *g_in.add(start + k) * c;
-                sums[2] += *b_in.add(start + k) * c;
-                k += 1;
-            }
-            ring[slot + ox] = sums[0];
-            ring[plane + slot + ox] = sums[1];
-            ring[2 * plane + slot + ox] = sums[2];
+            ring[slot + ox] = vaddvq_f32(acc[0]);
+            ring[plane + slot + ox] = vaddvq_f32(acc[1]);
+            ring[2 * plane + slot + ox] = vaddvq_f32(acc[2]);
         }
     }
 }
@@ -222,12 +217,14 @@ unsafe fn horiz_row_x4(
         use std::arch::aarch64::*;
         for ox in 0..dst_w {
             let start = w.starts[ox];
-            let size = w.sizes[ox];
-            let coeffs = &w.coeffs[ox * w.window_size..ox * w.window_size + size];
+            // Whole 4-tap blocks over the zero-padded coefficients (the
+            // tap order per lane is unchanged, so values are identical).
+            let padded = w.sizes[ox].div_ceil(4) * 4;
+            let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
             let mut acc = vdupq_n_f32(0.0);
             let mut k = 0usize;
-            while k + 4 <= size {
+            while k < padded {
                 let cv = vld1q_f32(coeffs.as_ptr().add(k));
                 macro_rules! tap {
                     ($j:tt) => {{
@@ -240,11 +237,6 @@ unsafe fn horiz_row_x4(
                 tap!(2);
                 tap!(3);
                 k += 4;
-            }
-            while k < size {
-                let p = vld1q_f32(stage.as_ptr().add((start + k) * 4));
-                acc = vfmaq_n_f32(acc, p, coeffs[k]);
-                k += 1;
             }
             let out = [
                 vgetq_lane_f32::<0>(acc),
