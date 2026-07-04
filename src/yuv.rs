@@ -55,8 +55,22 @@ pub(crate) fn chroma_blend(near: Row, other: Row, out: &mut [f32]) {
 }
 
 fn chroma_blend_scalar(near: Row, other: Row, out: &mut [f32]) {
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = (3.0 * near.at(i) + other.at(i)) * 0.25;
+    match (near, other) {
+        (Row::B8(n), Row::B8(o)) => {
+            for ((&n, &o), out) in n.iter().zip(o).zip(out.iter_mut()) {
+                *out = (3.0 * n as f32 + o as f32) * 0.25;
+            }
+        }
+        (Row::B16(n), Row::B16(o)) => {
+            for ((&n, &o), out) in n.iter().zip(o).zip(out.iter_mut()) {
+                *out = (3.0 * n as f32 + o as f32) * 0.25;
+            }
+        }
+        _ => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = (3.0 * near.at(i) + other.at(i)) * 0.25;
+            }
+        }
     }
 }
 
@@ -70,8 +84,17 @@ pub(crate) fn chroma_widen(row: Row, out: &mut [f32]) {
 }
 
 fn chroma_widen_scalar(row: Row, out: &mut [f32]) {
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = row.at(i);
+    match row {
+        Row::B8(s) => {
+            for (&v, o) in s.iter().zip(out.iter_mut()) {
+                *o = v as f32;
+            }
+        }
+        Row::B16(s) => {
+            for (&v, o) in s.iter().zip(out.iter_mut()) {
+                *o = v as f32;
+            }
+        }
     }
 }
 
@@ -117,10 +140,36 @@ pub(crate) fn yuv_row_to_rgb(y: Row, cb: &[f32], cr: &[f32], c: &Csc, out: &mut 
 }
 
 fn yuv_row_to_rgb_scalar(y: Row, cb: &[f32], cr: &[f32], c: &Csc, out: &mut [u8], from: usize) {
-    for (x, px) in out.chunks_exact_mut(3).enumerate().skip(from) {
-        let yf = (y.at(x) - c.y_off) * c.y_mul;
-        let cbf = (cb[x] - c.center) * c.c_mul;
-        let crf = (cr[x] - c.center) * c.c_mul;
+    // The Row match is hoisted out of the loop and all element access
+    // goes through zipped iterators: with per-pixel indexing, bounds
+    // checks kept some compilers from producing a sane loop body (~10x
+    // on the container toolchain, amplified further on some Intel
+    // cores), which dominated AVIF decode on x86-64.
+    let n = out.len() / 3;
+    match y {
+        Row::B8(s) => yuv_px_scalar(
+            s[from..n].iter().map(|&v| v as f32),
+            &cb[from..n],
+            &cr[from..n],
+            c,
+            &mut out[from * 3..n * 3],
+        ),
+        Row::B16(s) => yuv_px_scalar(
+            s[from..n].iter().map(|&v| v as f32),
+            &cb[from..n],
+            &cr[from..n],
+            c,
+            &mut out[from * 3..n * 3],
+        ),
+    }
+}
+
+#[inline(always)]
+fn yuv_px_scalar(ys: impl Iterator<Item = f32>, cb: &[f32], cr: &[f32], c: &Csc, out: &mut [u8]) {
+    for (((yv, &cbv), &crv), px) in ys.zip(cb).zip(cr).zip(out.chunks_exact_mut(3)) {
+        let yf = (yv - c.y_off) * c.y_mul;
+        let cbf = (cbv - c.center) * c.c_mul;
+        let crf = (crv - c.center) * c.c_mul;
         let r = yf + 2.0 * (1.0 - c.kr) * crf;
         let b = yf + 2.0 * (1.0 - c.kb) * cbf;
         let g = (yf - c.kr * r - c.kb * b) / c.kg;
@@ -141,8 +190,17 @@ pub(crate) fn alpha_row(src: Row, off: f32, mul: f32, out: &mut [u8]) {
 }
 
 fn alpha_row_scalar(src: Row, off: f32, mul: f32, out: &mut [u8]) {
-    for (i, o) in out.iter_mut().enumerate() {
-        *o = ((src.at(i) - off) * mul + 0.5).clamp(0.0, 255.0) as u8;
+    match src {
+        Row::B8(s) => {
+            for (&v, o) in s.iter().zip(out.iter_mut()) {
+                *o = ((v as f32 - off) * mul + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+        Row::B16(s) => {
+            for (&v, o) in s.iter().zip(out.iter_mut()) {
+                *o = ((v as f32 - off) * mul + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
     }
 }
 
