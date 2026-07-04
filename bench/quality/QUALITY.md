@@ -117,6 +117,42 @@ points: oximg encodes 10-bit 4:2:0 with SVT-AV1 tune=ssim. Its default
 q65 default at +6.7 SSIM2; matching nominal q65 instead trades +28%
 bytes for +12.1.
 
+## Cross-format operating points (JPEG source → WebP / AVIF output)
+
+Sweep over the Kodak corpus (fit 500x500, scored vs the same
+linear-light reference as Group B; `xfmt_sweep.py`). Candidates are
+decoded back to PNG through oximg itself (a same-dimension transcode
+is a lossless passthrough). oximg's JPEG-out default is the anchor:
+
+| Output (quality) | mean SSIM2 | mean bytes |
+|---|---|---|
+| JPEG q80 (default, anchor) | 77.5 | 34.8 KB |
+| AVIF q45 | 65.1 | 17.7 KB |
+| AVIF q50 | 69.7 | 20.9 KB |
+| AVIF q55 (default) | **74.5** | **25.3 KB** |
+| AVIF q60 | 78.2 | 30.2 KB |
+| AVIF q65 | 80.3 | 33.6 KB |
+| WebP q60 | 64.0 | 21.1 KB |
+| WebP q70 | 67.9 | 23.8 KB |
+| WebP q75 (default) | 69.5 | 25.2 KB |
+| WebP q80 | 74.2 | 30.4 KB |
+| WebP q85 | 78.5 | 36.9 KB |
+
+Conclusions the defaults rest on:
+
+- **AVIF keeps its same-format default (q55)** for cross-format: -27%
+  bytes vs the JPEG default at -3.0 SSIM2, and one notch up (q60)
+  strictly dominates JPEG q80 — fewer bytes *and* a higher score — for
+  operators who want parity instead of savings.
+- **AVIF dominates WebP across the whole curve**: at equal ~25 KB,
+  AVIF q55 scores +5.0 over WebP q75. When negotiating
+  (`OXIMG_AUTO_FORMAT`), prefer `avif,webp` order.
+- **WebP keeps q75** because the official throughput harness pins all
+  contenders to WebP q75, and a default change would decouple our
+  same-format WebP cell from those tables. For JPEG→WebP conversions
+  where quality matters more than bytes, `OXIMG_WEBP_QUALITY=80` is
+  the better point (-13% bytes vs JPEG q80 at -3.3 SSIM2).
+
 ## Notes
 
 - The linear-light reference is produced by ImageMagick (also a
@@ -133,4 +169,7 @@ cd bench/quality && npm i
 # corpus: Kodak PNGs from r0k.us + pinned picsum IDs; see run.py
 IMGPROXY_BIND=:8082 IMGPROXY_LOCAL_FILESYSTEM_ROOT=$PWD/corpus imgproxy &
 python3 run.py /tmp/qwork && python3 analyze.py /tmp/qwork/results.csv
+# cross-format sweep (needs --features avif):
+cargo build --release --example qcli --features avif
+python3 xfmt_sweep.py /tmp/xfmt
 ```
