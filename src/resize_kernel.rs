@@ -196,6 +196,52 @@ pub(crate) trait RowKernel {
     unsafe fn store_x3(acc: &[f32], dst_w: usize, out: &mut [u16]);
     /// Round-to-nearest f32 -> u16 with saturation, interleaving 4 planes.
     unsafe fn store_x4(acc: &[f32], dst_w: usize, out: &mut [u16]);
+
+    /// Rows the driver batches per horizontal pass. A batched pass
+    /// convolves several staged rows against each window's coefficients
+    /// once, amortizing the coefficient loads and shuffles; 1 keeps the
+    /// row-at-a-time behavior.
+    const HORIZ_BATCH: usize = 1;
+    /// Horizontally convolve `n` staged rows (`n <= HORIZ_BATCH`), row
+    /// `i` living at `stage[i * row_stride..]` and landing in ring slot
+    /// offset `slots[i]`. Each row's math is identical to
+    /// [`RowKernel::horiz_x3`], so batching cannot change any value.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn horiz_x3_batch(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        src_w: usize,
+        w: &Windows,
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    ) {
+        unsafe {
+            for (i, &slot) in slots.iter().enumerate().take(n) {
+                Self::horiz_x3(&stage[i * row_stride..], src_w, w, ring, plane, slot, dst_w);
+            }
+        }
+    }
+    /// 4-channel counterpart of [`RowKernel::horiz_x3_batch`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn horiz_x4_batch(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        w: &Windows,
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    ) {
+        unsafe {
+            for (i, &slot) in slots.iter().enumerate().take(n) {
+                Self::horiz_x4(&stage[i * row_stride..], w, ring, plane, slot, dst_w);
+            }
+        }
+    }
 }
 
 pub(crate) fn clamp_u16(v: f32) -> u16 {
@@ -220,6 +266,10 @@ pub(crate) struct StreamResize<K: RowKernel> {
     /// accepted and dropped (the full-frame driver never touches them).
     last_needed: usize,
     next_row: usize,
+    /// Staged rows not yet horizontally convolved (tail of `next_row`).
+    pending: usize,
+    /// f32s between consecutive staged rows in the batch buffer.
+    stage_row_stride: usize,
     oy: usize,
     scratch: Scratch,
     _k: std::marker::PhantomData<K>,
@@ -266,7 +316,9 @@ impl<K: RowKernel> StreamResize<K> {
         } else {
             channels
         };
-        grow(&mut scratch.stage, (src_w + wh.stride) * stage_px);
+        const { assert!(K::HORIZ_BATCH >= 1 && K::HORIZ_BATCH <= 4) };
+        let stage_row_stride = (src_w + wh.stride) * stage_px;
+        grow(&mut scratch.stage, stage_row_stride * K::HORIZ_BATCH);
         grow(&mut scratch.ring, plane * channels);
         grow(&mut scratch.acc, dst_w * channels);
         if scratch.offs.len() < wv.window_size {
@@ -287,6 +339,8 @@ impl<K: RowKernel> StreamResize<K> {
             plane,
             last_needed,
             next_row: 0,
+            pending: 0,
+            stage_row_stride,
             oy: 0,
             scratch,
             _k: std::marker::PhantomData,
@@ -318,40 +372,34 @@ impl<K: RowKernel> StreamResize<K> {
             self.next_row += 1;
             return; // trailing rows influence nothing
         }
-        let s = &mut self.scratch;
-        let slot = (self.next_row % self.cap) * self.dst_w;
+        // Stage into the next batch slot; the horizontal pass runs when
+        // the batch fills, the last needed row arrives, or an output row
+        // below needs rows still pending.
+        let base = self.pending * self.stage_row_stride;
         // SAFETY: constructor verified K::detect(); buffers were sized in
         // the constructor.
         unsafe {
             if self.channels == 3 {
                 let px = K::STAGE3_FLOATS_PER_PIXEL;
-                K::stage_x3(row, &mut s.stage[..self.src_w * px], self.src_w);
-                // Slice length includes the zero-coefficient slack the
-                // padded tap-blocks may read.
-                K::horiz_x3(
-                    &s.stage[..(self.src_w + self.wh.stride) * px],
+                K::stage_x3(
+                    row,
+                    &mut self.scratch.stage[base..base + self.src_w * px],
                     self.src_w,
-                    &self.wh,
-                    &mut s.ring[..],
-                    self.plane,
-                    slot,
-                    self.dst_w,
                 );
             } else {
-                K::stage_x4(&row[..self.src_w * 4], &mut s.stage[..self.src_w * 4]);
-                K::horiz_x4(
-                    &s.stage[..(self.src_w + self.wh.stride) * 4],
-                    &self.wh,
-                    &mut s.ring[..],
-                    self.plane,
-                    slot,
-                    self.dst_w,
+                K::stage_x4(
+                    &row[..self.src_w * 4],
+                    &mut self.scratch.stage[base..base + self.src_w * 4],
                 );
             }
         }
+        self.pending += 1;
         self.next_row += 1;
+        if self.pending == K::HORIZ_BATCH || self.next_row == self.last_needed {
+            self.flush_batch();
+        }
 
-        // Emit every output row whose window end has now been filled
+        // Emit every output row whose window end has now been staged
         // (window ends are non-decreasing in oy).
         while self.oy < self.dst_h {
             let start = self.wv.starts[self.oy];
@@ -359,6 +407,10 @@ impl<K: RowKernel> StreamResize<K> {
             if start + size > self.next_row {
                 break;
             }
+            if start + size > self.next_row - self.pending {
+                self.flush_batch();
+            }
+            let s = &mut self.scratch;
             let coeffs = &self.wv.coeffs[self.oy * self.wv.stride..][..size];
             // Ring slot offsets for this window, one wrap-increment per
             // tap instead of a modulo in the accumulation inner loop.
@@ -391,6 +443,49 @@ impl<K: RowKernel> StreamResize<K> {
             emit(self.oy, outrow);
             self.oy += 1;
         }
+    }
+
+    /// Run the horizontal pass over the staged batch. Ring slots are the
+    /// consecutive row indices modulo the ring capacity.
+    fn flush_batch(&mut self) {
+        if self.pending == 0 {
+            return;
+        }
+        let first = self.next_row - self.pending;
+        let mut slots = [0usize; 4];
+        for (i, slot) in slots.iter_mut().enumerate().take(self.pending) {
+            *slot = ((first + i) % self.cap) * self.dst_w;
+        }
+        let s = &mut self.scratch;
+        // SAFETY: constructor verified K::detect(); slice lengths include
+        // the zero-coefficient slack the padded tap-blocks may read.
+        unsafe {
+            if self.channels == 3 {
+                K::horiz_x3_batch(
+                    &s.stage[..self.stage_row_stride * self.pending],
+                    self.stage_row_stride,
+                    self.pending,
+                    self.src_w,
+                    &self.wh,
+                    &mut s.ring[..],
+                    self.plane,
+                    &slots,
+                    self.dst_w,
+                );
+            } else {
+                K::horiz_x4_batch(
+                    &s.stage[..self.stage_row_stride * self.pending],
+                    self.stage_row_stride,
+                    self.pending,
+                    &self.wh,
+                    &mut s.ring[..],
+                    self.plane,
+                    &slots,
+                    self.dst_w,
+                );
+            }
+        }
+        self.pending = 0;
     }
 
     /// Output rows emitted so far; equals `dst_h` once enough source

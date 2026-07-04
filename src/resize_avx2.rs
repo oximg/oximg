@@ -40,6 +40,7 @@ impl Avx2 {
 
 impl RowKernel for Avx2 {
     const STAGE3_FLOATS_PER_PIXEL: usize = 4;
+    const HORIZ_BATCH: usize = 4;
     fn detect() -> bool {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
     }
@@ -51,14 +52,14 @@ impl RowKernel for Avx2 {
     }
     unsafe fn horiz_x3(
         stage: &[f32],
-        src_w: usize,
+        _src_w: usize,
         w: &Windows,
         ring: &mut [f32],
         plane: usize,
         slot: usize,
         dst_w: usize,
     ) {
-        unsafe { horiz_row_x3(stage, src_w, w, ring, plane, slot, dst_w) }
+        unsafe { horiz_rows_x3::<1>(stage, 0, w, ring, plane, &[slot, 0, 0, 0], dst_w) }
     }
     unsafe fn horiz_x4(
         stage: &[f32],
@@ -78,6 +79,26 @@ impl RowKernel for Avx2 {
     }
     unsafe fn store_x4(acc: &[f32], dst_w: usize, out: &mut [u16]) {
         unsafe { store_row_x4(acc, dst_w, out) }
+    }
+    unsafe fn horiz_x3_batch(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        _src_w: usize,
+        w: &Windows,
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    ) {
+        unsafe {
+            match n {
+                4 => horiz_rows_x3::<4>(stage, row_stride, w, ring, plane, slots, dst_w),
+                3 => horiz_rows_x3::<3>(stage, row_stride, w, ring, plane, slots, dst_w),
+                2 => horiz_rows_x3::<2>(stage, row_stride, w, ring, plane, slots, dst_w),
+                _ => horiz_rows_x3::<1>(stage, row_stride, w, ring, plane, slots, dst_w),
+            }
+        }
     }
 }
 
@@ -162,20 +183,21 @@ unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
     }
 }
 
-/// One horizontal row, 3 channels, over the RGBX staged row: identical
-/// accumulation scheme to the 4-channel path (one 256-bit load covers
-/// two pixels; each FMA applies a lanewise coefficient-pair broadcast;
-/// two accumulator streams cover four zero-padded taps per iteration),
-/// with only the three color lanes stored to the ring. `src_w` is
-/// unused: the RGBX layout is self-describing.
+/// `N` horizontal rows, 3 channels, over RGBX staged rows (row `r` at
+/// `stage[r * row_stride..]`): identical per-row accumulation to the
+/// 4-channel path (one 256-bit load covers two pixels; each FMA
+/// applies a lanewise coefficient-pair broadcast; two accumulator
+/// streams cover four zero-padded taps per iteration), with each
+/// window's coefficient loads and broadcasts shared across all `N`
+/// rows. Per-row math is unchanged, so batching changes no value.
 #[target_feature(enable = "avx2,fma")]
-unsafe fn horiz_row_x3(
+unsafe fn horiz_rows_x3<const N: usize>(
     stage: &[f32],
-    _src_w: usize,
+    row_stride: usize,
     w: &Windows,
     ring: &mut [f32],
     plane: usize,
-    slot: usize,
+    slots: &[usize; 4],
     dst_w: usize,
 ) {
     unsafe {
@@ -188,33 +210,38 @@ unsafe fn horiz_row_x3(
             let padded = w.sizes[ox].div_ceil(4) * 4;
             let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
-            let mut acc_a = _mm256_setzero_ps();
-            let mut acc_b = _mm256_setzero_ps();
+            let mut acc_a = [_mm256_setzero_ps(); N];
+            let mut acc_b = [_mm256_setzero_ps(); N];
             let mut k = 0usize;
             while k < padded {
                 let c4 = _mm_loadu_ps(coeffs.as_ptr().add(k));
                 let cv = _mm256_set_m128(c4, c4);
-                let p01 = _mm256_loadu_ps(stage.as_ptr().add((start + k) * 4));
-                let p23 = _mm256_loadu_ps(stage.as_ptr().add((start + k + 2) * 4));
-                acc_a = _mm256_fmadd_ps(p01, _mm256_permutevar8x32_ps(cv, idx01), acc_a);
-                acc_b = _mm256_fmadd_ps(p23, _mm256_permutevar8x32_ps(cv, idx23), acc_b);
+                let ca = _mm256_permutevar8x32_ps(cv, idx01);
+                let cb = _mm256_permutevar8x32_ps(cv, idx23);
+                for r in 0..N {
+                    let base = stage.as_ptr().add(r * row_stride + (start + k) * 4);
+                    acc_a[r] = _mm256_fmadd_ps(_mm256_loadu_ps(base), ca, acc_a[r]);
+                    acc_b[r] = _mm256_fmadd_ps(_mm256_loadu_ps(base.add(8)), cb, acc_b[r]);
+                }
                 k += 4;
             }
-            let acc = _mm_add_ps(
-                _mm_add_ps(
-                    _mm256_castps256_ps128(acc_a),
-                    _mm256_extractf128_ps::<1>(acc_a),
-                ),
-                _mm_add_ps(
-                    _mm256_castps256_ps128(acc_b),
-                    _mm256_extractf128_ps::<1>(acc_b),
-                ),
-            );
-            let mut out = [0f32; 4];
-            _mm_storeu_ps(out.as_mut_ptr(), acc);
-            ring[slot + ox] = out[0];
-            ring[plane + slot + ox] = out[1];
-            ring[2 * plane + slot + ox] = out[2];
+            for r in 0..N {
+                let acc = _mm_add_ps(
+                    _mm_add_ps(
+                        _mm256_castps256_ps128(acc_a[r]),
+                        _mm256_extractf128_ps::<1>(acc_a[r]),
+                    ),
+                    _mm_add_ps(
+                        _mm256_castps256_ps128(acc_b[r]),
+                        _mm256_extractf128_ps::<1>(acc_b[r]),
+                    ),
+                );
+                let mut out = [0f32; 4];
+                _mm_storeu_ps(out.as_mut_ptr(), acc);
+                ring[slots[r] + ox] = out[0];
+                ring[plane + slots[r] + ox] = out[1];
+                ring[2 * plane + slots[r] + ox] = out[2];
+            }
         }
     }
 }
