@@ -160,15 +160,18 @@ c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **20.9** (137 ms) |
-| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 19.7 (144 ms) |
+| oximg (defaults) | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **23.1** (126 ms) |
+| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.1 (141 ms) |
 | imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
 | thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
 
 Notes:
 
-- The c7i AVIF cell reflects the current defaults (two dav1d worker
-  threads, quality 55); the earlier one-thread/q65 build measured 13.9.
+- The AVIF cells reflect the current defaults and the pinned SVT-AV1
+  revision; both were re-measured together with a same-box imgproxy
+  anchor (c7i: 15.7, c7g: 20.1) after the encoder upgrade, the
+  index-free scalar conversion paths, and the architecture-aware
+  decode-thread default landed.
 - The c7g oximg cells and the imgproxy AVIF cell were re-run together
   on a fresh c7g.large after the counter-guided aarch64 work (the NEON
   resize kernel and schedule, TBL deinterleaving, NEON YUV-to-RGB
