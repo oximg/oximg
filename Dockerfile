@@ -31,6 +31,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends libdav1d7 \
 COPY --from=build /usr/local/lib/libSvtAv1Enc.so* /usr/local/lib/
 RUN ldconfig
 COPY --from=build /app/target/release/oximg /usr/local/bin/oximg
+LABEL org.opencontainers.image.title="oximg" \
+      org.opencontainers.image.description="High-performance image compression and resizing: JPEG, PNG, WebP, AVIF. Linear-light Lanczos, per-architecture SIMD." \
+      org.opencontainers.image.source="https://github.com/oximg/oximg" \
+      org.opencontainers.image.licenses="Apache-2.0"
 ENV IMAGES_DIR=/images PORT=8081
 EXPOSE 8081
 CMD ["oximg"]
