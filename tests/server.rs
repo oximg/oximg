@@ -22,10 +22,15 @@ impl Server {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn oximg");
-        let server = Server { child, port };
-        for _ in 0..100 {
+        let mut server = Server { child, port };
+        // Generous deadline: loaded CI runners can take seconds to page in
+        // a release binary alongside the parallel test processes.
+        for _ in 0..400 {
             if server.get("/health").is_ok() {
                 return server;
+            }
+            if let Ok(Some(status)) = server.child.try_wait() {
+                panic!("server exited before becoming healthy: {status}");
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
