@@ -30,6 +30,14 @@ use anyhow::Result;
 /// Marker type implementing [`RowKernel`] with AVX2+FMA intrinsics.
 pub(crate) struct Avx2;
 
+impl Avx2 {
+    /// Runtime check callers can use before dispatching to this kernel
+    /// (AVX2+FMA is not part of the x86-64 baseline).
+    pub(crate) fn available() -> bool {
+        <Avx2 as RowKernel>::detect()
+    }
+}
+
 impl RowKernel for Avx2 {
     fn detect() -> bool {
         std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")

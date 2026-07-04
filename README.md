@@ -103,11 +103,11 @@ kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
 x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
 `OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
-second thread while the machine has idle hardware threads, cutting
-single-request latency ~25% with byte-identical output; `auto` by
-default — engages only while `2 x active requests <= logical CPUs` so
-saturated throughput keeps one core per request — `1` forces it, `0`
-disables it).
+second thread, cutting single-request latency ~20%; `auto` fuses while
+`2 x active requests <= visible CPUs` and falls back to one core per
+request under contention. Default `auto` on aarch64, where output
+bytes are identical either way; default off on x86-64 — set `1` to
+force fusing every request there).
 
 ## Not yet implemented (out of PoC scope)
 

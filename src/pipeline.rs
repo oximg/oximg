@@ -214,10 +214,12 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
         match format {
             ImageFormat::Jpeg => {
                 let dec = Decompress::new_reader(reader).context("parse JPEG")?;
-                // Fusing decode with resize+encode only pays while the
-                // machine has idle hardware threads for the second lane.
+                // Fused decode/resize+encode: on unless disabled (see
+                // overlap_gate). Band-parallel resize keeps the serial
+                // path so OXIMG_PAR semantics are unchanged.
                 let fuse_quality =
-                    (p.encoder == Encoder::Jpegli && overlap_gate()).then_some(p.quality);
+                    (p.encoder == Encoder::Jpegli && p.parallel <= 1 && overlap_gate())
+                        .then_some(p.quality);
                 let out = match decode_resize(
                     s,
                     dec,
@@ -383,14 +385,24 @@ fn resize_bands(
         fast_image_resize::images::ImageRef::new(dec_w as u32, dec_h as u32, src_bytes, px)?;
 
     if threads <= 1 || dst_h < 2 * threads {
-        // x86-64: pic-scale's AVX-512/SSE u16 paths convolve ~2.4x faster
-        // than fir at equal output quality (SSIMULACRA2-verified). Its
-        // aarch64 fixed-point path loses ~3 points, so ARM instead uses
-        // the in-tree NEON f32 kernel (same window math, f64-verified,
-        // ~1.9x fir on the full-decode shape).
+        // x86-64 full-frame dispatch (this fn is not on the fused JPEG
+        // path, which streams through the AVX2 row kernel directly):
+        // U16x3 keeps pic-scale — its row-batched horizontal pass is
+        // ~1.9x the in-tree AVX2 kernel full-frame and every full-frame
+        // format (PNG/WebP/AVIF, mozjpeg presets) always takes the same
+        // backend, so bytes stay per-URL stable. U16x4 (alpha) moves
+        // from fir to the AVX2 kernel (1.33x on the benchmark shape;
+        // see examples/resize_bench_x86.rs).
         #[cfg(target_arch = "x86_64")]
-        if px == PixelType::U16x3 && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
-            return resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h);
+        if std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
+            if px == PixelType::U16x3 {
+                return resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h);
+            }
+            if px == PixelType::U16x4 && crate::resize_avx2::Avx2::available() {
+                return crate::resize_avx2::resize_u16_avx2(
+                    src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h, 4,
+                );
+            }
         }
         #[cfg(target_arch = "aarch64")]
         if matches!(px, PixelType::U16x3 | PixelType::U16x4)
@@ -505,21 +517,38 @@ fn logical_cpus() -> usize {
     })
 }
 
-/// OXIMG_OVERLAP: "0" = never fuse, "1" = always fuse, otherwise auto.
+/// OXIMG_OVERLAP: "0" = never fuse, "1" = always fuse, "auto" = fuse
+/// while the machine has headroom. The default is auto on aarch64,
+/// where the serial path resizes with the same NEON kernel and a URL's
+/// bytes are identical either way; on x86-64 it is off, because the
+/// serial path's pic-scale backend still out-runs the streaming AVX2
+/// kernel full-frame — forcing "1" fuses every eligible request (all
+/// through the AVX2 kernel, still deterministic per configuration).
 fn overlap_mode() -> u8 {
     static M: OnceLock<u8> = OnceLock::new();
     *M.get_or_init(|| match std::env::var("OXIMG_OVERLAP").as_deref() {
         Ok("0") => 0,
         Ok("1") => 1,
-        _ => 2,
+        Ok("auto") => 2,
+        _ => {
+            if cfg!(target_arch = "aarch64") {
+                2
+            } else {
+                0
+            }
+        }
     })
 }
 
-/// Fuse decode with resize+encode only while the machine has headroom:
-/// each fused request runs two threads, so beyond half the logical CPUs
-/// the serial path wins saturated throughput (one core per request, no
-/// oversubscription). At light load the fused path hides the entire
-/// resize+encode behind the decode wall.
+/// Fuse decode with resize+encode while the machine has headroom for
+/// the second lane: each fused request runs two threads, so the auto
+/// gate stops fusing once active requests exceed half the visible
+/// CPUs. On a dedicated box fusing measured at or above serial
+/// throughput at every concurrency on both Zen4 and SMT-less Apple
+/// silicon — but when other CPU-hungry processes share the cores
+/// (e.g. a co-located load generator, or a container cpuset shared
+/// with a proxy), the extra threads regress throughput ~10%, so
+/// saturation falls back to one core per request.
 fn overlap_gate() -> bool {
     match overlap_mode() {
         0 => false,
@@ -670,6 +699,8 @@ fn decode_resize<R: std::io::BufRead>(
 /// The SIMD row kernel driving the fused path on this architecture.
 #[cfg(target_arch = "aarch64")]
 type FuseKernel = crate::resize_neon::Neon;
+#[cfg(target_arch = "x86_64")]
+type FuseKernel = crate::resize_avx2::Avx2;
 
 /// The fused JPEG fast path: this (request) thread keeps the decoder at
 /// its serial-decode floor while a worker thread converts each decoded
@@ -684,7 +715,10 @@ type FuseKernel = crate::resize_neon::Neon;
 /// kernel produces the same u16 rows (streamed emission is bit-identical
 /// to the full-frame schedule), and jpegli is deterministic for the same
 /// scanlines and settings regardless of write granularity.
-#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    allow(unused_variables)
+)]
 fn fused_resize_encode<R: std::io::BufRead>(
     started: &mut mozjpeg::decompress::DecompressStarted<R>,
     dec_w: usize,
@@ -693,11 +727,11 @@ fn fused_resize_encode<R: std::io::BufRead>(
     dst_h: usize,
     quality: f32,
 ) -> Result<Option<Vec<u8>>> {
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         Ok(None)
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         let Ok(mut resizer) =
             crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
@@ -706,7 +740,11 @@ fn fused_resize_encode<R: std::io::BufRead>(
         };
 
         let row_bytes = dec_w * 3;
-        let chunk_rows = (256 * 1024 / row_bytes).clamp(1, dec_h);
+        // Smaller chunks than the serial path's 256KB: granularity here
+        // sets the post-decode tail (the last chunk's convert+resize+
+        // encode work cannot hide behind the decode), and per-chunk
+        // handoff costs are ~µs.
+        let chunk_rows = (64 * 1024 / row_bytes).clamp(1, dec_h);
         // Decoded chunks flow A -> B; drained buffers flow back for reuse.
         // Capacity 2 gives the decoder one chunk of runway without letting
         // buffers pile up.
@@ -1402,22 +1440,61 @@ mod tests {
         assert!(out.starts_with(&[0xFF, 0xD8]), "not a JPEG");
     }
 
+    fn fuse_kernel_available() -> bool {
+        use crate::resize_kernel::RowKernel;
+        if FuseKernel::detect() {
+            true
+        } else {
+            eprintln!("skipping: no SIMD row kernel on this host");
+            false
+        }
+    }
+
+    /// aarch64's serial path resizes with the same NEON kernel the
+    /// fused path streams through, so the bytes must match exactly.
+    /// (x86-64's serial path uses pic-scale, which rounds differently;
+    /// there the fused plumbing is covered by the determinism test
+    /// below plus the kernel testkit's streamed==full-frame proofs.)
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn fused_path_bytes_match_serial_jpegli() {
+        if !fuse_kernel_available() {
+            return;
+        }
         // Odd dimensions exercise chunk boundaries and scalar tails.
         let jpeg = make_test_jpeg(799, 601, false);
         assert_eq!(run_jpeg(&jpeg, None), run_jpeg(&jpeg, Some(80.0)));
     }
 
-    #[cfg(target_arch = "aarch64")]
     #[test]
-    fn fused_path_handles_grayscale_sources() {
-        let jpeg = make_test_jpeg(400, 300, true);
-        assert_eq!(run_jpeg(&jpeg, None), run_jpeg(&jpeg, Some(80.0)));
+    fn fused_path_is_deterministic_and_valid() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        let jpeg = make_test_jpeg(799, 601, false);
+        let a = run_jpeg(&jpeg, Some(80.0));
+        let b = run_jpeg(&jpeg, Some(80.0));
+        assert!(a.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+        assert_eq!(a, b, "fused output must not vary run to run");
+        let (fmt, w, h) = probe(&a).unwrap();
+        assert_eq!(fmt, ImageFormat::Jpeg);
+        assert_eq!((w, h), (320, 241));
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fused_path_handles_grayscale_sources() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        let jpeg = make_test_jpeg(400, 300, true);
+        let fused = run_jpeg(&jpeg, Some(80.0));
+        assert!(fused.starts_with(&[0xFF, 0xD8]), "not a JPEG");
+        // Serial and fused resize with the same kernel on aarch64, so
+        // the bytes must match; x86-64's serial backend differs.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(run_jpeg(&jpeg, None), fused);
+    }
+
     #[test]
     fn fused_path_survives_truncated_sources() {
         // Truncation mid-scan must neither hang the worker handoff nor
