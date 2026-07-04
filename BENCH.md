@@ -160,8 +160,8 @@ c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **78.3** (32 ms) | **35.7** (72 ms) | **39.6** (72 ms) | 20.1 (141 ms) |
-| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.1 (141 ms) |
+| oximg (defaults) | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **20.9** (137 ms) |
+| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 19.7 (144 ms) |
 | imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
 | thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
 
@@ -169,17 +169,13 @@ Notes:
 
 - The c7i AVIF cell reflects the current defaults (two dav1d worker
   threads, quality 55); the earlier one-thread/q65 build measured 13.9.
-- The c7g oximg cells were re-run after the aarch64 NEON resize kernel
-  landed (resize stage 37 -> 20 ms on the full-decode shape); the
-  imgproxy AVIF cell re-run on the same instance (20.1 vs 20.4) anchors
-  comparability with the other contenders' original runs.
-- The c7g AVIF cell is a dead heat with imgproxy (20.12 vs 20.07
-  req/s, identical p95). dav1d's in-frame threading works on Graviton3
-  (1.9x on two cores, verified with a minimal repro against dav1d
-  1.4.1/1.5.1/1.5.3), and the NEON conversion kernels brought the
-  decode stage to ~32 ms (~28 ms threaded AV1 decode + ~3.5 ms
-  YUV-to-RGB); the residual spread sits in the resize and SVT encode
-  stages.
+- The c7g oximg cells and the imgproxy AVIF cell were re-run together
+  on a fresh c7g.large after the counter-guided aarch64 work (the NEON
+  resize kernel and schedule, TBL deinterleaving, NEON YUV-to-RGB
+  conversion, and scratch-buffer hygiene); the same-run imgproxy anchor
+  (19.7 vs its earlier 20.1-20.4) bounds instance-to-instance variance
+  at ~3%. dav1d's in-frame threading works on Graviton3 (1.9x on two
+  cores, verified against dav1d 1.4.1/1.5.1/1.5.3 with minimal repros).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
