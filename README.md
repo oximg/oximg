@@ -114,8 +114,7 @@ at +6.7 SSIMULACRA2.
 ## Usage
 
 **Docker** (recommended — multi-arch linux/amd64 + linux/arm64, AVIF
-included; GHCR rebuilds on every `main` push, the Docker Hub mirror
-updates on releases):
+included; both registries rebuild on every `main` push):
 
 ```sh
 docker run -p 8081:8081 -v $PWD/images:/images:ro ghcr.io/oximg/oximg:latest

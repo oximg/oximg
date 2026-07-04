@@ -81,13 +81,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Push by digest
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         id: push
         uses: docker/build-push-action@v6
         with:
           context: .
-          outputs: type=image,name=ghcr.io/oximg/oximg,push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,"name=ghcr.io/oximg/oximg,docker.io/oximg/oximg",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
 
       - name: Export digest
@@ -124,9 +131,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create multi-arch manifest
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create multi-arch manifests
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create -t ghcr.io/oximg/oximg:latest \
             $(printf 'ghcr.io/oximg/oximg@sha256:%s ' *)
           docker buildx imagetools inspect ghcr.io/oximg/oximg:latest
+          docker buildx imagetools create -t docker.io/oximg/oximg:latest \
+            $(printf 'docker.io/oximg/oximg@sha256:%s ' *)
+          docker buildx imagetools inspect docker.io/oximg/oximg:latest
