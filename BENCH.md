@@ -55,9 +55,10 @@ their same-URL peak RSS low. Peak RSS under 16-way diverse load: oximg
 
 ## macOS (Apple M2 Max, 12 cores), native installs
 
-oximg release build vs imgproxy 4.0.9 (Homebrew) + vips 8.18.3, both at
-quality 80, identical output dimensions, `ab`, 20-request warm-up,
-servers restarted per scenario. Methodology after
+oximg release build vs imgproxy (Homebrew) + vips, both at quality 80,
+identical output dimensions, 20-request warm-up, servers restarted per
+scenario; tool and versions noted per table (`ab` with a single URL
+unless stated otherwise). Methodology after
 [the imgproxy benchmark gist](https://gist.github.com/DarthSim/9d971d2859f3714a29cf8ce094b3fc55).
 
 ### Large: 7360x4912 (10.6MB) → 500x500, N=400, c=8
@@ -68,14 +69,33 @@ servers restarted per scenario. Methodology after
 | oximg speed mode | 72.2 | 107 ms | 111 ms | **130 MB** | 23.9 KB |
 | imgproxy | 60.7 | 127 ms | 138 ms | 317 MB | 22.9 KB |
 
-### Medium: 2000x1333 (0.8MB) → 500x500, N=1000
+### Medium: 2000x1333 (0.9MB) → 500x500
 
-| Server | c=8 req/s | c=12 req/s | peak RSS | output |
-|---|---|---|---|---|
-| oximg (defaults) | 533 | **647** | — | 23.4 KB |
-| oximg speed mode | **799** | — | 32 MB | 23.5 KB |
-| imgproxy | 590 | 615 | 124 MB | 22.4 KB |
-| oximg `PRESET=small` | 395 | — | 42 MB | **18.2 KB** |
+Re-measured 2026-07 at HEAD against imgproxy 4.0.11 (Homebrew) + vips.
+`wrk` cycling 48 distinct URLs (same source content) so oximg's request
+coalescing cannot inflate its numbers; five interleaved A/B rounds per
+concurrency, medians reported. Fresh plasma source (regenerated, so
+absolute values are not comparable with the historical tables around
+this one).
+
+| Server | c=8 req/s | c=12 req/s | c=1 latency | cpu-ms/req | peak RSS | output |
+|---|---|---|---|---|---|---|
+| oximg (defaults, jpegli) | **497** | **746** | 18.1 ms | 15.6 | 51 MB | 20.2 KB |
+| imgproxy | 455 | 499 | **12.0 ms** | **13.7** | 167 MB | 22.4 KB |
+
+Single-run preset points for the same workload: `PRESET=fast` 522 /
+688 req/s (22.9 KB), `PRESET=small` 296 / 488 req/s (**18.6 KB**).
+
+An earlier revision of this table (measured pre-jpegli, pre-NEON-resize,
+single-URL `ab`, imgproxy 4.0.9) had imgproxy ahead at c=8 (590 vs 533).
+Two mechanisms, both visible in the columns above, explained that shape:
+imgproxy holds a lower single-request wall latency (it overlaps pipeline
+stages across threads, ~1.1 cores per request, and spends less CPU per
+request by not supersampling), so below saturation its throughput ceiling
+is reached early; oximg runs one request per core and scales linearly
+with concurrency, passing imgproxy before c=12. oximg's per-request cost
+has since dropped enough that it now leads at c=8 as well, while
+producing a smaller output at higher quality (jpegli; see QUALITY.md).
 
 ### Pure HTTP layer (`/health`, zero image work), N=20000/50000
 
