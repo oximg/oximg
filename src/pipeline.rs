@@ -23,6 +23,20 @@ fn fwd_lut() -> &'static [u16; 256] {
     })
 }
 
+/// The fwd LUT's values as f32 (exact: u16 -> f32 is lossless), for
+/// kernels that stage u8 sources straight to f32.
+fn fwd_lut_f32() -> &'static [f32; 256] {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0f32; 256];
+        let fwd = fwd_lut();
+        for (d, &v) in t.iter_mut().zip(fwd.iter()) {
+            *d = v as f32;
+        }
+        t
+    })
+}
+
 /// linear u16 -> sRGB u8 (64KB global LUT, single lookup per component)
 fn back_lut() -> &'static [u8; 65536] {
     static LUT: OnceLock<Box<[u8; 65536]>> = OnceLock::new();
@@ -385,14 +399,15 @@ fn resize_bands(
         fast_image_resize::images::ImageRef::new(dec_w as u32, dec_h as u32, src_bytes, px)?;
 
     if threads <= 1 || dst_h < 2 * threads {
-        // x86-64 full-frame dispatch (this fn is not on the fused JPEG
-        // path, which streams through the AVX2 row kernel directly):
-        // U16x3 keeps pic-scale — its row-batched horizontal pass is
-        // ~1.9x the in-tree AVX2 kernel full-frame and every full-frame
-        // format (PNG/WebP/AVIF, mozjpeg presets) always takes the same
-        // backend, so bytes stay per-URL stable. U16x4 (alpha) moves
-        // from fir to the AVX2 kernel (1.33x on the benchmark shape;
-        // see examples/resize_bench_x86.rs).
+        // x86-64 full-frame dispatch. The linear JPEG path no longer
+        // arrives here (it streams through the AVX2 row kernel, serial
+        // and fused alike); what remains is PNG/WebP/AVIF, sRGB mode,
+        // band-parallel requests, and the fir escape hatch. U16x3 keeps
+        // pic-scale (still ~13% faster full-frame than the in-tree
+        // kernel; every user of this fn always takes the same backend,
+        // so bytes stay per-URL stable). U16x4 (alpha) uses the AVX2
+        // kernel (1.33x over fir on the benchmark shape; see
+        // examples/resize_bench_x86.rs).
         #[cfg(target_arch = "x86_64")]
         if std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
             if px == PixelType::U16x3 {
@@ -517,26 +532,16 @@ fn logical_cpus() -> usize {
     })
 }
 
-/// OXIMG_OVERLAP: "0" = never fuse, "1" = always fuse, "auto" = fuse
-/// while the machine has headroom. The default is auto on aarch64,
-/// where the serial path resizes with the same NEON kernel and a URL's
-/// bytes are identical either way; on x86-64 it is off, because the
-/// serial path's pic-scale backend still out-runs the streaming AVX2
-/// kernel full-frame — forcing "1" fuses every eligible request (all
-/// through the AVX2 kernel, still deterministic per configuration).
+/// OXIMG_OVERLAP: "0" = never fuse, "1" = always fuse, default "auto"
+/// = fuse while the machine has headroom. The serial path streams rows
+/// through the same SIMD kernel the fused path uses, so a URL's bytes
+/// are identical on either side of the gate on every architecture.
 fn overlap_mode() -> u8 {
     static M: OnceLock<u8> = OnceLock::new();
     *M.get_or_init(|| match std::env::var("OXIMG_OVERLAP").as_deref() {
         Ok("0") => 0,
         Ok("1") => 1,
-        Ok("auto") => 2,
-        _ => {
-            if cfg!(target_arch = "aarch64") {
-                2
-            } else {
-                0
-            }
-        }
+        _ => 2,
     })
 }
 
@@ -610,9 +615,65 @@ fn decode_resize<R: std::io::BufRead>(
     }
 
     if linear {
-        // Decode in chunks and apply the sRGB u8 -> linear u16 LUT on the
-        // fly: each chunk stays in L2, saving a second full-image memory
-        // pass.
+        // Stream each decoded chunk's rows through the SIMD resize
+        // kernel — the exact consumer the fused path runs on its worker
+        // thread, inline: the sRGB -> linear LUT fuses into row staging
+        // (no u16 intermediate image), and completed output rows go
+        // through the back LUT as they emit. Serial and fused therefore
+        // produce identical bytes on every architecture.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if parallel <= 1
+            && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir")
+            && let Ok(mut resizer) =
+                crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
+        {
+            let fwd = fwd_lut_f32();
+            let back = back_lut();
+            let chunk_rows = (256 * 1024 / row_bytes).clamp(1, dec_h);
+            scratch_u8(&mut s.chunk8, chunk_rows * row_bytes);
+            scratch_u8(&mut s.out8, dst_w * dst_h * 3);
+            let out8 = &mut s.out8;
+            let mut remaining = dec_h;
+            while remaining > 0 {
+                let want = remaining.min(chunk_rows) * row_bytes;
+                let got = started
+                    .read_scanlines_into(&mut s.chunk8[..want])
+                    .context("decode failed")?
+                    .len();
+                anyhow::ensure!(
+                    got > 0 && got % row_bytes == 0,
+                    "decoder returned a partial row"
+                );
+                remaining -= got / row_bytes;
+                for row in s.chunk8[..got].chunks_exact(row_bytes) {
+                    resizer.push_row_u8(row, fwd, |oy, out| {
+                        for (d, &v) in out8[oy * dst_w * 3..(oy + 1) * dst_w * 3]
+                            .iter_mut()
+                            .zip(out)
+                        {
+                            *d = back[v as usize];
+                        }
+                    });
+                }
+            }
+            anyhow::ensure!(
+                resizer.rows_emitted() == dst_h,
+                "decode ended before the image was complete"
+            );
+            started.finish().context("decode finish failed")?;
+            if timing {
+                eprintln!(
+                    "timing streamed({dec_w}x{dec_h}->{dst_w}x{dst_h}) total={:.1}ms",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            return Ok(Decoded::Pixels { dst_w, dst_h });
+        }
+
+        // Full-frame fallback (band-parallel resize, OXIMG_RESIZE_BACKEND
+        // =fir, or CPUs without the SIMD kernel): decode in chunks and
+        // apply the sRGB u8 -> linear u16 LUT on the fly; each chunk
+        // stays in L2, saving a second full-image memory pass.
         let fwd = fwd_lut();
         // Fully filled by the chunked LUT loop below (filled reaches
         // dec_w*dec_h*3 or the decode errors out).
@@ -758,9 +819,8 @@ fn fused_resize_encode<R: std::io::BufRead>(
         let worker = std::thread::Builder::new()
             .name("oximg-fuse".into())
             .spawn(move || -> Result<Vec<u8>> {
-                let fwd = fwd_lut();
+                let fwd = fwd_lut_f32();
                 let back = back_lut();
-                let mut row16 = vec![0u16; dec_w * 3];
                 let mut row8 = vec![0u8; dst_w * 3];
 
                 let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
@@ -775,11 +835,8 @@ fn fused_resize_encode<R: std::io::BufRead>(
                 while let Ok((buf, rows)) = chunk_rx.recv() {
                     for r in 0..rows {
                         let src = &buf[r * row_bytes..(r + 1) * row_bytes];
-                        for (d, &v) in row16.iter_mut().zip(src) {
-                            *d = fwd[v as usize];
-                        }
                         let mut enc_result = Ok(());
-                        resizer.push_row(&row16, |_, out| {
+                        resizer.push_row_u8(src, fwd, |_, out| {
                             for (d, &v) in row8.iter_mut().zip(out) {
                                 *d = back[v as usize];
                             }
@@ -1467,12 +1524,9 @@ mod tests {
         }
     }
 
-    /// aarch64's serial path resizes with the same NEON kernel the
-    /// fused path streams through, so the bytes must match exactly.
-    /// (x86-64's serial path uses pic-scale, which rounds differently;
-    /// there the fused plumbing is covered by the determinism test
-    /// below plus the kernel testkit's streamed==full-frame proofs.)
-    #[cfg(target_arch = "aarch64")]
+    /// The serial path streams rows through the same SIMD kernel the
+    /// fused path runs on its worker thread, so the bytes must match
+    /// exactly on every architecture.
     #[test]
     fn fused_path_bytes_match_serial_jpegli() {
         if !fuse_kernel_available() {
@@ -1506,9 +1560,6 @@ mod tests {
         let jpeg = make_test_jpeg(400, 300, true);
         let fused = run_jpeg(&jpeg, Some(80.0));
         assert!(fused.starts_with(&[0xFF, 0xD8]), "not a JPEG");
-        // Serial and fused resize with the same kernel on aarch64, so
-        // the bytes must match; x86-64's serial backend differs.
-        #[cfg(target_arch = "aarch64")]
         assert_eq!(run_jpeg(&jpeg, None), fused);
     }
 

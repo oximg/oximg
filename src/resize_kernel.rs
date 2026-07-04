@@ -169,6 +169,32 @@ pub(crate) trait RowKernel {
     fn detect() -> bool;
     /// Stage one u16 RGB row as f32 in this kernel's 3-channel layout.
     unsafe fn stage_x3(row: &[u16], stage: &mut [f32], w: usize);
+    /// Stage one u8 RGB row as f32 through a 256-entry lookup table
+    /// (fusing e.g. the sRGB -> linear transfer into staging, so no
+    /// separate full-image pass or u16 intermediate is needed). The
+    /// table holds exact f32 images of the u16 LUT values, making this
+    /// bit-identical to `lut[v] as u16` followed by [`RowKernel::stage_x3`].
+    unsafe fn stage_x3_u8(row: &[u8], lut: &[f32; 256], stage: &mut [f32], w: usize) {
+        unsafe {
+            if Self::STAGE3_FLOATS_PER_PIXEL == 4 {
+                for x in 0..w {
+                    *stage.get_unchecked_mut(x * 4) = lut[*row.get_unchecked(x * 3) as usize];
+                    *stage.get_unchecked_mut(x * 4 + 1) =
+                        lut[*row.get_unchecked(x * 3 + 1) as usize];
+                    *stage.get_unchecked_mut(x * 4 + 2) =
+                        lut[*row.get_unchecked(x * 3 + 2) as usize];
+                    *stage.get_unchecked_mut(x * 4 + 3) = 0.0;
+                }
+            } else {
+                for x in 0..w {
+                    *stage.get_unchecked_mut(x) = lut[*row.get_unchecked(x * 3) as usize];
+                    *stage.get_unchecked_mut(w + x) = lut[*row.get_unchecked(x * 3 + 1) as usize];
+                    *stage.get_unchecked_mut(2 * w + x) =
+                        lut[*row.get_unchecked(x * 3 + 2) as usize];
+                }
+            }
+        }
+    }
     /// Convert one u16 RGBA row to f32, keeping the interleaved layout.
     unsafe fn stage_x4(row: &[u16], stage: &mut [f32]);
     /// Horizontally convolve one staged 3-channel row into ring `slot`.
@@ -366,15 +392,12 @@ impl<K: RowKernel> StreamResize<K> {
     /// Push the next source row (interleaved u16, `src_w * channels`
     /// long). Emits `(oy, row)` for every output row whose vertical
     /// window is completed by this source row, in ascending `oy` order.
-    pub(crate) fn push_row(&mut self, row: &[u16], mut emit: impl FnMut(usize, &[u16])) {
+    pub(crate) fn push_row(&mut self, row: &[u16], emit: impl FnMut(usize, &[u16])) {
         assert!(row.len() >= self.src_w * self.channels, "short source row");
         if self.next_row >= self.last_needed {
             self.next_row += 1;
             return; // trailing rows influence nothing
         }
-        // Stage into the next batch slot; the horizontal pass runs when
-        // the batch fills, the last needed row arrives, or an output row
-        // below needs rows still pending.
         let base = self.pending * self.stage_row_stride;
         // SAFETY: constructor verified K::detect(); buffers were sized in
         // the constructor.
@@ -393,6 +416,44 @@ impl<K: RowKernel> StreamResize<K> {
                 );
             }
         }
+        self.after_stage(emit);
+    }
+
+    /// Push the next source row as interleaved u8 RGB, staging through a
+    /// u8 -> f32 lookup table (3-channel streams only). Values are
+    /// bit-identical to applying the equivalent u16 LUT and calling
+    /// [`StreamResize::push_row`].
+    pub(crate) fn push_row_u8(
+        &mut self,
+        row: &[u8],
+        lut: &[f32; 256],
+        emit: impl FnMut(usize, &[u16]),
+    ) {
+        assert_eq!(self.channels, 3, "u8 staging is 3-channel only");
+        assert!(row.len() >= self.src_w * 3, "short source row");
+        if self.next_row >= self.last_needed {
+            self.next_row += 1;
+            return; // trailing rows influence nothing
+        }
+        let base = self.pending * self.stage_row_stride;
+        let px = K::STAGE3_FLOATS_PER_PIXEL;
+        // SAFETY: as in push_row.
+        unsafe {
+            K::stage_x3_u8(
+                row,
+                lut,
+                &mut self.scratch.stage[base..base + self.src_w * px],
+                self.src_w,
+            );
+        }
+        self.after_stage(emit);
+    }
+
+    /// Shared continuation after a row lands in the batch buffer: flush
+    /// the horizontal pass when due, then emit completed output rows.
+    fn after_stage(&mut self, mut emit: impl FnMut(usize, &[u16])) {
+        // The horizontal pass runs when the batch fills, the last needed
+        // row arrives, or an output row below needs pending rows.
         self.pending += 1;
         self.next_row += 1;
         if self.pending == K::HORIZ_BATCH || self.next_row == self.last_needed {

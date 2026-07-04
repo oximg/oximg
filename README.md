@@ -103,11 +103,11 @@ kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
 x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
 `OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
-second thread, cutting single-request latency ~20%; `auto` fuses while
-`2 x active requests <= visible CPUs` and falls back to one core per
-request under contention. Default `auto` on aarch64, where output
-bytes are identical either way; default off on x86-64 — set `1` to
-force fusing every request there), `OXIMG_JPEG_PROGRESSIVE` (`0`
+second thread, cutting single-request latency ~20%; the default `auto`
+fuses while `2 x active requests <= visible CPUs` and falls back to
+one core per request under contention. Serial and fused stream through
+the same SIMD kernel, so a URL's bytes are identical either way; `1`
+forces fusing, `0` disables it), `OXIMG_JPEG_PROGRESSIVE` (`0`
 selects baseline jpegli: a few percent larger JPEG output — still at
 or below libjpeg-turbo size for the same input, at higher quality —
 in exchange for moving jpegli's entropy pass off the latency tail:

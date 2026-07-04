@@ -90,20 +90,29 @@ plasma source, identical 500x333 outputs:
 
 | Server | c=1 latency | c=8 req/s | c=16 req/s | output |
 |---|---|---|---|---|
-| oximg (default, serial) | 13.1 ms | 522 | 741 | **20.2 KB** |
-| oximg `OXIMG_OVERLAP=1` (fused) | 10.8 ms | 562 | 677 | **20.2 KB** |
-| oximg speed profile, fused | **9.4 ms** | **648** | 761 | 22.5 KB |
-| oximg speed profile, serial | 11.7 ms | 581 | **810** | 22.5 KB |
+| oximg (default) | 10.8 ms | 583 | 740 | **20.2 KB** |
+| oximg speed profile | **9.4 ms** | **659** | **810** | 22.5 KB |
 | imgproxy | 10.4 ms | 614 | 784 | 22.4 KB |
 
-The speed profile is `OXIMG_JPEG_PROGRESSIVE=0` (baseline jpegli:
-entropy coding no longer sits on the latency tail at `finish`, and
-per-request CPU drops ~1.2 ms) — output lands at libjpeg-turbo size
-for this source while keeping jpegli's quality-per-byte edge. Adding
-`OXIMG_OVERLAP=auto` composes the two lines: fused below saturation,
-serial at saturation — ahead of imgproxy at every concurrency in this
-table. The default profile instead keeps the 10% smaller progressive
-output and leads on the real-photo harness.
+Both oximg rows are the auto overlap gate composing one pipeline:
+decode fused with resize+encode on a second thread below saturation,
+one core per request at saturation — serial and fused stream through
+the same SIMD row kernel, so a URL's bytes never depend on load. The
+speed profile is `OXIMG_JPEG_PROGRESSIVE=0` (baseline jpegli: entropy
+coding leaves the latency tail and per-request CPU drops ~1.2 ms):
+output lands at libjpeg-turbo size for this source, keeps jpegli's
+quality-per-byte edge, and is ahead of imgproxy at every concurrency
+in this table.
+
+The default keeps the 10% smaller progressive output and leads the
+real-photo DIV2K harness (196-197 req/s on this box's 2-cpu pinned
+replica); its residual gap here — 4% at c=1, 5-6% at saturation on
+this one synthetic — is the deliberate quality work itself
+(2x-supersampled Lanczos, progressive jpegli), not overhead: the
+resize kernels, staging, and IDCT were each profiled to their
+practical floors (a prototyped AVX2 4x4 IDCT measured +3% over
+mozjpeg's SSE2 assembly, which already sustains ~4 IPC on Zen4 —
+left alone deliberately).
 
 This synthetic is the most imgproxy-favorable shape we know: a
 Huffman-heavy source (entropy decode is ~47% of oximg's request CPU
