@@ -57,9 +57,18 @@ group its output was byte-identical to the default configuration.
 At q80 oximg produces 33.9 KB (Kodak group mean, jpegli default);
 imgproxy reaches a lower score (76.0) at q90 with 63.8 KB.
 
-Scores with oximg's speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`)
-are ~60 on the medium group — the same level as imgproxy's and imagor's
-defaults. Throughput for both settings is in [../../BENCH.md](../../BENCH.md).
+The speed profile (`OXIMG_JPEG_PROGRESSIVE=0`, see BENCH.md) scores
+**identically to the default on all 30 corpus images** — baseline and
+progressive jpegli encode the same quantized coefficients, differing
+only in entropy layout — at +9-11% bytes (Kodak group: 37.2 KB vs
+34.0 KB; imgproxy produces 35.0 KB at 71.2). Re-measured 2026-07 at
+HEAD (streamed SIMD resize on both architectures): 77.5 / 72.1 / 67.3
+for the three groups, matching the table above.
+
+Scores with oximg's quality-reducing knobs (`OXIMG_RESIZE=srgb
+OXIMG_DCT_MARGIN=1.0`) are ~60 on the medium group — the same level as
+imgproxy's and imagor's defaults. Throughput for all profiles is in
+[../../BENCH.md](../../BENCH.md).
 
 ## PNG and WebP (same-format in/out, fit 500x500)
 
