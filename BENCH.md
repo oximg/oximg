@@ -104,7 +104,7 @@ req/s (p95 latency); all runs 100% successful checks:
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **190.8** (93 ms) | **72.7** (240 ms) | **70.6** (247 ms) | **33.7** (507 ms) |
+| oximg (defaults) | **192.7** (92 ms) | **76.6** (227 ms) | **72.6** (242 ms) | **36.5** (469 ms) |
 | imgproxy | 155.8 (121 ms) | 30.5 (617 ms) | 46.0 (412 ms) | 33.4 (545 ms) |
 | imagor 1.9.2 | 143.1 (169 ms) | 35.8 (670 ms) | 44.6 (493 ms) | 24.5 (920 ms) |
 | thumbor 7.x | 106.8 (188 ms) | 18.4 (1150 ms) | 33.7 (616 ms) | 30.8 (646 ms) |
@@ -114,14 +114,14 @@ c7i.large results. PNG output at these settings measures 448KB per
 image vs libvips' 482KB default. Output quality is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
-AVIF (oximg built with `--features avif`, SVT-AV1 4.1 encode / dav1d
-decode) is decode-bound for every server, which compresses the
-throughput spread. Output operating points differ substantially at the
-same nominal q65, so the quality table in QUALITY.md is the other half
-of this cell: at default settings oximg spends 28% more bytes and
-scores +12.1 SSIMULACRA2 over imgproxy; with `OXIMG_AVIF_QUALITY=55`
-its output is smaller than imgproxy's and still scores +6.7 while
-serving 34.3 req/s (p95 499 ms).
+AVIF (oximg built with `--features avif`: SVT-AV1 encode at the
+revision pinned in the Dockerfile, dav1d decode) is decode-heavy for
+every server. Nominal quality numbers are not comparable across
+encoders, so the quality table in QUALITY.md is the other half of this
+cell: at the defaults, oximg's 10-bit tune=ssim output is smaller than
+imgproxy's q65 output and scores +6.7 SSIMULACRA2; at matched nominal
+q65 (`OXIMG_AVIF_QUALITY=65`) it spends 28% more bytes and scores
++12.1.
 
 ### AVIF with alpha
 
@@ -132,7 +132,7 @@ SVT-AV1 auxiliary-image encode plus a second dav1d decode:
 
 | Server | req/s (p95) |
 |---|---|
-| oximg (defaults) | **29.5** (578 ms) |
+| oximg (defaults) | **32.1** (531 ms) |
 | thumbor 7.x | 27.3 (738 ms) |
 | imagor 1.9.2 | 27.2 (720 ms) |
 | imgproxy | 26.2 (684 ms) |
@@ -217,7 +217,15 @@ Quality per byte for each encoder is measured in
 
 ## Notes
 
-- Throughput tables above were measured with `PRESET=fast` as the
+- Measurement provenance: the official-harness tables (local Ryzen and
+  AWS) reflect the current code; the oximg rows were re-measured after
+  each significant pipeline change, and competitor rows are re-measured
+  whenever the environment changes (same-box anchors bound
+  instance-to-instance variance at ~3%). The earlier sustained-load,
+  macOS, and gist-reproduction sections are historical measurements of
+  the JPEG path and predate the format expansion; their competitor
+  ratios still hold for that path.
+- The sustained-load tables were measured with `PRESET=fast` as the
   encoder, before jpegli became the default; the preset table shows the
   relative cost of the current default.
 - oximg defaults resize in linear light with 1.7x DCT decode headroom;
@@ -227,8 +235,9 @@ Quality per byte for each encoder is measured in
 - The plasma-fractal test images compress differently from real photos;
   both servers consume the same files, so relative values hold. The
   quality benchmark uses Kodak and real photographs.
-- imgproxy is a full-featured product (many formats, URL signing, remote
-  sources, watermarks); oximg implements the JPEG resize path only.
+- imgproxy is a full-featured product (many formats, watermarks, a rich
+  processing URL grammar); oximg covers same-format resizing for JPEG,
+  PNG, WebP, and AVIF with URL signing and HTTP sources.
 
 ## Reproduce
 

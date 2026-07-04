@@ -96,16 +96,17 @@ for the 10 outputs:
 
 | Server | SSIM2 (linear ref) | total bytes |
 |---|---|---|
-| oximg q65 (default) | **79.6** | 409 KB |
-| oximg `OXIMG_AVIF_QUALITY=55` | **74.2** | **307 KB** |
+| oximg `OXIMG_AVIF_QUALITY=65` | **79.6** | 409 KB |
+| oximg (default, q55) | **74.2** | **307 KB** |
 | thumbor 7.x (q65) | 68.5 | 317 KB |
 | imagor 1.9.2 (q65) | 68.4 | 306 KB |
 | imgproxy (q65) | 67.5 | 319 KB |
 
 The same nominal quality lands on very different rate/distortion
-points: oximg encodes 10-bit 4:2:0 with SVT-AV1 tune=ssim. At matched
-output size (q55 row) it stays +6.7 SSIM2 ahead of imgproxy; at the
-default it trades +28% bytes for +12.1.
+points: oximg encodes 10-bit 4:2:0 with SVT-AV1 tune=ssim. Its default
+(q55) was chosen by operating point — smaller files than imgproxy's
+q65 default at +6.7 SSIM2; matching nominal q65 instead trades +28%
+bytes for +12.1.
 
 ## Notes
 

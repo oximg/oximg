@@ -8,7 +8,11 @@
 High-performance image compression in Rust: a library, a CLI, and a
 self-hostable HTTP server (PoC). JPEG, PNG, WebP — and AVIF with the
 `avif` feature — in and out; sources are format-sniffed by magic bytes
-and re-encoded in their own format.
+and re-encoded in their own format. On imgproxy's official benchmark
+harness, run on the same AWS instance types as their published
+results, oximg leads every format cell on both x86-64 and Graviton
+while resizing in linear light at measurably higher output quality
+(see [Benchmarks](#benchmarks)).
 
 ## Pipeline
 
@@ -19,8 +23,10 @@ source bytes (local file or HTTP origin)
       PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
       WebP: libwebp
       AVIF: dav1d (8/10/12-bit, all subsamplings, alpha, bilinear chroma upsampling)
-  → linear-light resize: sRGB u8 → linear u16 → Lanczos3 (SIMD) → sRGB u8
-      (alpha is premultiplied before resampling, unpremultiplied after)
+  → linear-light resize: sRGB u8 → linear u16 → Lanczos3 → sRGB u8
+      (alpha is premultiplied before resampling, unpremultiplied after;
+       x86-64 convolves via pic-scale AVX-512, aarch64 via an in-tree
+       ring-scheduled NEON f32 kernel verified against an f64 reference)
   → encode in the source format
       JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
@@ -32,8 +38,27 @@ layer (axum/tokio) only does queueing and IO.
 
 ## Benchmarks
 
-- [BENCH.md](BENCH.md) — throughput, latency, and memory vs imgproxy and
-  imagor, on macOS and Linux x86_64.
+imgproxy's official harness (DIV2K corpus over nginx, fit into 512x512,
+k6, all defaults) on the AWS instance types behind imgproxy's published
+numbers — req/s, higher is better, p95 in parentheses:
+
+| c7i.large (x86-64) | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg | **81.8** (32 ms) | **32.9** (79 ms) | **31.0** (91 ms) | **19.1** (149 ms) |
+| best of imgproxy/imagor/thumbor | 68.4 | 15.5 | 20.5 | 15.7 |
+
+| c7g.large (Graviton3) | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **23.1** (126 ms) |
+| best of imgproxy/imagor/thumbor | 68.4 | 22.0 | 25.4 | 20.1 |
+
+At the same time, output quality is higher, not traded away: pure
+resize quality (lossless PNG path) scores 97.6 SSIMULACRA2 vs
+imgproxy's 81.9 on the 24-image Kodak corpus, and the AVIF default
+produces smaller files than imgproxy's default at +6.7 SSIMULACRA2.
+
+- [BENCH.md](BENCH.md) — full methodology and tables: official harness
+  (local and AWS), sustained-load and memory measurements, presets.
 - [bench/quality/QUALITY.md](bench/quality/QUALITY.md) — output quality
   (SSIMULACRA2) at matched settings vs imgproxy and sharp.
 
@@ -46,7 +71,9 @@ curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
 AVIF support is an opt-in feature with two system dependencies
-(SVT-AV1 >= 4.1 and dav1d, found via pkg-config):
+(SVT-AV1 >= 4.1 and dav1d, found via pkg-config; the Docker image
+builds a pinned post-4.1 SVT-AV1 revision that carries the aarch64
+kernels for the still-image path):
 
 ```sh
 cargo build --release --features avif
@@ -70,8 +97,11 @@ download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
 (55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
-sRGB space instead of linear light), `OXIMG_DCT_MARGIN` (1.7),
-`OXIMG_PAR` (resize threads, 1).
+sRGB space instead of linear light), `OXIMG_RESIZE_BACKEND=fir` (use
+the portable fast_image_resize convolution instead of the platform
+kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
+x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
+`OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1).
 
 ## Not yet implemented (out of PoC scope)
 
