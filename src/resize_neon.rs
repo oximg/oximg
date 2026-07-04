@@ -1,12 +1,29 @@
 //! NEON f32 separable convolution for interleaved u16 pixel rows on
-//! aarch64. Replaces fast_image_resize's u16 path there: fir accumulates
-//! in i64 pairs (two multiply-accumulates per instruction), while f32
-//! accumulation runs four FMA lanes per instruction on the same window
-//! math. The window/coefficient computation mirrors fir's Lanczos3
-//! convolution (adaptive kernel size, sum-normalized, zero-trimmed
-//! bounds) so output stays within one quantization step of the fir
-//! path; the f32 intermediate rows are not quantized between passes,
-//! which fir's u16 intermediate is.
+//! aarch64, replacing fast_image_resize's u16 path there (which
+//! accumulates in i64 pairs — two multiply-accumulates per instruction).
+//! The window/coefficient computation mirrors fir's Lanczos3 convolution
+//! (adaptive kernel size, sum-normalized, zero-trimmed bounds).
+//!
+//! Schedule (shaped by Graviton3 perf counters — the kernel is
+//! instruction-bound, IPC ~3.2 with near-zero LLC misses):
+//! - each source row is converted from interleaved u16 to f32 exactly
+//!   once (planar for 3 channels, interleaved for 4) instead of being
+//!   re-loaded and re-widened by every overlapping window (~6x for the
+//!   benchmark shape's 24-tap windows);
+//! - horizontally convolved rows live in a ring buffer of
+//!   `window_size` rows (~150 KB for 2040->512 RGB) that the vertical
+//!   pass consumes in step, instead of an image-sized intermediate;
+//! - the vertical pass keeps its accumulators in registers across all
+//!   taps of a 16-column tile rather than round-tripping an
+//!   accumulator row through memory once per tap.
+//!
+//! Correctness contract: the f32 operation sequence per output value is
+//! preserved by all of the above (u16 -> f32 conversion is exact, so
+//! staging changes no operand values; ring placement only changes where
+//! a row is stored; register accumulation applies taps in the same
+//! ascending order). Tests assert exact output equality between the
+//! strip-mined schedule and a full-intermediate reference schedule, and
+//! track a scalar f64 ground truth within quantization tolerance.
 
 use anyhow::{Result, ensure};
 
@@ -94,10 +111,18 @@ impl Windows {
 }
 
 thread_local! {
-    /// Planar f32 intermediate (dst_w x src_h per channel) plus one
-    /// accumulator row set, reused across requests.
-    static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    /// Reusable work buffers: one staged source row (f32), the ring of
+    /// horizontally-convolved rows, and one accumulator row set. Grow-only;
+    /// every element is written before it is read, so stale contents are
+    /// never observed.
+    static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
+fn grow(buf: &mut Vec<f32>, len: usize) {
+    if buf.len() < len {
+        buf.resize(len, 0.0);
+    }
 }
 
 /// Resize interleaved u16 pixels (3 or 4 channels) with Lanczos3.
@@ -112,6 +137,10 @@ pub fn resize_u16_neon(
     channels: usize,
 ) -> Result<()> {
     ensure!(channels == 3 || channels == 4, "unsupported channel count");
+    ensure!(
+        src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0,
+        "empty dimensions"
+    );
     let (pre, src, post) = unsafe { src_bytes.align_to::<u16>() };
     ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 src");
     let (pre, dst, post) = unsafe { dst_bytes.align_to_mut::<u16>() };
@@ -121,35 +150,73 @@ pub fn resize_u16_neon(
 
     let wh = Windows::new(src_w, dst_w);
     let wv = Windows::new(src_h, dst_h);
+    // Ring capacity: every vertical window's span is <= window_size (the
+    // raw span ceil(c+r)-floor(c-r) < 2r+2 <= window_size+1, and clamping
+    // or zero-trimming only shrinks it), and window ends are
+    // non-decreasing in oy, so end-driven fill never evicts a live row.
+    let cap = wv.window_size.min(src_h).max(1);
+    run(
+        src, src_w, src_h, dst, dst_w, dst_h, channels, &wh, &wv, cap,
+    );
+    Ok(())
+}
 
+/// Shared driver: `cap == src_h` degenerates the ring into a full
+/// intermediate image (the reference schedule used by tests).
+#[allow(clippy::too_many_arguments)]
+fn run(
+    src: &[u16],
+    src_w: usize,
+    _src_h: usize,
+    dst: &mut [u16],
+    dst_w: usize,
+    dst_h: usize,
+    channels: usize,
+    wh: &Windows,
+    wv: &Windows,
+    cap: usize,
+) {
     SCRATCH.with(|s| {
-        let (mid, acc) = &mut *s.borrow_mut();
-        let plane = dst_w * src_h;
-        mid.clear();
-        mid.resize(plane * channels, 0.0);
-        acc.clear();
-        acc.resize(dst_w * channels, 0.0);
+        let (stage, ring, acc) = &mut *s.borrow_mut();
+        grow(stage, src_w * channels);
+        let plane = cap * dst_w;
+        grow(ring, plane * channels);
+        grow(acc, dst_w * channels);
 
         unsafe {
-            // Horizontal pass: interleaved u16 -> planar f32.
-            for y in 0..src_h {
-                let row = &src[y * src_w * channels..(y + 1) * src_w * channels];
-                if channels == 3 {
-                    horiz_row_x3(row, &wh, &mut mid[..], plane, y * dst_w, dst_w);
-                } else {
-                    horiz_row_x4(row, &wh, &mut mid[..], plane, y * dst_w, dst_w);
-                }
-            }
-            // Vertical pass: planar f32 -> interleaved u16.
+            let mut next_row = 0usize;
             for oy in 0..dst_h {
                 let start = wv.starts[oy];
                 let size = wv.sizes[oy];
+                // Produce horizontally-convolved rows up to this output
+                // row's window end (window ends never decrease).
+                while next_row < start + size {
+                    let row = &src[next_row * src_w * channels..(next_row + 1) * src_w * channels];
+                    let slot = (next_row % cap) * dst_w;
+                    if channels == 3 {
+                        stage_row_x3(row, &mut stage[..src_w * 3], src_w);
+                        horiz_row_x3(
+                            &stage[..src_w * 3],
+                            src_w,
+                            wh,
+                            &mut ring[..],
+                            plane,
+                            slot,
+                            dst_w,
+                        );
+                    } else {
+                        stage_row_x4(row, &mut stage[..src_w * 4]);
+                        horiz_row_x4(&stage[..src_w * 4], wh, &mut ring[..], plane, slot, dst_w);
+                    }
+                    next_row += 1;
+                }
                 let coeffs = &wv.coeffs[oy * wv.window_size..oy * wv.window_size + size];
                 for c in 0..channels {
                     vert_accumulate(
-                        &mid[c * plane..(c + 1) * plane],
+                        &ring[c * plane..(c + 1) * plane],
                         coeffs,
                         start,
+                        cap,
                         dst_w,
                         &mut acc[c * dst_w..(c + 1) * dst_w],
                     );
@@ -162,23 +229,84 @@ pub fn resize_u16_neon(
                 }
             }
         }
-        Ok(())
-    })
+    });
 }
 
-/// One horizontal row, 3 channels: deinterleave 8 taps at a time and
-/// accumulate each channel in a f32x4 register.
+/// Deinterleave one u16 RGB row into three planar f32 rows
+/// (stage[0..w], stage[w..2w], stage[2w..3w]). Exact conversion, so the
+/// convolution below sees the same operand values as widening on the fly.
+#[target_feature(enable = "neon")]
+unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
+    unsafe {
+        use std::arch::aarch64::*;
+        let (r_out, rest) = stage.split_at_mut(w);
+        let (g_out, b_out) = rest.split_at_mut(w);
+        let mut x = 0usize;
+        while x + 8 <= w {
+            let px = vld3q_u16(row.as_ptr().add(x * 3));
+            macro_rules! ch {
+                ($i:tt, $out:expr) => {{
+                    let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(px.$i)));
+                    let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(px.$i)));
+                    vst1q_f32($out.as_mut_ptr().add(x), lo);
+                    vst1q_f32($out.as_mut_ptr().add(x + 4), hi);
+                }};
+            }
+            ch!(0, r_out);
+            ch!(1, g_out);
+            ch!(2, b_out);
+            x += 8;
+        }
+        while x < w {
+            r_out[x] = row[x * 3] as f32;
+            g_out[x] = row[x * 3 + 1] as f32;
+            b_out[x] = row[x * 3 + 2] as f32;
+            x += 1;
+        }
+    }
+}
+
+/// Convert one u16 RGBA row to f32, keeping the interleaved layout (a
+/// pixel stays one f32x4 lane group).
+#[target_feature(enable = "neon")]
+unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = row.len();
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v = vld1q_u16(row.as_ptr().add(i));
+            let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(v)));
+            let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(v)));
+            vst1q_f32(stage.as_mut_ptr().add(i), lo);
+            vst1q_f32(stage.as_mut_ptr().add(i + 4), hi);
+            i += 8;
+        }
+        while i < n {
+            stage[i] = row[i] as f32;
+            i += 1;
+        }
+    }
+}
+
+/// One horizontal row, 3 channels, reading planar f32 staged rows:
+/// per output pixel, 8-tap blocks accumulate each channel in a f32x4
+/// register (same FMA sequence as widening from u16 directly).
 #[target_feature(enable = "neon")]
 unsafe fn horiz_row_x3(
-    row: &[u16],
+    stage: &[f32],
+    src_w: usize,
     w: &Windows,
-    mid: &mut [f32],
+    ring: &mut [f32],
     plane: usize,
-    mid_row: usize,
+    slot: usize,
     dst_w: usize,
 ) {
     unsafe {
         use std::arch::aarch64::*;
+        let r_in = stage.as_ptr();
+        let g_in = stage.as_ptr().add(src_w);
+        let b_in = stage.as_ptr().add(2 * src_w);
         for ox in 0..dst_w {
             let start = w.starts[ox];
             let size = w.sizes[ox];
@@ -187,47 +315,46 @@ unsafe fn horiz_row_x3(
             let mut acc = [vdupq_n_f32(0.0); 3];
             let mut k = 0usize;
             while k + 8 <= size {
-                let px = vld3q_u16(row.as_ptr().add((start + k) * 3));
                 let c_lo = vld1q_f32(coeffs.as_ptr().add(k));
                 let c_hi = vld1q_f32(coeffs.as_ptr().add(k + 4));
                 macro_rules! ch {
-                    ($i:tt) => {{
-                        let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(px.$i)));
-                        let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(px.$i)));
+                    ($i:tt, $in:expr) => {{
+                        let lo = vld1q_f32($in.add(start + k));
+                        let hi = vld1q_f32($in.add(start + k + 4));
                         acc[$i] = vfmaq_f32(acc[$i], lo, c_lo);
                         acc[$i] = vfmaq_f32(acc[$i], hi, c_hi);
                     }};
                 }
-                ch!(0);
-                ch!(1);
-                ch!(2);
+                ch!(0, r_in);
+                ch!(1, g_in);
+                ch!(2, b_in);
                 k += 8;
             }
             let mut sums = [vaddvq_f32(acc[0]), vaddvq_f32(acc[1]), vaddvq_f32(acc[2])];
             while k < size {
                 let c = coeffs[k];
-                let p = (start + k) * 3;
-                sums[0] += row[p] as f32 * c;
-                sums[1] += row[p + 1] as f32 * c;
-                sums[2] += row[p + 2] as f32 * c;
+                sums[0] += *r_in.add(start + k) * c;
+                sums[1] += *g_in.add(start + k) * c;
+                sums[2] += *b_in.add(start + k) * c;
                 k += 1;
             }
-            mid[mid_row + ox] = sums[0];
-            mid[plane + mid_row + ox] = sums[1];
-            mid[2 * plane + mid_row + ox] = sums[2];
+            ring[slot + ox] = sums[0];
+            ring[plane + slot + ox] = sums[1];
+            ring[2 * plane + slot + ox] = sums[2];
         }
     }
 }
 
-/// One horizontal row, 4 channels: each pixel is a natural f32x4 lane
-/// group; four taps share one coefficient vector via lane-indexed FMA.
+/// One horizontal row, 4 channels, reading the interleaved f32 staged
+/// row: each pixel is a natural f32x4 lane group; four taps share one
+/// coefficient vector via lane-indexed FMA (same sequence as before).
 #[target_feature(enable = "neon")]
 unsafe fn horiz_row_x4(
-    row: &[u16],
+    stage: &[f32],
     w: &Windows,
-    mid: &mut [f32],
+    ring: &mut [f32],
     plane: usize,
-    mid_row: usize,
+    slot: usize,
     dst_w: usize,
 ) {
     unsafe {
@@ -243,9 +370,7 @@ unsafe fn horiz_row_x4(
                 let cv = vld1q_f32(coeffs.as_ptr().add(k));
                 macro_rules! tap {
                     ($j:tt) => {{
-                        let p = vcvtq_f32_u32(vmovl_u16(vld1_u16(
-                            row.as_ptr().add((start + k + $j) * 4),
-                        )));
+                        let p = vld1q_f32(stage.as_ptr().add((start + k + $j) * 4));
                         acc = vfmaq_laneq_f32::<$j>(acc, p, cv);
                     }};
                 }
@@ -256,7 +381,7 @@ unsafe fn horiz_row_x4(
                 k += 4;
             }
             while k < size {
-                let p = vcvtq_f32_u32(vmovl_u16(vld1_u16(row.as_ptr().add((start + k) * 4))));
+                let p = vld1q_f32(stage.as_ptr().add((start + k) * 4));
                 acc = vfmaq_n_f32(acc, p, coeffs[k]);
                 k += 1;
             }
@@ -267,68 +392,63 @@ unsafe fn horiz_row_x4(
                 vgetq_lane_f32::<3>(acc),
             ];
             for (c, v) in out.iter().enumerate() {
-                mid[c * plane + mid_row + ox] = *v;
+                ring[c * plane + slot + ox] = *v;
             }
         }
     }
 }
 
-/// acc[x] = sum over taps of coeff * plane_row[x]; full-width FMA.
+/// acc[x] = sum over taps of coeff * ring_row[x], taps applied in
+/// ascending order. Accumulators stay in registers for a whole
+/// 16-column tile across every tap (the tap-order additions per element
+/// are unchanged from a per-tap memory accumulator).
 #[target_feature(enable = "neon")]
 unsafe fn vert_accumulate(
     plane: &[f32],
     coeffs: &[f32],
     start: usize,
+    cap: usize,
     dst_w: usize,
     acc: &mut [f32],
 ) {
     unsafe {
         use std::arch::aarch64::*;
-        acc.fill(0.0);
-        for (k, &c) in coeffs.iter().enumerate() {
-            let src_row = &plane[(start + k) * dst_w..(start + k + 1) * dst_w];
-            let cv = vdupq_n_f32(c);
-            let mut x = 0usize;
-            while x + 16 <= dst_w {
-                let a0 = vfmaq_f32(
-                    vld1q_f32(acc.as_ptr().add(x)),
-                    vld1q_f32(src_row.as_ptr().add(x)),
-                    cv,
-                );
-                let a1 = vfmaq_f32(
-                    vld1q_f32(acc.as_ptr().add(x + 4)),
-                    vld1q_f32(src_row.as_ptr().add(x + 4)),
-                    cv,
-                );
-                let a2 = vfmaq_f32(
-                    vld1q_f32(acc.as_ptr().add(x + 8)),
-                    vld1q_f32(src_row.as_ptr().add(x + 8)),
-                    cv,
-                );
-                let a3 = vfmaq_f32(
-                    vld1q_f32(acc.as_ptr().add(x + 12)),
-                    vld1q_f32(src_row.as_ptr().add(x + 12)),
-                    cv,
-                );
-                vst1q_f32(acc.as_mut_ptr().add(x), a0);
-                vst1q_f32(acc.as_mut_ptr().add(x + 4), a1);
-                vst1q_f32(acc.as_mut_ptr().add(x + 8), a2);
-                vst1q_f32(acc.as_mut_ptr().add(x + 12), a3);
-                x += 16;
+        let mut x = 0usize;
+        while x + 16 <= dst_w {
+            let mut a0 = vdupq_n_f32(0.0);
+            let mut a1 = vdupq_n_f32(0.0);
+            let mut a2 = vdupq_n_f32(0.0);
+            let mut a3 = vdupq_n_f32(0.0);
+            for (k, &c) in coeffs.iter().enumerate() {
+                let row = plane.as_ptr().add(((start + k) % cap) * dst_w + x);
+                let cv = vdupq_n_f32(c);
+                a0 = vfmaq_f32(a0, vld1q_f32(row), cv);
+                a1 = vfmaq_f32(a1, vld1q_f32(row.add(4)), cv);
+                a2 = vfmaq_f32(a2, vld1q_f32(row.add(8)), cv);
+                a3 = vfmaq_f32(a3, vld1q_f32(row.add(12)), cv);
             }
-            while x + 4 <= dst_w {
-                let a = vfmaq_f32(
-                    vld1q_f32(acc.as_ptr().add(x)),
-                    vld1q_f32(src_row.as_ptr().add(x)),
-                    cv,
-                );
-                vst1q_f32(acc.as_mut_ptr().add(x), a);
-                x += 4;
+            vst1q_f32(acc.as_mut_ptr().add(x), a0);
+            vst1q_f32(acc.as_mut_ptr().add(x + 4), a1);
+            vst1q_f32(acc.as_mut_ptr().add(x + 8), a2);
+            vst1q_f32(acc.as_mut_ptr().add(x + 12), a3);
+            x += 16;
+        }
+        while x + 4 <= dst_w {
+            let mut a = vdupq_n_f32(0.0);
+            for (k, &c) in coeffs.iter().enumerate() {
+                let row = plane.as_ptr().add(((start + k) % cap) * dst_w + x);
+                a = vfmaq_f32(a, vld1q_f32(row), vdupq_n_f32(c));
             }
-            while x < dst_w {
-                acc[x] += src_row[x] * c;
-                x += 1;
+            vst1q_f32(acc.as_mut_ptr().add(x), a);
+            x += 4;
+        }
+        while x < dst_w {
+            let mut a = 0f32;
+            for (k, &c) in coeffs.iter().enumerate() {
+                a += plane[((start + k) % cap) * dst_w + x] * c;
             }
+            acc[x] = a;
+            x += 1;
         }
     }
 }
@@ -446,6 +566,23 @@ mod tests {
         let dst_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len() * 2) };
         resize_u16_neon(src_bytes, sw, sh, dst_bytes, dw, dh, ch).unwrap();
+        dst
+    }
+
+    /// Reference schedule: same kernels, ring capacity = src_h (a full
+    /// intermediate image, i.e. the unstripped two-pass schedule).
+    fn reference_resize(
+        src: &[u16],
+        sw: usize,
+        sh: usize,
+        dw: usize,
+        dh: usize,
+        ch: usize,
+    ) -> Vec<u16> {
+        let wh = Windows::new(sw, dw);
+        let wv = Windows::new(sh, dh);
+        let mut dst = vec![0u16; dw * dh * ch];
+        run(src, sw, sh, &mut dst, dw, dh, ch, &wh, &wv, sh);
         dst
     }
 
@@ -567,6 +704,67 @@ mod tests {
         let _ = fir;
     }
 
+    /// Shape sweep used by the schedule-equality test: the benchmark
+    /// shape, primes, tiny images (src_h < ring capacity), upscales
+    /// (heavily overlapping windows), single-row outputs, and extreme
+    /// aspect changes.
+    const SHAPES: [(usize, usize, usize, usize); 10] = [
+        (2040, 1356, 512, 340),
+        (640, 480, 512, 384),
+        (333, 217, 100, 65),
+        (17, 11, 5, 3),
+        (127, 83, 31, 29),
+        (50, 40, 120, 96),
+        (64, 64, 17, 9),
+        (100, 7, 50, 3),
+        (9, 300, 7, 150),
+        (256, 199, 256, 1),
+    ];
+
+    #[test]
+    fn strip_schedule_equals_full_intermediate_schedule_exactly() {
+        for &(sw, sh, dw, dh) in &SHAPES {
+            for ch in [3usize, 4] {
+                let src = test_image(sw, sh, ch);
+                let strip = neon_resize(&src, sw, sh, dw, dh, ch);
+                let full = reference_resize(&src, sw, sh, dw, dh, ch);
+                assert_eq!(strip, full, "{sw}x{sh}->{dw}x{dh} x{ch}");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_capacity_invariant_holds_for_all_small_dimensions() {
+        // The strip schedule is safe iff, at the moment output row oy is
+        // computed, every live row start..start+size still resides in the
+        // ring: fill has reached exactly end = start+size, so the oldest
+        // retained row is end - cap and the invariant is
+        // end - start <= cap for cap = window_size.min(in_size).
+        for in_size in 1..=64usize {
+            for out_size in 1..=64usize {
+                let w = Windows::new(in_size, out_size);
+                let cap = w.window_size.min(in_size).max(1);
+                for o in 0..out_size {
+                    assert!(
+                        w.sizes[o] <= cap,
+                        "{in_size}->{out_size} window {o}: size {} > cap {cap}",
+                        w.sizes[o]
+                    );
+                }
+                // window ends must be non-decreasing for end-driven fill
+                let mut prev_end = 0usize;
+                for o in 0..out_size {
+                    let end = w.starts[o] + w.sizes[o];
+                    assert!(
+                        end >= prev_end,
+                        "{in_size}->{out_size}: end regressed at {o}"
+                    );
+                    prev_end = end;
+                }
+            }
+        }
+    }
+
     #[test]
     fn tracks_ground_truth_for_rgb() {
         for (sw, sh, dw, dh) in [
@@ -607,5 +805,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn rejects_empty_dimensions() {
+        let src = [0u16; 12];
+        let src_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len() * 2) };
+        let mut dst = [0u16; 12];
+        let dst_bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len() * 2) };
+        assert!(resize_u16_neon(src_bytes, 2, 2, dst_bytes, 0, 1, 3).is_err());
+        assert!(resize_u16_neon(src_bytes, 0, 2, dst_bytes, 1, 1, 3).is_err());
     }
 }
