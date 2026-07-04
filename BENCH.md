@@ -173,9 +173,11 @@ Notes:
   landed (resize stage 37 -> 20 ms on the full-decode shape); the
   imgproxy AVIF cell re-run on the same instance (20.1 vs 20.4) anchors
   comparability with the other contenders' original runs.
-- The remaining c7g AVIF gap is decode-bound: dav1d's in-frame
-  threading, which cuts decode ~40% on x86 and Apple Silicon, yields no
-  speedup on Graviton3 (verified with dav1d 1.5.1 and 1.5.3).
+- The remaining c7g AVIF gap is decode-stage-bound. dav1d's in-frame
+  threading works on Graviton3 (1.9x on two cores, verified with a
+  minimal repro against dav1d 1.4.1/1.5.1/1.5.3); the stage's cost is
+  split between the AV1 decode proper (~28 ms threaded) and the
+  YUV-to-RGB conversion (~22 ms, currently scalar).
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
