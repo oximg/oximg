@@ -1,0 +1,71 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  image:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: oximg:ci
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+
+      - name: Smoke test the served pipeline
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/img && cp tests/fixtures/photo.jpg tests/fixtures/rgb.png \
+            tests/fixtures/photo.webp tests/fixtures/photo.avif tests/fixtures/alpha.avif /tmp/img/
+          docker run -d --rm --name ox -v /tmp/img:/images:ro -p 8081:8081 oximg:ci
+          for i in $(seq 1 100); do curl -sf http://127.0.0.1:8081/health >/dev/null && break; sleep 0.3; done
+
+          fetch() { # file expected-content-type
+            local got
+            got=$(curl -sf -o "/tmp/out.$1" -w '%{content_type}' "http://127.0.0.1:8081/resize/100/100/$1")
+            [ "$got" = "$2" ] || { echo "FAIL $1: content-type $got != $2"; exit 1; }
+            [ "$(stat -c%s "/tmp/out.$1")" -gt 200 ] || { echo "FAIL $1: output too small"; exit 1; }
+            echo "ok: $1 -> $2 ($(stat -c%s "/tmp/out.$1") bytes)"
+          }
+          fetch photo.jpg image/jpeg
+          head -c2 /tmp/out.photo.jpg | od -An -tx1 | grep -q "ff d8"
+          fetch rgb.png image/png
+          head -c8 /tmp/out.rgb.png | grep -q PNG
+          fetch photo.webp image/webp
+          head -c16 /tmp/out.photo.webp | grep -q WEBP
+          fetch photo.avif image/avif
+          head -c12 /tmp/out.photo.avif | grep -q ftypavif
+          fetch alpha.avif image/avif
+          head -c12 /tmp/out.alpha.avif | grep -q ftypavif
+          echo "ok: magic bytes for all five outputs"
+
+          # Round-trip: the AVIF the server just encoded must decode through
+          # the server's own pipeline.
+          mkdir -p /tmp/img-rt && cp /tmp/out.photo.avif /tmp/img-rt/rt.avif
+          docker run -d --rm --name ox2 -v /tmp/img-rt:/images:ro -p 8082:8081 oximg:ci
+          for i in $(seq 1 100); do curl -sf http://127.0.0.1:8082/health >/dev/null && break; sleep 0.3; done
+          curl -sf -o /tmp/rt.avif "http://127.0.0.1:8082/resize/50/50/rt.avif"
+          head -c12 /tmp/rt.avif | grep -q ftypavif
+          echo "ok: served AVIF round-trips through the decoder"
+
+          # Error mapping stays intact.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/100/100/missing.jpg)" = 404 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/0/100/photo.jpg)" = 400 ]
+          echo "ok: error mapping"
+
+          docker stop ox ox2 >/dev/null
