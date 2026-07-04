@@ -42,3 +42,7 @@ avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
 [[example]]
 name = "avif_parity"
 required-features = ["avif"]
+
+[[example]]
+name = "enc_loop"
+required-features = ["avif"]

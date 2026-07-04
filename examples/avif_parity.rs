@@ -43,8 +43,13 @@ fn main() -> anyhow::Result<()> {
     pos += 1;
     let (w, h): (usize, usize) = (parts[1].parse()?, parts[2].parse()?);
     let rgb = &data[pos..pos + w * h * 3];
+    let speed: i8 = std::env::var("OXIMG_SPEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let p = oximg::avif::AvifParams {
         quality: args[2].parse()?,
+        speed,
         ..Default::default()
     };
     let t = std::time::Instant::now();
