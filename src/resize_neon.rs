@@ -1,152 +1,66 @@
-//! NEON f32 separable convolution for interleaved u16 pixel rows on
+//! NEON f32 row stages for the u16 separable-convolution resize on
 //! aarch64, replacing fast_image_resize's u16 path there (which
 //! accumulates in i64 pairs — two multiply-accumulates per instruction).
-//! The window/coefficient computation mirrors fir's Lanczos3 convolution
-//! (adaptive kernel size, sum-normalized, zero-trimmed bounds).
+//! The shared driver, window math, and schedule invariants live in
+//! [`crate::resize_kernel`].
 //!
-//! Schedule (shaped by Graviton3 perf counters — the kernel is
+//! Stage design (shaped by Graviton3 perf counters — the kernel is
 //! instruction-bound, IPC ~3.2 with near-zero LLC misses):
 //! - each source row is converted from interleaved u16 to f32 exactly
 //!   once (planar for 3 channels, interleaved for 4) instead of being
 //!   re-loaded and re-widened by every overlapping window (~6x for the
 //!   benchmark shape's 24-tap windows);
-//! - horizontally convolved rows live in a ring buffer of
-//!   `window_size` rows (~150 KB for 2040->512 RGB) that the vertical
-//!   pass consumes in step, instead of an image-sized intermediate;
+//! - deinterleaving uses three-register table lookups instead of LD3
+//!   (a slow multi-uop structure load on Neoverse cores);
 //! - the vertical pass keeps its accumulators in registers across all
 //!   taps of a 16-column tile rather than round-tripping an
 //!   accumulator row through memory once per tap.
-//!
-//! Correctness contract: the f32 operation sequence per output value is
-//! preserved by all of the above (u16 -> f32 conversion is exact, so
-//! staging changes no operand values; ring placement only changes where
-//! a row is stored; register accumulation applies taps in the same
-//! ascending order). Tests assert exact output equality between the
-//! strip-mined schedule and a full-intermediate reference schedule, and
-//! track a scalar f64 ground truth within quantization tolerance.
 
-use anyhow::{Result, ensure};
+use crate::resize_kernel::{RowKernel, Windows, clamp_u16, resize_u16};
+use anyhow::Result;
 
-/// Per-axis convolution windows, identical math to fir's
-/// `precompute_coefficients` with no crop box.
-struct Windows {
-    window_size: usize,
-    /// First source index of each output pixel's window.
-    starts: Vec<usize>,
-    /// Tap count of each window.
-    sizes: Vec<usize>,
-    /// f32 coefficients, `window_size` stride per output pixel,
-    /// zero-padded past each window's size.
-    coeffs: Vec<f32>,
-}
+/// Marker type implementing [`RowKernel`] with NEON intrinsics.
+pub(crate) struct Neon;
 
-pub(crate) fn lanczos3(x: f64) -> f64 {
-    fn sinc(x: f64) -> f64 {
-        if x == 0.0 {
-            1.0
-        } else {
-            let x = x * std::f64::consts::PI;
-            x.sin() / x
-        }
+impl RowKernel for Neon {
+    fn detect() -> bool {
+        std::arch::is_aarch64_feature_detected!("neon")
     }
-    if (-3.0..3.0).contains(&x) {
-        sinc(x) * sinc(x / 3.0)
-    } else {
-        0.0
+    unsafe fn stage_x3(row: &[u16], stage: &mut [f32], w: usize) {
+        unsafe { stage_row_x3(row, stage, w) }
     }
-}
-
-impl Windows {
-    fn new(in_size: usize, out_size: usize) -> Windows {
-        let scale = in_size as f64 / out_size as f64;
-        let filter_scale = scale.max(1.0);
-        let filter_radius = 3.0 * filter_scale;
-        let window_size = filter_radius.ceil() as usize * 2 + 1;
-        let recip = 1.0 / filter_scale;
-
-        let mut starts = Vec::with_capacity(out_size);
-        let mut sizes = Vec::with_capacity(out_size);
-        let mut coeffs = vec![0f32; window_size * out_size];
-        let mut window = vec![0f64; window_size];
-
-        for out_x in 0..out_size {
-            let in_center = (out_x as f64 + 0.5) * scale;
-            let x_min = (in_center - filter_radius).floor().max(0.0) as usize;
-            let x_max = ((in_center + filter_radius).ceil() as usize).min(in_size);
-            let center = in_center - 0.5;
-
-            let mut ww = 0.0;
-            let mut n = 0usize;
-            let mut lead_trim = 0usize;
-            for x in x_min..x_max {
-                let w = lanczos3((x as f64 - center) * recip);
-                if n == 0 && w == 0.0 {
-                    lead_trim += 1; // trim leading zero taps
-                } else {
-                    window[n] = w;
-                    ww += w;
-                    n += 1;
-                }
-            }
-            let x_min = x_min + lead_trim;
-            while n > 1 && window[n - 1] == 0.0 {
-                n -= 1; // trim trailing zero taps
-            }
-            let dst = &mut coeffs[out_x * window_size..(out_x + 1) * window_size];
-            if ww != 0.0 {
-                for (d, w) in dst.iter_mut().zip(&window[..n]) {
-                    *d = (*w / ww) as f32;
-                }
-            }
-            starts.push(x_min);
-            sizes.push(n);
-        }
-        Windows {
-            window_size,
-            starts,
-            sizes,
-            coeffs,
-        }
+    unsafe fn stage_x4(row: &[u16], stage: &mut [f32]) {
+        unsafe { stage_row_x4(row, stage) }
     }
-}
-
-/// Reusable work buffers: one staged source row (f32), the ring of
-/// horizontally-convolved rows, one accumulator row set, and the ring
-/// slot offsets of the current vertical window. Grow-only; every
-/// element is written before it is read, so stale contents are never
-/// observed.
-#[derive(Default)]
-struct Scratch {
-    stage: Vec<f32>,
-    ring: Vec<f32>,
-    acc: Vec<f32>,
-    offs: Vec<usize>,
-}
-
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
-    /// Windows are pure functions of (in_size, out_size); servers hit a
-    /// handful of shapes over and over, and recomputing one costs ~20K
-    /// f64 sin() calls. Bounded: reset when it grows past 64 shapes.
-    static WINDOWS: std::cell::RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<Windows>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-}
-
-fn cached_windows(in_size: usize, out_size: usize) -> std::rc::Rc<Windows> {
-    WINDOWS.with(|w| {
-        let mut w = w.borrow_mut();
-        if w.len() > 64 {
-            w.clear();
-        }
-        w.entry((in_size, out_size))
-            .or_insert_with(|| std::rc::Rc::new(Windows::new(in_size, out_size)))
-            .clone()
-    })
-}
-
-fn grow(buf: &mut Vec<f32>, len: usize) {
-    if buf.len() < len {
-        buf.resize(len, 0.0);
+    unsafe fn horiz_x3(
+        stage: &[f32],
+        src_w: usize,
+        w: &Windows,
+        ring: &mut [f32],
+        plane: usize,
+        slot: usize,
+        dst_w: usize,
+    ) {
+        unsafe { horiz_row_x3(stage, src_w, w, ring, plane, slot, dst_w) }
+    }
+    unsafe fn horiz_x4(
+        stage: &[f32],
+        w: &Windows,
+        ring: &mut [f32],
+        plane: usize,
+        slot: usize,
+        dst_w: usize,
+    ) {
+        unsafe { horiz_row_x4(stage, w, ring, plane, slot, dst_w) }
+    }
+    unsafe fn vert(plane: &[f32], coeffs: &[f32], offs: &[usize], dst_w: usize, acc: &mut [f32]) {
+        unsafe { vert_accumulate(plane, coeffs, offs, dst_w, acc) }
+    }
+    unsafe fn store_x3(acc: &[f32], dst_w: usize, out: &mut [u16]) {
+        unsafe { store_row_x3(acc, dst_w, out) }
+    }
+    unsafe fn store_x4(acc: &[f32], dst_w: usize, out: &mut [u16]) {
+        unsafe { store_row_x4(acc, dst_w, out) }
     }
 }
 
@@ -161,113 +75,7 @@ pub fn resize_u16_neon(
     dst_h: usize,
     channels: usize,
 ) -> Result<()> {
-    ensure!(channels == 3 || channels == 4, "unsupported channel count");
-    ensure!(
-        src_w > 0 && src_h > 0 && dst_w > 0 && dst_h > 0,
-        "empty dimensions"
-    );
-    let (pre, src, post) = unsafe { src_bytes.align_to::<u16>() };
-    ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 src");
-    let (pre, dst, post) = unsafe { dst_bytes.align_to_mut::<u16>() };
-    ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 dst");
-    ensure!(src.len() >= src_w * src_h * channels, "src too small");
-    ensure!(dst.len() >= dst_w * dst_h * channels, "dst too small");
-
-    let wh = cached_windows(src_w, dst_w);
-    let wv = cached_windows(src_h, dst_h);
-    // Ring capacity: every vertical window's span is <= window_size (the
-    // raw span ceil(c+r)-floor(c-r) < 2r+2 <= window_size+1, and clamping
-    // or zero-trimming only shrinks it), and window ends are
-    // non-decreasing in oy, so end-driven fill never evicts a live row.
-    let cap = wv.window_size.min(src_h).max(1);
-    run(
-        src, src_w, src_h, dst, dst_w, dst_h, channels, &wh, &wv, cap,
-    );
-    Ok(())
-}
-
-/// Shared driver: `cap == src_h` degenerates the ring into a full
-/// intermediate image (the reference schedule used by tests).
-#[allow(clippy::too_many_arguments)]
-fn run(
-    src: &[u16],
-    src_w: usize,
-    _src_h: usize,
-    dst: &mut [u16],
-    dst_w: usize,
-    dst_h: usize,
-    channels: usize,
-    wh: &Windows,
-    wv: &Windows,
-    cap: usize,
-) {
-    SCRATCH.with(|s| {
-        let s = &mut *s.borrow_mut();
-        let (stage, ring, acc, offs) = (&mut s.stage, &mut s.ring, &mut s.acc, &mut s.offs);
-        grow(stage, src_w * channels);
-        let plane = cap * dst_w;
-        grow(ring, plane * channels);
-        grow(acc, dst_w * channels);
-        if offs.len() < wv.window_size {
-            offs.resize(wv.window_size, 0);
-        }
-
-        unsafe {
-            let mut next_row = 0usize;
-            for oy in 0..dst_h {
-                let start = wv.starts[oy];
-                let size = wv.sizes[oy];
-                // Produce horizontally-convolved rows up to this output
-                // row's window end (window ends never decrease).
-                while next_row < start + size {
-                    let row = &src[next_row * src_w * channels..(next_row + 1) * src_w * channels];
-                    let slot = (next_row % cap) * dst_w;
-                    if channels == 3 {
-                        stage_row_x3(row, &mut stage[..src_w * 3], src_w);
-                        horiz_row_x3(
-                            &stage[..src_w * 3],
-                            src_w,
-                            wh,
-                            &mut ring[..],
-                            plane,
-                            slot,
-                            dst_w,
-                        );
-                    } else {
-                        stage_row_x4(row, &mut stage[..src_w * 4]);
-                        horiz_row_x4(&stage[..src_w * 4], wh, &mut ring[..], plane, slot, dst_w);
-                    }
-                    next_row += 1;
-                }
-                let coeffs = &wv.coeffs[oy * wv.window_size..oy * wv.window_size + size];
-                // Ring slot offsets for this window, one wrap-increment per
-                // tap instead of a modulo in the accumulation inner loop.
-                let mut slot = start % cap;
-                for o in offs[..size].iter_mut() {
-                    *o = slot * dst_w;
-                    slot += 1;
-                    if slot == cap {
-                        slot = 0;
-                    }
-                }
-                for c in 0..channels {
-                    vert_accumulate(
-                        &ring[c * plane..(c + 1) * plane],
-                        coeffs,
-                        &offs[..size],
-                        dst_w,
-                        &mut acc[c * dst_w..(c + 1) * dst_w],
-                    );
-                }
-                let out_row = &mut dst[oy * dst_w * channels..(oy + 1) * dst_w * channels];
-                if channels == 3 {
-                    store_row_x3(acc, dst_w, out_row);
-                } else {
-                    store_row_x4(acc, dst_w, out_row);
-                }
-            }
-        }
-    });
+    resize_u16::<Neon>(src_bytes, src_w, src_h, dst_bytes, dst_w, dst_h, channels)
 }
 
 /// Deinterleave one u16 RGB row into three planar f32 rows
@@ -563,258 +371,19 @@ unsafe fn store_row_x4(acc: &[f32], dst_w: usize, out: &mut [u16]) {
     }
 }
 
-fn clamp_u16(v: f32) -> u16 {
-    (v + 0.5).clamp(0.0, 65535.0) as u16
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fast_image_resize::images::{Image, ImageRef};
-    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
-
-    /// Deterministic synthetic image: gradients plus LCG noise so
-    /// convolution windows see realistic variation.
-    fn test_image(w: usize, h: usize, ch: usize) -> Vec<u16> {
-        let mut seed = 0x2545F491u32;
-        let mut px = Vec::with_capacity(w * h * ch);
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..ch {
-                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                    let noise = (seed >> 16) & 0x3FFF;
-                    let base = (x * 48000 / w + y * 16000 / h + c * 999) as u32;
-                    px.push(((base + noise).min(65535)) as u16);
-                }
-            }
-        }
-        px
-    }
-
-    fn fir_resize(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize, ch: usize) -> Vec<u16> {
-        let px = if ch == 3 {
-            PixelType::U16x3
-        } else {
-            PixelType::U16x4
-        };
-        let src_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len() * 2) };
-        let src_view = ImageRef::new(sw as u32, sh as u32, src_bytes, px).unwrap();
-        let mut dst = Image::new(dw as u32, dh as u32, px);
-        let opts = ResizeOptions::new()
-            .resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))
-            .use_alpha(false); // compare plain convolution on both sides
-        Resizer::new().resize(&src_view, &mut dst, &opts).unwrap();
-        dst.buffer()
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect()
-    }
-
-    fn neon_resize(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize, ch: usize) -> Vec<u16> {
-        let src_bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len() * 2) };
-        let mut dst = vec![0u16; dw * dh * ch];
-        let dst_bytes: &mut [u8] =
-            unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len() * 2) };
-        resize_u16_neon(src_bytes, sw, sh, dst_bytes, dw, dh, ch).unwrap();
-        dst
-    }
-
-    /// Reference schedule: same kernels, ring capacity = src_h (a full
-    /// intermediate image, i.e. the unstripped two-pass schedule).
-    fn reference_resize(
-        src: &[u16],
-        sw: usize,
-        sh: usize,
-        dw: usize,
-        dh: usize,
-        ch: usize,
-    ) -> Vec<u16> {
-        let wh = Windows::new(sw, dw);
-        let wv = Windows::new(sh, dh);
-        let mut dst = vec![0u16; dw * dh * ch];
-        run(src, sw, sh, &mut dst, dw, dh, ch, &wh, &wv, sh);
-        dst
-    }
-
-    /// Scalar f64 separable resize with un-quantized intermediate:
-    /// ground truth for accuracy comparisons.
-    fn ref_resize_f64(
-        src: &[u16],
-        sw: usize,
-        sh: usize,
-        dw: usize,
-        dh: usize,
-        ch: usize,
-    ) -> Vec<u16> {
-        struct W64 {
-            starts: Vec<usize>,
-            windows: Vec<Vec<f64>>,
-        }
-        fn windows64(in_size: usize, out_size: usize) -> W64 {
-            let scale = in_size as f64 / out_size as f64;
-            let fs = scale.max(1.0);
-            let radius = 3.0 * fs;
-            let recip = 1.0 / fs;
-            let (mut starts, mut windows) = (Vec::new(), Vec::new());
-            for o in 0..out_size {
-                let center = (o as f64 + 0.5) * scale;
-                let x_min = (center - radius).floor().max(0.0) as usize;
-                let x_max = ((center + radius).ceil() as usize).min(in_size);
-                let c = center - 0.5;
-                let mut win = Vec::new();
-                let mut lead = 0usize;
-                for x in x_min..x_max {
-                    let w = lanczos3((x as f64 - c) * recip);
-                    if win.is_empty() && w == 0.0 {
-                        lead += 1;
-                    } else {
-                        win.push(w);
-                    }
-                }
-                let x_min = x_min + lead;
-                while win.len() > 1 && *win.last().unwrap() == 0.0 {
-                    win.pop();
-                }
-                let ww: f64 = win.iter().sum();
-                if ww != 0.0 {
-                    win.iter_mut().for_each(|w| *w /= ww);
-                }
-                starts.push(x_min);
-                windows.push(win);
-            }
-            W64 { starts, windows }
-        }
-        let wh = windows64(sw, dw);
-        let wv = windows64(sh, dh);
-        let mut mid = vec![0f64; dw * sh * ch];
-        for y in 0..sh {
-            for ox in 0..dw {
-                for c in 0..ch {
-                    let mut s = 0f64;
-                    for (k, &w) in wh.windows[ox].iter().enumerate() {
-                        s += w * src[(y * sw + wh.starts[ox] + k) * ch + c] as f64;
-                    }
-                    mid[(y * dw + ox) * ch + c] = s;
-                }
-            }
-        }
-        let mut out = vec![0u16; dw * dh * ch];
-        for oy in 0..dh {
-            for x in 0..dw {
-                for c in 0..ch {
-                    let mut s = 0f64;
-                    for (k, &w) in wv.windows[oy].iter().enumerate() {
-                        s += w * mid[((wv.starts[oy] + k) * dw + x) * ch + c];
-                    }
-                    out[(oy * dw + x) * ch + c] = s.round().clamp(0.0, 65535.0) as u16;
-                }
-            }
-        }
-        out
-    }
-
-    fn rmse(a: &[u16], b: &[u16]) -> f64 {
-        let se: f64 = a
-            .iter()
-            .zip(b)
-            .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
-            .sum();
-        (se / a.len() as f64).sqrt()
-    }
-
-    /// The NEON kernel must track the f64 ground truth at least as
-    /// closely as fir does (fir quantizes its intermediate image to u16;
-    /// we keep f32 rows), and stay within a couple of quantization steps
-    /// of the truth itself.
-    fn assert_accuracy(sw: usize, sh: usize, dw: usize, dh: usize, ch: usize, label: &str) {
-        let src = test_image(sw, sh, ch);
-        let ours = neon_resize(&src, sw, sh, dw, dh, ch);
-        let fir = fir_resize(&src, sw, sh, dw, dh, ch);
-        let truth = ref_resize_f64(&src, sw, sh, dw, dh, ch);
-
-        let ours_err = rmse(&ours, &truth);
-        let fir_err = rmse(&fir, &truth);
-        let worst_vs_truth = ours
-            .iter()
-            .zip(&truth)
-            .map(|(&x, &y)| x.abs_diff(y))
-            .max()
-            .unwrap();
-        assert!(
-            ours_err <= fir_err + 0.05,
-            "{label}: ours rmse {ours_err:.4} vs truth worse than fir {fir_err:.4}"
-        );
-        assert!(
-            worst_vs_truth <= 2,
-            "{label}: worst diff vs f64 truth {worst_vs_truth} > 2 (rmse {ours_err:.4})"
-        );
-        // (On mild scale factors fir's u16-quantized intermediate rows
-        // drift much further from the f64 truth than the f32 kernel does
-        // on noisy content, so no closeness-to-fir bound is asserted.)
-        let _ = fir;
-    }
-
-    /// Shape sweep used by the schedule-equality test: the benchmark
-    /// shape, primes, tiny images (src_h < ring capacity), upscales
-    /// (heavily overlapping windows), single-row outputs, and extreme
-    /// aspect changes.
-    const SHAPES: [(usize, usize, usize, usize); 10] = [
-        (2040, 1356, 512, 340),
-        (640, 480, 512, 384),
-        (333, 217, 100, 65),
-        (17, 11, 5, 3),
-        (127, 83, 31, 29),
-        (50, 40, 120, 96),
-        (64, 64, 17, 9),
-        (100, 7, 50, 3),
-        (9, 300, 7, 150),
-        (256, 199, 256, 1),
-    ];
+    use crate::resize_kernel::testkit;
 
     #[test]
     fn strip_schedule_equals_full_intermediate_schedule_exactly() {
-        for &(sw, sh, dw, dh) in &SHAPES {
-            for ch in [3usize, 4] {
-                let src = test_image(sw, sh, ch);
-                let strip = neon_resize(&src, sw, sh, dw, dh, ch);
-                let full = reference_resize(&src, sw, sh, dw, dh, ch);
-                assert_eq!(strip, full, "{sw}x{sh}->{dw}x{dh} x{ch}");
-            }
-        }
+        testkit::assert_schedule_equality::<Neon>();
     }
 
     #[test]
-    fn ring_capacity_invariant_holds_for_all_small_dimensions() {
-        // The strip schedule is safe iff, at the moment output row oy is
-        // computed, every live row start..start+size still resides in the
-        // ring: fill has reached exactly end = start+size, so the oldest
-        // retained row is end - cap and the invariant is
-        // end - start <= cap for cap = window_size.min(in_size).
-        for in_size in 1..=64usize {
-            for out_size in 1..=64usize {
-                let w = Windows::new(in_size, out_size);
-                let cap = w.window_size.min(in_size).max(1);
-                for o in 0..out_size {
-                    assert!(
-                        w.sizes[o] <= cap,
-                        "{in_size}->{out_size} window {o}: size {} > cap {cap}",
-                        w.sizes[o]
-                    );
-                }
-                // window ends must be non-decreasing for end-driven fill
-                let mut prev_end = 0usize;
-                for o in 0..out_size {
-                    let end = w.starts[o] + w.sizes[o];
-                    assert!(
-                        end >= prev_end,
-                        "{in_size}->{out_size}: end regressed at {o}"
-                    );
-                    prev_end = end;
-                }
-            }
-        }
+    fn streaming_with_trailing_rows_matches_full_frame() {
+        testkit::assert_streaming_with_trailing_rows::<Neon>();
     }
 
     #[test]
@@ -825,38 +394,34 @@ mod tests {
             (333, 217, 100, 65),
             (17, 11, 5, 3),
         ] {
-            assert_accuracy(sw, sh, dw, dh, 3, &format!("rgb {sw}x{sh}->{dw}x{dh}"));
+            testkit::assert_accuracy::<Neon>(
+                sw,
+                sh,
+                dw,
+                dh,
+                3,
+                &format!("rgb {sw}x{sh}->{dw}x{dh}"),
+            );
         }
     }
 
     #[test]
     fn tracks_ground_truth_for_rgba() {
         for (sw, sh, dw, dh) in [(801, 601, 256, 192), (64, 64, 17, 9)] {
-            assert_accuracy(sw, sh, dw, dh, 4, &format!("rgba {sw}x{sh}->{dw}x{dh}"));
+            testkit::assert_accuracy::<Neon>(
+                sw,
+                sh,
+                dw,
+                dh,
+                4,
+                &format!("rgba {sw}x{sh}->{dw}x{dh}"),
+            );
         }
     }
 
     #[test]
     fn tracks_ground_truth_when_upscaling() {
-        assert_accuracy(50, 40, 120, 96, 3, "rgb upscale");
-    }
-
-    #[test]
-    fn windows_are_normalized_and_in_bounds() {
-        for (in_s, out_s) in [(2040, 512), (100, 99), (7, 3), (3, 7)] {
-            let w = Windows::new(in_s, out_s);
-            for i in 0..out_s {
-                assert!(w.starts[i] + w.sizes[i] <= in_s, "{in_s}->{out_s} px {i}");
-                let sum: f64 = w.coeffs[i * w.window_size..i * w.window_size + w.sizes[i]]
-                    .iter()
-                    .map(|&c| c as f64)
-                    .sum();
-                assert!(
-                    (sum - 1.0).abs() < 1e-4,
-                    "{in_s}->{out_s} px {i}: sum={sum}"
-                );
-            }
-        }
+        testkit::assert_accuracy::<Neon>(50, 40, 120, 96, 3, "rgb upscale");
     }
 
     #[test]
