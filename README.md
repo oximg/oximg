@@ -122,13 +122,13 @@ docker run -p 8081:8081 -v $PWD/images:/images:ro ghcr.io/oximg/oximg:latest
 curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
-**Homebrew** (builds v0.1.0 from source; JPEG/PNG/WebP, no AVIF):
+**Homebrew** (builds v0.2.0 from source; JPEG/PNG/WebP, no AVIF):
 
 ```sh
 brew install oximg/tap/oximg
 ```
 
-**Cargo** (crates.io, v0.1.0; add `--features avif` if SVT-AV1 >= 4.1
+**Cargo** (crates.io, v0.2.0; add `--features avif` if SVT-AV1 >= 4.1
 and dav1d are installed and visible to pkg-config):
 
 ```sh
@@ -197,8 +197,7 @@ default).
 ## Status
 
 Experimental PoC — APIs and the HTTP interface will change without
-notice. The `oximg` crates.io / `@oximg` npm packages are name
-reservations for now.
+notice. The `@oximg` npm package is a name reservation.
 
 ## License
 
