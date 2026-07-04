@@ -10,6 +10,66 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- Cross-format output: an imgproxy-style `@{fmt}` token on the filename
+  (`/resize/300/200/photo.jpg@webp`; `jpg`/`jpeg`, `png`, `webp`,
+  `avif` — `jxl` reserved) re-encodes any supported source in the
+  requested format. Unknown suffixes stay part of the filename, and
+  signed URLs cover the token, so a signature for one format does not
+  authorize a heavier one. Alpha sources targeting JPEG are flattened
+  in linear light onto `OXIMG_FLATTEN_BG` (hex, default white).
+- Opt-in `Accept` negotiation for bare URLs: `OXIMG_AUTO_FORMAT`
+  (comma-separated preference list, e.g. `avif,webp`); when enabled,
+  every `/resize` response carries a config-static `Vary: Accept`.
+  Precedence: explicit `@{fmt}` > negotiated > source format.
+- `pipeline::Params` gains `output: Option<ImageFormat>` (`None` keeps
+  the sniff-and-match behavior, byte-identical to 0.2.0), and
+  `ImageFormat` gains `from_token`. `qcli` gains a `transcode` mode.
+  **Breaking** for library users writing exhaustive `Params { ... }`
+  literals — the next release must be 0.3.0, not 0.2.x.
+
+### Changed
+
+- Request coalescing keys on the resolved output format, so mixed
+  same-URL traffic (e.g. `photo.jpg` and `photo.jpg@webp`) can never
+  share a response. Same-format requests keep the fused JPEG path and
+  its byte-identical output; cross-format JPEG requests stream through
+  the same SIMD resize kernel without the second-thread overlap.
+- Fully opaque RGBA no longer pays for an AVIF alpha item: an
+  early-exit scan drops it to the 3-channel output (byte-identical to
+  encoding the same pixels as RGB), skipping the second SVT-AV1
+  session entirely. Images with any transparency are unaffected.
+- Cross-format JPEG requests now fuse too: decode overlaps the SIMD
+  resize into the pixel buffer on a second thread (same `OXIMG_OVERLAP`
+  gate and byte-identical output vs the serial path), with the one-shot
+  WebP/AVIF/PNG encode after — ~-10-12% single-request latency on
+  JPEG→WebP/AVIF locally. The same-format jpegli fused path is
+  untouched.
+- The encode-side RGB→YUV conversion (AVIF output) gained NEON row
+  kernels on aarch64, bit-identical to the scalar reference (the
+  division is replaced by an exhaustively-proven exact magic-multiply;
+  chroma mirrors the f32 arithmetic operation for operation). Not
+  measurable end-to-end at thumbnail sizes; scales with output
+  resolution.
+
+### Fixed
+
+- Truncated or malformed AVIF containers now return a parse error
+  instead of crashing the request: avif-parse 2.1.0 can panic on such
+  input (internal parser-state assertion), so the container parse is
+  unwind-caught at the library boundary — quietly (no crash-shaped
+  stderr trace per malformed input), with the upstream assertion text
+  preserved in the error message.
+- `OXIMG_RESIZE_BACKEND=fir` now also disables the fused decode overlap
+  (both the jpegli and the new cross-format variants): the fused
+  workers run the in-tree SIMD kernel, so fusing under the fir escape
+  hatch made a URL's bytes depend on the instantaneous load gate.
+- Fused workers return their kernel scratch to the request thread's
+  pool instead of leaking it into the ephemeral worker's TLS, and a
+  failed worker-thread spawn (thread limits) now falls back to the
+  byte-identical serial path instead of failing the request.
+
 ## [0.2.0] - 2026-07-04
 
 ### Added

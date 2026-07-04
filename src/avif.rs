@@ -15,7 +15,10 @@ fn quality_to_qp(quality: u8) -> u32 {
 /// RGB(A)8 -> 10-bit 4:2:0 YUV, BT.601 matrix, full range (matching the
 /// avifenc defaults used in the encoder study). Chroma is averaged over
 /// each 2x2 block; an alpha channel, if present, is ignored here (it is
-/// encoded as a separate auxiliary image).
+/// encoded as a separate auxiliary image). The scalar rows are the
+/// reference; the aarch64 NEON rows mirror their arithmetic operation
+/// for operation and are asserted bit-identical in tests (the yuv.rs
+/// contract). x86-64 AVX2 rows are a possible follow-up.
 fn rgb_to_yuv420_10bit(
     pixels: &[u8],
     w: usize,
@@ -39,40 +42,224 @@ fn rgb_to_yuv420_10bit(
         plane.truncate(len);
     }
 
-    // Luma: Y10 = (0.299 R + 0.587 G + 0.114 B) * 1023/255, fixed point.
-    // Coefficients sum to 4096, so the pre-scale maximum is 4096*255 and the
-    // rounding divide maps 255 -> exactly 1023 (never 1024: out-of-range
-    // samples make SVT emit full-scale luma garbage in the affected blocks).
-    for (i, px) in pixels.chunks_exact(channels).enumerate() {
-        let (r, g, b) = (px[0] as u32, px[1] as u32, px[2] as u32);
-        y_plane[i] = (((1225 * r + 2404 * g + 467 * b) * 1023 + 522_240) / 1_044_480) as u16;
+    luma_rows(&pixels[..w * h * channels], channels, y_plane);
+    chroma_rows(pixels, w, h, channels, cb_plane, cr_plane);
+}
+
+/// Luma: Y10 = (0.299 R + 0.587 G + 0.114 B) * 1023/255, fixed point.
+/// Coefficients sum to 4096, so the pre-scale maximum is 4096*255 and the
+/// rounding divide maps 255 -> exactly 1023 (never 1024: out-of-range
+/// samples make SVT emit full-scale luma garbage in the affected blocks).
+fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
+    #[cfg(target_arch = "aarch64")]
+    if crate::yuv::neon() {
+        return unsafe { neon_enc::luma_rows(pixels, channels, y_plane) };
     }
-    // Chroma from 2x2-averaged RGB.
+    luma_rows_scalar(pixels, channels, y_plane);
+}
+
+fn luma_rows_scalar(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
+    for (px, y) in pixels.chunks_exact(channels).zip(y_plane.iter_mut()) {
+        *y = luma_px(px[0], px[1], px[2]);
+    }
+}
+
+#[inline]
+fn luma_px(r: u8, g: u8, b: u8) -> u16 {
+    let (r, g, b) = (r as u32, g as u32, b as u32);
+    (((1225 * r + 2404 * g + 467 * b) * 1023 + 522_240) / 1_044_480) as u16
+}
+
+fn chroma_rows(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    cb_plane: &mut [u16],
+    cr_plane: &mut [u16],
+) {
+    #[cfg(target_arch = "aarch64")]
+    if crate::yuv::neon() {
+        return unsafe { neon_enc::chroma_rows(pixels, w, h, channels, cb_plane, cr_plane) };
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     for cy in 0..ch {
         for cx in 0..cw {
-            let (mut rs, mut gs, mut bs, mut n) = (0u32, 0u32, 0u32, 0u32);
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let (x, yy) = (cx * 2 + dx, cy * 2 + dy);
-                    if x < w && yy < h {
-                        let p = (yy * w + x) * channels;
-                        rs += pixels[p] as u32;
-                        gs += pixels[p + 1] as u32;
-                        bs += pixels[p + 2] as u32;
-                        n += 1;
+            let (cb, cr) = chroma_block(pixels, w, h, channels, cx, cy);
+            cb_plane[cy * cw + cx] = cb;
+            cr_plane[cy * cw + cx] = cr;
+        }
+    }
+}
+
+/// Chroma from the 2x2-averaged RGB block at (cx, cy); partial blocks
+/// at the right/bottom edges average the pixels that exist. The scalar
+/// reference for both the scalar loop and the NEON edge handling.
+#[inline]
+fn chroma_block(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    cx: usize,
+    cy: usize,
+) -> (u16, u16) {
+    let (mut rs, mut gs, mut bs, mut n) = (0u32, 0u32, 0u32, 0u32);
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let (x, yy) = (cx * 2 + dx, cy * 2 + dy);
+            if x < w && yy < h {
+                let p = (yy * w + x) * channels;
+                rs += pixels[p] as u32;
+                gs += pixels[p + 1] as u32;
+                bs += pixels[p + 2] as u32;
+                n += 1;
+            }
+        }
+    }
+    let (r, g, b) = (
+        rs as f32 / n as f32,
+        gs as f32 / n as f32,
+        bs as f32 / n as f32,
+    );
+    let y = 0.299 * r + 0.587 * g + 0.114 * b;
+    let cb = (b - y) * (0.5 / (1.0 - 0.114)) * (1023.0 / 255.0) + 512.0;
+    let cr = (r - y) * (0.5 / (1.0 - 0.299)) * (1023.0 / 255.0) + 512.0;
+    (
+        (cb.round() as i32).clamp(0, 1023) as u16,
+        (cr.round() as i32).clamp(0, 1023) as u16,
+    )
+}
+
+/// Encode-side RGB(A)8 -> YUV NEON rows, mirroring the scalar reference
+/// operation for operation (same integer formula for luma via an exact
+/// division identity, same f32 order for chroma, no FMA contraction) so
+/// output is bit-identical — asserted exhaustively in tests.
+#[cfg(target_arch = "aarch64")]
+mod neon_enc {
+    use std::arch::aarch64::*;
+
+    /// Deinterleave 8 RGB(A) pixels starting at `p`.
+    /// Safety: caller guarantees 8 full pixels at `p`; NEON enabled.
+    #[inline]
+    unsafe fn load8(p: *const u8, channels: usize) -> (uint8x8_t, uint8x8_t, uint8x8_t) {
+        unsafe {
+            if channels == 3 {
+                let v = vld3_u8(p);
+                (v.0, v.1, v.2)
+            } else {
+                let v = vld4_u8(p);
+                (v.0, v.1, v.2)
+            }
+        }
+    }
+
+    /// The scalar luma divide, vectorized exactly: the divisor factors
+    /// as 1044480 = 4096 * 255, floor division composes through the
+    /// factors, and (t * 8421505) >> 31 == floor(t / 255) — the
+    /// round-up magic m = ceil(2^31/255) with error e = m*255 - 2^31 =
+    /// 127, exact for every t <= floor(2^31/127) = 16.9M, far above
+    /// this path's t <= 260992. Proven exhaustively in
+    /// tests::luma_divider_identity_is_exact.
+    #[inline]
+    unsafe fn luma4(r: uint16x4_t, g: uint16x4_t, b: uint16x4_t) -> uint16x4_t {
+        unsafe {
+            let acc = vmlal_n_u16(vmlal_n_u16(vmull_n_u16(r, 1225), g, 2404), b, 467);
+            let acc = vaddq_u32(vmulq_n_u32(acc, 1023), vdupq_n_u32(522_240));
+            let t = vshrq_n_u32::<12>(acc);
+            let lo = vshrq_n_u64::<31>(vmull_n_u32(vget_low_u32(t), 8_421_505));
+            let hi = vshrq_n_u64::<31>(vmull_n_u32(vget_high_u32(t), 8_421_505));
+            vmovn_u32(vcombine_u32(vmovn_u64(lo), vmovn_u64(hi)))
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
+        unsafe {
+            let n = y_plane.len();
+            let mut i = 0;
+            while i + 8 <= n {
+                let (r, g, b) = load8(pixels.as_ptr().add(i * channels), channels);
+                let (r, g, b) = (vmovl_u8(r), vmovl_u8(g), vmovl_u8(b));
+                let y = vcombine_u16(
+                    luma4(vget_low_u16(r), vget_low_u16(g), vget_low_u16(b)),
+                    luma4(vget_high_u16(r), vget_high_u16(g), vget_high_u16(b)),
+                );
+                vst1q_u16(y_plane.as_mut_ptr().add(i), y);
+                i += 8;
+            }
+            for (j, y) in y_plane.iter_mut().enumerate().skip(i) {
+                let p = j * channels;
+                *y = super::luma_px(pixels[p], pixels[p + 1], pixels[p + 2]);
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn chroma_rows(
+        pixels: &[u8],
+        w: usize,
+        h: usize,
+        channels: usize,
+        cb_plane: &mut [u16],
+        cr_plane: &mut [u16],
+    ) {
+        // The same f32 constants the scalar reference spells inline.
+        const CB1: f32 = 0.5 / (1.0 - 0.114);
+        const CR1: f32 = 0.5 / (1.0 - 0.299);
+        const SCALE: f32 = 1023.0 / 255.0;
+        unsafe {
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let four = vdupq_n_f32(4.0);
+            let v512 = vdupq_n_f32(512.0);
+            let vmax = vdupq_n_s32(1023);
+            for cy in 0..ch {
+                let y0 = cy * 2;
+                let mut cx = 0usize;
+                // Vector path: 4 chroma columns = 8 source pixels, both
+                // rows in range, so every block is a full 2x2 (n = 4).
+                if y0 + 1 < h {
+                    while cx * 2 + 8 <= w {
+                        let p0 = pixels.as_ptr().add((y0 * w + cx * 2) * channels);
+                        let p1 = pixels.as_ptr().add(((y0 + 1) * w + cx * 2) * channels);
+                        let (r0, g0, b0) = load8(p0, channels);
+                        let (r1, g1, b1) = load8(p1, channels);
+                        // Pairwise-add columns, then the two rows: the
+                        // 2x2 sums for 4 chroma columns (max 1020).
+                        let rs = vadd_u16(vpaddl_u8(r0), vpaddl_u8(r1));
+                        let gs = vadd_u16(vpaddl_u8(g0), vpaddl_u8(g1));
+                        let bs = vadd_u16(vpaddl_u8(b0), vpaddl_u8(b1));
+                        // Mirror the scalar: sums / n, then the mul/add
+                        // chain in source order (no FMA).
+                        let r = vdivq_f32(vcvtq_f32_u32(vmovl_u16(rs)), four);
+                        let g = vdivq_f32(vcvtq_f32_u32(vmovl_u16(gs)), four);
+                        let b = vdivq_f32(vcvtq_f32_u32(vmovl_u16(bs)), four);
+                        let y = vaddq_f32(
+                            vaddq_f32(vmulq_n_f32(r, 0.299), vmulq_n_f32(g, 0.587)),
+                            vmulq_n_f32(b, 0.114),
+                        );
+                        let cb =
+                            vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(b, y), CB1), SCALE), v512);
+                        let cr =
+                            vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(r, y), CR1), SCALE), v512);
+                        // round() then clamp(0, 1023): ties-away convert,
+                        // min against 1023, saturating-unsigned narrow
+                        // (which floors negatives at 0).
+                        let cb = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cb), vmax));
+                        let cr = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cr), vmax));
+                        vst1_u16(cb_plane.as_mut_ptr().add(cy * cw + cx), cb);
+                        vst1_u16(cr_plane.as_mut_ptr().add(cy * cw + cx), cr);
+                        cx += 4;
                     }
                 }
+                // Right-edge columns and the odd-height bottom row take
+                // the scalar reference block (partial 2x2 averages).
+                for cx in cx..cw {
+                    let (cb, cr) = super::chroma_block(pixels, w, h, channels, cx, cy);
+                    cb_plane[cy * cw + cx] = cb;
+                    cr_plane[cy * cw + cx] = cr;
+                }
             }
-            let (r, g, b) = (
-                rs as f32 / n as f32,
-                gs as f32 / n as f32,
-                bs as f32 / n as f32,
-            );
-            let y = 0.299 * r + 0.587 * g + 0.114 * b;
-            let cb = (b - y) * (0.5 / (1.0 - 0.114)) * (1023.0 / 255.0) + 512.0;
-            let cr = (r - y) * (0.5 / (1.0 - 0.299)) * (1023.0 / 255.0) + 512.0;
-            cb_plane[cy * cw + cx] = (cb.round() as i32).clamp(0, 1023) as u16;
-            cr_plane[cy * cw + cx] = (cr.round() as i32).clamp(0, 1023) as u16;
         }
     }
 }
@@ -136,7 +323,13 @@ pub fn encode_avif(
             p,
         )
     })?;
-    let alpha = if channels == 4 {
+    // A fully opaque alpha plane would still cost a whole second SVT
+    // session; the scan below is one early-exit pass (first transparent
+    // pixel aborts it), so alpha-bearing images pay ~nothing and opaque
+    // RGBA drops to the 3-channel output — byte-identical to encoding
+    // the same pixels as RGB, since the color path ignores px[3].
+    let has_alpha = channels == 4 && pixels[..w * h * 4].chunks_exact(4).any(|px| px[3] != 255);
+    let alpha = if has_alpha {
         let a_plane: Vec<u16> = pixels
             .chunks_exact(4)
             .map(|px| ((px[3] as u32 * 1023 + 128) / 255) as u16)
@@ -306,11 +499,63 @@ const EAGAIN: std::os::raw::c_int = 11;
 #[cfg(not(target_os = "linux"))]
 const EAGAIN: std::os::raw::c_int = 35;
 
+thread_local! {
+    /// Set while the deliberately unwind-caught avif-parse call runs, so
+    /// the filtering panic hook stays silent for it: without this, every
+    /// attacker-supplied malformed AVIF would print a crash-shaped trace
+    /// (and, under RUST_BACKTRACE, serialize on the global backtrace
+    /// lock) even though the request fails cleanly.
+    static SUPPRESS_PANIC_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install (once) a panic hook that skips logging for panics this
+/// module catches on purpose and delegates to the previous hook for
+/// everything else.
+fn install_quiet_panic_hook() {
+    static HOOK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !SUPPRESS_PANIC_LOG.with(|s| s.get()) {
+                prev(info);
+            }
+        }));
+    });
+}
+
+/// avif-parse can panic on truncated/malformed containers (internal
+/// parser-state assertions, observed in 2.1.0); malformed input must
+/// surface as a parse error, not a crash, so the call is unwind-caught.
+/// The crate is pure Rust and the input is a shared slice, so no state
+/// can be left torn.
+fn read_avif_container(data: &[u8]) -> Result<avif_parse::AvifData> {
+    install_quiet_panic_hook();
+    struct Unsuppress;
+    impl Drop for Unsuppress {
+        fn drop(&mut self) {
+            SUPPRESS_PANIC_LOG.with(|s| s.set(false));
+        }
+    }
+    SUPPRESS_PANIC_LOG.with(|s| s.set(true));
+    let _guard = Unsuppress;
+    match std::panic::catch_unwind(|| avif_parse::read_avif(&mut std::io::Cursor::new(data))) {
+        Ok(parsed) => parsed.context("parse AVIF container"),
+        // Keep the assertion text: it identifies which upstream bug fired.
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            Err(anyhow::anyhow!("AVIF container parse panicked: {msg}"))
+        }
+    }
+}
+
 /// Container-level probe: dimensions from the primary item's AV1
 /// sequence header, no pixel decoding.
 pub fn probe_avif(data: &[u8]) -> Result<(usize, usize)> {
-    let avif =
-        avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
+    let avif = read_avif_container(data)?;
     let meta = avif
         .primary_item_metadata()
         .context("parse AV1 sequence header")?;
@@ -333,8 +578,7 @@ pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize, usize)> {
 
 /// Like [`decode_avif`], but reuses `out` as the pixel buffer.
 pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize, usize)> {
-    let avif =
-        avif_parse::read_avif(&mut std::io::Cursor::new(data)).context("parse AVIF container")?;
+    let avif = read_avif_container(data)?;
     let (w, h) = with_decoded_picture(&avif.primary_item, |pic| picture_to_rgb(pic, out))?;
     let Some(alpha_item) = avif.alpha_item.as_deref() else {
         return Ok((w, h, 3));
@@ -652,6 +896,84 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-random pixels covering 0 and 255 exactly.
+    fn pixel_samples(n: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|i| match i % 17 {
+                0 => 0,
+                1 => 255,
+                _ => {
+                    s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (s >> 24) as u8
+                }
+            })
+            .collect()
+    }
+
+    /// The NEON luma path replaces `acc / 1044480` with
+    /// `((acc >> 12) * 8421505) >> 31`; prove both identities it stacks
+    /// (factor split and magic-multiply /255) over the full domain the
+    /// pipeline can produce.
+    #[test]
+    fn luma_divider_identity_is_exact() {
+        for x in 0..=1_044_480u32 {
+            let acc = x * 1023 + 522_240;
+            let reference = acc / 1_044_480;
+            let vectorized = (((acc >> 12) as u64 * 8_421_505) >> 31) as u32;
+            assert_eq!(reference, vectorized, "x={x}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_luma_rows_match_scalar_bit_exactly() {
+        if !crate::yuv::neon() {
+            return;
+        }
+        // Odd lengths exercise the scalar tail after the 8-wide loop.
+        for (n, channels, seed) in [(1024, 3, 1), (1021, 3, 2), (1024, 4, 3), (777, 4, 4)] {
+            let px = pixel_samples(n * channels, seed);
+            let mut scalar = vec![0u16; n];
+            let mut neon = vec![0u16; n];
+            luma_rows_scalar(&px, channels, &mut scalar);
+            unsafe { neon_enc::luma_rows(&px, channels, &mut neon) };
+            assert_eq!(scalar, neon, "n={n} channels={channels}");
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_chroma_rows_match_scalar_bit_exactly() {
+        if !crate::yuv::neon() {
+            return;
+        }
+        // Odd dims exercise the right-edge columns and bottom row that
+        // fall back to the scalar block.
+        for (w, h, channels, seed) in [
+            (128, 64, 3, 5),
+            (127, 63, 3, 6),
+            (9, 5, 3, 7),
+            (130, 62, 4, 8),
+            (33, 7, 4, 9),
+        ] {
+            let px = pixel_samples(w * h * channels, seed);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let (mut cb_s, mut cr_s) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
+            for cy in 0..ch {
+                for cx in 0..cw {
+                    let (cb, cr) = chroma_block(&px, w, h, channels, cx, cy);
+                    cb_s[cy * cw + cx] = cb;
+                    cr_s[cy * cw + cx] = cr;
+                }
+            }
+            let (mut cb_n, mut cr_n) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
+            unsafe { neon_enc::chroma_rows(&px, w, h, channels, &mut cb_n, &mut cr_n) };
+            assert_eq!(cb_s, cb_n, "cb {w}x{h} channels={channels}");
+            assert_eq!(cr_s, cr_n, "cr {w}x{h} channels={channels}");
+        }
+    }
 
     #[test]
     fn encodes_a_decodable_avif() {

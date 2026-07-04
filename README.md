@@ -43,8 +43,9 @@ while resizing in linear light at measurably higher output quality
 
 ### Supported formats
 
-Sources are identified by magic bytes (extensions are never trusted)
-and re-encoded in their own format:
+Sources are identified by magic bytes (extensions are never trusted).
+By default the output format is the source's own; any decode column
+combines with any encode column:
 
 | Format | Decode | Encode |
 |---|---|---|
@@ -53,9 +54,20 @@ and re-encoded in their own format:
 | WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
 
-Cross-format output (JPEG in → WebP/AVIF out, `Accept` negotiation) is
-not implemented yet — see
-[Not yet implemented](#not-yet-implemented-out-of-poc-scope).
+**Cross-format output**: append an imgproxy-style `@{fmt}` token to the
+filename — `/resize/300/200/photo.jpg@webp` (`jpg`/`jpeg`, `png`,
+`webp`, `avif`; `jxl` is reserved). Only exact tokens count, so
+`photo@2x.jpg` is still a filename. Precedence: explicit `@{fmt}` >
+`Accept` negotiation > source format. Negotiation is opt-in: set
+`OXIMG_AUTO_FORMAT` to a preference list (e.g. `avif,webp`) and
+bare-URL responses follow the request's `Accept` header; every response
+then carries `Vary: Accept` (make sure your CDN honors it or normalizes
+`Accept` into the cache key — explicit `@{fmt}` URLs avoid the issue
+entirely, which is what signed deployments should prefer since headers
+are outside the signature). Alpha sources encoded to JPEG are flattened
+in linear light onto `OXIMG_FLATTEN_BG` (hex `RRGGBB`, default white).
+Encode settings are keyed by the *output* format, using the same knobs
+as same-format requests.
 
 ## Pipeline
 
@@ -167,7 +179,10 @@ instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
 (55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
-`small` = mozjpeg trellis+progressive), `OXIMG_RESIZE=srgb` (resize in
+`small` = mozjpeg trellis+progressive), `OXIMG_AUTO_FORMAT` (unset;
+comma-separated `Accept`-negotiation preference list, e.g. `avif,webp`),
+`OXIMG_FLATTEN_BG` (`ffffff`; background for alpha → JPEG flattening),
+`OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_RESIZE_BACKEND=fir` (use
 the portable fast_image_resize convolution instead of the platform
 kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
@@ -188,7 +203,9 @@ default).
 
 ## Not yet implemented (out of PoC scope)
 
-- Cross-format output and content negotiation (JXL / `Accept`-driven)
+- JXL output (the `@jxl` token is reserved and returns a clear error)
+- Fused decode‖encode overlap on cross-format JPEG requests (they use
+  the same streamed SIMD resize path, minus the second-thread overlap)
 - Animated AVIF sources
 - EXIF orientation / ICC profile handling
 - Private S3 sources (public/presigned HTTP origins work), caching

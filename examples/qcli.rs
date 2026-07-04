@@ -1,10 +1,12 @@
 //! Quality-benchmark CLI: exercises the pipeline outside the HTTP server.
 //!
 //! Modes:
-//!   resize:  qcli resize <in.jpg> <max_w> <max_h> <quality> <fast|small> <out.jpg> [out.ppm]
-//!            (full pipeline; optional PPM dump of the pre-encode pixels)
-//!   encode:  qcli encode <in.ppm> <quality> <fast|small> <out.jpg>
-//!            (encoder isolation: PPM in, JPEG out, no resize)
+//!   resize:    qcli resize <in.jpg> <max_w> <max_h> <quality> <fast|small> <out.jpg> [out.ppm]
+//!              (full pipeline; optional PPM dump of the pre-encode pixels)
+//!   encode:    qcli encode <in.ppm> <quality> <fast|small> <out.jpg>
+//!              (encoder isolation: PPM in, JPEG out, no resize)
+//!   transcode: qcli transcode <in> <max_w> <max_h> <jpg|png|webp|avif> <out>
+//!              (full cross-format pipeline, any supported source)
 
 use oximg::pipeline;
 use std::fs;
@@ -52,6 +54,7 @@ fn params(quality: f32, preset: &str) -> pipeline::Params {
         quality,
         encoder: pipeline::Encoder::from_preset(preset),
         parallel: 1,
+        output: None,
     }
 }
 
@@ -78,6 +81,28 @@ fn main() -> anyhow::Result<()> {
                 (&args[2], args[3].parse()?, args[4].as_str(), &args[5]);
             let (rgb, w, h) = read_ppm(input)?;
             fs::write(out, pipeline::encode(&rgb, w, h, &params(quality, preset))?)?;
+        }
+        "transcode" => {
+            let (input, max_w, max_h) = (&args[2], args[3].parse()?, args[4].parse()?);
+            let (fmt, out) = (args[5].as_str(), &args[6]);
+            let target = pipeline::ImageFormat::from_token(fmt)
+                .ok_or_else(|| anyhow::anyhow!("unknown format token: {fmt}"))?;
+            let p = pipeline::Params {
+                max_width: max_w,
+                max_height: max_h,
+                quality: std::env::var("QUALITY")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(80.0),
+                encoder: pipeline::Encoder::from_preset(
+                    std::env::var("PRESET").as_deref().unwrap_or("jpegli"),
+                ),
+                parallel: 1,
+                output: Some(target),
+            };
+            let (bytes, got) = pipeline::process(&fs::read(input)?, &p)?;
+            anyhow::ensure!(got == target, "pipeline returned {got:?}");
+            fs::write(out, bytes)?;
         }
         other => anyhow::bail!("unknown mode: {other}"),
     }

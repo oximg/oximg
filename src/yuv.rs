@@ -206,7 +206,7 @@ fn alpha_row_scalar(src: Row, off: f32, mul: f32, out: &mut [u8]) {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn neon() -> bool {
+pub(crate) fn neon() -> bool {
     std::arch::is_aarch64_feature_detected!("neon")
 }
 

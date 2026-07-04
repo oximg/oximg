@@ -88,6 +88,9 @@ pub struct Params {
     /// trade mild transient oversubscription for lower latency at light
     /// load.
     pub parallel: usize,
+    /// Output format; None re-encodes in the sniffed source format
+    /// (the original contract, byte-identical to before this field).
+    pub output: Option<ImageFormat>,
 }
 
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).
@@ -131,7 +134,7 @@ fn dct_margin() -> f64 {
         .unwrap_or(1.7)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ImageFormat {
     Jpeg,
     Png,
@@ -146,6 +149,21 @@ impl ImageFormat {
             ImageFormat::Png => "image/png",
             ImageFormat::Webp => "image/webp",
             ImageFormat::Avif => "image/avif",
+        }
+    }
+
+    /// Parse an output-format token (the URL's `@{fmt}` suffix and the
+    /// OXIMG_AUTO_FORMAT list). Unlike source extensions — which are
+    /// never trusted — these name the *requested* output format.
+    /// Returns Avif even in non-avif builds; availability is the
+    /// caller's check (HTTP rejects before spending a CPU slot).
+    pub fn from_token(token: &str) -> Option<ImageFormat> {
+        match token {
+            "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
+            "png" => Some(ImageFormat::Png),
+            "webp" => Some(ImageFormat::Webp),
+            "avif" => Some(ImageFormat::Avif),
+            _ => None,
         }
     }
 
@@ -212,50 +230,75 @@ pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     process_reader(std::io::Cursor::new(bytes), p)
 }
 
-/// Sniff the source format, then resize + re-encode in the same format.
-/// JPEG keeps its fully streaming decode path; PNG streams through the
-/// png crate; WebP requires the whole compressed source in memory
-/// (libwebp has no incremental one-shot API).
+/// Sniff the source format, then resize + re-encode in the target
+/// format (`p.output`, defaulting to the source's own). JPEG keeps its
+/// fully streaming decode path; PNG streams through the png crate; WebP
+/// requires the whole compressed source in memory (libwebp has no
+/// incremental one-shot API). Decode-side optimizations (DCT
+/// shrink-on-load, WebP decode-scaler) are per-source and stay active
+/// for every target.
 fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     let mut header = [0u8; 12];
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
+    let target = p.output.unwrap_or(format);
+    // Fail before decode work; the HTTP layer rejects earlier still,
+    // this covers library callers.
+    #[cfg(not(feature = "avif"))]
+    anyhow::ensure!(
+        target != ImageFormat::Avif,
+        "AVIF support is not enabled in this build"
+    );
     let reader = std::io::BufReader::new(std::io::Read::chain(&header[..], reader));
 
     let _active = ActiveGuard::enter();
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        match format {
+        let out = match format {
             ImageFormat::Jpeg => {
                 let dec = Decompress::new_reader(reader).context("parse JPEG")?;
-                // Fused decode/resize+encode: on unless disabled (see
+                // Fused decode overlap: on unless disabled (see
                 // overlap_gate). Band-parallel resize keeps the serial
-                // path so OXIMG_PAR semantics are unchanged.
-                let fuse_quality =
-                    (p.encoder == Encoder::Jpegli && p.parallel <= 1 && overlap_gate())
-                        .then_some(p.quality);
-                let out = match decode_resize(
-                    s,
-                    dec,
-                    p.max_width,
-                    p.max_height,
-                    p.parallel,
-                    fuse_quality,
-                )? {
+                // path so OXIMG_PAR semantics are unchanged. Jpegli
+                // JPEG-out additionally overlaps the incremental encode;
+                // cross-format targets overlap decode with resize into
+                // out8 and run their one-shot encoder after. Same-format
+                // mozjpeg presets stay serial (extending Pixels fusing
+                // to them is a possible follow-up; it changes their
+                // threading profile, so it needs its own bench pass).
+                // The fir escape hatch must also disable fusing: the
+                // fused workers run the in-tree SIMD kernel, and fir vs
+                // kernel are byte-different backends, so fusing under
+                // fir would make a URL's bytes load-dependent.
+                let fuse = if p.parallel > 1
+                    || !overlap_gate()
+                    || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
+                {
+                    Fuse::Off
+                } else if target == ImageFormat::Jpeg {
+                    if p.encoder == Encoder::Jpegli {
+                        Fuse::Jpegli { quality: p.quality }
+                    } else {
+                        Fuse::Off
+                    }
+                } else {
+                    Fuse::Pixels
+                };
+                match decode_resize(s, dec, p.max_width, p.max_height, p.parallel, fuse)? {
                     Decoded::Encoded(out) => out,
                     Decoded::Pixels { dst_w, dst_h } => {
-                        encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)?
+                        encode_output(s, dst_w, dst_h, 3, target, p)?
                     }
-                };
-                Ok((out, ImageFormat::Jpeg))
+                }
             }
-            ImageFormat::Png => Ok((process_png(s, reader, p)?, ImageFormat::Png)),
-            ImageFormat::Webp => Ok((process_webp(s, reader, p)?, ImageFormat::Webp)),
+            ImageFormat::Png => process_png(s, reader, target, p)?,
+            ImageFormat::Webp => process_webp(s, reader, target, p)?,
             #[cfg(feature = "avif")]
-            ImageFormat::Avif => Ok((process_avif(s, reader, p)?, ImageFormat::Avif)),
+            ImageFormat::Avif => process_avif(s, reader, target, p)?,
             #[cfg(not(feature = "avif"))]
             ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
-        }
+        };
+        Ok((out, target))
     })
 }
 
@@ -362,7 +405,7 @@ pub fn decode_and_resize(
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        match decode_resize(s, dec, max_w, max_h, parallel, None)? {
+        match decode_resize(s, dec, max_w, max_h, parallel, Fuse::Off)? {
             Decoded::Pixels { dst_w, dst_h } => {
                 Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
             }
@@ -504,6 +547,21 @@ enum Decoded {
     Encoded(Vec<u8>),
 }
 
+/// How the JPEG decode overlaps with downstream work (all variants
+/// produce identical pixels/bytes; see overlap_gate).
+#[derive(Clone, Copy)]
+enum Fuse {
+    /// Serial: decode, then resize inline on the same thread.
+    Off,
+    /// Decode ∥ resize + incremental jpegli encode on a worker thread —
+    /// the same-format JPEG fast path; yields `Decoded::Encoded`.
+    Jpegli { quality: f32 },
+    /// Decode ∥ resize into `Scratch::out8` on a worker thread; the
+    /// (one-shot) target encoder runs after. Used for cross-format
+    /// targets, hiding the resize behind the decode wall.
+    Pixels,
+}
+
 /// Requests currently inside the pixel pipeline, all formats. Used as
 /// the load signal for the overlap gate.
 static ACTIVE_PIPELINES: AtomicUsize = AtomicUsize::new(0);
@@ -568,7 +626,7 @@ fn decode_resize<R: std::io::BufRead>(
     max_w: u32,
     max_h: u32,
     parallel: usize,
-    fuse_quality: Option<f32>,
+    fuse: Fuse,
 ) -> Result<Decoded> {
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
@@ -598,7 +656,7 @@ fn decode_resize<R: std::io::BufRead>(
         return Ok(Decoded::Pixels { dst_w, dst_h });
     }
 
-    if let Some(quality) = fuse_quality
+    if let Fuse::Jpegli { quality } = fuse
         && linear
         && let Some((out, decode_ms)) =
             fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality)?
@@ -612,6 +670,30 @@ fn decode_resize<R: std::io::BufRead>(
         }
         started.finish().context("decode finish failed")?;
         return Ok(Decoded::Encoded(out));
+    }
+
+    if let Fuse::Pixels = fuse
+        && linear
+    {
+        scratch_u8(&mut s.out8, dst_w * dst_h * 3);
+        if let Some(decode_ms) = fused_resize_pixels(
+            &mut started,
+            dec_w,
+            dec_h,
+            dst_w,
+            dst_h,
+            &mut s.out8[..dst_w * dst_h * 3],
+        )? {
+            if timing {
+                let total = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "timing fused-px({dec_w}x{dec_h}->{dst_w}x{dst_h}) decode={decode_ms:.1}ms tail={:.1}ms total={total:.1}ms",
+                    total - decode_ms
+                );
+            }
+            started.finish().context("decode finish failed")?;
+            return Ok(Decoded::Pixels { dst_w, dst_h });
+        }
     }
 
     if linear {
@@ -816,87 +898,220 @@ fn fused_resize_encode<R: std::io::BufRead>(
         let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-        let worker = std::thread::Builder::new()
-            .name("oximg-fuse".into())
-            .spawn(move || -> Result<Vec<u8>> {
-                let fwd = fwd_lut_f32();
-                let back = back_lut();
-                let mut row8 = vec![0u8; dst_w * 3];
+        std::thread::scope(|sc| -> Result<Option<(Vec<u8>, f64)>> {
+            // Borrowed, not moved: the resizer's Drop must run on this
+            // long-lived blocking-pool thread so its kernel scratch
+            // returns to this thread's pool instead of dying with the
+            // ephemeral worker's TLS.
+            let resizer = &mut resizer;
+            let spawned = std::thread::Builder::new()
+                .name("oximg-fuse".into())
+                .spawn_scoped(sc, move || -> Result<Vec<u8>> {
+                    let fwd = fwd_lut_f32();
+                    let back = back_lut();
+                    let mut row8 = vec![0u8; dst_w * 3];
 
-                let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
-                comp.set_size(dst_w, dst_h);
-                comp.set_quality(quality);
-                // Mirrors encode_jpegli (including the progressive knob).
-                if jpegli_progressive() {
-                    comp.set_progressive_mode();
-                }
-                let mut enc = comp.start_compress(Vec::with_capacity(64 * 1024))?;
-
-                while let Ok((buf, rows)) = chunk_rx.recv() {
-                    for r in 0..rows {
-                        let src = &buf[r * row_bytes..(r + 1) * row_bytes];
-                        let mut enc_result = Ok(());
-                        resizer.push_row_u8(src, fwd, |_, out| {
-                            for (d, &v) in row8.iter_mut().zip(out) {
-                                *d = back[v as usize];
-                            }
-                            if enc_result.is_ok() {
-                                enc_result = enc.write_scanlines(&row8);
-                            }
-                        });
-                        enc_result.context("fused encode failed")?;
+                    let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
+                    comp.set_size(dst_w, dst_h);
+                    comp.set_quality(quality);
+                    // Mirrors encode_jpegli (including the progressive knob).
+                    if jpegli_progressive() {
+                        comp.set_progressive_mode();
                     }
-                    let _ = recycle_tx.send(buf);
-                }
-                // Channel closed: either the decoder delivered everything
-                // or it failed mid-image; only a complete image may be
-                // finished into a JPEG.
-                anyhow::ensure!(
-                    resizer.rows_emitted() == dst_h,
-                    "decode ended before the image was complete"
-                );
-                enc.finish().context("fused encode finish failed")
-            })
-            .context("spawn fuse worker")?;
+                    let mut enc = comp.start_compress(Vec::with_capacity(64 * 1024))?;
 
-        // Decode loop on the request thread: read a chunk, hand it to the
-        // worker, reuse buffers the worker has drained.
-        let t_decode = std::time::Instant::now();
-        let decode_result = (|| -> Result<()> {
-            let mut remaining = dec_h;
-            while remaining > 0 {
-                let mut buf = recycle_rx.try_recv().unwrap_or_default();
-                let want = remaining.min(chunk_rows) * row_bytes;
-                if buf.len() < want {
-                    buf.resize(want, 0);
-                }
-                let got = started
-                    .read_scanlines_into(&mut buf[..want])
-                    .context("decode failed")?
-                    .len();
-                anyhow::ensure!(
-                    got > 0 && got % row_bytes == 0,
-                    "decoder returned a partial row"
-                );
-                let rows = got / row_bytes;
-                remaining -= rows;
-                if chunk_tx.send((buf, rows)).is_err() {
-                    // Worker died; its join below reports the real error.
-                    anyhow::bail!("fuse worker exited early");
-                }
-            }
-            Ok(())
-        })();
-        let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
-        drop(chunk_tx);
+                    while let Ok((buf, rows)) = chunk_rx.recv() {
+                        for r in 0..rows {
+                            let src = &buf[r * row_bytes..(r + 1) * row_bytes];
+                            let mut enc_result = Ok(());
+                            resizer.push_row_u8(src, fwd, |_, out| {
+                                for (d, &v) in row8.iter_mut().zip(out) {
+                                    *d = back[v as usize];
+                                }
+                                if enc_result.is_ok() {
+                                    enc_result = enc.write_scanlines(&row8);
+                                }
+                            });
+                            enc_result.context("fused encode failed")?;
+                        }
+                        let _ = recycle_tx.send(buf);
+                    }
+                    // Channel closed: either the decoder delivered everything
+                    // or it failed mid-image; only a complete image may be
+                    // finished into a JPEG.
+                    anyhow::ensure!(
+                        resizer.rows_emitted() == dst_h,
+                        "decode ended before the image was complete"
+                    );
+                    enc.finish().context("fused encode finish failed")
+                });
+            // Spawn failure (thread limits, transient EAGAIN) leaves the
+            // decoder untouched, exactly like a missing kernel — fall
+            // back to the byte-identical serial path instead of failing.
+            let Ok(worker) = spawned else {
+                return Ok(None);
+            };
 
-        let encoded = worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("fuse worker panicked"))?;
-        // A decode error is the root cause; report it over the worker's
-        // consequent "incomplete image" error.
-        decode_result?;
-        Ok(Some((encoded?, decode_ms)))
+            // Decode loop on the request thread: read a chunk, hand it to
+            // the worker, reuse buffers the worker has drained.
+            let t_decode = std::time::Instant::now();
+            let decode_result = (|| -> Result<()> {
+                let mut remaining = dec_h;
+                while remaining > 0 {
+                    let mut buf = recycle_rx.try_recv().unwrap_or_default();
+                    let want = remaining.min(chunk_rows) * row_bytes;
+                    if buf.len() < want {
+                        buf.resize(want, 0);
+                    }
+                    let got = started
+                        .read_scanlines_into(&mut buf[..want])
+                        .context("decode failed")?
+                        .len();
+                    anyhow::ensure!(
+                        got > 0 && got % row_bytes == 0,
+                        "decoder returned a partial row"
+                    );
+                    let rows = got / row_bytes;
+                    remaining -= rows;
+                    if chunk_tx.send((buf, rows)).is_err() {
+                        // Worker died; its join below reports the real error.
+                        anyhow::bail!("fuse worker exited early");
+                    }
+                }
+                Ok(())
+            })();
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            drop(chunk_tx);
+
+            let encoded = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("fuse worker panicked"))?;
+            // A decode error is the root cause; report it over the worker's
+            // consequent "incomplete image" error.
+            decode_result?;
+            Ok(Some((encoded?, decode_ms)))
+        })
+    }
+}
+
+/// The cross-format sibling of [`fused_resize_encode`]: the request
+/// thread runs the same decode loop while a scoped worker streams rows
+/// through the SIMD kernel straight into `out8` — the exact writes the
+/// serial path performs inline, so pixels are byte-identical to it.
+/// The (one-shot) target encoder runs after, on the request thread;
+/// only the encode stays outside the decode wall, which is as much
+/// overlap as WebP/AVIF/PNG's full-frame encode APIs allow.
+///
+/// Returns Ok(None) — decoder untouched — when no SIMD row kernel
+/// exists for this CPU; on success returns the decode-loop wall
+/// milliseconds, with `out8` fully written.
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    allow(unused_variables)
+)]
+fn fused_resize_pixels<R: std::io::BufRead>(
+    started: &mut mozjpeg::decompress::DecompressStarted<R>,
+    dec_w: usize,
+    dec_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    out8: &mut [u8],
+) -> Result<Option<f64>> {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        Ok(None)
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let Ok(mut resizer) =
+            crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
+        else {
+            return Ok(None);
+        };
+
+        let row_bytes = dec_w * 3;
+        // Chunking and channel shapes mirror fused_resize_encode.
+        let chunk_rows = (64 * 1024 / row_bytes).clamp(1, dec_h);
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::scope(|sc| -> Result<Option<f64>> {
+            // The worker borrows the resizer instead of consuming it, so
+            // its Drop runs on this (long-lived blocking-pool) thread and
+            // the kernel scratch returns to this thread's pool — dropping
+            // it on the ephemeral worker would leak the pool entry into
+            // that thread's dying TLS.
+            let resizer = &mut resizer;
+            let spawned = std::thread::Builder::new()
+                .name("oximg-fuse".into())
+                .spawn_scoped(sc, move || -> Result<()> {
+                    let fwd = fwd_lut_f32();
+                    let back = back_lut();
+                    while let Ok((buf, rows)) = chunk_rx.recv() {
+                        for r in 0..rows {
+                            let src = &buf[r * row_bytes..(r + 1) * row_bytes];
+                            resizer.push_row_u8(src, fwd, |oy, out| {
+                                for (d, &v) in out8[oy * dst_w * 3..(oy + 1) * dst_w * 3]
+                                    .iter_mut()
+                                    .zip(out)
+                                {
+                                    *d = back[v as usize];
+                                }
+                            });
+                        }
+                        let _ = recycle_tx.send(buf);
+                    }
+                    anyhow::ensure!(
+                        resizer.rows_emitted() == dst_h,
+                        "decode ended before the image was complete"
+                    );
+                    Ok(())
+                });
+            // Spawn failure (thread limits, transient EAGAIN) leaves the
+            // decoder untouched, exactly like a missing kernel — fall
+            // back to the byte-identical serial path instead of failing.
+            let Ok(worker) = spawned else {
+                return Ok(None);
+            };
+
+            let t_decode = std::time::Instant::now();
+            let decode_result = (|| -> Result<()> {
+                let mut remaining = dec_h;
+                while remaining > 0 {
+                    let mut buf = recycle_rx.try_recv().unwrap_or_default();
+                    let want = remaining.min(chunk_rows) * row_bytes;
+                    if buf.len() < want {
+                        buf.resize(want, 0);
+                    }
+                    let got = started
+                        .read_scanlines_into(&mut buf[..want])
+                        .context("decode failed")?
+                        .len();
+                    anyhow::ensure!(
+                        got > 0 && got % row_bytes == 0,
+                        "decoder returned a partial row"
+                    );
+                    let rows = got / row_bytes;
+                    remaining -= rows;
+                    if chunk_tx.send((buf, rows)).is_err() {
+                        // Worker died; its join below reports the real error.
+                        anyhow::bail!("fuse worker exited early");
+                    }
+                }
+                Ok(())
+            })();
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            drop(chunk_tx);
+
+            let worker_result = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("fuse worker panicked"))?;
+            // A decode error is the root cause; report it over the
+            // worker's consequent "incomplete image" error.
+            decode_result?;
+            worker_result?;
+            Ok(Some(decode_ms))
+        })
     }
 }
 
@@ -904,7 +1119,12 @@ fn linear_light() -> bool {
     std::env::var("OXIMG_RESIZE").as_deref() != Ok("srgb")
 }
 
-fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+fn process_png<R: std::io::Read>(
+    s: &mut Scratch,
+    mut reader: R,
+    target: ImageFormat,
+    p: &Params,
+) -> Result<Vec<u8>> {
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
     s.srcbuf.clear();
@@ -963,7 +1183,7 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
             }
             let t_resize = t1.elapsed();
             let t2 = std::time::Instant::now();
-            let out = encode_png(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3);
+            let out = encode_output(s, dst_w, dst_h, 3, target, p);
             if timing {
                 eprintln!(
                     "timing png(fused) decode+fwd({src_w}x{src_h})={:.1}ms resize+back={:.1}ms encode={:.1}ms",
@@ -1004,7 +1224,7 @@ fn process_png<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> 
     let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
     let t_resize = t1.elapsed();
     let t2 = std::time::Instant::now();
-    let out = encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels);
+    let out = encode_output(s, dst_w, dst_h, channels, target, p);
     if timing {
         eprintln!(
             "timing png decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1039,7 +1259,12 @@ fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
     }
 }
 
-fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+fn process_webp<R: std::io::Read>(
+    s: &mut Scratch,
+    mut reader: R,
+    target: ImageFormat,
+    p: &Params,
+) -> Result<Vec<u8>> {
     s.srcbuf.clear();
     reader
         .read_to_end(&mut s.srcbuf)
@@ -1061,7 +1286,7 @@ fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    let out = encode_webp(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)?;
+    let out = encode_output(s, dst_w, dst_h, channels, target, p)?;
     if timing {
         eprintln!(
             "timing webp decode({dec_w}x{dec_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1077,7 +1302,12 @@ fn process_webp<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
 /// reduced-resolution decode mode, so unlike JPEG/WebP the decode always
 /// runs at full source resolution.
 #[cfg(feature = "avif")]
-fn process_avif<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) -> Result<Vec<u8>> {
+fn process_avif<R: std::io::Read>(
+    s: &mut Scratch,
+    mut reader: R,
+    target: ImageFormat,
+    p: &Params,
+) -> Result<Vec<u8>> {
     s.srcbuf.clear();
     reader
         .read_to_end(&mut s.srcbuf)
@@ -1093,19 +1323,7 @@ fn process_avif<R: std::io::Read>(s: &mut Scratch, mut reader: R, p: &Params) ->
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    let quality = avif_quality();
-    let params = crate::avif::AvifParams {
-        quality,
-        alpha_quality: avif_alpha_quality(quality),
-        ..Default::default()
-    };
-    let out = crate::avif::encode_avif(
-        &s.out8[..dst_w * dst_h * channels],
-        dst_w,
-        dst_h,
-        channels,
-        &params,
-    )?;
+    let out = encode_output(s, dst_w, dst_h, channels, target, p)?;
     if timing {
         eprintln!(
             "timing avif decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1409,6 +1627,97 @@ fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec
     }
 }
 
+/// Encode the resized RGB(A)8 pixels in `Scratch::out8` as `target`.
+/// When `target` matches the source format this calls the same encoder
+/// with the same arguments as the pre-cross-format code, so same-format
+/// output stays byte-identical. JPEG is the only alpha-less target;
+/// RGBA input is flattened onto OXIMG_FLATTEN_BG first.
+fn encode_output(
+    s: &mut Scratch,
+    dst_w: usize,
+    dst_h: usize,
+    channels: usize,
+    target: ImageFormat,
+    p: &Params,
+) -> Result<Vec<u8>> {
+    match target {
+        ImageFormat::Jpeg => {
+            if channels == 4 {
+                flatten_alpha_in_out8(s, dst_w, dst_h);
+            }
+            encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+        }
+        ImageFormat::Png => encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels),
+        ImageFormat::Webp => {
+            encode_webp(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)
+        }
+        // Fully opaque RGBA drops its alpha item inside encode_avif
+        // (skipping the second SVT session entirely).
+        #[cfg(feature = "avif")]
+        ImageFormat::Avif => {
+            let quality = avif_quality();
+            let params = crate::avif::AvifParams {
+                quality,
+                alpha_quality: avif_alpha_quality(quality),
+                ..Default::default()
+            };
+            crate::avif::encode_avif(
+                &s.out8[..dst_w * dst_h * channels],
+                dst_w,
+                dst_h,
+                channels,
+                &params,
+            )
+        }
+        #[cfg(not(feature = "avif"))]
+        ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
+    }
+}
+
+/// OXIMG_FLATTEN_BG: background for alpha -> JPEG flattening, as RRGGBB
+/// hex; default white.
+fn flatten_bg() -> [u8; 3] {
+    static BG: OnceLock<[u8; 3]> = OnceLock::new();
+    *BG.get_or_init(|| {
+        std::env::var("OXIMG_FLATTEN_BG")
+            .ok()
+            .and_then(|v| {
+                let v = v.trim().trim_start_matches('#');
+                // is_ascii keeps the byte-offset slicing below from
+                // panicking on multi-byte values; malformed input falls
+                // back to white either way.
+                if v.len() != 6 || !v.is_ascii() {
+                    return None;
+                }
+                let c = |i| u8::from_str_radix(&v[i..i + 2], 16).ok();
+                Some([c(0)?, c(2)?, c(4)?])
+            })
+            .unwrap_or([255, 255, 255])
+    })
+}
+
+/// Composite the straight-alpha RGBA8 pixels in `out8` onto the
+/// flatten background in linear light, compacting to RGB8 in place
+/// (pixel i writes 3i..3i+3 after reading 4i..4i+4, so the forward
+/// pass never clobbers unread input).
+fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize) {
+    let (fwd, back) = (fwd_lut(), back_lut());
+    let bg = flatten_bg();
+    let bg_lin = [
+        fwd[bg[0] as usize] as u32,
+        fwd[bg[1] as usize] as u32,
+        fwd[bg[2] as usize] as u32,
+    ];
+    for i in 0..dst_w * dst_h {
+        let px: [u8; 4] = s.out8[i * 4..i * 4 + 4].try_into().unwrap();
+        let a = px[3] as u32;
+        for c in 0..3 {
+            let lin = (fwd[px[c] as usize] as u32 * a + bg_lin[c] * (255 - a) + 127) / 255;
+            s.out8[i * 3 + c] = back[lin as usize];
+        }
+    }
+}
+
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
     if p.encoder == Encoder::Jpegli {
         return encode_jpegli(rgb, w, h, p.quality);
@@ -1489,10 +1798,15 @@ mod tests {
             quality: 80.0,
             encoder: Encoder::Jpegli,
             parallel: 1,
+            output: None,
+        };
+        let fuse = match fuse_quality {
+            Some(quality) => Fuse::Jpegli { quality },
+            None => Fuse::Off,
         };
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, 1, fuse_quality).unwrap() {
+        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
             Decoded::Encoded(out) => {
                 assert!(fuse_quality.is_some(), "fused output without fuse request");
                 out
@@ -1504,6 +1818,17 @@ mod tests {
                 );
                 encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p).unwrap()
             }
+        }
+    }
+
+    /// Resized RGB pixels via the given fuse mode (Off = the serial
+    /// streamed kernel path, Pixels = the cross-format fused worker).
+    fn run_jpeg_pixels(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
+        let mut s = Scratch::default();
+        let dec = Decompress::new_mem(jpeg).unwrap();
+        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
+            Decoded::Pixels { dst_w, dst_h } => s.out8[..dst_w * dst_h * 3].to_vec(),
+            Decoded::Encoded(_) => panic!("pixel run must not encode"),
         }
     }
 
@@ -1563,6 +1888,34 @@ mod tests {
         assert_eq!(run_jpeg(&jpeg, None), fused);
     }
 
+    /// The cross-format fused worker writes the same rows the serial
+    /// streamed path writes inline, so out8 must match byte for byte.
+    #[test]
+    fn fused_pixels_match_serial_pixels() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        // Odd dimensions exercise chunk boundaries and scalar tails.
+        for (w, h, gray) in [(799, 601, false), (400, 300, true)] {
+            let jpeg = make_test_jpeg(w, h, gray);
+            assert_eq!(
+                run_jpeg_pixels(&jpeg, Fuse::Off),
+                run_jpeg_pixels(&jpeg, Fuse::Pixels),
+                "{w}x{h} gray={gray}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_pixels_survive_truncated_sources() {
+        let jpeg = make_test_jpeg(799, 601, false);
+        let cut = &jpeg[..jpeg.len() * 3 / 5];
+        let mut s = Scratch::default();
+        if let Ok(dec) = Decompress::new_mem(cut) {
+            let _ = decode_resize(&mut s, dec, 320, 320, 1, Fuse::Pixels);
+        }
+    }
+
     #[test]
     fn fused_path_survives_truncated_sources() {
         // Truncation mid-scan must neither hang the worker handoff nor
@@ -1576,10 +1929,18 @@ mod tests {
             quality: 80.0,
             encoder: Encoder::Jpegli,
             parallel: 1,
+            output: None,
         };
         let mut s = Scratch::default();
         if let Ok(dec) = Decompress::new_mem(cut) {
-            let _ = decode_resize(&mut s, dec, 320, 320, 1, Some(p.quality));
+            let _ = decode_resize(
+                &mut s,
+                dec,
+                320,
+                320,
+                1,
+                Fuse::Jpegli { quality: p.quality },
+            );
         }
     }
 

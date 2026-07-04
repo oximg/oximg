@@ -18,6 +18,7 @@ fn params(max: u32) -> Params {
         quality: 80.0,
         encoder: Encoder::Jpegli,
         parallel: 1,
+        output: None,
     }
 }
 
@@ -155,6 +156,217 @@ fn avif_garbage_and_truncation_error_instead_of_panicking() {
             "avif truncated at {cut} should error"
         );
     }
+}
+
+/// All 200x150 fixtures and their source formats.
+fn all_fixtures() -> Vec<(&'static str, ImageFormat)> {
+    let mut v = vec![
+        ("rgb.png", ImageFormat::Png),
+        ("rgba.png", ImageFormat::Png),
+        ("gray.png", ImageFormat::Png),
+        ("graya.png", ImageFormat::Png),
+        ("palette.png", ImageFormat::Png),
+        ("gray16.png", ImageFormat::Png),
+        ("rgb16.png", ImageFormat::Png),
+        ("interlaced.png", ImageFormat::Png),
+        ("photo.jpg", ImageFormat::Jpeg),
+        ("photo.webp", ImageFormat::Webp),
+        ("alpha.webp", ImageFormat::Webp),
+    ];
+    if cfg!(feature = "avif") {
+        v.push(("photo.avif", ImageFormat::Avif));
+        v.push(("alpha.avif", ImageFormat::Avif));
+    }
+    v
+}
+
+/// The refactor pin: requesting the source's own format must reproduce
+/// the default (sniff-and-match) output byte for byte — including
+/// through the fused JPEG gate, whose condition gained a target check.
+#[test]
+fn explicit_same_format_is_byte_identical() {
+    for (name, format) in all_fixtures() {
+        let src = fixture(name);
+        let implicit = pipeline::process(&src, &params(100)).unwrap();
+        let explicit = pipeline::process(
+            &src,
+            &Params {
+                output: Some(format),
+                ..params(100)
+            },
+        )
+        .unwrap();
+        assert_eq!(implicit.1, explicit.1, "{name}");
+        assert_eq!(implicit.0, explicit.0, "{name}: bytes must be identical");
+    }
+}
+
+#[test]
+fn cross_format_matrix() {
+    let mut targets = vec![ImageFormat::Jpeg, ImageFormat::Png, ImageFormat::Webp];
+    if cfg!(feature = "avif") {
+        targets.push(ImageFormat::Avif);
+    }
+    for (name, _) in all_fixtures() {
+        for &target in &targets {
+            let p = Params {
+                output: Some(target),
+                ..params(100)
+            };
+            let (out, fmt) = pipeline::process(&fixture(name), &p)
+                .unwrap_or_else(|e| panic!("{name}->{target:?}: {e:#}"));
+            assert_eq!(fmt, target, "{name}->{target:?}");
+            let (sniffed, w, h) = pipeline::probe(&out).unwrap();
+            assert_eq!(sniffed, target, "{name}->{target:?}: output magic bytes");
+            assert_eq!((w, h), (100, 75), "{name}->{target:?}");
+        }
+    }
+}
+
+/// rgba.png is transparent at the left edge; flattening onto the
+/// default white background must leave that region near-white in the
+/// JPEG (which has no alpha channel to hide behind).
+#[test]
+fn rgba_to_jpeg_flattens_onto_white() {
+    let p = Params {
+        output: Some(ImageFormat::Jpeg),
+        ..params(50)
+    };
+    let (out, fmt) = pipeline::process(&fixture("rgba.png"), &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Jpeg);
+    let mut dec = mozjpeg::Decompress::new_mem(&out).unwrap().rgb().unwrap();
+    let (w, h) = (dec.width(), dec.height());
+    let px: Vec<[u8; 3]> = dec.read_scanlines().unwrap();
+    let mid = px[(h / 2) * w + 1];
+    for c in mid {
+        assert!(
+            c > 230,
+            "transparent edge should flatten to white, got {mid:?}"
+        );
+    }
+}
+
+/// Cross-format must route alpha through targets that support it:
+/// WebP-with-alpha -> PNG keeps the transparent/opaque edges intact.
+#[test]
+fn cross_format_alpha_survives_webp_to_png() {
+    let p = Params {
+        output: Some(ImageFormat::Png),
+        ..params(50)
+    };
+    let (out, fmt) = pipeline::process(&fixture("alpha.webp"), &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Png);
+    let mut r = png::Decoder::new(std::io::Cursor::new(&out))
+        .read_info()
+        .unwrap();
+    assert_eq!(r.info().color_type, png::ColorType::Rgba);
+    let (w, h) = (r.info().width as usize, r.info().height as usize);
+    let mut buf = vec![0u8; r.output_buffer_size().unwrap()];
+    r.next_frame(&mut buf).unwrap();
+    let alpha = |x: usize| buf[((h / 2) * w + x) * 4 + 3];
+    assert!(alpha(1) < 24, "left edge should stay transparent");
+    assert!(alpha(w - 2) > 230, "right edge should stay opaque");
+}
+
+#[test]
+fn rgba_to_webp_keeps_alpha_channel() {
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        ..params(50)
+    };
+    let (out, fmt) = pipeline::process(&fixture("rgba.png"), &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Webp);
+    unsafe {
+        let mut features: libwebp_sys::WebPBitstreamFeatures = std::mem::zeroed();
+        let status = libwebp_sys::WebPGetFeatures(out.as_ptr(), out.len(), &mut features);
+        assert_eq!(status, libwebp_sys::VP8StatusCode::VP8_STATUS_OK);
+        assert_eq!(features.has_alpha, 1, "alpha must survive PNG->WebP");
+    }
+}
+
+#[test]
+fn cross_format_never_upscales() {
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        ..params(500)
+    };
+    let (out, _) = pipeline::process(&fixture("tiny.jpg"), &p).unwrap();
+    assert_eq!(dims_of(&out), (40, 30));
+}
+
+/// Mid-stream JPEG truncation degrades gracefully on the same-format
+/// path (libjpeg fills the tail); the cross-format dispatch must keep
+/// that behavior instead of turning it into an error or panic.
+#[test]
+fn truncated_jpeg_to_webp_degrades_gracefully() {
+    let full = fixture("photo.jpg");
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        ..params(100)
+    };
+    let (out, fmt) = pipeline::process(&full[..full.len() / 2], &p)
+        .expect("truncated jpeg should degrade gracefully");
+    assert_eq!(fmt, ImageFormat::Webp);
+    assert_eq!(dims_of(&out), (100, 75));
+}
+
+#[cfg(not(feature = "avif"))]
+#[test]
+fn avif_output_errors_cleanly_without_the_feature() {
+    let p = Params {
+        output: Some(ImageFormat::Avif),
+        ..params(100)
+    };
+    let err = pipeline::process(&fixture("rgb.png"), &p).unwrap_err();
+    assert!(format!("{err:#}").contains("not enabled"), "got: {err:#}");
+}
+
+/// Fully opaque RGBA must not pay for an AVIF alpha item: the output
+/// drops to 3 channels and is byte-identical to encoding the same
+/// pixels as plain RGB (the color path ignores the alpha byte).
+#[cfg(feature = "avif")]
+#[test]
+fn opaque_rgba_avif_drops_the_alpha_item() {
+    let (w, h) = (97, 61);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for i in 0..w * h {
+        let px = [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8];
+        rgb.extend_from_slice(&px);
+        rgba.extend_from_slice(&px);
+        rgba.push(255);
+    }
+    let params = oximg::avif::AvifParams {
+        quality: 55,
+        alpha_quality: 55,
+        ..Default::default()
+    };
+    let from_rgba = oximg::avif::encode_avif(&rgba, w, h, 4, &params).unwrap();
+    let from_rgb = oximg::avif::encode_avif(&rgb, w, h, 3, &params).unwrap();
+    assert_eq!(from_rgba, from_rgb, "opaque RGBA must match the RGB encode");
+    let (_, _, _, channels) = oximg::avif::decode_avif(&from_rgba).unwrap();
+    assert_eq!(channels, 3, "no alpha item expected");
+
+    // One transparent pixel is enough to keep the alpha item.
+    rgba[3] = 254;
+    let with_alpha = oximg::avif::encode_avif(&rgba, w, h, 4, &params).unwrap();
+    let (_, _, _, channels) = oximg::avif::decode_avif(&with_alpha).unwrap();
+    assert_eq!(channels, 4, "alpha item must survive");
+}
+
+#[cfg(feature = "avif")]
+#[test]
+fn avif_alpha_survives_cross_format_to_png() {
+    let p = Params {
+        output: Some(ImageFormat::Png),
+        ..params(50)
+    };
+    let (out, fmt) = pipeline::process(&fixture("alpha.avif"), &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Png);
+    let r = png::Decoder::new(std::io::Cursor::new(&out))
+        .read_info()
+        .unwrap();
+    assert_eq!(r.info().color_type, png::ColorType::Rgba);
 }
 
 #[test]

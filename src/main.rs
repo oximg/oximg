@@ -13,13 +13,23 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{StatusCode, header};
-use axum::response::IntoResponse;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::{HeaderValue, StatusCode, header, request::Parts};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio::sync::{Semaphore, watch};
 
-type FlightKey = (u32, u32, String);
+use oximg::pipeline::ImageFormat;
+
+// The format is the one *resolved* before keying (explicit @fmt token,
+// else Accept negotiation, else None = source format), never the raw
+// Accept header — so cardinality stays bounded and negotiated requests
+// coalesce with explicit ones. The filename is token-stripped. Known
+// boundary: None never coalesces with Some(X) even when X is the actual
+// source format — the source format is untrusted before sniffing, so
+// merging them pre-sniff would mislabel Content-Types; cost is capped
+// at one extra flight per hot (w, h, file).
+type FlightKey = (u32, u32, String, Option<ImageFormat>);
 type FlightResult = Result<(Bytes, &'static str), (StatusCode, String)>;
 type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>>;
 
@@ -39,6 +49,10 @@ struct App {
     // share the result, absorbing cache stampedes on hot images.
     inflight: Arc<FlightMap>,
     signing: Option<Arc<Signing>>,
+    // OXIMG_AUTO_FORMAT preference order for Accept negotiation; empty =
+    // negotiation off (and no Vary header, exactly the pre-feature
+    // response shape).
+    auto_format: Arc<[ImageFormat]>,
 }
 
 /// imgproxy-style URL signing: base64url(HMAC-SHA256(key, salt || path)),
@@ -152,9 +166,20 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         resize_threads: env_or("OXIMG_PAR", 1),
         inflight: Arc::new(Mutex::new(HashMap::new())),
         signing: Signing::from_env().map(Arc::new),
+        auto_format: auto_format_from_env().into(),
     };
     if app.signing.is_some() {
         eprintln!("oximg: URL signing enabled");
+    }
+    if !app.auto_format.is_empty() {
+        eprintln!(
+            "oximg: Accept negotiation enabled ({})",
+            app.auto_format
+                .iter()
+                .map(|f| f.content_type())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     let router = Router::new()
@@ -172,28 +197,113 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
+/// the Accept header, in preference order (e.g. "avif,webp"). Unknown
+/// or build-unavailable entries are skipped with a warning so one
+/// config works across builds.
+fn auto_format_from_env() -> Vec<ImageFormat> {
+    let Ok(list) = std::env::var("OXIMG_AUTO_FORMAT") else {
+        return Vec::new();
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter_map(|t| {
+            let fmt = ImageFormat::from_token(t);
+            match fmt {
+                Some(ImageFormat::Avif) if cfg!(not(feature = "avif")) => {
+                    eprintln!("oximg: OXIMG_AUTO_FORMAT: avif not enabled in this build; skipped");
+                    None
+                }
+                Some(f) => Some(f),
+                None => {
+                    eprintln!("oximg: OXIMG_AUTO_FORMAT: unknown format {t:?}; skipped");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// The request's Accept value, cloned by itself so the hot path never
+/// clones the whole header map.
+struct AcceptHeader(Option<HeaderValue>);
+
+impl<S: Send + Sync> FromRequestParts<S> for AcceptHeader {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(AcceptHeader(parts.headers.get(header::ACCEPT).cloned()))
+    }
+}
+
 async fn handle_signed_resize(
     State(app): State<App>,
     Path((sig, w, h, file)): Path<(String, u32, u32, String)>,
+    accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let Some(signing) = app.signing.as_ref() else {
         return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
     };
+    // Signed material is the raw file segment, so an explicit @fmt token
+    // is covered by the signature: photo.jpg's signature does not
+    // authorize photo.jpg@avif and its heavier encode.
     let path = format!("/resize/{w}/{h}/{file}");
     if !signing.verify(&sig, &path) {
         return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
     }
-    serve_resize(app, w, h, file).await
+    serve_resize(app, w, h, file, accept).await
 }
 
 async fn handle_resize(
     State(app): State<App>,
     Path((w, h, file)): Path<(u32, u32, String)>,
+    accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if app.signing.is_some() {
         return Err((StatusCode::FORBIDDEN, "signature required".into()));
     }
-    serve_resize(app, w, h, file).await
+    serve_resize(app, w, h, file, accept).await
+}
+
+/// Split a trailing imgproxy-style `@{fmt}` output-format token off the
+/// filename. Only exact known tokens count — any other suffix is part
+/// of the filename (`photo@2x.jpg` keeps working; a file literally
+/// named `x.jpg@webp` becomes unreachable, a documented trade). "jxl"
+/// is reserved so the future encoder slots in with a clear error today.
+fn split_format(file: &str) -> Result<(&str, Option<ImageFormat>), (StatusCode, String)> {
+    let Some((base, token)) = file.rsplit_once('@') else {
+        return Ok((file, None));
+    };
+    if base.is_empty() {
+        return Ok((file, None));
+    }
+    match ImageFormat::from_token(token) {
+        Some(ImageFormat::Avif) if cfg!(not(feature = "avif")) => Err((
+            StatusCode::BAD_REQUEST,
+            "avif output is not enabled in this build".into(),
+        )),
+        Some(fmt) => Ok((base, Some(fmt))),
+        None if token == "jxl" => Err((
+            StatusCode::BAD_REQUEST,
+            "jxl output is not supported in this build".into(),
+        )),
+        None => Ok((file, None)),
+    }
+}
+
+/// First OXIMG_AUTO_FORMAT entry the Accept header names. Substring
+/// match without q-value parsing — the imgproxy/imagor de-facto
+/// standard, and allocation-free. With negotiation off (the default),
+/// the header is never even scanned.
+fn negotiate(auto: &[ImageFormat], accept: &AcceptHeader) -> Option<ImageFormat> {
+    if auto.is_empty() {
+        return None;
+    }
+    let accept = accept.0.as_ref()?.to_str().ok()?;
+    auto.iter()
+        .copied()
+        .find(|f| accept.contains(f.content_type()))
 }
 
 async fn serve_resize(
@@ -201,22 +311,39 @@ async fn serve_resize(
     w: u32,
     h: u32,
     file: String,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+    accept: AcceptHeader,
+) -> Result<Response, (StatusCode, String)> {
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
     }
     if file.contains(['/', '\\']) || file.contains("..") {
         return Err((StatusCode::BAD_REQUEST, "invalid filename".into()));
     }
+    let (base, explicit) = split_format(&file)?;
+    // Precedence: explicit @fmt > Accept negotiation > source format.
+    let target = explicit.or_else(|| negotiate(&app.auto_format, &accept));
+    let vary_accept = !app.auto_format.is_empty();
 
-    let (out, content_type) = singleflight(&app, (w, h, file)).await?;
-    Ok((
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=31536000"),
-        ],
-        out,
-    ))
+    // base is always a prefix of file, so truncating in place moves the
+    // already-owned String into the key — no allocation on the bare-URL
+    // path (which strips nothing).
+    let base_len = base.len();
+    let mut file = file;
+    file.truncate(base_len);
+    let (out, content_type) = singleflight(&app, (w, h, file, target)).await?;
+    let headers = [
+        (header::CONTENT_TYPE, content_type),
+        (header::CACHE_CONTROL, "public, max-age=31536000"),
+    ];
+    // Vary is config-static — emitted on every 200 whenever negotiation
+    // is enabled, including explicit-@fmt and non-negotiated outcomes.
+    // Outcome-conditional Vary poisons CDN caches under the 1-year
+    // max-age (a served no-Vary response is cached for all Accepts).
+    if vary_accept {
+        Ok((headers, [(header::VARY, "Accept")], out).into_response())
+    } else {
+        Ok((headers, out).into_response())
+    }
 }
 
 /// Removes the in-flight map entry when dropped, so a cancelled leader
@@ -280,7 +407,7 @@ async fn singleflight(app: &App, key: FlightKey) -> FlightResult {
 }
 
 async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
-    let (w, h, file) = key;
+    let (w, h, file, output) = key;
     let path = app.images_dir.join(file);
 
     // CPU concurrency cap = core count; queueing happens here instead of
@@ -302,6 +429,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         // average oversubscription stays <30% in exchange for lower
         // light-load latency.
         parallel: app.resize_threads,
+        output: *output,
     };
     let source_url = app
         .source_base
@@ -375,6 +503,64 @@ mod tests {
         // vector computed independently with python hmac/hashlib
         let sig = "lrio_2A_EDYOogJybA7hm-AfXAr5YhjYhXwJ7_K93-U";
         assert!(test_signing().verify(sig, "/resize/100/100/x.jpg"));
+    }
+
+    #[test]
+    fn split_format_token_grammar() {
+        // plain names pass through untouched
+        assert_eq!(split_format("photo.jpg"), Ok(("photo.jpg", None)));
+        // '@' suffixes that aren't format tokens stay part of the filename
+        assert_eq!(split_format("photo@2x.jpg"), Ok(("photo@2x.jpg", None)));
+        assert_eq!(
+            split_format("photo.jpg@bogus"),
+            Ok(("photo.jpg@bogus", None))
+        );
+        assert_eq!(split_format("@webp"), Ok(("@webp", None)));
+        // known tokens strip and resolve
+        for (token, fmt) in [
+            ("jpg", ImageFormat::Jpeg),
+            ("jpeg", ImageFormat::Jpeg),
+            ("png", ImageFormat::Png),
+            ("webp", ImageFormat::Webp),
+        ] {
+            assert_eq!(
+                split_format(&format!("photo.png@{token}")),
+                Ok(("photo.png", Some(fmt))),
+                "@{token}"
+            );
+        }
+        // reserved: jxl errors clearly instead of 404ing as a filename
+        assert_eq!(
+            split_format("photo.jpg@jxl").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+        #[cfg(feature = "avif")]
+        assert_eq!(
+            split_format("photo.jpg@avif"),
+            Ok(("photo.jpg", Some(ImageFormat::Avif)))
+        );
+        #[cfg(not(feature = "avif"))]
+        assert_eq!(
+            split_format("photo.jpg@avif").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn negotiate_picks_first_acceptable() {
+        let auto = [ImageFormat::Avif, ImageFormat::Webp];
+        let accept = |v: &str| AcceptHeader(Some(HeaderValue::from_str(v).unwrap()));
+        assert_eq!(
+            negotiate(&auto, &accept("image/avif,image/webp,*/*")),
+            Some(ImageFormat::Avif)
+        );
+        assert_eq!(
+            negotiate(&auto, &accept("image/webp,*/*")),
+            Some(ImageFormat::Webp)
+        );
+        assert_eq!(negotiate(&auto, &accept("image/apng,*/*")), None);
+        assert_eq!(negotiate(&auto, &AcceptHeader(None)), None);
+        assert_eq!(negotiate(&[], &accept("image/webp")), None);
     }
 
     #[test]
