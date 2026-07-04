@@ -160,7 +160,7 @@ c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **78.3** (32 ms) | **35.7** (72 ms) | **39.6** (72 ms) | 16.8 (163 ms) |
+| oximg (defaults) | **78.3** (32 ms) | **35.7** (72 ms) | **39.6** (72 ms) | 20.1 (141 ms) |
 | imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.1 (141 ms) |
 | imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
 | thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
@@ -173,11 +173,13 @@ Notes:
   landed (resize stage 37 -> 20 ms on the full-decode shape); the
   imgproxy AVIF cell re-run on the same instance (20.1 vs 20.4) anchors
   comparability with the other contenders' original runs.
-- The remaining c7g AVIF gap is decode-stage-bound. dav1d's in-frame
-  threading works on Graviton3 (1.9x on two cores, verified with a
-  minimal repro against dav1d 1.4.1/1.5.1/1.5.3); the stage's cost is
-  split between the AV1 decode proper (~28 ms threaded) and the
-  YUV-to-RGB conversion (~22 ms, currently scalar).
+- The c7g AVIF cell is a dead heat with imgproxy (20.12 vs 20.07
+  req/s, identical p95). dav1d's in-frame threading works on Graviton3
+  (1.9x on two cores, verified with a minimal repro against dav1d
+  1.4.1/1.5.1/1.5.3), and the NEON conversion kernels brought the
+  decode stage to ~32 ms (~28 ms threaded AV1 decode + ~3.5 ms
+  YUV-to-RGB); the residual spread sits in the resize and SVT encode
+  stages.
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
