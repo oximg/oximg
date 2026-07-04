@@ -4,6 +4,7 @@
 //! `avifenc -c svt` transfer.
 
 use crate::svt::bindings as svt;
+use crate::yuv::{self, Row};
 use anyhow::{Context, Result, ensure};
 
 /// libavif's quality -> quantizer mapping (codec_svt.c).
@@ -451,31 +452,46 @@ fn picture_to_alpha(pic: &dav1d_sys::Dav1dPicture, w: usize, h: usize) -> Result
         (255.0 / (219.0 * scale8), 16.0 * scale8)
     };
 
-    let stride = pic.stride[0] as usize;
+    let hbd = bpc > 8;
     let mut alpha = vec![0u8; w * h];
     for y in 0..h {
         let row = &mut alpha[y * w..(y + 1) * w];
-        if bpc > 8 {
-            let src = unsafe {
-                std::slice::from_raw_parts((pic.data[0] as *const u16).add(y * (stride / 2)), w)
-            };
-            for (dst, &v) in row.iter_mut().zip(src) {
-                *dst = ((v as f32 - a_off) * a_mul + 0.5).clamp(0.0, 255.0) as u8;
-            }
-        } else {
-            let src = unsafe {
-                std::slice::from_raw_parts((pic.data[0] as *const u8).add(y * stride), w)
-            };
-            if seq.color_range != 0 {
-                row.copy_from_slice(src);
-            } else {
-                for (dst, &v) in row.iter_mut().zip(src) {
-                    *dst = ((v as f32 - a_off) * a_mul + 0.5).clamp(0.0, 255.0) as u8;
-                }
-            }
+        let src = plane_row(pic, 0, y, w, hbd);
+        match src {
+            Row::B8(s) if seq.color_range != 0 => row.copy_from_slice(s),
+            src => yuv::alpha_row(src, a_off, a_mul, row),
         }
     }
     Ok(alpha)
+}
+
+/// Borrow one row of a dav1d plane as typed samples. Plane 0 uses the
+/// luma stride; planes 1/2 share the chroma stride. Strides are bytes.
+fn plane_row(
+    pic: &dav1d_sys::Dav1dPicture,
+    plane: usize,
+    y: usize,
+    len: usize,
+    hbd: bool,
+) -> Row<'_> {
+    let (ptr, stride) = if plane == 0 {
+        (pic.data[0], pic.stride[0] as usize)
+    } else {
+        (pic.data[plane], pic.stride[1] as usize)
+    };
+    unsafe {
+        if hbd {
+            Row::B16(std::slice::from_raw_parts(
+                (ptr as *const u16).add(y * (stride / 2)),
+                len,
+            ))
+        } else {
+            Row::B8(std::slice::from_raw_parts(
+                (ptr as *const u8).add(y * stride),
+                len,
+            ))
+        }
+    }
 }
 
 /// Convert a decoded dav1d picture (planar YUV) to interleaved RGB8.
@@ -493,24 +509,7 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
         _ => (0, 0),
     };
 
-    // Plane sampler: strides are in bytes; samples are u8 or little-endian
-    // u16 depending on bit depth.
     let hbd = bpc > 8;
-    let sample = |plane: usize, x: usize, y: usize| -> f32 {
-        let (ptr, stride) = if plane == 0 {
-            (pic.data[0], pic.stride[0])
-        } else {
-            (pic.data[plane], pic.stride[1])
-        };
-        unsafe {
-            if hbd {
-                *(ptr as *const u16).add(y * (stride as usize / 2) + x) as f32
-            } else {
-                *(ptr as *const u8).add(y * stride as usize + x) as f32
-            }
-        }
-    };
-
     let max = ((1u32 << bpc) - 1) as f32;
     let center = ((1u32 << bpc) / 2) as f32;
     let scale8 = (1u32 << (bpc - 8)) as f32;
@@ -556,6 +555,15 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
 
     out.clear();
     out.resize(w * h * 3, 0);
+    let csc = yuv::Csc {
+        y_off,
+        y_mul,
+        center,
+        c_mul,
+        kr,
+        kb,
+        kg,
+    };
     for y in 0..h {
         if !monochrome {
             // Vertical pass at chroma horizontal resolution.
@@ -570,48 +578,40 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
             } else {
                 (y, y)
             };
-            for cx in 0..cw {
+            for (plane, mid) in [(1usize, &mut cb_mid), (2, &mut cr_mid)] {
                 if sy == 1 {
-                    cb_mid[cx] = (3.0 * sample(1, cx, near) + sample(1, cx, other)) * 0.25;
-                    cr_mid[cx] = (3.0 * sample(2, cx, near) + sample(2, cx, other)) * 0.25;
+                    yuv::chroma_blend(
+                        plane_row(pic, plane, near, cw, hbd),
+                        plane_row(pic, plane, other, cw, hbd),
+                        mid,
+                    );
                 } else {
-                    cb_mid[cx] = sample(1, cx, near);
-                    cr_mid[cx] = sample(2, cx, near);
+                    yuv::chroma_widen(plane_row(pic, plane, near, cw, hbd), mid);
                 }
             }
             // Horizontal pass to full resolution.
             if sx == 1 {
-                for x in 0..w {
-                    let cx = x >> 1;
-                    let other = if x & 1 == 1 {
-                        (cx + 1).min(cw - 1)
-                    } else {
-                        cx.saturating_sub(1)
-                    };
-                    cb_row[x] = (3.0 * cb_mid[cx] + cb_mid[other]) * 0.25;
-                    cr_row[x] = (3.0 * cr_mid[cx] + cr_mid[other]) * 0.25;
-                }
+                yuv::chroma_upsample_h(&cb_mid, &mut cb_row);
+                yuv::chroma_upsample_h(&cr_mid, &mut cr_row);
             } else {
                 cb_row.copy_from_slice(&cb_mid);
                 cr_row.copy_from_slice(&cr_mid);
             }
         }
 
+        let y_row = plane_row(pic, 0, y, w, hbd);
         let row = &mut out[y * w * 3..(y + 1) * w * 3];
+        if !monochrome && !identity {
+            yuv::yuv_row_to_rgb(y_row, &cb_row, &cr_row, &csc, row);
+            continue;
+        }
         for (x, px) in row.chunks_exact_mut(3).enumerate() {
-            let yf = (sample(0, x, y) - y_off) * y_mul;
+            let yf = (y_row.at(x) - y_off) * y_mul;
             let (r, g, b) = if monochrome {
                 (yf, yf, yf)
-            } else if identity {
+            } else {
                 // Identity: G=Y, B=U, R=V, chroma is not centered.
                 (cr_row[x] * y_mul, yf, cb_row[x] * y_mul)
-            } else {
-                let cb = (cb_row[x] - center) * c_mul;
-                let cr = (cr_row[x] - center) * c_mul;
-                let r = yf + 2.0 * (1.0 - kr) * cr;
-                let b = yf + 2.0 * (1.0 - kb) * cb;
-                let g = (yf - kr * r - kb * b) / kg;
-                (r, g, b)
             };
             px[0] = (r + 0.5).clamp(0.0, 255.0) as u8;
             px[1] = (g + 0.5).clamp(0.0, 255.0) as u8;

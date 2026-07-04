@@ -8,3 +8,6 @@ pub mod svt;
 
 #[cfg(feature = "avif")]
 pub mod avif;
+
+#[cfg(feature = "avif")]
+mod yuv;
