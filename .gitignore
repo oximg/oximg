@@ -3,3 +3,4 @@ target/
 bench/quality/node_modules/
 bench/quality/corpus/
 bench/quality/package*.json
+.env
