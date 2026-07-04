@@ -2,9 +2,15 @@ FROM rust:1-slim-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake make gcc g++ nasm pkg-config git ca-certificates libdav1d-dev \
     && rm -rf /var/lib/apt/lists/*
-# SVT-AV1 4.1 from source: distro packages are either older or built
-# without optimization (some ship debug builds that encode at half speed).
-RUN git clone --depth 1 -b v4.1.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt \
+# SVT-AV1 from source at a pinned post-4.1 revision: distro packages are
+# older or unoptimized (some ship debug builds that encode at half
+# speed), and this revision carries the aarch64 kernels missing from
+# 4.1 for the QM/tune=IQ still-image path (-36% encode time at equal
+# quality). ABI-verified against the pregenerated bindings (identical
+# struct size and field offsets).
+RUN git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt \
+    && git -C /svt fetch --depth 1 origin d3c4cb3947a8bfed0aa5a2be996b37bb117fa1bd \
+    && git -C /svt checkout d3c4cb3947a8bfed0aa5a2be996b37bb117fa1bd \
     && cmake -S /svt -B /svt/build -DCMAKE_BUILD_TYPE=Release \
        -DBUILD_APPS=OFF -DBUILD_TESTING=OFF \
        -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
