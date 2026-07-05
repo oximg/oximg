@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- The mozjpeg presets (`PRESET=fast|small`) now fuse the JPEG decode
+  with the SIMD resize on a second thread under the same
+  `OXIMG_OVERLAP` gate as the other paths, running the one-shot
+  mozjpeg encode after — bytes identical to the serial path (and
+  gate-independent, tested). Single-request latency on the Ryzen SMT
+  pair: `fast` -10% (8.0 → 7.2 ms), `small` -2.6%; saturated
+  throughput unchanged.
+
 ## [0.3.0] - 2026-07-05
 
 ### Added

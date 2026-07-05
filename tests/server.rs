@@ -312,6 +312,27 @@ fn forced_overlap_cross_format_matches_serial() {
     assert_eq!(&body[8..12], b"WEBP");
 }
 
+/// mozjpeg presets fuse the decode with the resize on a second thread;
+/// like every fused path, their bytes must not depend on the overlap
+/// gate.
+#[test]
+fn preset_bytes_do_not_depend_on_overlap_gate() {
+    for (port_a, port_b, preset) in [(47117, 47118, "fast"), (47119, 47120, "small")] {
+        let fused = Server::start(
+            port_a,
+            &[("OXIMG_OVERLAP", "1".into()), ("PRESET", preset.into())],
+        );
+        let serial = Server::start(
+            port_b,
+            &[("OXIMG_OVERLAP", "0".into()), ("PRESET", preset.into())],
+        );
+        let a = fused.get("/resize/100/100/photo.jpg").unwrap().2;
+        let b = serial.get("/resize/100/100/photo.jpg").unwrap().2;
+        assert_eq!(a, b, "PRESET={preset}: fused and serial bytes must match");
+        assert!(a.starts_with(&[0xFF, 0xD8]), "PRESET={preset}: not a JPEG");
+    }
+}
+
 /// The fir escape hatch swaps in a byte-different resize backend, so it
 /// must also switch fusing off — otherwise the same URL's bytes would
 /// depend on the instantaneous overlap gate. PNG output keeps the

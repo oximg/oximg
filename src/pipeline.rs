@@ -261,11 +261,9 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                 // overlap_gate). Band-parallel resize keeps the serial
                 // path so OXIMG_PAR semantics are unchanged. Jpegli
                 // JPEG-out additionally overlaps the incremental encode;
-                // cross-format targets overlap decode with resize into
-                // out8 and run their one-shot encoder after. Same-format
-                // mozjpeg presets stay serial (extending Pixels fusing
-                // to them is a possible follow-up; it changes their
-                // threading profile, so it needs its own bench pass).
+                // every other encoder (mozjpeg presets and cross-format
+                // targets) overlaps decode with resize into out8/planes
+                // and runs its one-shot encode after.
                 // The fir escape hatch must also disable fusing: the
                 // fused workers run the in-tree SIMD kernel, and fir vs
                 // kernel are byte-different backends, so fusing under
@@ -297,7 +295,11 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     if p.encoder == Encoder::Jpegli {
                         Fuse::Jpegli { quality: p.quality }
                     } else {
-                        Fuse::Off
+                        // mozjpeg presets have no incremental encoder,
+                        // but the decode still overlaps the resize into
+                        // out8 (byte-identical to the serial path); the
+                        // one-shot mozjpeg encode runs after.
+                        Fuse::Pixels
                     }
                 } else {
                     cross_fuse()

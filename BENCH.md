@@ -434,6 +434,15 @@ Apple M2 Max (c=12, single URL, coalescing active — relative values):
 `jpegli` 685 / `fast` 751 / `small` 456 req/s; output sizes for
 test-medium: 20.1 / 22.9 / 18.6 KB.
 
+Since 0.3.0 the mozjpeg presets also fuse the decode with the resize
+on a second thread under the same `OXIMG_OVERLAP` gate (the one-shot
+mozjpeg encode runs after; bytes are identical to the serial path and
+never depend on the gate). Interleaved A/B on the Ryzen SMT pair,
+512-fit DIV2K, single-request medians: `fast` 8.0 → 7.2 ms (-10%),
+`small` 24.4 → 23.8 ms (-2.6% — the trellis encode dominates its
+request), with saturated 2-VU throughput unchanged (the auto gate
+closes under load, as designed).
+
 Quality per byte for each encoder is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
