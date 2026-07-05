@@ -1,5 +1,6 @@
 pub mod pipeline;
 
+pub(crate) mod meta;
 pub(crate) mod resize_kernel;
 
 #[cfg(target_arch = "aarch64")]

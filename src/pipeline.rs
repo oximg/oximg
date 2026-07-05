@@ -185,7 +185,11 @@ impl ImageFormat {
     }
 }
 
-/// Cheap header probe: format + source dimensions without decoding pixels.
+/// Cheap header probe: format + *stored* source dimensions without
+/// decoding pixels. EXIF orientation is not consulted — with
+/// auto-rotation on (the default), `process` fits and emits the
+/// *displayed* frame, so for orientations 5-8 its output axes are
+/// swapped relative to these dimensions.
 pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     let mut header = [0u8; 12];
     anyhow::ensure!(bytes.len() >= 12, "source too short");
@@ -256,6 +260,22 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
         let s = &mut *s.borrow_mut();
         let out = match format {
             ImageFormat::Jpeg => {
+                // With auto-rotation on (the default), a bounded
+                // pre-scan of the leading APP/COM segments extracts the
+                // EXIF orientation; the scanned bytes are re-chained in
+                // front of the stream so the decoder sees identical
+                // input. libjpeg-side marker saving is deliberately not
+                // used: its per-request memory scales with the number
+                // of attacker-supplied APP1 segments, while this buffer
+                // is hard-capped (see meta::SCAN_CAP).
+                let mut reader = reader;
+                let mut exif_prefix = Vec::new();
+                let orientation = if auto_rotate() {
+                    crate::meta::scan_jpeg_orientation(&mut reader, &mut exif_prefix)
+                } else {
+                    crate::meta::Orientation::UPRIGHT
+                };
+                let reader = std::io::Read::chain(&exif_prefix[..], reader);
                 let dec = Decompress::new_reader(reader).context("parse JPEG")?;
                 // Fused decode overlap: on unless disabled (see
                 // overlap_gate). Band-parallel resize keeps the serial
@@ -291,6 +311,16 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
                 {
                     Fuse::Off
+                } else if !orientation.is_upright() {
+                    // Rotation happens on the resized frame before the
+                    // one-shot encode — incompatible with streaming rows
+                    // into jpegli or into the YUV planes, so oriented
+                    // sources take the pixel fuse and rotate after.
+                    // TODO(orient-fuse): a rotation-aware row sink could
+                    // recover the jpegli/YUV overlap for the flip-only
+                    // orientations (2-4); oriented traffic is a small
+                    // minority, so correctness ships first.
+                    Fuse::Pixels
                 } else if target == ImageFormat::Jpeg {
                     if p.encoder == Encoder::Jpegli {
                         Fuse::Jpegli { quality: p.quality }
@@ -304,10 +334,34 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                 } else {
                     cross_fuse()
                 };
-                match decode_resize(s, dec, p.max_width, p.max_height, p.parallel, fuse)? {
+                match decode_resize(
+                    s,
+                    dec,
+                    p.max_width,
+                    p.max_height,
+                    p.parallel,
+                    orientation,
+                    fuse,
+                )? {
                     Decoded::Encoded(out) => out,
                     Decoded::Pixels { dst_w, dst_h } => {
-                        encode_output(s, dst_w, dst_h, 3, target, p)?
+                        let (dw, dh) = if orientation.is_upright() {
+                            (dst_w, dst_h)
+                        } else {
+                            // Rotate the resized frame into chunk8 (free
+                            // at this point) and swap it in as out8.
+                            let dims = crate::meta::apply_orientation(
+                                &s.out8[..dst_w * dst_h * 3],
+                                dst_w,
+                                dst_h,
+                                3,
+                                orientation,
+                                &mut s.chunk8,
+                            );
+                            std::mem::swap(&mut s.out8, &mut s.chunk8);
+                            dims
+                        };
+                        encode_output(s, dw, dh, 3, target, p)?
                     }
                     #[cfg(feature = "avif")]
                     Decoded::YuvPlanes { session } => {
@@ -431,7 +485,9 @@ fn u16_as_bytes_mut(buf: &mut [u16]) -> &mut [u8] {
     unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * 2) }
 }
 
-/// Decode (with DCT shrink-on-load) + SIMD resize; returns RGB pixels and final dimensions.
+/// Decode (with DCT shrink-on-load) + SIMD resize; returns RGB pixels
+/// and final dimensions. Honors EXIF auto-rotation exactly like the
+/// server pipeline (`OXIMG_AUTO_ROTATE=0` disables).
 pub fn decode_and_resize(
     jpeg: &[u8],
     max_w: u32,
@@ -440,10 +496,30 @@ pub fn decode_and_resize(
 ) -> Result<(Vec<u8>, usize, usize)> {
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
+        let orientation = if auto_rotate() {
+            let mut prefix = Vec::new();
+            let mut r = jpeg;
+            crate::meta::scan_jpeg_orientation(&mut r, &mut prefix)
+        } else {
+            crate::meta::Orientation::UPRIGHT
+        };
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        match decode_resize(s, dec, max_w, max_h, parallel, Fuse::Off)? {
+        match decode_resize(s, dec, max_w, max_h, parallel, orientation, Fuse::Off)? {
             Decoded::Pixels { dst_w, dst_h } => {
-                Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
+                if orientation.is_upright() {
+                    Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
+                } else {
+                    let mut rotated = Vec::new();
+                    let (dw, dh) = crate::meta::apply_orientation(
+                        &s.out8[..dst_w * dst_h * 3],
+                        dst_w,
+                        dst_h,
+                        3,
+                        orientation,
+                        &mut rotated,
+                    );
+                    Ok((rotated, dw, dh))
+                }
             }
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { .. } => unreachable!("no fuse was requested"),
@@ -680,13 +756,24 @@ fn decode_resize<R: std::io::BufRead>(
     max_w: u32,
     max_h: u32,
     parallel: usize,
+    orientation: crate::meta::Orientation,
     fuse: Fuse,
 ) -> Result<Decoded> {
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
 
     let (src_w, src_h) = dec.size();
-    let (dst_w, dst_h) = fit_dims(src_w, src_h, max_w, max_h);
+    // The target box constrains the *displayed* frame; for the
+    // axis-swapping orientations the resize target (still in stored
+    // orientation — the rotation happens on the resized frame) is the
+    // fitted box with its axes swapped back.
+    let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
+    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, max_w, max_h);
+    let (dst_w, dst_h) = if orientation.swaps_axes() {
+        (fit_h, fit_w)
+    } else {
+        (fit_w, fit_h)
+    };
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
 
@@ -1365,6 +1452,13 @@ fn fused_resize_yuv<R: std::io::BufRead>(
 
 fn linear_light() -> bool {
     std::env::var("OXIMG_RESIZE").as_deref() != Ok("srgb")
+}
+
+/// OXIMG_AUTO_ROTATE: apply EXIF orientation (default on; "0"
+/// disables, which also skips the pre-decode segment scan entirely).
+fn auto_rotate() -> bool {
+    static A: OnceLock<bool> = OnceLock::new();
+    *A.get_or_init(|| std::env::var("OXIMG_AUTO_ROTATE").as_deref() != Ok("0"))
 }
 
 fn process_png<R: std::io::Read>(
@@ -2067,7 +2161,17 @@ mod tests {
         };
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
+        match decode_resize(
+            &mut s,
+            dec,
+            320,
+            320,
+            1,
+            crate::meta::Orientation::UPRIGHT,
+            fuse,
+        )
+        .unwrap()
+        {
             Decoded::Encoded(out) => {
                 assert!(fuse_quality.is_some(), "fused output without fuse request");
                 out
@@ -2089,7 +2193,17 @@ mod tests {
     fn run_jpeg_pixels(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
+        match decode_resize(
+            &mut s,
+            dec,
+            320,
+            320,
+            1,
+            crate::meta::Orientation::UPRIGHT,
+            fuse,
+        )
+        .unwrap()
+        {
             Decoded::Pixels { dst_w, dst_h } => s.out8[..dst_w * dst_h * 3].to_vec(),
             Decoded::Encoded(_) => panic!("pixel run must not encode"),
             #[cfg(feature = "avif")]
@@ -2120,7 +2234,17 @@ mod tests {
         };
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
+        match decode_resize(
+            &mut s,
+            dec,
+            320,
+            320,
+            1,
+            crate::meta::Orientation::UPRIGHT,
+            fuse,
+        )
+        .unwrap()
+        {
             Decoded::Pixels { dst_w, dst_h } => {
                 crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3, &params)
                     .unwrap()
@@ -2163,6 +2287,7 @@ mod tests {
                 320,
                 320,
                 1,
+                crate::meta::Orientation::UPRIGHT,
                 Fuse::Yuv {
                     params: test_avif_params(),
                 },
@@ -2250,7 +2375,15 @@ mod tests {
         let cut = &jpeg[..jpeg.len() * 3 / 5];
         let mut s = Scratch::default();
         if let Ok(dec) = Decompress::new_mem(cut) {
-            let _ = decode_resize(&mut s, dec, 320, 320, 1, Fuse::Pixels);
+            let _ = decode_resize(
+                &mut s,
+                dec,
+                320,
+                320,
+                1,
+                crate::meta::Orientation::UPRIGHT,
+                Fuse::Pixels,
+            );
         }
     }
 
@@ -2277,6 +2410,7 @@ mod tests {
                 320,
                 320,
                 1,
+                crate::meta::Orientation::UPRIGHT,
                 Fuse::Jpegli { quality: p.quality },
             );
         }

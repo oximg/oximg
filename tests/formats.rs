@@ -1,6 +1,8 @@
 //! Format-matrix integration tests over `pipeline::process`, driven by
 //! committed fixtures (tests/fixtures/, all 200x150 unless noted).
 
+mod common;
+
 use oximg::pipeline::{self, Encoder, ImageFormat, Params};
 
 fn fixture(name: &str) -> Vec<u8> {
@@ -367,6 +369,104 @@ fn avif_alpha_survives_cross_format_to_png() {
         .read_info()
         .unwrap();
     assert_eq!(r.info().color_type, png::ColorType::Rgba);
+}
+
+/// Every EXIF orientation must display upright: sources are built by
+/// applying the *inverse* transform (an implementation independent of
+/// src/meta.rs) to a frame with four distinct corner colors, tagging
+/// them, and asserting the pipeline output shows the corners where the
+/// original had them — at the orientation-corrected dimensions.
+#[test]
+fn every_exif_orientation_displays_upright() {
+    let (w, h, block) = (240usize, 180usize, 60usize);
+    let display = common::corner_base(w, h, block);
+    for o in 1..=8u8 {
+        let (stored, sw, sh) = common::store_for_orientation(&display, w, h, o);
+        let jpeg = common::jpeg_with_orientation(&stored, sw, sh, Some(o as u16));
+        let (out, fmt) = pipeline::process(&jpeg, &params(120)).unwrap();
+        assert_eq!(fmt, ImageFormat::Jpeg, "o={o}");
+        let (ow, oh, corners) = common::corner_classes(&out);
+        assert_eq!((ow, oh), (120, 90), "o={o}: output must be display-fit");
+        assert_eq!(corners, ['R', 'G', 'B', 'W'], "o={o}");
+    }
+}
+
+/// An orientation-1 tag and no tag at all must produce identical
+/// output bytes (the marker changes nothing but the source file).
+#[test]
+fn orientation_one_matches_untagged_bytes() {
+    let display = common::corner_base(240, 180, 60);
+    let tagged = common::jpeg_with_orientation(&display, 240, 180, Some(1));
+    let untagged = common::jpeg_with_orientation(&display, 240, 180, None);
+    let (a, _) = pipeline::process(&tagged, &params(120)).unwrap();
+    let (b, _) = pipeline::process(&untagged, &params(120)).unwrap();
+    assert_eq!(a, b);
+}
+
+/// Orientation applies before the cross-format encode, so a rotated
+/// source converts with corrected dimensions in any target format.
+#[test]
+fn orientation_applies_to_cross_format_targets() {
+    let display = common::corner_base(240, 180, 60);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
+    let jpeg = common::jpeg_with_orientation(&stored, sw, sh, Some(6));
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        ..params(120)
+    };
+    let (out, fmt) = pipeline::process(&jpeg, &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Webp);
+    assert_eq!(dims_of(&out), (120, 90));
+}
+
+/// The *first* Exif APP1 decides, matching Chrome and Firefox: a
+/// non-Exif APP1 (XMP) before it must not mask it, and an
+/// orientation-less first Exif pins the image upright even when a
+/// later Exif segment carries a rotation.
+#[test]
+fn first_exif_app1_wins_across_multiple_app1_segments() {
+    let display = common::corner_base(240, 180, 60);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
+    let xmp = b"http://ns.adobe.com/xap/1.0/\0<x/>".to_vec();
+    let exif6 = common::app1_orientation(6);
+
+    let jpeg = common::jpeg_with_app1s(&stored, sw, sh, &[&xmp, &exif6]);
+    let (out, _) = pipeline::process(&jpeg, &params(120)).unwrap();
+    let (ow, oh, corners) = common::corner_classes(&out);
+    assert_eq!((ow, oh), (120, 90), "XMP before Exif must not mask it");
+    assert_eq!(corners, ['R', 'G', 'B', 'W']);
+
+    let no_tag = common::app1_exif_no_orientation();
+    let jpeg = common::jpeg_with_app1s(&stored, sw, sh, &[&no_tag, &exif6]);
+    let (out, _) = pipeline::process(&jpeg, &params(120)).unwrap();
+    let (ow, oh, _) = common::corner_classes(&out);
+    assert_eq!(
+        (ow, oh),
+        (90, 120),
+        "orientation-less first Exif wins: stored (portrait) frame served as-is"
+    );
+}
+
+/// The library decode API (qcli's path) honors rotation exactly like
+/// the server: display-fit dims and upright pixels.
+#[test]
+fn decode_and_resize_honors_orientation() {
+    let display = common::corner_base(240, 180, 60);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
+    let jpeg = common::jpeg_with_orientation(&stored, sw, sh, Some(6));
+    let (px, w, h) = pipeline::decode_and_resize(&jpeg, 120, 120, 1).unwrap();
+    assert_eq!((w, h), (120, 90), "box must fit the displayed frame");
+    let at = |x: usize, y: usize| common::classify(&px[(y * w + x) * 3..]);
+    let (ix, iy) = (w / 8, h / 8);
+    assert_eq!(
+        [
+            at(ix, iy),
+            at(w - 1 - ix, iy),
+            at(ix, h - 1 - iy),
+            at(w - 1 - ix, h - 1 - iy)
+        ],
+        ['R', 'G', 'B', 'W']
+    );
 }
 
 #[test]

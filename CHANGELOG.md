@@ -10,6 +10,28 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- EXIF auto-rotation for JPEG sources (on by default;
+  `OXIMG_AUTO_ROTATE=0` disables): the orientation tag steers the
+  target box (it fits the *displayed* frame) and the pixels are
+  rotated after the resize on the small output frame — Lanczos is
+  separable, so resize-then-rotate is exactly rotate-then-resize at a
+  fraction of the cost, and every streaming decode/resize path stays
+  untouched. Oriented sources take the pixel-fuse path (rotation is
+  incompatible with streaming rows into the incremental encoders);
+  untagged sources are byte-identical to 0.3.0 and pay no measurable
+  cost. Applies before cross-format encoding, so a rotated phone photo
+  converts upright into any target format. Tag semantics deliberately
+  match Chrome and Firefox: the *first* Exif APP1 decides (an
+  orientation-less one pins upright) and only strict `SHORT/count==1`
+  entries rotate, so oximg output always agrees with how browsers
+  render the original. The tag is read by a bounded in-tree scan of
+  the leading JPEG segments (hard-capped at 256KB) rather than
+  libjpeg marker saving, whose memory would scale with
+  attacker-supplied APP1 counts; `qcli resize` honors the same
+  rotation.
+
 ### Changed
 
 - The mozjpeg presets (`PRESET=fast|small`) now fuse the JPEG decode

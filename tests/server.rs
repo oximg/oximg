@@ -2,6 +2,8 @@
 //! full request path, including content types, error mapping, request
 //! coalescing, URL signing, and the remote-source mode.
 
+mod common;
+
 use std::io::Read;
 use std::process::{Child, Command};
 
@@ -310,6 +312,55 @@ fn forced_overlap_cross_format_matches_serial() {
     assert_eq!(ct, "image/webp");
     assert!(body.starts_with(b"RIFF"), "fused gate leaked jpegli bytes");
     assert_eq!(&body[8..12], b"WEBP");
+}
+
+/// Write an orientation-6 (90°-rotated) JPEG into a fresh directory
+/// usable as IMAGES_DIR.
+fn oriented_images_dir(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-orient-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let display = common::corner_base(240, 180, 60);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
+    let jpeg = common::jpeg_with_orientation(&stored, sw, sh, Some(6));
+    std::fs::write(dir.join("rotated.jpg"), jpeg).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
+/// Auto-rotation is on by default (dimensions come out display-fit)
+/// and OXIMG_AUTO_ROTATE=0 restores the stored-orientation behavior.
+#[test]
+fn auto_rotate_default_and_kill_switch() {
+    let dir = oriented_images_dir("kill");
+    let on = Server::start(47121, &[("IMAGES_DIR", dir.clone())]);
+    let (status, _, body) = on.get("/resize/120/120/rotated.jpg").unwrap();
+    assert_eq!(status, 200);
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    // Stored portrait 180x240 displays as landscape 240x180.
+    assert_eq!((w, h), (120, 90), "default: display-oriented fit");
+    drop(on);
+
+    let off = Server::start(
+        47122,
+        &[("IMAGES_DIR", dir), ("OXIMG_AUTO_ROTATE", "0".into())],
+    );
+    let (_, _, body) = off.get("/resize/120/120/rotated.jpg").unwrap();
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (90, 120), "kill switch: stored orientation");
+}
+
+/// Oriented sources force the pixel fuse; their bytes must still be
+/// independent of the overlap gate.
+#[test]
+fn oriented_bytes_do_not_depend_on_overlap_gate() {
+    let dir = oriented_images_dir("gate");
+    let fused = Server::start(
+        47123,
+        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())],
+    );
+    let serial = Server::start(47124, &[("IMAGES_DIR", dir), ("OXIMG_OVERLAP", "0".into())]);
+    let a = fused.get("/resize/120/120/rotated.jpg").unwrap().2;
+    let b = serial.get("/resize/120/120/rotated.jpg").unwrap().2;
+    assert_eq!(a, b, "oriented fused and serial bytes must match");
 }
 
 /// mozjpeg presets fuse the decode with the resize on a second thread;

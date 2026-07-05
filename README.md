@@ -69,6 +69,11 @@ in linear light onto `OXIMG_FLATTEN_BG` (hex `RRGGBB`, default white).
 Encode settings are keyed by the *output* format, using the same knobs
 as same-format requests.
 
+**EXIF orientation**: JPEG sources auto-rotate — the target box applies
+to the displayed frame and the pixels come out upright in every output
+format (the tag itself is not forwarded, so nothing double-rotates).
+`OXIMG_AUTO_ROTATE=0` restores the raw stored orientation.
+
 ## Pipeline
 
 ```
@@ -216,10 +221,10 @@ default).
 ## Not yet implemented (out of PoC scope)
 
 - JXL output (the `@jxl` token is reserved and returns a clear error)
-- Fused decode‖encode overlap on cross-format JPEG requests (they use
-  the same streamed SIMD resize path, minus the second-thread overlap)
+- EXIF orientation for non-JPEG sources (WebP EXIF chunks, AVIF
+  irot/imir, PNG eXIf); JPEG sources auto-rotate
 - Animated AVIF sources
-- EXIF orientation / ICC profile handling
+- ICC profile handling (in progress: pass-through planned)
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
 
