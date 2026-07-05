@@ -89,31 +89,105 @@ fn parse_exif_orientation(data: &[u8]) -> Option<Orientation> {
     None
 }
 
-/// Scan cap: EXIF sits right after SOI in practice; a source whose
-/// APP/COM preamble exceeds this is served unrotated rather than
-/// buffered without bound.
+/// Scan cap: EXIF and ICC sit in the pre-frame header in practice; a
+/// source whose header exceeds this is served without rotation or
+/// profile rather than buffered without bound.
 const SCAN_CAP: usize = 256 * 1024;
 
-/// Walk the leading JPEG segments of `reader`, buffering every byte
+/// Metadata pulled from the JPEG header scan.
+pub(crate) struct JpegMeta {
+    pub(crate) orientation: Orientation,
+    pub(crate) icc: Option<Vec<u8>>,
+}
+
+impl JpegMeta {
+    pub(crate) const NONE: JpegMeta = JpegMeta {
+        orientation: Orientation::UPRIGHT,
+        icc: None,
+    };
+}
+
+/// Reassembles the APP2 `ICC_PROFILE` chunk chain, enforcing the same
+/// rules as libjpeg's `jpeg_read_icc_profile` (which browsers
+/// ultimately follow): 1-based sequence numbers, a chunk count every
+/// chunk agrees on, no duplicates, every chunk present. Any violation
+/// poisons the whole chain — a broken profile must never ship, it just
+/// means "no profile here".
+#[derive(Default)]
+struct IccAssembler {
+    chunks: Vec<Option<Vec<u8>>>,
+    broken: bool,
+}
+
+impl IccAssembler {
+    /// Feed one APP2 payload; non-ICC APP2 segments are ignored.
+    fn add(&mut self, body: &[u8]) {
+        if self.broken {
+            return;
+        }
+        let Some(rest) = body.strip_prefix(b"ICC_PROFILE\0") else {
+            return;
+        };
+        if rest.len() < 2 {
+            // libjpeg's marker_is_icc requires the full 14-byte
+            // overhead before classifying a marker as ICC at all, so a
+            // truncated header is "not ICC" (skip), not poison.
+            return;
+        }
+        let (seq, count, data) = (rest[0] as usize, rest[1] as usize, &rest[2..]);
+        if seq == 0 || count == 0 || seq > count {
+            self.broken = true;
+            return;
+        }
+        if self.chunks.is_empty() {
+            self.chunks = vec![None; count];
+        }
+        if self.chunks.len() != count || self.chunks[seq - 1].is_some() {
+            self.broken = true;
+            return;
+        }
+        self.chunks[seq - 1] = Some(data.to_vec());
+    }
+
+    fn finish(self) -> Option<Vec<u8>> {
+        if self.broken || self.chunks.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        for c in self.chunks {
+            out.extend_from_slice(&c?);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+/// Walk the JPEG header segments of `reader`, buffering every byte
 /// read into `prefix` (so the caller can re-chain it in front of the
-/// remaining stream), and return the orientation from the *first* Exif
-/// APP1 — matching the first-Exif-wins behavior of Chrome and Firefox,
-/// including treating an orientation-less first Exif as upright.
+/// remaining stream) and returning the orientation from the *first*
+/// Exif APP1 — matching the first-Exif-wins behavior of Chrome and
+/// Firefox, including treating an orientation-less first Exif as
+/// upright — plus, when `want_icc`, the reassembled APP2 ICC profile.
 ///
-/// Marker fill bytes (0xFF padding, B.1.1.2) are skipped like libjpeg
-/// and Skia do. Scanning stops at the first non-APPn/COM marker
-/// (tables/frame data follow), at [`SCAN_CAP`] buffered bytes, on EOF,
-/// or on anything structurally bogus — all of which mean "no rotation"
-/// and leave the real error handling to the decoder, which always sees
-/// the byte-identical stream (every consumed byte lands in `prefix`,
-/// even on a short final read). This replaces libjpeg-side marker
-/// saving, whose per-request memory scales with the number of
+/// The walk covers every length-framed segment up to SOS/EOI (the
+/// same span libjpeg's marker saving covers); without `want_icc` it
+/// short-circuits at the first Exif segment. Marker fill bytes (0xFF
+/// padding, B.1.1.2) are skipped like libjpeg and Skia do. Scanning
+/// stops at [`SCAN_CAP`] buffered bytes, on EOF, or on anything
+/// structurally bogus — all of which mean "no metadata" and leave the
+/// real error handling to the decoder, which always sees the
+/// byte-identical stream (every consumed byte lands in `prefix`, even
+/// on a short final read). This replaces libjpeg-side marker saving,
+/// whose per-request memory scales with the number of
 /// attacker-supplied APP1 segments; here the buffer is hard-capped.
-pub(crate) fn scan_jpeg_orientation<R: std::io::BufRead>(
+pub(crate) fn scan_jpeg_meta<R: std::io::BufRead>(
     reader: &mut R,
     prefix: &mut Vec<u8>,
-) -> Orientation {
+    want_icc: bool,
+) -> JpegMeta {
     prefix.clear();
+    let mut meta = JpegMeta::NONE;
+    let mut exif_seen = false;
+    let mut icc = IccAssembler::default();
     // Read exactly `n` bytes into `prefix`, returning their start
     // offset. fill_buf/consume instead of read_exact so a short read
     // (EOF, I/O error) keeps whatever *was* consumed in `prefix` —
@@ -141,49 +215,69 @@ pub(crate) fn scan_jpeg_orientation<R: std::io::BufRead>(
         }
         Some(start)
     };
-    // SOI
-    let Some(soi) = take(prefix, 2) else {
-        return Orientation::UPRIGHT;
-    };
-    if prefix[soi..] != [0xFF, 0xD8] {
-        return Orientation::UPRIGHT;
-    }
-    loop {
-        let Some(m) = take(prefix, 2) else {
-            return Orientation::UPRIGHT;
+    'walk: {
+        // SOI
+        let Some(soi) = take(prefix, 2) else {
+            break 'walk;
         };
-        if prefix[m] != 0xFF {
-            return Orientation::UPRIGHT;
+        if prefix[soi..] != [0xFF, 0xD8] {
+            break 'walk;
         }
-        // Markers may be padded with any number of 0xFF fill bytes
-        // (B.1.1.2); libjpeg and Skia skip them, so the scan must too.
-        let mut marker = prefix[m + 1];
-        while marker == 0xFF {
-            let Some(b) = take(prefix, 1) else {
-                return Orientation::UPRIGHT;
+        loop {
+            let Some(m) = take(prefix, 2) else {
+                break 'walk;
             };
-            marker = prefix[b];
-        }
-        // APPn (0xE0..=0xEF) and COM (0xFE) may precede the frame;
-        // anything else ends the metadata preamble.
-        if !((0xE0..=0xEF).contains(&marker) || marker == 0xFE) {
-            return Orientation::UPRIGHT;
-        }
-        let Some(l) = take(prefix, 2) else {
-            return Orientation::UPRIGHT;
-        };
-        let len = u16::from_be_bytes([prefix[l], prefix[l + 1]]) as usize;
-        if len < 2 {
-            return Orientation::UPRIGHT;
-        }
-        let Some(body) = take(prefix, len - 2) else {
-            return Orientation::UPRIGHT;
-        };
-        if marker == 0xE1 && prefix[body..].starts_with(b"Exif\0\0") {
-            // First Exif segment decides, orientation tag or not.
-            return Orientation::from_exif_app1(&prefix[body..]).unwrap_or(Orientation::UPRIGHT);
+            if prefix[m] != 0xFF {
+                break 'walk;
+            }
+            // Markers may be padded with any number of 0xFF fill bytes
+            // (B.1.1.2); libjpeg and Skia skip them, so the scan must too.
+            let mut marker = prefix[m + 1];
+            while marker == 0xFF {
+                let Some(b) = take(prefix, 1) else {
+                    break 'walk;
+                };
+                marker = prefix[b];
+            }
+            // SOS/EOI end the header. Stray TEM/RSTn are standalone
+            // (no length field); libjpeg's read_markers skips them and
+            // keeps scanning, so the walk must too — otherwise a
+            // profile behind one would be stripped from a file the
+            // decoder accepts.
+            if marker == 0xDA || marker == 0xD9 {
+                break 'walk;
+            }
+            if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+                continue;
+            }
+            let Some(l) = take(prefix, 2) else {
+                break 'walk;
+            };
+            let len = u16::from_be_bytes([prefix[l], prefix[l + 1]]) as usize;
+            if len < 2 {
+                break 'walk;
+            }
+            let Some(body) = take(prefix, len - 2) else {
+                break 'walk;
+            };
+            if marker == 0xE1 && !exif_seen && prefix[body..].starts_with(b"Exif\0\0") {
+                // First Exif segment decides, orientation tag or not.
+                exif_seen = true;
+                meta.orientation =
+                    Orientation::from_exif_app1(&prefix[body..]).unwrap_or(Orientation::UPRIGHT);
+                if !want_icc {
+                    // Nothing left to look for.
+                    break 'walk;
+                }
+            } else if want_icc && marker == 0xE2 {
+                icc.add(&prefix[body..]);
+            }
         }
     }
+    if want_icc {
+        meta.icc = icc.finish();
+    }
+    meta
 }
 
 /// Apply the orientation to interleaved `channels`-byte pixels,
@@ -340,7 +434,7 @@ mod tests {
         let mut r = &jpeg[..];
         let mut prefix = Vec::new();
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation(6),
             "XMP APP1 before the Exif must not mask it"
         );
@@ -362,7 +456,7 @@ mod tests {
         jpeg.extend(b"\xFF\xDAtail");
         let mut r = &jpeg[..];
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation::UPRIGHT
         );
         assert_rechains(&prefix, r, &jpeg);
@@ -383,7 +477,7 @@ mod tests {
         let mut r = &jpeg[..];
         let mut prefix = Vec::new();
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation::UPRIGHT
         );
         assert!(prefix.len() <= SCAN_CAP);
@@ -393,7 +487,7 @@ mod tests {
         let png = b"\x89PNG\r\n\x1a\n....".to_vec();
         let mut r = &png[..];
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation::UPRIGHT
         );
         assert_rechains(&prefix, r, &png);
@@ -402,7 +496,7 @@ mod tests {
         let jpeg = b"\xFF\xD8\xFF\xE1\x00\x01junk".to_vec();
         let mut r = &jpeg[..];
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation::UPRIGHT
         );
         assert_rechains(&prefix, r, &jpeg);
@@ -412,9 +506,121 @@ mod tests {
         let jpeg = b"\xFF\xD8\xFF\xE1\x00\x30Exif".to_vec();
         let mut r = &jpeg[..];
         assert_eq!(
-            scan_jpeg_orientation(&mut r, &mut prefix),
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
             Orientation::UPRIGHT
         );
+        assert_rechains(&prefix, r, &jpeg);
+    }
+
+    /// APP2 payload for one ICC chunk.
+    fn app2_icc(seq: u8, count: u8, data: &[u8]) -> Vec<u8> {
+        let mut v = b"ICC_PROFILE\0".to_vec();
+        v.push(seq);
+        v.push(count);
+        v.extend(data);
+        v
+    }
+
+    /// Wrap segments into a JPEG-shaped stream ending in a DQT-like
+    /// table and SOS so the header walk has a realistic footer.
+    fn jpeg_stream(segments: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        for (marker, body) in segments {
+            jpeg.extend(seg(*marker, body));
+        }
+        jpeg.extend(seg(0xDB, &[0u8; 4])); // table segment
+        jpeg.extend(b"\xFF\xDAentropy...");
+        jpeg
+    }
+
+    fn scan_icc(jpeg: &[u8]) -> (Orientation, Option<Vec<u8>>) {
+        let mut r = jpeg;
+        let mut prefix = Vec::new();
+        let m = scan_jpeg_meta(&mut r, &mut prefix, true);
+        assert_rechains(&prefix, r, jpeg);
+        (m.orientation, m.icc)
+    }
+
+    #[test]
+    fn icc_chain_reassembles_in_sequence_order() {
+        let profile: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+        // single chunk
+        let jpeg = jpeg_stream(&[(0xE2, app2_icc(1, 1, &profile))]);
+        assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
+        // two chunks, delivered out of order, Exif in between
+        let jpeg = jpeg_stream(&[
+            (0xE2, app2_icc(2, 2, &profile[300..])),
+            (0xE1, app1(6, false)),
+            (0xE2, app2_icc(1, 2, &profile[..300])),
+        ]);
+        let (o, icc) = scan_icc(&jpeg);
+        assert_eq!(o, Orientation(6), "orientation and ICC coexist");
+        assert_eq!(icc.as_deref(), Some(&profile[..]));
+        // chunks may follow tables (the walk spans the whole header)
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(seg(0xDB, &[0u8; 4]));
+        jpeg.extend(seg(0xE2, &app2_icc(1, 1, &profile)));
+        jpeg.extend(b"\xFF\xDAentropy");
+        assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
+    }
+
+    #[test]
+    fn broken_icc_chains_yield_no_profile() {
+        let d = [7u8; 40];
+        let cases: Vec<Vec<(u8, Vec<u8>)>> = vec![
+            vec![(0xE2, app2_icc(1, 2, &d))], // missing chunk 2
+            vec![(0xE2, app2_icc(1, 1, &d)), (0xE2, app2_icc(1, 1, &d))], // duplicate
+            vec![(0xE2, app2_icc(1, 1, &d)), (0xE2, app2_icc(2, 2, &d))], // count mismatch
+            vec![(0xE2, app2_icc(0, 1, &d))], // zero-based seq
+            vec![(0xE2, app2_icc(2, 1, &d))], // seq > count
+            vec![(0xE2, app2_icc(1, 1, &[]))], // empty profile
+            vec![(0xE2, b"ICC_PROFILE\0".to_vec())], // truncated header
+        ];
+        for (i, segs) in cases.iter().enumerate() {
+            assert_eq!(scan_icc(&jpeg_stream(segs)).1, None, "case {i}");
+        }
+        // non-ICC APP2 segments are ignored, not poison
+        let profile = [9u8; 64];
+        let jpeg = jpeg_stream(&[
+            (0xE2, b"FPXR\0not-icc".to_vec()),
+            (0xE2, app2_icc(1, 1, &profile)),
+        ]);
+        assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
+        // ...and so is a truncated "ICC_PROFILE\0" header: libjpeg's
+        // marker_is_icc never classifies it as ICC, so it must not
+        // poison a valid chain next to it.
+        let jpeg = jpeg_stream(&[
+            (0xE2, b"ICC_PROFILE\0".to_vec()),
+            (0xE2, app2_icc(1, 1, &profile)),
+        ]);
+        assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
+    }
+
+    /// Stray standalone markers (TEM, RSTn) are skipped exactly like
+    /// libjpeg's read_markers skips them: metadata behind one must
+    /// still be found, since the decoder accepts such files.
+    #[test]
+    fn stray_standalone_markers_do_not_end_the_walk() {
+        let profile = [3u8; 48];
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xD0, 0xFF, 0x01]; // RST0, TEM
+        jpeg.extend(seg(0xE1, &app1(6, false)));
+        jpeg.extend(seg(0xE2, &app2_icc(1, 1, &profile)));
+        jpeg.extend(b"\xFF\xDAtail");
+        let mut r = &jpeg[..];
+        let mut prefix = Vec::new();
+        let m = scan_jpeg_meta(&mut r, &mut prefix, true);
+        assert_eq!(m.orientation, Orientation(6));
+        assert_eq!(m.icc.as_deref(), Some(&profile[..]));
+        assert_rechains(&prefix, r, &jpeg);
+    }
+
+    #[test]
+    fn icc_is_not_collected_when_unwanted() {
+        let jpeg = jpeg_stream(&[(0xE2, app2_icc(1, 1, &[5u8; 16]))]);
+        let mut r = &jpeg[..];
+        let mut prefix = Vec::new();
+        let m = scan_jpeg_meta(&mut r, &mut prefix, false);
+        assert_eq!(m.icc, None);
         assert_rechains(&prefix, r, &jpeg);
     }
 
@@ -428,7 +634,10 @@ mod tests {
         jpeg.extend(b"\xFF\xDAtail");
         let mut r = &jpeg[..];
         let mut prefix = Vec::new();
-        assert_eq!(scan_jpeg_orientation(&mut r, &mut prefix), Orientation(6));
+        assert_eq!(
+            scan_jpeg_meta(&mut r, &mut prefix, false).orientation,
+            Orientation(6)
+        );
         assert_rechains(&prefix, r, &jpeg);
     }
 

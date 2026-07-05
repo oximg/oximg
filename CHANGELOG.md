@@ -12,6 +12,20 @@ HTTP interface without notice.
 
 ### Added
 
+- ICC profile pass-through (on by default; `OXIMG_ICC=0` strips): the
+  source's profile — JPEG APP2 `ICC_PROFILE` chain (reassembled with
+  libjpeg's chunk rules by the same bounded header scan that reads the
+  orientation), PNG `iCCP`, WebP `ICCP` — is carried byte-for-byte
+  into any profile-capable output, across format conversion included.
+  Pixels are never color-converted. AVIF is the documented gap in both
+  directions (CICP-only serializer, no source-side colr parsing).
+  Profiled JPEG sources take the one-shot encode path (the profile
+  must precede the incremental encoder's scanlines). The header scan
+  now spans every pre-frame segment — the same span libjpeg's marker
+  saving covers — so an Exif tag placed after the tables (which
+  browsers honor) now rotates too, where 0.3.x-era scanning would
+  have missed it.
+
 - EXIF auto-rotation for JPEG sources (on by default;
   `OXIMG_AUTO_ROTATE=0` disables): the orientation tag steers the
   target box (it fits the *displayed* frame) and the pixels are
@@ -20,8 +34,8 @@ HTTP interface without notice.
   fraction of the cost, and every streaming decode/resize path stays
   untouched. Oriented sources take the pixel-fuse path (rotation is
   incompatible with streaming rows into the incremental encoders);
-  untagged sources are byte-identical to 0.3.0 and pay no measurable
-  cost. Applies before cross-format encoding, so a rotated phone photo
+  untagged, profile-less sources are byte-identical to 0.3.0 and pay
+  no measurable cost. Applies before cross-format encoding, so a rotated phone photo
   converts upright into any target format. Tag semantics deliberately
   match Chrome and Firefox: the *first* Exif APP1 decides (an
   orientation-less one pins upright) and only strict `SHORT/count==1`

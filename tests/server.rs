@@ -363,6 +363,72 @@ fn oriented_bytes_do_not_depend_on_overlap_gate() {
     assert_eq!(a, b, "oriented fused and serial bytes must match");
 }
 
+/// ICC pass-through is on by default and OXIMG_ICC=0 strips it; the
+/// profiled source serves fine either way, and profiled bytes stay
+/// independent of the overlap gate (they force the pixel fuse).
+#[test]
+fn icc_default_kill_switch_and_gate_independence() {
+    let dir = std::env::temp_dir().join(format!("oximg-icc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let icc = common::fake_icc(700);
+    let px = common::corner_base(240, 180, 60);
+    let app2 = common::app2_icc_payloads(&icc, 60_000).remove(0);
+    let jpeg = common::jpeg_with_markers(&px, 240, 180, &[(2, &app2)]);
+    std::fs::write(dir.join("profiled.jpg"), jpeg).unwrap();
+    let dir = dir.to_str().unwrap().to_string();
+
+    let on = Server::start(
+        47125,
+        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())],
+    );
+    let (status, _, body) = on.get("/resize/120/120/profiled.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(
+        common::jpeg_icc(&body).as_deref(),
+        Some(&icc[..]),
+        "default: profile passes through"
+    );
+    let fused_bytes = body;
+    drop(on);
+
+    let serial = Server::start(
+        47127,
+        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "0".into())],
+    );
+    let (_, _, body) = serial.get("/resize/120/120/profiled.jpg").unwrap();
+    assert_eq!(body, fused_bytes, "profiled bytes are gate-independent");
+    drop(serial);
+
+    let off = Server::start(
+        47126,
+        &[("IMAGES_DIR", dir.clone()), ("OXIMG_ICC", "0".into())],
+    );
+    let (status, _, body) = off.get("/resize/120/120/profiled.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(common::jpeg_icc(&body), None, "kill switch: no profile");
+    drop(off);
+
+    // The knobs are independent: rotation off, profile still carried.
+    let display = common::corner_base(240, 180, 60);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
+    let app1 = common::app1_orientation(6);
+    let app2 = common::app2_icc_payloads(&icc, 60_000).remove(0);
+    let both = common::jpeg_with_markers(&stored, sw, sh, &[(1, &app1), (2, &app2)]);
+    std::fs::write(std::path::Path::new(&dir).join("both.jpg"), both).unwrap();
+    let no_rot = Server::start(
+        47128,
+        &[("IMAGES_DIR", dir), ("OXIMG_AUTO_ROTATE", "0".into())],
+    );
+    let (_, _, body) = no_rot.get("/resize/120/120/both.jpg").unwrap();
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (90, 120), "rotation off: stored orientation");
+    assert_eq!(
+        common::jpeg_icc(&body).as_deref(),
+        Some(&icc[..]),
+        "rotation off: profile still passes through"
+    );
+}
+
 /// mozjpeg presets fuse the decode with the resize on a second thread;
 /// like every fused path, their bytes must not depend on the overlap
 /// gate.

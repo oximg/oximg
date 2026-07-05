@@ -260,22 +260,30 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
         let s = &mut *s.borrow_mut();
         let out = match format {
             ImageFormat::Jpeg => {
-                // With auto-rotation on (the default), a bounded
-                // pre-scan of the leading APP/COM segments extracts the
-                // EXIF orientation; the scanned bytes are re-chained in
-                // front of the stream so the decoder sees identical
-                // input. libjpeg-side marker saving is deliberately not
+                // A bounded pre-scan of the header segments (through
+                // the tables, up to SOS — the span libjpeg's marker
+                // saving covers) extracts the EXIF orientation and,
+                // for profile-capable targets, the APP2 ICC chain; the
+                // scanned bytes are re-chained in front of the stream
+                // so the decoder sees identical input. libjpeg-side marker saving is deliberately not
                 // used: its per-request memory scales with the number
                 // of attacker-supplied APP1 segments, while this buffer
                 // is hard-capped (see meta::SCAN_CAP).
                 let mut reader = reader;
-                let mut exif_prefix = Vec::new();
+                let mut scan_prefix = Vec::new();
+                let want_icc = icc_passthrough() && target_supports_icc(target);
+                let meta = if auto_rotate() || want_icc {
+                    crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
+                } else {
+                    crate::meta::JpegMeta::NONE
+                };
                 let orientation = if auto_rotate() {
-                    crate::meta::scan_jpeg_orientation(&mut reader, &mut exif_prefix)
+                    meta.orientation
                 } else {
                     crate::meta::Orientation::UPRIGHT
                 };
-                let reader = std::io::Read::chain(&exif_prefix[..], reader);
+                let icc = meta.icc;
+                let reader = std::io::Read::chain(&scan_prefix[..], reader);
                 let dec = Decompress::new_reader(reader).context("parse JPEG")?;
                 // Fused decode overlap: on unless disabled (see
                 // overlap_gate). Band-parallel resize keeps the serial
@@ -311,7 +319,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
                 {
                     Fuse::Off
-                } else if !orientation.is_upright() {
+                } else if !orientation.is_upright() || icc.is_some() {
                     // Rotation happens on the resized frame before the
                     // one-shot encode — incompatible with streaming rows
                     // into jpegli or into the YUV planes, so oriented
@@ -320,6 +328,11 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     // recover the jpegli/YUV overlap for the flip-only
                     // orientations (2-4); oriented traffic is a small
                     // minority, so correctness ships first.
+                    // ICC likewise: the profile must be written before
+                    // the incremental encoder's first scanline, so
+                    // profiled sources take the one-shot encode.
+                    // TODO(icc-fuse): thread the profile into the fused
+                    // jpegli worker to recover the overlap.
                     Fuse::Pixels
                 } else if target == ImageFormat::Jpeg {
                     if p.encoder == Encoder::Jpegli {
@@ -361,7 +374,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                             std::mem::swap(&mut s.out8, &mut s.chunk8);
                             dims
                         };
-                        encode_output(s, dw, dh, 3, target, p)?
+                        encode_output(s, dw, dh, 3, target, p, icc.as_deref())?
                     }
                     #[cfg(feature = "avif")]
                     Decoded::YuvPlanes { session } => {
@@ -499,7 +512,7 @@ pub fn decode_and_resize(
         let orientation = if auto_rotate() {
             let mut prefix = Vec::new();
             let mut r = jpeg;
-            crate::meta::scan_jpeg_orientation(&mut r, &mut prefix)
+            crate::meta::scan_jpeg_meta(&mut r, &mut prefix, false).orientation
         } else {
             crate::meta::Orientation::UPRIGHT
         };
@@ -1461,6 +1474,29 @@ fn auto_rotate() -> bool {
     *A.get_or_init(|| std::env::var("OXIMG_AUTO_ROTATE").as_deref() != Ok("0"))
 }
 
+/// OXIMG_ICC: carry the source's ICC profile into the output (default
+/// on; "0" disables and skips profile extraction entirely). Pixels are
+/// never color-converted — the profile bytes are passed through.
+fn icc_passthrough() -> bool {
+    static I: OnceLock<bool> = OnceLock::new();
+    *I.get_or_init(|| std::env::var("OXIMG_ICC").as_deref() != Ok("0"))
+}
+
+/// Targets that can carry an ICC profile. AVIF is the gap: our
+/// serializer speaks CICP only (TODO(avif-icc)).
+fn target_supports_icc(target: ImageFormat) -> bool {
+    matches!(
+        target,
+        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Webp
+    )
+}
+
+/// Profiles larger than this are dropped rather than copied into every
+/// resized output (real-world profiles top out around 2-3MB for
+/// LUT-based print profiles; web images carry a few KB). The JPEG scan
+/// is bounded tighter still by `meta::SCAN_CAP`.
+const ICC_CAP: usize = 4 * 1024 * 1024;
+
 fn process_png<R: std::io::Read>(
     s: &mut Scratch,
     mut reader: R,
@@ -1476,6 +1512,18 @@ fn process_png<R: std::io::Read>(
     let mut decoder = png::Decoder::new(std::io::Cursor::new(&s.srcbuf[..]));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut png_reader = decoder.read_info().context("parse PNG")?;
+    // iCCP profile (the png crate has already inflated it), bytes
+    // passed through untouched.
+    let icc: Option<Vec<u8>> = if icc_passthrough() && target_supports_icc(target) {
+        png_reader
+            .info()
+            .icc_profile
+            .as_ref()
+            .filter(|c| !c.is_empty() && c.len() <= ICC_CAP)
+            .map(|c| c.to_vec())
+    } else {
+        None
+    };
 
     // Hot path: plain RGB8, non-interlaced, linear-light mode. Rows are
     // sRGB->linear LUT-mapped as they are decoded, so the pixels never
@@ -1525,7 +1573,7 @@ fn process_png<R: std::io::Read>(
             }
             let t_resize = t1.elapsed();
             let t2 = std::time::Instant::now();
-            let out = encode_output(s, dst_w, dst_h, 3, target, p);
+            let out = encode_output(s, dst_w, dst_h, 3, target, p, icc.as_deref());
             if timing {
                 eprintln!(
                     "timing png(fused) decode+fwd({src_w}x{src_h})={:.1}ms resize+back={:.1}ms encode={:.1}ms",
@@ -1566,7 +1614,7 @@ fn process_png<R: std::io::Read>(
     let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
     let t_resize = t1.elapsed();
     let t2 = std::time::Instant::now();
-    let out = encode_output(s, dst_w, dst_h, channels, target, p);
+    let out = encode_output(s, dst_w, dst_h, channels, target, p, icc.as_deref());
     if timing {
         eprintln!(
             "timing png decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1619,6 +1667,11 @@ fn process_webp<R: std::io::Read>(
     // costs other servers their score.
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
+    let icc = if icc_passthrough() && target_supports_icc(target) {
+        webp_icc(&s.srcbuf)
+    } else {
+        None
+    };
     let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, p)?;
     let _ = (src_w, src_h);
     let t_dec = t0.elapsed();
@@ -1628,7 +1681,7 @@ fn process_webp<R: std::io::Read>(
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    let out = encode_output(s, dst_w, dst_h, channels, target, p)?;
+    let out = encode_output(s, dst_w, dst_h, channels, target, p, icc.as_deref())?;
     if timing {
         eprintln!(
             "timing webp decode({dec_w}x{dec_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1665,7 +1718,9 @@ fn process_avif<R: std::io::Read>(
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    let out = encode_output(s, dst_w, dst_h, channels, target, p)?;
+    // TODO(avif-icc-src): avif-parse exposes no colr boxes, so an ICC
+    // profile in an AVIF source is not carried to any target yet.
+    let out = encode_output(s, dst_w, dst_h, channels, target, p, None)?;
     if timing {
         eprintln!(
             "timing avif decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -1881,9 +1936,24 @@ fn png_compression() -> png::Compression {
     }
 }
 
-fn encode_png(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
+fn encode_png(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(64 * 1024);
-    let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+    // The no-profile arm constructs the encoder exactly as the pre-ICC
+    // code did, keeping profile-less output byte-identical.
+    let mut enc = match icc {
+        Some(icc) => {
+            let mut info = png::Info::with_size(w as u32, h as u32);
+            info.icc_profile = Some(std::borrow::Cow::Borrowed(icc));
+            png::Encoder::with_info(&mut out, info).context("PNG info")?
+        }
+        None => png::Encoder::new(&mut out, w as u32, h as u32),
+    };
     enc.set_color(if channels == 4 {
         png::ColorType::Rgba
     } else {
@@ -1945,7 +2015,21 @@ fn webp_effort() -> i32 {
         .unwrap_or(2)
 }
 
-fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
+fn encode_webp(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let out = encode_webp_bare(pixels, w, h, channels)?;
+    match icc {
+        Some(icc) => wrap_webp_icc(&out, icc),
+        None => Ok(out),
+    }
+}
+
+fn encode_webp_bare(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec<u8>> {
     use libwebp_sys as wp;
     unsafe {
         let mut config: wp::WebPConfig = std::mem::zeroed();
@@ -1981,6 +2065,67 @@ fn encode_webp(pixels: &[u8], w: usize, h: usize, channels: usize) -> Result<Vec
     }
 }
 
+/// Re-container an encoded WebP with an `ICCP` chunk via WebPMux (the
+/// mux sets the required VP8X flags itself). Only profiled sources pay
+/// for the extra assembly copy.
+fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
+    use libwebp_sys as wp;
+    unsafe {
+        let data = wp::WebPData {
+            bytes: webp.as_ptr(),
+            size: webp.len(),
+        };
+        // copy_data=0: the mux borrows `webp`, which outlives it.
+        let mux = wp::WebPMuxCreateInternal(&data, 0, wp::WEBP_MUX_ABI_VERSION as _);
+        anyhow::ensure!(!mux.is_null(), "webp mux parse");
+        let chunk = wp::WebPData {
+            bytes: icc.as_ptr(),
+            size: icc.len(),
+        };
+        let rc = wp::WebPMuxSetChunk(mux, c"ICCP".as_ptr(), &chunk, 1);
+        if rc != wp::WebPMuxError::WEBP_MUX_OK {
+            wp::WebPMuxDelete(mux);
+            anyhow::bail!("webp ICCP set failed ({rc:?})");
+        }
+        let mut assembled: wp::WebPData = std::mem::zeroed();
+        let rc = wp::WebPMuxAssemble(mux, &mut assembled);
+        wp::WebPMuxDelete(mux);
+        if rc != wp::WebPMuxError::WEBP_MUX_OK {
+            wp::WebPDataClear(&mut assembled);
+            anyhow::bail!("webp mux assemble failed ({rc:?})");
+        }
+        let out = std::slice::from_raw_parts(assembled.bytes, assembled.size).to_vec();
+        wp::WebPDataClear(&mut assembled);
+        Ok(out)
+    }
+}
+
+/// Extract the ICCP chunk from a WebP container, if any.
+fn webp_icc(srcbuf: &[u8]) -> Option<Vec<u8>> {
+    use libwebp_sys as wp;
+    unsafe {
+        let data = wp::WebPData {
+            bytes: srcbuf.as_ptr(),
+            size: srcbuf.len(),
+        };
+        let mux = wp::WebPMuxCreateInternal(&data, 0, wp::WEBP_MUX_ABI_VERSION as _);
+        if mux.is_null() {
+            return None;
+        }
+        let mut chunk: wp::WebPData = std::mem::zeroed();
+        let rc = wp::WebPMuxGetChunk(mux, c"ICCP".as_ptr(), &mut chunk);
+        // The chunk data points into `srcbuf`/mux internals: copy out
+        // before the mux is deleted.
+        let out = (rc == wp::WebPMuxError::WEBP_MUX_OK
+            && !chunk.bytes.is_null()
+            && chunk.size > 0
+            && chunk.size <= ICC_CAP)
+            .then(|| std::slice::from_raw_parts(chunk.bytes, chunk.size).to_vec());
+        wp::WebPMuxDelete(mux);
+        out
+    }
+}
+
 /// Encode the resized RGB(A)8 pixels in `Scratch::out8` as `target`.
 /// When `target` matches the source format this calls the same encoder
 /// with the same arguments as the pre-cross-format code, so same-format
@@ -1993,20 +2138,34 @@ fn encode_output(
     channels: usize,
     target: ImageFormat,
     p: &Params,
+    icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     match target {
         ImageFormat::Jpeg => {
             if channels == 4 {
                 flatten_alpha_in_out8(s, dst_w, dst_h);
             }
-            encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p)
+            encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p, icc)
         }
-        ImageFormat::Png => encode_png(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels),
-        ImageFormat::Webp => {
-            encode_webp(&s.out8[..dst_w * dst_h * channels], dst_w, dst_h, channels)
-        }
+        ImageFormat::Png => encode_png(
+            &s.out8[..dst_w * dst_h * channels],
+            dst_w,
+            dst_h,
+            channels,
+            icc,
+        ),
+        ImageFormat::Webp => encode_webp(
+            &s.out8[..dst_w * dst_h * channels],
+            dst_w,
+            dst_h,
+            channels,
+            icc,
+        ),
         // Fully opaque RGBA drops its alpha item inside encode_avif
-        // (skipping the second SVT session entirely).
+        // (skipping the second SVT session entirely). ICC is never
+        // extracted for AVIF targets (avif-serialize carries color via
+        // CICP only); `icc` is None here by construction.
+        // TODO(avif-icc): embed the profile once the serializer can.
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
             let quality = avif_quality();
@@ -2074,8 +2233,21 @@ fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize) {
 }
 
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
+    encode_with_icc(rgb, w, h, p, None)
+}
+
+/// JPEG encode with an optional ICC profile written ahead of the
+/// scanlines (both encoders chunk it into the standard APP2 chain).
+/// With `icc: None` this is byte-identical to the pre-ICC encoder.
+fn encode_with_icc(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    p: &Params,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     if p.encoder == Encoder::Jpegli {
-        return encode_jpegli(rgb, w, h, p.quality);
+        return encode_jpegli(rgb, w, h, p.quality, icc);
     }
     let mut comp = Compress::new(ColorSpace::JCS_RGB);
     if p.encoder == Encoder::MozFast {
@@ -2088,8 +2260,34 @@ pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
     comp.set_size(w, h);
     comp.set_quality(p.quality);
     let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
+    if let Some(icc) = icc {
+        for chunk in icc_app2_chunks(icc) {
+            started.write_marker(mozjpeg::Marker::APP(2), &chunk);
+        }
+    }
     started.write_scanlines(rgb)?;
     Ok(started.finish()?)
+}
+
+/// Chunk a profile into standard APP2 `ICC_PROFILE` payloads with
+/// 1-based sequence numbers. Deliberately not the mozjpeg crate's
+/// `write_icc_profile`, which emits 0-based sequence numbers (as of
+/// 0.10.13) that libjpeg's own `jpeg_read_icc_profile` — and therefore
+/// browsers — reject wholesale.
+fn icc_app2_chunks(icc: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ {
+    const MAX_DATA: usize = 65533 - 14;
+    let count = icc.len().div_ceil(MAX_DATA);
+    // ICC_CAP (and SCAN_CAP on the JPEG side) keep count well under
+    // the u8 chunk-count limit.
+    debug_assert!(count <= 255);
+    icc.chunks(MAX_DATA).enumerate().map(move |(i, part)| {
+        let mut v = Vec::with_capacity(14 + part.len());
+        v.extend_from_slice(b"ICC_PROFILE\0");
+        v.push((i + 1) as u8);
+        v.push(count as u8);
+        v.extend_from_slice(part);
+        v
+    })
 }
 
 /// jpegli encode via its libjpeg-compatible API (symbols are
@@ -2102,7 +2300,13 @@ fn jpegli_progressive() -> bool {
     *P.get_or_init(|| std::env::var("OXIMG_JPEG_PROGRESSIVE").as_deref() != Ok("0"))
 }
 
-fn encode_jpegli(rgb: &[u8], w: usize, h: usize, quality: f32) -> Result<Vec<u8>> {
+fn encode_jpegli(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    quality: f32,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut comp = jpegli::Compress::new(jpegli::ColorSpace::JCS_RGB);
     comp.set_size(w, h);
     comp.set_quality(quality);
@@ -2112,6 +2316,11 @@ fn encode_jpegli(rgb: &[u8], w: usize, h: usize, quality: f32) -> Result<Vec<u8>
         comp.set_progressive_mode();
     }
     let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
+    if let Some(icc) = icc {
+        for chunk in icc_app2_chunks(icc) {
+            started.write_marker(jpegli::Marker::APP(2), &chunk);
+        }
+    }
     started.write_scanlines(rgb)?;
     Ok(started.finish()?)
 }

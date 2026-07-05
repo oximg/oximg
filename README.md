@@ -74,6 +74,14 @@ to the displayed frame and the pixels come out upright in every output
 format (the tag itself is not forwarded, so nothing double-rotates).
 `OXIMG_AUTO_ROTATE=0` restores the raw stored orientation.
 
+**ICC profiles**: a source's color profile (JPEG APP2 chain, PNG
+`iCCP`, WebP `ICCP`) passes through byte-for-byte into any
+profile-capable output format, across format conversion included.
+Pixels are never color-converted — wide-gamut images keep rendering
+the way the original did. AVIF is the gap in both directions (the
+serializer speaks CICP only, and AVIF-source profiles are not read
+yet). `OXIMG_ICC=0` strips profiles instead.
+
 ## Pipeline
 
 ```
@@ -199,6 +207,9 @@ c7i.large, ahead of imgproxy by +16%; see [BENCH.md](BENCH.md) and
 `small` = mozjpeg trellis+progressive), `OXIMG_AUTO_FORMAT` (unset;
 comma-separated `Accept`-negotiation preference list, e.g. `avif,webp`),
 `OXIMG_FLATTEN_BG` (`ffffff`; background for alpha → JPEG flattening),
+`OXIMG_AUTO_ROTATE` (`1`; `0` serves the stored orientation),
+`OXIMG_ICC` (`1`; `0` strips source ICC profiles from outputs; the
+shared JPEG header scan is skipped only when both knobs are off),
 `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_RESIZE_BACKEND=fir` (use
 the portable fast_image_resize convolution instead of the platform
@@ -224,7 +235,9 @@ default).
 - EXIF orientation for non-JPEG sources (WebP EXIF chunks, AVIF
   irot/imir, PNG eXIf); JPEG sources auto-rotate
 - Animated AVIF sources
-- ICC profile handling (in progress: pass-through planned)
+- ICC for AVIF (either direction: profiles are not read from AVIF
+  sources, and AVIF outputs carry CICP only); JPEG/PNG/WebP profiles
+  pass through
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
 
