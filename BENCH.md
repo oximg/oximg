@@ -219,60 +219,51 @@ AVIF q65) so cross-format cells stay comparable with the same-format
 cells above. Example: `FORMAT=jpg OUT_FORMAT=avif` measures
 JPEG-source → AVIF-output across all four servers.
 
-Measured 2026-07-04 (this repo's Docker image built from source on
-each machine, all runs 100% successful checks). Converting from JPEG
-sources swaps the expensive source decode for oximg's cheapest one
-(streaming mozjpeg with DCT shrink-on-load), so JPEG→WebP runs ~2x the
-WebP→WebP cell and JPEG→AVIF ~3x the AVIF→AVIF cell.
+Converting from JPEG sources swaps the expensive source decode for
+oximg's cheapest one (streaming mozjpeg with DCT shrink-on-load), so
+JPEG→WebP runs ~2x the WebP→WebP cell and JPEG→AVIF ~3x the AVIF→AVIF
+cell.
 
-Local Ryzen harness (same cpuset 0-1 environment as the table above;
-req/s, p95 in parentheses):
+Local Ryzen harness, measured 2026-07-04 on the pre-fused-YUV build
+(same cpuset 0-1 environment as the table above; req/s, p95 in
+parentheses):
 
 | Cell | oximg | imgproxy |
 |---|---|---|
 | JPEG→WebP | **158.8** (17 ms) | 81.5 (34 ms) |
 | JPEG→AVIF | **115.0** (23 ms) | 102.2 (28 ms) |
 
-AWS reference instances (same harness deployment as the section
-below; oximg p95 from a second identical pass, imgproxy p95 not
-captured on AWS):
+AWS reference instances, measured 2026-07-05 in the wholesale re-run
+(fresh instances, current build, same run as the tables in the next
+section):
 
 | c7i.large (x86-64) | oximg | imgproxy |
 |---|---|---|
-| JPEG→WebP | **65.2** (41 ms) | 35.1 |
-| JPEG→AVIF | 43.3 (59 ms) | 44.8 |
+| JPEG→WebP | **65.3** (41 ms) | 35.3 (73 ms) |
+| JPEG→AVIF | 44.6 (57 ms) | 44.9 (59 ms) |
 
 | c7g.large (Graviton3) | oximg | imgproxy |
 |---|---|---|
-| JPEG→WebP | **78.2** (34 ms) | 36.9 |
-| JPEG→AVIF | **57.2** (45 ms) | 52.5 |
+| JPEG→WebP | **79.3** (33 ms) | 37.0 (69 ms) |
+| JPEG→AVIF | **56.5** (46 ms) | 52.7 (50 ms) |
 
 JPEG→WebP leads imgproxy ~2x everywhere. JPEG→AVIF leads on Graviton3
-(+9%) and the Ryzen (+13%) and lands ~3% behind on c7i — while
+(+7%) and the Ryzen (+13%) and lands at parity on c7i (-0.7%) — while
 encoding at oximg's default operating point (10-bit tune=ssim q55),
 which produces smaller files at higher SSIMULACRA2 than the q65 the
 harness hands the competitors (see
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md)); nominal
 qualities are not comparable across encoders.
 
-The c7i gap traces to SMT: c7i.large is one physical core running two
+The c7i cell traces to SMT: c7i.large is one physical core running two
 hyperthreads, and pinning this Ryzen harness to an SMT sibling pair
-(cpuset 0,8) reproduces it — oximg's lead narrows from +13% to +3%
-(oximg loses 28% to SMT contention, imgproxy 22%; SVT-AV1's dense
-vector kernels contend harder than libaom's). A follow-up landed after
-these tables: the fused AVIF path now converts YUV row-by-row inside
-the decode overlap with AVX2 conversion rows, measuring +3.5-4% on
-JPEG→AVIF in interleaved A/B on both topologies (bytes unchanged) —
-enough to roughly close the c7i gap; the AWS cells will be refreshed
-at the next release re-measure.
-
-The same runs re-verified every same-format cell: oximg and the
-same-run imgproxy anchors landed within the ~3% instance variance of
-the tables below on both instance types — except JPEG on c7g.large,
-which measured 90.8 req/s (28 ms p95) against the published 81.3 with
-its anchor unchanged: the fused-path scratch-pool fix landed between
-the runs. The full tables will be refreshed wholesale at the next
-release re-measure.
+(cpuset 0,8) reproduces the effect — oximg's lead narrows from +13% to
++3% (oximg loses 28% to SMT contention, imgproxy 22%; SVT-AV1's dense
+vector kernels contend harder than libaom's). Fusing the RGB→YUV
+conversion into the decode overlap (with AVX2 conversion rows)
+measured +3.5-4% on JPEG→AVIF in interleaved A/B on both topologies
+with bytes unchanged, and moved the c7i cell from -3.3% to the parity
+above; it is included in the 2026-07-05 tables.
 
 Fused-overlap A/B for cross-format (`XFMT=1 FEATURES=avif
 bench/native.sh`, Apple M2 Max, 2000x1333 plasma JPEG → 500x500, ab
@@ -298,40 +289,46 @@ target encode outside the decode wall.
 The same harness run unmodified on the instance types imgproxy uses for
 its published results, deployed with the harness's own CloudFormation
 template (Ubuntu 24.04, Docker, k6 with 2 VUs for 5 minutes per cell,
-all defaults). req/s (p95); all runs 100% successful checks.
+all defaults). req/s (p95); all runs 100% successful checks. All four
+servers re-measured together per instance in one wholesale run
+(2026-07-05, fresh instances, oximg built from source at the
+cross-format + fused-overlap state).
 
 c7i.large (x86-64, 2 vCPU = one SMT core):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **81.8** (32 ms) | **32.9** (79 ms) | **31.0** (91 ms) | **16.0** (176 ms) |
-| imgproxy | 68.4 (40 ms) | 14.3 (187 ms) | 20.5 (137 ms) | 15.6 (185 ms) |
-| imagor 1.9.2 | 59.4 (43 ms) | 15.5 (174 ms) | 17.5 (153 ms) | 10.2 (283 ms) |
-| thumbor 7.x | 52.1 (48 ms) | 8.7 (304 ms) | 14.1 (185 ms) | 13.0 (210 ms) |
+| oximg (defaults) | **78.7** (33 ms) | **32.8** (79 ms) | **30.9** (92 ms) | **15.6** (181 ms) |
+| imgproxy | 67.0 (40 ms) | 14.3 (187 ms) | 20.3 (136 ms) | 15.2 (190 ms) |
+| imagor 1.9.2 | 58.7 (44 ms) | 15.5 (174 ms) | 17.7 (152 ms) | 10.1 (283 ms) |
+| thumbor 7.x | 50.0 (50 ms) | 8.7 (304 ms) | 14.0 (187 ms) | 12.1 (225 ms) |
 
 c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **23.1** (126 ms) |
-| imgproxy | 68.4 (39 ms) | 21.0 (123 ms) | 25.4 (111 ms) | 20.1 (141 ms) |
-| imagor 1.9.2 | 57.7 (44 ms) | 22.0 (116 ms) | 19.7 (132 ms) | 13.7 (208 ms) |
-| thumbor 7.x | 63.3 (41 ms) | 12.4 (209 ms) | 20.5 (128 ms) | 14.8 (195 ms) |
+| oximg (defaults) | **91.2** (28 ms) | **39.0** (66 ms) | **41.5** (70 ms) | **23.4** (124 ms) |
+| imgproxy | 68.0 (39 ms) | 21.0 (123 ms) | 25.4 (110 ms) | 20.3 (139 ms) |
+| imagor 1.9.2 | 57.5 (44 ms) | 22.1 (115 ms) | 19.7 (133 ms) | 13.7 (204 ms) |
+| thumbor 7.x | 63.2 (41 ms) | 12.5 (210 ms) | 20.2 (129 ms) | 14.7 (196 ms) |
 
 Notes:
 
+- Deltas vs the previous tables (2026-06, retired by this run): JPEG
+  on c7g jumped 81.3 → 91.2 — the fused-path scratch-pool fix (kernel
+  scratch now returns to the request thread's pool instead of dying
+  with the ephemeral worker's TLS) landed in between; the remaining
+  oximg cells and every competitor cell moved within the ~3%
+  instance-to-instance variance the same-run anchors bound (e.g.
+  imgproxy JPEG 68.4 → 67.0/68.0, AVIF 15.6 → 15.2 and 20.1 → 20.3).
 - The AVIF cells reflect the current defaults and the pinned SVT-AV1
-  revision; both were re-measured together with a same-box imgproxy
-  anchor (c7i: 15.7, c7g: 20.1) after the encoder upgrade, the
-  index-free scalar conversion paths, and the architecture-aware
-  decode-thread default landed.
-- The c7g oximg cells and the imgproxy AVIF cell were re-run together
-  on a fresh c7g.large after the counter-guided aarch64 work (the NEON
-  resize kernel and schedule, TBL deinterleaving, NEON YUV-to-RGB
-  conversion, and scratch-buffer hygiene); the same-run imgproxy anchor
-  (19.7 vs its earlier 20.1-20.4) bounds instance-to-instance variance
-  at ~3%. dav1d's in-frame threading works on Graviton3 (1.9x on two
-  cores, verified against dav1d 1.4.1/1.5.1/1.5.3 with minimal repros).
+  revision. dav1d's in-frame threading works on Graviton3 (1.9x on two
+  cores, verified against dav1d 1.4.1/1.5.1/1.5.3 with minimal
+  repros).
+- History of what previous re-measures covered (encoder upgrade,
+  index-free scalar conversion paths, architecture-aware decode-thread
+  default, counter-guided aarch64 work) is in the git log of this
+  file.
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 

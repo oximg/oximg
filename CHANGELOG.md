@@ -63,6 +63,15 @@ HTTP interface without notice.
   A/B on the Ryzen: JPEG→AVIF +3.5-4% req/s on both the two-core and
   the SMT-pair (c7i-like) topologies, output bytes unchanged.
 
+### Changed (benchmarks)
+
+- BENCH.md's AWS c7i.large/c7g.large tables were refreshed wholesale
+  (2026-07-05, fresh instances, all four servers re-measured in one
+  run, cross-format cells included with full p95 capture). Headline
+  movement: Graviton3 JPEG 81.3 → 91.2 req/s from the scratch-pool
+  fix; JPEG→AVIF on c7i reaches parity with imgproxy after the
+  fused-YUV work while producing smaller, higher-scoring files.
+
 ### Fixed
 
 - Truncated or malformed AVIF containers now return a parse error

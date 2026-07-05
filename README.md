@@ -102,13 +102,21 @@ numbers — req/s, higher is better, p95 in parentheses:
 
 | c7i.large (x86-64) | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg | **81.8** (32 ms) | **32.9** (79 ms) | **31.0** (91 ms) | **19.1** (149 ms) |
-| best of imgproxy/imagor/thumbor | 68.4 | 15.5 | 20.5 | 15.7 |
+| oximg | **78.7** (33 ms) | **32.8** (79 ms) | **30.9** (92 ms) | **15.6** (181 ms) |
+| best of imgproxy/imagor/thumbor | 67.0 | 15.5 | 20.3 | 15.2 |
 
 | c7g.large (Graviton3) | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg | **81.3** (31 ms) | **37.6** (68 ms) | **40.0** (72 ms) | **23.1** (126 ms) |
-| best of imgproxy/imagor/thumbor | 68.4 | 22.0 | 25.4 | 20.1 |
+| oximg | **91.2** (28 ms) | **39.0** (66 ms) | **41.5** (70 ms) | **23.4** (124 ms) |
+| best of imgproxy/imagor/thumbor | 68.0 | 22.1 | 25.4 | 20.3 |
+
+Cross-format cells (our harness extension; JPEG sources, oximg vs
+imgproxy):
+
+| JPEG→ | c7i oximg | c7i imgproxy | c7g oximg | c7g imgproxy |
+|---|---|---|---|---|
+| WebP | **65.3** (41 ms) | 35.3 | **79.3** (33 ms) | 37.0 |
+| AVIF | 44.6 (57 ms) | 44.9 | **56.5** (46 ms) | 52.7 |
 
 At the same time, output quality is higher, not traded away:
 end-to-end JPEG at the same q80 scores +6 to +18 SSIMULACRA2 over
