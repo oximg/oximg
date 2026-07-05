@@ -156,9 +156,10 @@ Conclusions the defaults rest on:
   throughput knob: at q55 it costs -0.6 SSIM2 at unchanged bytes
   (73.9/25.2 KB vs 74.5/25.3 KB on this sweep — still far above
   imgproxy's q65 at 67.5) and cuts the SVT encode ~28%, measuring +21%
-  req/s on the JPEG→AVIF cell on an SMT-pair topology. The default
-  stays 8: quality per byte is the shipped identity, and the
-  benchmarked cells are measured there.
+  req/s on the JPEG→AVIF cell on an SMT-pair topology and +19% on a
+  real c7i.large (53.3 vs 44.8 req/s, ahead of the same-run imgproxy
+  anchor by +16% — BENCH.md). The default stays 8: quality per byte is
+  the shipped identity, and the benchmarked cells are measured there.
 
 ## Notes
 

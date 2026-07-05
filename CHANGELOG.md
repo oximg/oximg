@@ -63,6 +63,16 @@ HTTP interface without notice.
   A/B on the Ryzen: JPEG→AVIF +3.5-4% req/s on both the two-core and
   the SMT-pair (c7i-like) topologies, output bytes unchanged.
 
+### Added (post-refresh)
+
+- `OXIMG_AVIF_SPEED` (SVT preset, default 8): the AVIF throughput
+  knob. Setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes for ~28%
+  less encode CPU — measured +19% JPEG→AVIF req/s on a real c7i.large
+  (53.3 vs 44.8, +16% over the same-run imgproxy anchor). The AVIF
+  encoder session is also created during the decode overlap now
+  (bytes unchanged, ~-1ms light-load latency), and `OXIMG_TIMING`
+  reports the SVT init/encode split.
+
 ### Changed (benchmarks)
 
 - BENCH.md's AWS c7i.large/c7g.large tables were refreshed wholesale
