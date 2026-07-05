@@ -10,6 +10,8 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-05
+
 ### Added
 
 - Cross-format output: an imgproxy-style `@{fmt}` token on the filename
@@ -23,64 +25,53 @@ HTTP interface without notice.
   (comma-separated preference list, e.g. `avif,webp`); when enabled,
   every `/resize` response carries a config-static `Vary: Accept`.
   Precedence: explicit `@{fmt}` > negotiated > source format.
+- `OXIMG_AVIF_SPEED` (SVT preset, default 8): the AVIF throughput
+  knob. Setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes for ~28%
+  less encode CPU — measured +19% JPEG→AVIF req/s on a real c7i.large,
+  +16% over the same-run imgproxy anchor (BENCH.md, QUALITY.md).
 - `pipeline::Params` gains `output: Option<ImageFormat>` (`None` keeps
   the sniff-and-match behavior, byte-identical to 0.2.0), and
-  `ImageFormat` gains `from_token`. `qcli` gains a `transcode` mode.
+  `ImageFormat` gains `from_token`; `qcli` gains a `transcode` mode.
   **Breaking** for library users writing exhaustive `Params { ... }`
-  literals — the next release must be 0.3.0, not 0.2.x.
+  literals — hence 0.3.0.
+- New reproducible benchmarks: `bench/coldstart.sh` (start → ready →
+  first real response, as distributions; oximg native is ready in 6ms
+  and serves its first image at 13ms) and `bench/stress.sh` (k6
+  connection-capacity ramp with coalescing-proof URL assignment; zero
+  failures through 8192 concurrent connections at ~25-30KB each).
+  `OXIMG_TIMING` now also reports the SVT init/encode split.
 
 ### Changed
 
 - Request coalescing keys on the resolved output format, so mixed
   same-URL traffic (e.g. `photo.jpg` and `photo.jpg@webp`) can never
   share a response. Same-format requests keep the fused JPEG path and
-  its byte-identical output; cross-format JPEG requests stream through
-  the same SIMD resize kernel without the second-thread overlap.
+  its byte-identical output.
+- Cross-format JPEG requests fuse the decode with the SIMD resize on a
+  second thread (same `OXIMG_OVERLAP` gate, byte-identical to the
+  serial path). AVIF targets go further: the fused worker converts
+  each resized row straight into the 10-bit planes (the resized frame
+  never exists as an interleaved RGB copy) and creates the SVT session
+  during the decode overlap — ~-10-12% single-request latency on
+  JPEG→WebP and JPEG→AVIF, plus +3.5-4% saturated JPEG→AVIF
+  throughput from the fused conversion.
+- The encode-side RGB→YUV conversion gained bit-identical SIMD rows on
+  both architectures (NEON on aarch64, AVX2 on x86-64): the exact
+  integer division is replaced by an exhaustively-proven magic
+  multiply, and chroma mirrors the scalar f32 arithmetic operation for
+  operation, asserted bit-exact in tests.
 - Fully opaque RGBA no longer pays for an AVIF alpha item: an
   early-exit scan drops it to the 3-channel output (byte-identical to
   encoding the same pixels as RGB), skipping the second SVT-AV1
   session entirely. Images with any transparency are unaffected.
-- Cross-format JPEG requests now fuse too: decode overlaps the SIMD
-  resize into the pixel buffer on a second thread (same `OXIMG_OVERLAP`
-  gate and byte-identical output vs the serial path), with the one-shot
-  WebP/AVIF/PNG encode after — ~-10-12% single-request latency on
-  JPEG→WebP/AVIF locally. The same-format jpegli fused path is
-  untouched.
-- The encode-side RGB→YUV conversion (AVIF output) gained NEON row
-  kernels on aarch64, bit-identical to the scalar reference (the
-  division is replaced by an exhaustively-proven exact magic-multiply;
-  chroma mirrors the f32 arithmetic operation for operation). Not
-  measurable end-to-end at thumbnail sizes; scales with output
-  resolution.
-- AVIF targets now fuse the RGB→YUV conversion too: the fused worker
-  converts each resized row straight into the 10-bit planes (the
-  resized frame never exists as an interleaved RGB copy), and the
-  conversion gained AVX2 rows on x86-64 under the same bit-exact
-  contract (0.44→0.08 ms per 512x340 frame — note the scalar luma was
-  already LLVM-auto-vectorized; the hand kernels only win with
-  `target_feature` on their inlined helpers, which an interleaved A/B
-  caught as a 12x-slower footgun first). Interleaved official-harness
-  A/B on the Ryzen: JPEG→AVIF +3.5-4% req/s on both the two-core and
-  the SMT-pair (c7i-like) topologies, output bytes unchanged.
-
-### Added (post-refresh)
-
-- `OXIMG_AVIF_SPEED` (SVT preset, default 8): the AVIF throughput
-  knob. Setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes for ~28%
-  less encode CPU — measured +19% JPEG→AVIF req/s on a real c7i.large
-  (53.3 vs 44.8, +16% over the same-run imgproxy anchor). The AVIF
-  encoder session is also created during the decode overlap now
-  (bytes unchanged, ~-1ms light-load latency), and `OXIMG_TIMING`
-  reports the SVT init/encode split.
-
-### Changed (benchmarks)
-
-- BENCH.md's AWS c7i.large/c7g.large tables were refreshed wholesale
-  (2026-07-05, fresh instances, all four servers re-measured in one
-  run, cross-format cells included with full p95 capture). Headline
-  movement: Graviton3 JPEG 81.3 → 91.2 req/s from the scratch-pool
-  fix; JPEG→AVIF on c7i reaches parity with imgproxy after the
-  fused-YUV work while producing smaller, higher-scoring files.
+- BENCH.md was re-measured wholesale on fresh c7i.large/c7g.large
+  instances (all four servers per instance, cross-format cells with
+  full p95 capture) and gained cells for the newest generations
+  (c8i.large "Granite Rapids" and c9g.large), where oximg leads all 40
+  cells; plus cold-start and connection-capacity sections. Headline
+  movement: Graviton3 JPEG 81.3 → 91.2 req/s (scratch-pool fix);
+  JPEG→AVIF reaches imgproxy parity on c7i at the default operating
+  point and +2% on c8i, while producing smaller, higher-scoring files.
 
 ### Fixed
 
@@ -91,9 +82,9 @@ HTTP interface without notice.
   stderr trace per malformed input), with the upstream assertion text
   preserved in the error message.
 - `OXIMG_RESIZE_BACKEND=fir` now also disables the fused decode overlap
-  (both the jpegli and the new cross-format variants): the fused
-  workers run the in-tree SIMD kernel, so fusing under the fir escape
-  hatch made a URL's bytes depend on the instantaneous load gate.
+  (both the jpegli and the cross-format variants): the fused workers
+  run the in-tree SIMD kernel, so fusing under the fir escape hatch
+  made a URL's bytes depend on the instantaneous load gate.
 - Fused workers return their kernel scratch to the request thread's
   pool instead of leaking it into the ephemeral worker's TLS, and a
   failed worker-thread spawn (thread limits) now falls back to the
@@ -167,6 +158,7 @@ HTTP interface without notice.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/oximg/oximg/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/oximg/oximg/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/oximg/oximg/releases/tag/v0.1.0
