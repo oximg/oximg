@@ -219,16 +219,53 @@ AVIF q65) so cross-format cells stay comparable with the same-format
 cells above. Example: `FORMAT=jpg OUT_FORMAT=avif` measures
 JPEG-source → AVIF-output across all four servers.
 
-Cross-format cells have not been run on the AWS reference instances
-yet; until they are, treat local numbers as directional only. Two
-effects to expect: jpg→webp/avif swaps the expensive source decode for
-oximg's cheapest one (streaming mozjpeg with DCT shrink-on-load), and
-AVIF output dominates whatever the source format is.
+Measured 2026-07-04 (this repo's Docker image built from source on
+each machine, all runs 100% successful checks). Converting from JPEG
+sources swaps the expensive source decode for oximg's cheapest one
+(streaming mozjpeg with DCT shrink-on-load), so JPEG→WebP runs ~2x the
+WebP→WebP cell and JPEG→AVIF ~3x the AVIF→AVIF cell.
 
-Directional local rows (`XFMT=1 FEATURES=avif bench/native.sh`, Apple
-M2 Max, 2000x1333 plasma JPEG → 500x500, ab c=8, diverse-URL rps /
-single-URL p50; "serial" is the pre-fuse cross-format path kept under
-`OXIMG_OVERLAP=0`, "fused" the default):
+Local Ryzen harness (same cpuset 0-1 environment as the table above;
+req/s, p95 in parentheses):
+
+| Cell | oximg | imgproxy |
+|---|---|---|
+| JPEG→WebP | **158.8** (17 ms) | 81.5 (34 ms) |
+| JPEG→AVIF | **115.0** (23 ms) | 102.2 (28 ms) |
+
+AWS reference instances (same harness deployment as the section
+below; oximg p95 from a second identical pass, imgproxy p95 not
+captured on AWS):
+
+| c7i.large (x86-64) | oximg | imgproxy |
+|---|---|---|
+| JPEG→WebP | **65.2** (41 ms) | 35.1 |
+| JPEG→AVIF | 43.3 (59 ms) | 44.8 |
+
+| c7g.large (Graviton3) | oximg | imgproxy |
+|---|---|---|
+| JPEG→WebP | **78.2** (34 ms) | 36.9 |
+| JPEG→AVIF | **57.2** (45 ms) | 52.5 |
+
+JPEG→WebP leads imgproxy ~2x everywhere. JPEG→AVIF leads on Graviton3
+(+9%) and the Ryzen (+13%) and lands ~3% behind on c7i — while
+encoding at oximg's default operating point (10-bit tune=ssim q55),
+which produces smaller files at higher SSIMULACRA2 than the q65 the
+harness hands the competitors (see
+[bench/quality/QUALITY.md](bench/quality/QUALITY.md)); nominal
+qualities are not comparable across encoders.
+
+The same runs re-verified every same-format cell: oximg and the
+same-run imgproxy anchors landed within the ~3% instance variance of
+the tables below on both instance types — except JPEG on c7g.large,
+which measured 90.8 req/s (28 ms p95) against the published 81.3 with
+its anchor unchanged: the fused-path scratch-pool fix landed between
+the runs. The full tables will be refreshed wholesale at the next
+release re-measure.
+
+Fused-overlap A/B for cross-format (`XFMT=1 FEATURES=avif
+bench/native.sh`, Apple M2 Max, 2000x1333 plasma JPEG → 500x500, ab
+c=8; "serial" pins `OXIMG_OVERLAP=0`):
 
 | Output | serial req/s (p50) | fused req/s (p50) |
 |---|---|---|
