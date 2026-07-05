@@ -353,6 +353,55 @@ Notes:
   default, counter-guided aarch64 work) is in the git log of this
   file.
 
+## Newer instance generations (c8i.large and c9g.large)
+
+The same harness and deployment on the newest compute generations
+available in us-east-1 as of 2026-07 — c8i.large (Intel Xeon 6975P-C
+"Granite Rapids", one SMT core at 3.9 GHz) and c9g.large (next-gen
+Graviton, two physical cores at 2.8 GHz). us-east-1 offers no
+c9i.large yet. The c7 tables above remain the canonical comparison
+(imgproxy's published numbers are c7-based); this section is the
+forward-looking data point. All four servers measured together per
+instance, 100% checks; req/s (p95).
+
+c8i.large:
+
+| Server | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg (defaults) | **110.3** (24 ms) | **44.7** (58 ms) | **40.7** (70 ms) | **21.5** (134 ms) |
+| imgproxy | 90.3 (31 ms) | 19.0 (142 ms) | 27.0 (104 ms) | 20.8 (140 ms) |
+| imagor 1.9.2 | 76.9 (34 ms) | 20.8 (130 ms) | 24.5 (110 ms) | 14.5 (199 ms) |
+| thumbor 7.x | 66.4 (38 ms) | 11.2 (235 ms) | 18.6 (139 ms) | 16.0 (171 ms) |
+
+c9g.large:
+
+| Server | JPEG | PNG | WebP | AVIF |
+|---|---|---|---|---|
+| oximg (defaults) | **135.6** (19 ms) | **53.9** (48 ms) | **58.9** (51 ms) | **36.2** (82 ms) |
+| imgproxy | 112.8 (25 ms) | 32.8 (80 ms) | 36.3 (79 ms) | 32.4 (90 ms) |
+| imagor 1.9.2 | 100.6 (26 ms) | 34.5 (75 ms) | 29.7 (88 ms) | 22.3 (129 ms) |
+| thumbor 7.x | 100.4 (26 ms) | 18.7 (140 ms) | 30.6 (86 ms) | 22.1 (135 ms) |
+
+Cross-format cells (JPEG sources):
+
+| JPEG→ | c8i oximg | c8i imgproxy | c9g oximg | c9g imgproxy |
+|---|---|---|---|---|
+| WebP | **89.6** (30 ms) | 46.7 (55 ms) | **116.6** (23 ms) | 56.8 (46 ms) |
+| AVIF | **64.8** (40 ms) | 63.4 (43 ms) | **96.9** (27 ms) | 87.6 (33 ms) |
+
+Notes:
+
+- oximg leads every cell on both generations — including JPEG→AVIF on
+  the Intel SMT topology (+2% on c8i at the preset-8 default), where
+  c7i measured at parity: Granite Rapids narrows the SMT contention
+  penalty that SVT-AV1's dense vector kernels pay on Sapphire Rapids.
+  `OXIMG_AVIF_SPEED=9` applies on top for deployments that want a
+  wider margin.
+- Generational uplift for oximg at unchanged defaults: c7i → c8i
+  +37-45% per cell; c7g → c9g +49-71% (JPEG→AVIF +71%, 56.5 → 96.9
+  req/s — the new Graviton is disproportionately good at the SVT
+  encode).
+
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
 Methodology from
