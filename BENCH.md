@@ -437,6 +437,70 @@ test-medium: 20.1 / 22.9 / 18.6 KB.
 Quality per byte for each encoder is measured in
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 
+## Cold start
+
+Container platforms (Cloud Run class) bill the whole cold-start chain:
+image pull + container start + app ready + first real request.
+[bench/coldstart.sh](bench/coldstart.sh) measures the app-controllable
+part as distributions (the tail is what pages you), from process/
+container start to a 200 on `/health` (ready) and to the first real
+`/resize` 200 (first work). Ryzen 7 8745HS, local Docker (runc; gVisor
+platforms add their own constant):
+
+| | ready p50 / p95 | first work p50 / p95 |
+|---|---|---|
+| oximg native binary | **6 / 6 ms** | **13 / 14 ms** |
+| oximg Docker | 124 / 192 ms | 132 / 199 ms |
+| imgproxy Docker | 138 / 143 ms | 145 / 151 ms |
+
+Under Docker both servers are dominated by the ~120ms container
+runtime floor — the app-level difference shows in the native row:
+oximg's own init is ~6ms (a single 8.9MB static-leaning binary, no
+lazy init on the first request beyond ~1ms of LUT building). The
+pull-and-provision side favors the same shape: the oximg image is
+113MB vs imgproxy's 235MB, and idle RSS after ready is 10MB vs 29MB —
+smaller instances, faster pulls, cheaper warm pools.
+
+## Connection capacity and overload behavior
+
+How many concurrent connections can one instance hold, and what does
+overload look like? [bench/stress.sh](bench/stress.sh) ramps constant
+open connections (k6 VUs, each pinned to its own distinct URL out of a
+4100-URL space so request coalescing can never serve duplicates),
+server and load generator on disjoint cpusets of the same Ryzen box
+(server: 4 cores + SMT), 30s per level, 30s client timeout, DIV2K
+512-fit JPEG. req/s, latency, failures, `memory.peak`:
+
+| c | oximg | imgproxy |
+|---|---|---|
+| 16 | 649 rps, p50 24ms, p99 31ms, **0%** fail, 50MB | 444 rps, p50 36ms, p99 48ms, 0% fail, 128MB |
+| 256 | 598 rps, p50 0.43s, p99 0.44s, **0%**, 62MB | 443 rps, p50 0.58s, p99 0.64s, 0%, 167MB |
+| 1024 | 587 rps, p50 1.7s, p99 1.8s, **0%**, 88MB | 439 rps, p50 2.3s, p99 2.4s, 0%, 248MB |
+| 2048 | 578 rps, p50 3.5s, p99 4.2s, **0%**, 106MB | 439 rps, p50 4.6s, p99 4.7s, 0%, 358MB |
+| 4096 | 565 rps, p50 7.2s, p99 8.9s, **0%**, 168MB | 489 rps, p50 4.8s, **p95 30s, 12% fail**, 361MB |
+| 8192* | 0% fail, 265MB | **29% fail**, 356MB |
+
+\* c=8192 exceeds the 4100 distinct URLs, so oximg's coalescing
+engages and its throughput is no longer comparable; the failure and
+memory columns remain valid.
+
+Two different failure philosophies show up. oximg accepts every
+connection and queues work behind the CPU semaphore: throughput
+degrades only 13% from c=16 to c=4096, latency grows linearly with
+queue depth (pure queueing, p99 ≈ p50 — the FIFO semaphore is fair),
+memory stays at ~25-30KB per open connection, and nothing fails
+through 8192 connections. imgproxy holds steady to c=2048 and then
+starts starving connections (its default `IMGPROXY_MAX_CLIENTS`
+ceiling is 2048): p50 stays low while p95 pins at the client timeout —
+a bimodal split where some clients never get served — reaching 12%
+failures at 4096 and 29% at 8192.
+
+Neither server applies backpressure by default; if you want load
+shedding rather than queueing, put a queue-depth limit in front. What
+this table establishes is the safe envelope: on 4 cores, oximg
+sustains its full throughput with zero failures at any connection
+count a real deployment will see, and degrades by latency only.
+
 ## Notes
 
 - Measurement provenance: the official-harness tables (local Ryzen and
@@ -471,6 +535,10 @@ IMAGES_DIR=./images PORT=8081 ./target/release/oximg &
 IMGPROXY_BIND=:8082 IMGPROXY_LOCAL_FILESYSTEM_ROOT=$PWD/images IMGPROXY_QUALITY=80 imgproxy &
 ./bench/bench.sh oximg "http://127.0.0.1:8081/resize/500/500/test-large.jpg" <rs-pid>
 ./bench/bench.sh imgproxy "http://127.0.0.1:8082/insecure/resize:fit:500:500/plain/local:///test-large.jpg" <go-pid>
+# cold start (needs target/release/oximg + the two Docker images):
+bench/coldstart.sh
+# connection-capacity ramp (needs the harness dataset and k6's image):
+DATASET=~/benchmark/dataset bench/stress.sh
 ```
 
 Docker (Linux): build with the repo `Dockerfile`; run competitors from
