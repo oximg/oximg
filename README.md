@@ -186,7 +186,9 @@ Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
-(55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
+(55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `OXIMG_AVIF_SPEED`
+(SVT preset, 8; 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes for ~28%
+less encode CPU — see bench/quality/QUALITY.md), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
 `small` = mozjpeg trellis+progressive), `OXIMG_AUTO_FORMAT` (unset;
 comma-separated `Accept`-negotiation preference list, e.g. `avif,webp`),
 `OXIMG_FLATTEN_BG` (`ffffff`; background for alpha → JPEG flattening),

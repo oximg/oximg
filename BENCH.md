@@ -265,6 +265,16 @@ measured +3.5-4% on JPEG→AVIF in interleaved A/B on both topologies
 with bytes unchanged, and moved the c7i cell from -3.3% to the parity
 above; it is included in the 2026-07-05 tables.
 
+At this point the cell is encode-work-bound at the default operating
+point: the SVT session setup (~1ms) also moved into the decode overlap
+(bytes unchanged), which cut light-load latency by ~1ms/request but —
+as interleaved A/B confirms — leaves the saturated 2-VU cell unmoved,
+since only removing work (not relocating it) changes that number. The
+remaining lever is the operating point itself: `OXIMG_AVIF_SPEED=9`
+removes ~28% of the encode work and measures +21% on this cell
+(interleaved with a same-window preset-8 control) at -0.6 SSIMULACRA2
+and unchanged bytes — see QUALITY.md; the default stays at preset 8.
+
 Fused-overlap A/B for cross-format (`XFMT=1 FEATURES=avif
 bench/native.sh`, Apple M2 Max, 2000x1333 plasma JPEG → 500x500, ab
 c=8; "serial" pins `OXIMG_OVERLAP=0`):

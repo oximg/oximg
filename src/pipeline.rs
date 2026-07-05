@@ -273,7 +273,18 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                 let cross_fuse = || -> Fuse {
                     #[cfg(feature = "avif")]
                     if target == ImageFormat::Avif {
-                        return Fuse::Yuv;
+                        // Mirrors encode_output's AVIF arm (the tuned
+                        // operating point); the session the fused worker
+                        // creates from these is what encodes the planes.
+                        let quality = avif_quality();
+                        return Fuse::Yuv {
+                            params: crate::avif::AvifParams {
+                                quality,
+                                alpha_quality: avif_alpha_quality(quality),
+                                speed: avif_speed(),
+                                ..Default::default()
+                            },
+                        };
                     }
                     Fuse::Pixels
                 };
@@ -297,25 +308,12 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                         encode_output(s, dst_w, dst_h, 3, target, p)?
                     }
                     #[cfg(feature = "avif")]
-                    Decoded::YuvPlanes { dst_w, dst_h } => {
-                        // Mirrors encode_output's AVIF arm (same tuned
-                        // operating point); only the conversion already
-                        // happened inside the decode overlap.
-                        let quality = avif_quality();
-                        let params = crate::avif::AvifParams {
-                            quality,
-                            alpha_quality: avif_alpha_quality(quality),
-                            ..Default::default()
-                        };
-                        let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
-                        crate::avif::encode_avif_from_planes(
-                            &s.y16[..dst_w * dst_h],
-                            &s.cb16[..cw * chh],
-                            &s.cr16[..cw * chh],
-                            dst_w,
-                            dst_h,
-                            &params,
-                        )?
+                    Decoded::YuvPlanes { session } => {
+                        // Conversion and encoder setup already happened
+                        // inside the decode overlap; only the encode
+                        // itself remains. The plane vectors are truncated
+                        // to exactly this frame by the fused branch.
+                        crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16)?
                     }
                 }
             }
@@ -586,13 +584,12 @@ enum Decoded {
         dst_h: usize,
     },
     Encoded(Vec<u8>),
-    /// 10-bit 4:2:0 planes left in `Scratch::{y16,cb16,cr16}` — the
-    /// fused AVIF path converts rows during the decode overlap, so only
-    /// the SVT encode remains.
+    /// 10-bit 4:2:0 planes left in `Scratch::{y16,cb16,cr16}`, plus the
+    /// encoder session the fused worker already created during the
+    /// decode overlap — only the SVT encode itself remains.
     #[cfg(feature = "avif")]
     YuvPlanes {
-        dst_w: usize,
-        dst_h: usize,
+        session: crate::avif::SvtSession,
     },
 }
 
@@ -610,10 +607,11 @@ enum Fuse {
     /// targets, hiding the resize behind the decode wall.
     Pixels,
     /// Decode ∥ resize + RGB→YUV conversion straight into the 10-bit
-    /// planes on the worker thread — AVIF targets, hiding both the
-    /// resize and the conversion behind the decode wall.
+    /// planes on the worker thread, which also creates the SVT session
+    /// while the decode runs — AVIF targets, hiding the resize, the
+    /// conversion, and the encoder setup behind the decode wall.
     #[cfg(feature = "avif")]
-    Yuv,
+    Yuv { params: crate::avif::AvifParams },
 }
 
 /// Requests currently inside the pixel pipeline, all formats. Used as
@@ -751,22 +749,28 @@ fn decode_resize<R: std::io::BufRead>(
     }
 
     #[cfg(feature = "avif")]
-    if let Fuse::Yuv = fuse
+    if let Fuse::Yuv { params } = fuse
         && linear
     {
         let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
+        // Truncate to the exact frame: the session encode consumes the
+        // whole vectors (their length feeds SVT's n_filled_len).
         scratch_u16(&mut s.y16, dst_w * dst_h);
+        s.y16.truncate(dst_w * dst_h);
         scratch_u16(&mut s.cb16, cw * chh);
+        s.cb16.truncate(cw * chh);
         scratch_u16(&mut s.cr16, cw * chh);
-        if let Some(decode_ms) = fused_resize_yuv(
+        s.cr16.truncate(cw * chh);
+        if let Some((decode_ms, session)) = fused_resize_yuv(
             &mut started,
             dec_w,
             dec_h,
             dst_w,
             dst_h,
-            &mut s.y16[..dst_w * dst_h],
-            &mut s.cb16[..cw * chh],
-            &mut s.cr16[..cw * chh],
+            &params,
+            &mut s.y16,
+            &mut s.cb16,
+            &mut s.cr16,
         )? {
             if timing {
                 let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -776,7 +780,7 @@ fn decode_resize<R: std::io::BufRead>(
                 );
             }
             started.finish().context("decode finish failed")?;
-            return Ok(Decoded::YuvPlanes { dst_w, dst_h });
+            return Ok(Decoded::YuvPlanes { session });
         }
     }
 
@@ -1222,10 +1226,11 @@ fn fused_resize_yuv<R: std::io::BufRead>(
     dec_h: usize,
     dst_w: usize,
     dst_h: usize,
+    params: &crate::avif::AvifParams,
     y_plane: &mut [u16],
     cb_plane: &mut [u16],
     cr_plane: &mut [u16],
-) -> Result<Option<f64>> {
+) -> Result<Option<(f64, crate::avif::SvtSession)>> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         Ok(None)
@@ -1239,18 +1244,24 @@ fn fused_resize_yuv<R: std::io::BufRead>(
         };
 
         let row_bytes = dec_w * 3;
-        // Chunking and channel shapes mirror fused_resize_encode.
+        // Chunking mirrors fused_resize_encode, but with double the
+        // channel runway: the worker spends its first ~1ms creating the
+        // SVT session, and four in-flight chunks let the decoder keep
+        // running instead of stalling on the bounded channel meanwhile.
         let chunk_rows = (64 * 1024 / row_bytes).clamp(1, dec_h);
-        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(4);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-        std::thread::scope(|sc| -> Result<Option<f64>> {
+        std::thread::scope(|sc| -> Result<Option<(f64, crate::avif::SvtSession)>> {
             // Borrowed, not moved — see fused_resize_pixels.
             let resizer = &mut resizer;
             let cw = dst_w.div_ceil(2);
             let spawned = std::thread::Builder::new()
                 .name("oximg-fuse".into())
-                .spawn_scoped(sc, move || -> Result<()> {
+                .spawn_scoped(sc, move || -> Result<crate::avif::SvtSession> {
+                    // Encoder setup first: its ~1ms overlaps the
+                    // decoder's first chunks instead of the tail.
+                    let session = crate::avif::start_color_session(dst_w, dst_h, params)?;
                     let fwd = fwd_lut_f32();
                     let back = back_lut();
                     let mut row8 = vec![0u8; dst_w * 3];
@@ -1301,7 +1312,7 @@ fn fused_resize_yuv<R: std::io::BufRead>(
                             &mut cr_plane[cy * cw..][..cw],
                         );
                     }
-                    Ok(())
+                    Ok(session)
                 });
             // Spawn failure leaves the decoder untouched — fall back to
             // the byte-identical serial path instead of failing.
@@ -1344,8 +1355,8 @@ fn fused_resize_yuv<R: std::io::BufRead>(
             // A decode error is the root cause; report it over the
             // worker's consequent "incomplete image" error.
             decode_result?;
-            worker_result?;
-            Ok(Some(decode_ms))
+            let session = worker_result?;
+            Ok(Some((decode_ms, session)))
         })
     }
 }
@@ -1812,6 +1823,18 @@ fn avif_alpha_quality(color_quality: u8) -> u8 {
         .unwrap_or(color_quality)
 }
 
+/// OXIMG_AVIF_SPEED: SVT preset (enc_mode). The default (8) is the
+/// benchmarked sync-path operating point; 9 trades some quality per
+/// byte for a faster encode (see QUALITY.md before changing it fleet-
+/// wide).
+#[cfg(feature = "avif")]
+fn avif_speed() -> i8 {
+    std::env::var("OXIMG_AVIF_SPEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+}
+
 fn webp_quality() -> f32 {
     std::env::var("OXIMG_WEBP_QUALITY")
         .ok()
@@ -1894,6 +1917,7 @@ fn encode_output(
             let params = crate::avif::AvifParams {
                 quality,
                 alpha_quality: avif_alpha_quality(quality),
+                speed: avif_speed(),
                 ..Default::default()
             };
             crate::avif::encode_avif(
@@ -2071,15 +2095,26 @@ mod tests {
         }
     }
 
-    /// The fused AVIF path converts rows during the decode overlap; its
-    /// planes — and therefore the encoded bytes — must match the serial
-    /// path's full-frame conversion of the same pixels exactly.
     #[cfg(feature = "avif")]
-    fn run_jpeg_avif(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
-        let params = crate::avif::AvifParams {
+    fn test_avif_params() -> crate::avif::AvifParams {
+        crate::avif::AvifParams {
             quality: 55,
             alpha_quality: 55,
             ..Default::default()
+        }
+    }
+
+    /// The fused AVIF path converts rows (and creates the encoder
+    /// session) during the decode overlap; its planes — and therefore
+    /// the encoded bytes — must match the serial path's full-frame
+    /// conversion of the same pixels exactly.
+    #[cfg(feature = "avif")]
+    fn run_jpeg_avif(jpeg: &[u8], yuv_fuse: bool) -> Vec<u8> {
+        let params = test_avif_params();
+        let fuse = if yuv_fuse {
+            Fuse::Yuv { params }
+        } else {
+            Fuse::Off
         };
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(jpeg).unwrap();
@@ -2088,17 +2123,8 @@ mod tests {
                 crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3, &params)
                     .unwrap()
             }
-            Decoded::YuvPlanes { dst_w, dst_h } => {
-                let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
-                crate::avif::encode_avif_from_planes(
-                    &s.y16[..dst_w * dst_h],
-                    &s.cb16[..cw * chh],
-                    &s.cr16[..cw * chh],
-                    dst_w,
-                    dst_h,
-                    &params,
-                )
-                .unwrap()
+            Decoded::YuvPlanes { session } => {
+                crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16).unwrap()
             }
             Decoded::Encoded(_) => panic!("avif run must not hit the jpegli fuse"),
         }
@@ -2115,8 +2141,8 @@ mod tests {
         for (w, h, gray) in [(799, 601, false), (400, 300, true), (321, 243, false)] {
             let jpeg = make_test_jpeg(w, h, gray);
             assert_eq!(
-                run_jpeg_avif(&jpeg, Fuse::Off),
-                run_jpeg_avif(&jpeg, Fuse::Yuv),
+                run_jpeg_avif(&jpeg, false),
+                run_jpeg_avif(&jpeg, true),
                 "{w}x{h} gray={gray}"
             );
         }
@@ -2129,7 +2155,16 @@ mod tests {
         let cut = &jpeg[..jpeg.len() * 3 / 5];
         let mut s = Scratch::default();
         if let Ok(dec) = Decompress::new_mem(cut) {
-            let _ = decode_resize(&mut s, dec, 320, 320, 1, Fuse::Yuv);
+            let _ = decode_resize(
+                &mut s,
+                dec,
+                320,
+                320,
+                1,
+                Fuse::Yuv {
+                    params: test_avif_params(),
+                },
+            );
         }
     }
 

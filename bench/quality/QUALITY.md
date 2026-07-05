@@ -152,6 +152,13 @@ Conclusions the defaults rest on:
   same-format WebP cell from those tables. For JPEG→WebP conversions
   where quality matters more than bytes, `OXIMG_WEBP_QUALITY=80` is
   the better point (-13% bytes vs JPEG q80 at -3.3 SSIM2).
+- **`OXIMG_AVIF_SPEED=9`** (SVT preset; default 8) is the AVIF
+  throughput knob: at q55 it costs -0.6 SSIM2 at unchanged bytes
+  (73.9/25.2 KB vs 74.5/25.3 KB on this sweep — still far above
+  imgproxy's q65 at 67.5) and cuts the SVT encode ~28%, measuring +21%
+  req/s on the JPEG→AVIF cell on an SMT-pair topology. The default
+  stays 8: quality per byte is the shipped identity, and the
+  benchmarked cells are measured there.
 
 ## Notes
 
