@@ -52,6 +52,16 @@ HTTP interface without notice.
   chroma mirrors the f32 arithmetic operation for operation). Not
   measurable end-to-end at thumbnail sizes; scales with output
   resolution.
+- AVIF targets now fuse the RGB→YUV conversion too: the fused worker
+  converts each resized row straight into the 10-bit planes (the
+  resized frame never exists as an interleaved RGB copy), and the
+  conversion gained AVX2 rows on x86-64 under the same bit-exact
+  contract (0.44→0.08 ms per 512x340 frame — note the scalar luma was
+  already LLVM-auto-vectorized; the hand kernels only win with
+  `target_feature` on their inlined helpers, which an interleaved A/B
+  caught as a 12x-slower footgun first). Interleaved official-harness
+  A/B on the Ryzen: JPEG→AVIF +3.5-4% req/s on both the two-core and
+  the SMT-pair (c7i-like) topologies, output bytes unchanged.
 
 ### Fixed
 

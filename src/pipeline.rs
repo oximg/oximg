@@ -270,6 +270,13 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                 // fused workers run the in-tree SIMD kernel, and fir vs
                 // kernel are byte-different backends, so fusing under
                 // fir would make a URL's bytes load-dependent.
+                let cross_fuse = || -> Fuse {
+                    #[cfg(feature = "avif")]
+                    if target == ImageFormat::Avif {
+                        return Fuse::Yuv;
+                    }
+                    Fuse::Pixels
+                };
                 let fuse = if p.parallel > 1
                     || !overlap_gate()
                     || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
@@ -282,12 +289,33 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                         Fuse::Off
                     }
                 } else {
-                    Fuse::Pixels
+                    cross_fuse()
                 };
                 match decode_resize(s, dec, p.max_width, p.max_height, p.parallel, fuse)? {
                     Decoded::Encoded(out) => out,
                     Decoded::Pixels { dst_w, dst_h } => {
                         encode_output(s, dst_w, dst_h, 3, target, p)?
+                    }
+                    #[cfg(feature = "avif")]
+                    Decoded::YuvPlanes { dst_w, dst_h } => {
+                        // Mirrors encode_output's AVIF arm (same tuned
+                        // operating point); only the conversion already
+                        // happened inside the decode overlap.
+                        let quality = avif_quality();
+                        let params = crate::avif::AvifParams {
+                            quality,
+                            alpha_quality: avif_alpha_quality(quality),
+                            ..Default::default()
+                        };
+                        let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
+                        crate::avif::encode_avif_from_planes(
+                            &s.y16[..dst_w * dst_h],
+                            &s.cb16[..cw * chh],
+                            &s.cr16[..cw * chh],
+                            dst_w,
+                            dst_h,
+                            &params,
+                        )?
                     }
                 }
             }
@@ -366,6 +394,14 @@ struct Scratch {
     // churn is what the allocator retains across thread heaps.
     out8: Vec<u8>,
     resizer: Option<Resizer>,
+    // 10-bit 4:2:0 planes for the fused AVIF path (converted during the
+    // decode overlap; encode_avif_from_planes consumes them).
+    #[cfg(feature = "avif")]
+    y16: Vec<u16>,
+    #[cfg(feature = "avif")]
+    cb16: Vec<u16>,
+    #[cfg(feature = "avif")]
+    cr16: Vec<u16>,
 }
 
 /// Grow-only scratch access: ensures length without re-zeroing retained
@@ -409,6 +445,8 @@ pub fn decode_and_resize(
             Decoded::Pixels { dst_w, dst_h } => {
                 Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
             }
+            #[cfg(feature = "avif")]
+            Decoded::YuvPlanes { .. } => unreachable!("no fuse was requested"),
             Decoded::Encoded(_) => unreachable!("no fuse quality was requested"),
         }
     })
@@ -543,8 +581,19 @@ fn resize_u16x3_picscale(
 /// `Scratch::out8` for a separate encode, or — on the fused path — the
 /// finished JPEG bytes (decode overlapped with resize+encode).
 enum Decoded {
-    Pixels { dst_w: usize, dst_h: usize },
+    Pixels {
+        dst_w: usize,
+        dst_h: usize,
+    },
     Encoded(Vec<u8>),
+    /// 10-bit 4:2:0 planes left in `Scratch::{y16,cb16,cr16}` — the
+    /// fused AVIF path converts rows during the decode overlap, so only
+    /// the SVT encode remains.
+    #[cfg(feature = "avif")]
+    YuvPlanes {
+        dst_w: usize,
+        dst_h: usize,
+    },
 }
 
 /// How the JPEG decode overlaps with downstream work (all variants
@@ -560,6 +609,11 @@ enum Fuse {
     /// (one-shot) target encoder runs after. Used for cross-format
     /// targets, hiding the resize behind the decode wall.
     Pixels,
+    /// Decode ∥ resize + RGB→YUV conversion straight into the 10-bit
+    /// planes on the worker thread — AVIF targets, hiding both the
+    /// resize and the conversion behind the decode wall.
+    #[cfg(feature = "avif")]
+    Yuv,
 }
 
 /// Requests currently inside the pixel pipeline, all formats. Used as
@@ -693,6 +747,36 @@ fn decode_resize<R: std::io::BufRead>(
             }
             started.finish().context("decode finish failed")?;
             return Ok(Decoded::Pixels { dst_w, dst_h });
+        }
+    }
+
+    #[cfg(feature = "avif")]
+    if let Fuse::Yuv = fuse
+        && linear
+    {
+        let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
+        scratch_u16(&mut s.y16, dst_w * dst_h);
+        scratch_u16(&mut s.cb16, cw * chh);
+        scratch_u16(&mut s.cr16, cw * chh);
+        if let Some(decode_ms) = fused_resize_yuv(
+            &mut started,
+            dec_w,
+            dec_h,
+            dst_w,
+            dst_h,
+            &mut s.y16[..dst_w * dst_h],
+            &mut s.cb16[..cw * chh],
+            &mut s.cr16[..cw * chh],
+        )? {
+            if timing {
+                let total = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "timing fused-yuv({dec_w}x{dec_h}->{dst_w}x{dst_h}) decode={decode_ms:.1}ms tail={:.1}ms total={total:.1}ms",
+                    total - decode_ms
+                );
+            }
+            started.finish().context("decode finish failed")?;
+            return Ok(Decoded::YuvPlanes { dst_w, dst_h });
         }
     }
 
@@ -1070,6 +1154,157 @@ fn fused_resize_pixels<R: std::io::BufRead>(
             // Spawn failure (thread limits, transient EAGAIN) leaves the
             // decoder untouched, exactly like a missing kernel — fall
             // back to the byte-identical serial path instead of failing.
+            let Ok(worker) = spawned else {
+                return Ok(None);
+            };
+
+            let t_decode = std::time::Instant::now();
+            let decode_result = (|| -> Result<()> {
+                let mut remaining = dec_h;
+                while remaining > 0 {
+                    let mut buf = recycle_rx.try_recv().unwrap_or_default();
+                    let want = remaining.min(chunk_rows) * row_bytes;
+                    if buf.len() < want {
+                        buf.resize(want, 0);
+                    }
+                    let got = started
+                        .read_scanlines_into(&mut buf[..want])
+                        .context("decode failed")?
+                        .len();
+                    anyhow::ensure!(
+                        got > 0 && got % row_bytes == 0,
+                        "decoder returned a partial row"
+                    );
+                    let rows = got / row_bytes;
+                    remaining -= rows;
+                    if chunk_tx.send((buf, rows)).is_err() {
+                        // Worker died; its join below reports the real error.
+                        anyhow::bail!("fuse worker exited early");
+                    }
+                }
+                Ok(())
+            })();
+            let decode_ms = t_decode.elapsed().as_secs_f64() * 1e3;
+            drop(chunk_tx);
+
+            let worker_result = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("fuse worker panicked"))?;
+            // A decode error is the root cause; report it over the
+            // worker's consequent "incomplete image" error.
+            decode_result?;
+            worker_result?;
+            Ok(Some(decode_ms))
+        })
+    }
+}
+
+/// The AVIF sibling of [`fused_resize_pixels`]: the worker converts
+/// each resized row straight into the 10-bit 4:2:0 planes (luma per
+/// row, chroma per row pair via the same row API the full-frame
+/// conversion uses, so the planes are bit-identical to converting
+/// `out8` afterwards) — both the resize and the RGB→YUV conversion hide
+/// behind the decode wall, and the resized frame never exists as an
+/// interleaved RGB copy. Only the one-shot SVT encode remains outside.
+///
+/// Returns Ok(None) — decoder untouched — when no SIMD row kernel
+/// exists; on success returns the decode-loop wall milliseconds with
+/// all three planes fully written.
+#[cfg(feature = "avif")]
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64")),
+    allow(unused_variables)
+)]
+#[allow(clippy::too_many_arguments)]
+fn fused_resize_yuv<R: std::io::BufRead>(
+    started: &mut mozjpeg::decompress::DecompressStarted<R>,
+    dec_w: usize,
+    dec_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    y_plane: &mut [u16],
+    cb_plane: &mut [u16],
+    cr_plane: &mut [u16],
+) -> Result<Option<f64>> {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        Ok(None)
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    {
+        let Ok(mut resizer) =
+            crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
+        else {
+            return Ok(None);
+        };
+
+        let row_bytes = dec_w * 3;
+        // Chunking and channel shapes mirror fused_resize_encode.
+        let chunk_rows = (64 * 1024 / row_bytes).clamp(1, dec_h);
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+        let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::scope(|sc| -> Result<Option<f64>> {
+            // Borrowed, not moved — see fused_resize_pixels.
+            let resizer = &mut resizer;
+            let cw = dst_w.div_ceil(2);
+            let spawned = std::thread::Builder::new()
+                .name("oximg-fuse".into())
+                .spawn_scoped(sc, move || -> Result<()> {
+                    let fwd = fwd_lut_f32();
+                    let back = back_lut();
+                    let mut row8 = vec![0u8; dst_w * 3];
+                    // Chroma needs the row pair; even rows park here.
+                    let mut prev_row = vec![0u8; dst_w * 3];
+                    while let Ok((buf, rows)) = chunk_rx.recv() {
+                        for r in 0..rows {
+                            let src = &buf[r * row_bytes..(r + 1) * row_bytes];
+                            resizer.push_row_u8(src, fwd, |oy, out| {
+                                for (d, &v) in row8.iter_mut().zip(out) {
+                                    *d = back[v as usize];
+                                }
+                                crate::avif::luma_rows(
+                                    &row8,
+                                    3,
+                                    &mut y_plane[oy * dst_w..][..dst_w],
+                                );
+                                if oy % 2 == 1 {
+                                    let cy = oy / 2;
+                                    crate::avif::chroma_row_pair(
+                                        &prev_row,
+                                        Some(&row8),
+                                        dst_w,
+                                        3,
+                                        &mut cb_plane[cy * cw..][..cw],
+                                        &mut cr_plane[cy * cw..][..cw],
+                                    );
+                                } else {
+                                    prev_row.copy_from_slice(&row8);
+                                }
+                            });
+                        }
+                        let _ = recycle_tx.send(buf);
+                    }
+                    anyhow::ensure!(
+                        resizer.rows_emitted() == dst_h,
+                        "decode ended before the image was complete"
+                    );
+                    // Odd height: the last row's chroma has no partner.
+                    if dst_h % 2 == 1 {
+                        let cy = dst_h / 2;
+                        crate::avif::chroma_row_pair(
+                            &prev_row,
+                            None,
+                            dst_w,
+                            3,
+                            &mut cb_plane[cy * cw..][..cw],
+                            &mut cr_plane[cy * cw..][..cw],
+                        );
+                    }
+                    Ok(())
+                });
+            // Spawn failure leaves the decoder untouched — fall back to
+            // the byte-identical serial path instead of failing.
             let Ok(worker) = spawned else {
                 return Ok(None);
             };
@@ -1818,6 +2053,8 @@ mod tests {
                 );
                 encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p).unwrap()
             }
+            #[cfg(feature = "avif")]
+            Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
         }
     }
 
@@ -1829,6 +2066,70 @@ mod tests {
         match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
             Decoded::Pixels { dst_w, dst_h } => s.out8[..dst_w * dst_h * 3].to_vec(),
             Decoded::Encoded(_) => panic!("pixel run must not encode"),
+            #[cfg(feature = "avif")]
+            Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
+        }
+    }
+
+    /// The fused AVIF path converts rows during the decode overlap; its
+    /// planes — and therefore the encoded bytes — must match the serial
+    /// path's full-frame conversion of the same pixels exactly.
+    #[cfg(feature = "avif")]
+    fn run_jpeg_avif(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
+        let params = crate::avif::AvifParams {
+            quality: 55,
+            alpha_quality: 55,
+            ..Default::default()
+        };
+        let mut s = Scratch::default();
+        let dec = Decompress::new_mem(jpeg).unwrap();
+        match decode_resize(&mut s, dec, 320, 320, 1, fuse).unwrap() {
+            Decoded::Pixels { dst_w, dst_h } => {
+                crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3, &params)
+                    .unwrap()
+            }
+            Decoded::YuvPlanes { dst_w, dst_h } => {
+                let (cw, chh) = (dst_w.div_ceil(2), dst_h.div_ceil(2));
+                crate::avif::encode_avif_from_planes(
+                    &s.y16[..dst_w * dst_h],
+                    &s.cb16[..cw * chh],
+                    &s.cr16[..cw * chh],
+                    dst_w,
+                    dst_h,
+                    &params,
+                )
+                .unwrap()
+            }
+            Decoded::Encoded(_) => panic!("avif run must not hit the jpegli fuse"),
+        }
+    }
+
+    #[cfg(feature = "avif")]
+    #[test]
+    fn fused_yuv_bytes_match_serial_avif() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        // Odd dimensions exercise chunk boundaries, scalar tails, and
+        // the odd-height final chroma row.
+        for (w, h, gray) in [(799, 601, false), (400, 300, true), (321, 243, false)] {
+            let jpeg = make_test_jpeg(w, h, gray);
+            assert_eq!(
+                run_jpeg_avif(&jpeg, Fuse::Off),
+                run_jpeg_avif(&jpeg, Fuse::Yuv),
+                "{w}x{h} gray={gray}"
+            );
+        }
+    }
+
+    #[cfg(feature = "avif")]
+    #[test]
+    fn fused_yuv_survives_truncated_sources() {
+        let jpeg = make_test_jpeg(799, 601, false);
+        let cut = &jpeg[..jpeg.len() * 3 / 5];
+        let mut s = Scratch::default();
+        if let Ok(dec) = Decompress::new_mem(cut) {
+            let _ = decode_resize(&mut s, dec, 320, 320, 1, Fuse::Yuv);
         }
     }
 

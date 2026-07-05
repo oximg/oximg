@@ -289,10 +289,16 @@ fn mixed_format_requests_do_not_cross_coalesce() {
 fn forced_overlap_cross_format_matches_serial() {
     let fused = Server::start(47113, &[("OXIMG_OVERLAP", "1".into())]);
     let serial = Server::start(47114, &[("OXIMG_OVERLAP", "0".into())]);
-    for url in [
+    let mut urls = vec![
         "/resize/100/100/photo.jpg@webp",
         "/resize/100/100/photo.jpg@png",
-    ] {
+    ];
+    if cfg!(feature = "avif") {
+        // The fused AVIF path converts YUV during the decode overlap;
+        // bytes must still match the serial full-frame conversion.
+        urls.push("/resize/100/100/photo.jpg@avif");
+    }
+    for url in urls {
         let (status, ct, body) = fused.get(url).unwrap();
         assert_eq!(status, 200, "{url}");
         let (s2, ct2, body2) = serial.get(url).unwrap();

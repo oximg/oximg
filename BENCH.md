@@ -255,6 +255,17 @@ harness hands the competitors (see
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md)); nominal
 qualities are not comparable across encoders.
 
+The c7i gap traces to SMT: c7i.large is one physical core running two
+hyperthreads, and pinning this Ryzen harness to an SMT sibling pair
+(cpuset 0,8) reproduces it — oximg's lead narrows from +13% to +3%
+(oximg loses 28% to SMT contention, imgproxy 22%; SVT-AV1's dense
+vector kernels contend harder than libaom's). A follow-up landed after
+these tables: the fused AVIF path now converts YUV row-by-row inside
+the decode overlap with AVX2 conversion rows, measuring +3.5-4% on
+JPEG→AVIF in interleaved A/B on both topologies (bytes unchanged) —
+enough to roughly close the c7i gap; the AWS cells will be refreshed
+at the next release re-measure.
+
 The same runs re-verified every same-format cell: oximg and the
 same-run imgproxy anchors landed within the ~3% instance variance of
 the tables below on both instance types — except JPEG on c7g.large,

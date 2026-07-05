@@ -50,10 +50,17 @@ fn rgb_to_yuv420_10bit(
 /// Coefficients sum to 4096, so the pre-scale maximum is 4096*255 and the
 /// rounding divide maps 255 -> exactly 1023 (never 1024: out-of-range
 /// samples make SVT emit full-scale luma garbage in the affected blocks).
-fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
+/// The math is position-independent, so any whole-pixel slice works — a
+/// single row (the pipeline's fused AVIF path converts rows as the
+/// resize emits them) or the full frame.
+pub(crate) fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
     #[cfg(target_arch = "aarch64")]
     if crate::yuv::neon() {
         return unsafe { neon_enc::luma_rows(pixels, channels, y_plane) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enc::detect() {
+        return unsafe { avx2_enc::luma_rows(pixels, channels, y_plane) };
     }
     luma_rows_scalar(pixels, channels, y_plane);
 }
@@ -78,41 +85,75 @@ fn chroma_rows(
     cb_plane: &mut [u16],
     cr_plane: &mut [u16],
 ) {
-    #[cfg(target_arch = "aarch64")]
-    if crate::yuv::neon() {
-        return unsafe { neon_enc::chroma_rows(pixels, w, h, channels, cb_plane, cr_plane) };
-    }
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let row_bytes = w * channels;
     for cy in 0..ch {
-        for cx in 0..cw {
-            let (cb, cr) = chroma_block(pixels, w, h, channels, cx, cy);
-            cb_plane[cy * cw + cx] = cb;
-            cr_plane[cy * cw + cx] = cr;
-        }
+        let y0 = cy * 2;
+        let row0 = &pixels[y0 * row_bytes..][..row_bytes];
+        let row1 = (y0 + 1 < h).then(|| &pixels[(y0 + 1) * row_bytes..][..row_bytes]);
+        chroma_row_pair(
+            row0,
+            row1,
+            w,
+            channels,
+            &mut cb_plane[cy * cw..][..cw],
+            &mut cr_plane[cy * cw..][..cw],
+        );
     }
 }
 
-/// Chroma from the 2x2-averaged RGB block at (cx, cy); partial blocks
-/// at the right/bottom edges average the pixels that exist. The scalar
-/// reference for both the scalar loop and the NEON edge handling.
-#[inline]
-fn chroma_block(
-    pixels: &[u8],
+/// One chroma row from a source row pair; `row1` is `None` on the
+/// odd-height bottom row (vertical averages then cover one row). Fills
+/// `cb_row`/`cr_row`, both `w.div_ceil(2)` long. pub(crate) so the
+/// pipeline's fused AVIF path can convert as resize rows emit.
+pub(crate) fn chroma_row_pair(
+    row0: &[u8],
+    row1: Option<&[u8]>,
     w: usize,
-    h: usize,
+    channels: usize,
+    cb_row: &mut [u16],
+    cr_row: &mut [u16],
+) {
+    // The vector paths want both rows (every block a full 2x2); the
+    // odd-height bottom row is a single pass of scalar blocks.
+    if let Some(row1) = row1 {
+        #[cfg(target_arch = "aarch64")]
+        if crate::yuv::neon() {
+            return unsafe { neon_enc::chroma_row_pair(row0, row1, w, channels, cb_row, cr_row) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if avx2_enc::detect() {
+            return unsafe { avx2_enc::chroma_row_pair(row0, row1, w, channels, cb_row, cr_row) };
+        }
+    }
+    for cx in 0..w.div_ceil(2) {
+        let (cb, cr) = chroma_block_rows(row0, row1, channels, cx, w);
+        cb_row[cx] = cb;
+        cr_row[cx] = cr;
+    }
+}
+
+/// Chroma from the 2x2-averaged RGB block at column `cx` of a row pair;
+/// partial blocks at the right edge (and the missing bottom row when
+/// `row1` is None) average the pixels that exist. The scalar reference
+/// for the vector paths' edge handling and the dispatcher's fallback.
+#[inline]
+fn chroma_block_rows(
+    row0: &[u8],
+    row1: Option<&[u8]>,
     channels: usize,
     cx: usize,
-    cy: usize,
+    w: usize,
 ) -> (u16, u16) {
     let (mut rs, mut gs, mut bs, mut n) = (0u32, 0u32, 0u32, 0u32);
-    for dy in 0..2 {
+    for row in [Some(row0), row1].into_iter().flatten() {
         for dx in 0..2 {
-            let (x, yy) = (cx * 2 + dx, cy * 2 + dy);
-            if x < w && yy < h {
-                let p = (yy * w + x) * channels;
-                rs += pixels[p] as u32;
-                gs += pixels[p + 1] as u32;
-                bs += pixels[p + 2] as u32;
+            let x = cx * 2 + dx;
+            if x < w {
+                let p = x * channels;
+                rs += row[p] as u32;
+                gs += row[p + 1] as u32;
+                bs += row[p + 2] as u32;
                 n += 1;
             }
         }
@@ -195,70 +236,333 @@ mod neon_enc {
         }
     }
 
+    /// One chroma row from a full row pair (the dispatcher guarantees
+    /// both rows exist; the odd-height bottom row never reaches here).
     #[target_feature(enable = "neon")]
-    pub(super) unsafe fn chroma_rows(
-        pixels: &[u8],
+    pub(super) unsafe fn chroma_row_pair(
+        row0: &[u8],
+        row1: &[u8],
         w: usize,
-        h: usize,
         channels: usize,
-        cb_plane: &mut [u16],
-        cr_plane: &mut [u16],
+        cb_row: &mut [u16],
+        cr_row: &mut [u16],
     ) {
         // The same f32 constants the scalar reference spells inline.
         const CB1: f32 = 0.5 / (1.0 - 0.114);
         const CR1: f32 = 0.5 / (1.0 - 0.299);
         const SCALE: f32 = 1023.0 / 255.0;
         unsafe {
-            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let cw = w.div_ceil(2);
             let four = vdupq_n_f32(4.0);
             let v512 = vdupq_n_f32(512.0);
             let vmax = vdupq_n_s32(1023);
-            for cy in 0..ch {
-                let y0 = cy * 2;
-                let mut cx = 0usize;
-                // Vector path: 4 chroma columns = 8 source pixels, both
-                // rows in range, so every block is a full 2x2 (n = 4).
-                if y0 + 1 < h {
-                    while cx * 2 + 8 <= w {
-                        let p0 = pixels.as_ptr().add((y0 * w + cx * 2) * channels);
-                        let p1 = pixels.as_ptr().add(((y0 + 1) * w + cx * 2) * channels);
-                        let (r0, g0, b0) = load8(p0, channels);
-                        let (r1, g1, b1) = load8(p1, channels);
-                        // Pairwise-add columns, then the two rows: the
-                        // 2x2 sums for 4 chroma columns (max 1020).
-                        let rs = vadd_u16(vpaddl_u8(r0), vpaddl_u8(r1));
-                        let gs = vadd_u16(vpaddl_u8(g0), vpaddl_u8(g1));
-                        let bs = vadd_u16(vpaddl_u8(b0), vpaddl_u8(b1));
-                        // Mirror the scalar: sums / n, then the mul/add
-                        // chain in source order (no FMA).
-                        let r = vdivq_f32(vcvtq_f32_u32(vmovl_u16(rs)), four);
-                        let g = vdivq_f32(vcvtq_f32_u32(vmovl_u16(gs)), four);
-                        let b = vdivq_f32(vcvtq_f32_u32(vmovl_u16(bs)), four);
-                        let y = vaddq_f32(
-                            vaddq_f32(vmulq_n_f32(r, 0.299), vmulq_n_f32(g, 0.587)),
-                            vmulq_n_f32(b, 0.114),
-                        );
-                        let cb =
-                            vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(b, y), CB1), SCALE), v512);
-                        let cr =
-                            vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(r, y), CR1), SCALE), v512);
-                        // round() then clamp(0, 1023): ties-away convert,
-                        // min against 1023, saturating-unsigned narrow
-                        // (which floors negatives at 0).
-                        let cb = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cb), vmax));
-                        let cr = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cr), vmax));
-                        vst1_u16(cb_plane.as_mut_ptr().add(cy * cw + cx), cb);
-                        vst1_u16(cr_plane.as_mut_ptr().add(cy * cw + cx), cr);
-                        cx += 4;
-                    }
-                }
-                // Right-edge columns and the odd-height bottom row take
-                // the scalar reference block (partial 2x2 averages).
-                for cx in cx..cw {
-                    let (cb, cr) = super::chroma_block(pixels, w, h, channels, cx, cy);
-                    cb_plane[cy * cw + cx] = cb;
-                    cr_plane[cy * cw + cx] = cr;
-                }
+            let mut cx = 0usize;
+            // Vector path: 4 chroma columns = 8 source pixels, every
+            // block a full 2x2 (n = 4).
+            while cx * 2 + 8 <= w {
+                let p0 = row0.as_ptr().add(cx * 2 * channels);
+                let p1 = row1.as_ptr().add(cx * 2 * channels);
+                let (r0, g0, b0) = load8(p0, channels);
+                let (r1, g1, b1) = load8(p1, channels);
+                // Pairwise-add columns, then the two rows: the 2x2 sums
+                // for 4 chroma columns (max 1020).
+                let rs = vadd_u16(vpaddl_u8(r0), vpaddl_u8(r1));
+                let gs = vadd_u16(vpaddl_u8(g0), vpaddl_u8(g1));
+                let bs = vadd_u16(vpaddl_u8(b0), vpaddl_u8(b1));
+                // Mirror the scalar: sums / n, then the mul/add chain in
+                // source order (no FMA).
+                let r = vdivq_f32(vcvtq_f32_u32(vmovl_u16(rs)), four);
+                let g = vdivq_f32(vcvtq_f32_u32(vmovl_u16(gs)), four);
+                let b = vdivq_f32(vcvtq_f32_u32(vmovl_u16(bs)), four);
+                let y = vaddq_f32(
+                    vaddq_f32(vmulq_n_f32(r, 0.299), vmulq_n_f32(g, 0.587)),
+                    vmulq_n_f32(b, 0.114),
+                );
+                let cb = vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(b, y), CB1), SCALE), v512);
+                let cr = vaddq_f32(vmulq_n_f32(vmulq_n_f32(vsubq_f32(r, y), CR1), SCALE), v512);
+                // round() then clamp(0, 1023): ties-away convert, min
+                // against 1023, saturating-unsigned narrow (which floors
+                // negatives at 0).
+                let cb = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cb), vmax));
+                let cr = vqmovun_s32(vminq_s32(vcvtaq_s32_f32(cr), vmax));
+                vst1_u16(cb_row.as_mut_ptr().add(cx), cb);
+                vst1_u16(cr_row.as_mut_ptr().add(cx), cr);
+                cx += 4;
+            }
+            // Right-edge columns take the scalar reference block.
+            for cx in cx..cw {
+                let (cb, cr) = super::chroma_block_rows(row0, Some(row1), channels, cx, w);
+                cb_row[cx] = cb;
+                cr_row[cx] = cr;
+            }
+        }
+    }
+}
+
+/// Encode-side RGB(A)8 -> YUV AVX2 rows for x86-64 — the neon_enc
+/// counterpart, under the same contract: luma runs the scalar integer
+/// formula through the exhaustively-proven exact magic-multiply
+/// division, chroma mirrors the scalar f32 arithmetic operation for
+/// operation, and the tests assert bit-identical planes. Rounding note:
+/// the scalar `f32::round` (ties away from zero) is reproduced as
+/// `floor(x + 0.5)` — valid because cb/cr are >= 0 by construction (the
+/// BT.601 offsets map the extremes to 512 +/- 511.5), and for
+/// non-negative x the two are equal, ties included.
+#[cfg(target_arch = "x86_64")]
+mod avx2_enc {
+    use std::arch::x86_64::*;
+
+    #[inline]
+    pub(super) fn detect() -> bool {
+        is_x86_feature_detected!("avx2")
+    }
+
+    /// Deinterleave 16 RGB(A) pixels starting at `p` into r/g/b u8x16.
+    /// Safety: caller guarantees 16 full pixels at `p`; AVX2 enabled.
+    /// The target_feature attribute is load-bearing: AVX2 is not in the
+    /// x86-64 baseline, so without it this helper compiles to SSE2-era
+    /// codegen and cannot inline into its AVX2 callers (measured 12x
+    /// slower on the luma path).
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn load16(p: *const u8, channels: usize) -> (__m128i, __m128i, __m128i) {
+        unsafe {
+            if channels == 3 {
+                // 48 bytes: r0 g0 b0 r1 ... r15 g15 b15
+                let x0 = _mm_loadu_si128(p.cast()); // bytes 0..16
+                let x1 = _mm_loadu_si128(p.add(16).cast()); // bytes 16..32
+                let x2 = _mm_loadu_si128(p.add(32).cast()); // bytes 32..48
+                let z = -1i8;
+                // r: 0,3,6,9,12,15 | 18,21,24,27,30 | 33,36,39,42,45
+                let r = _mm_or_si128(
+                    _mm_or_si128(
+                        _mm_shuffle_epi8(
+                            x0,
+                            _mm_setr_epi8(0, 3, 6, 9, 12, 15, z, z, z, z, z, z, z, z, z, z),
+                        ),
+                        _mm_shuffle_epi8(
+                            x1,
+                            _mm_setr_epi8(z, z, z, z, z, z, 2, 5, 8, 11, 14, z, z, z, z, z),
+                        ),
+                    ),
+                    _mm_shuffle_epi8(
+                        x2,
+                        _mm_setr_epi8(z, z, z, z, z, z, z, z, z, z, z, 1, 4, 7, 10, 13),
+                    ),
+                );
+                // g: 1,4,7,10,13 | 16,19,22,25,28,31 | 34,37,40,43,46
+                let g = _mm_or_si128(
+                    _mm_or_si128(
+                        _mm_shuffle_epi8(
+                            x0,
+                            _mm_setr_epi8(1, 4, 7, 10, 13, z, z, z, z, z, z, z, z, z, z, z),
+                        ),
+                        _mm_shuffle_epi8(
+                            x1,
+                            _mm_setr_epi8(z, z, z, z, z, 0, 3, 6, 9, 12, 15, z, z, z, z, z),
+                        ),
+                    ),
+                    _mm_shuffle_epi8(
+                        x2,
+                        _mm_setr_epi8(z, z, z, z, z, z, z, z, z, z, z, 2, 5, 8, 11, 14),
+                    ),
+                );
+                // b: 2,5,8,11,14 | 17,20,23,26,29 | 32,35,38,41,44,47
+                let b = _mm_or_si128(
+                    _mm_or_si128(
+                        _mm_shuffle_epi8(
+                            x0,
+                            _mm_setr_epi8(2, 5, 8, 11, 14, z, z, z, z, z, z, z, z, z, z, z),
+                        ),
+                        _mm_shuffle_epi8(
+                            x1,
+                            _mm_setr_epi8(z, z, z, z, z, 1, 4, 7, 10, 13, z, z, z, z, z, z),
+                        ),
+                    ),
+                    _mm_shuffle_epi8(
+                        x2,
+                        _mm_setr_epi8(z, z, z, z, z, z, z, z, z, z, 0, 3, 6, 9, 12, 15),
+                    ),
+                );
+                (r, g, b)
+            } else {
+                // 64 bytes: rgba x16; select every 4th byte per channel.
+                let x0 = _mm_loadu_si128(p.cast());
+                let x1 = _mm_loadu_si128(p.add(16).cast());
+                let x2 = _mm_loadu_si128(p.add(32).cast());
+                let x3 = _mm_loadu_si128(p.add(48).cast());
+                let z = -1i8;
+                let pick = |off: i8| -> [__m128i; 4] {
+                    let m = |s: i8| unsafe {
+                        _mm_setr_epi8(
+                            if s == 0 { off } else { z },
+                            if s == 0 { off + 4 } else { z },
+                            if s == 0 { off + 8 } else { z },
+                            if s == 0 { off + 12 } else { z },
+                            if s == 1 { off } else { z },
+                            if s == 1 { off + 4 } else { z },
+                            if s == 1 { off + 8 } else { z },
+                            if s == 1 { off + 12 } else { z },
+                            if s == 2 { off } else { z },
+                            if s == 2 { off + 4 } else { z },
+                            if s == 2 { off + 8 } else { z },
+                            if s == 2 { off + 12 } else { z },
+                            if s == 3 { off } else { z },
+                            if s == 3 { off + 4 } else { z },
+                            if s == 3 { off + 8 } else { z },
+                            if s == 3 { off + 12 } else { z },
+                        )
+                    };
+                    [m(0), m(1), m(2), m(3)]
+                };
+                let gather = |off: i8| unsafe {
+                    let m = pick(off);
+                    _mm_or_si128(
+                        _mm_or_si128(_mm_shuffle_epi8(x0, m[0]), _mm_shuffle_epi8(x1, m[1])),
+                        _mm_or_si128(_mm_shuffle_epi8(x2, m[2]), _mm_shuffle_epi8(x3, m[3])),
+                    )
+                };
+                (gather(0), gather(1), gather(2))
+            }
+        }
+    }
+
+    /// The scalar luma divide, vectorized exactly as in neon_enc::luma4:
+    /// 1044480 = 4096 * 255 and (t * 8421505) >> 31 == floor(t / 255)
+    /// for t <= 16.9M (proven in tests::luma_divider_identity_is_exact).
+    /// Input: 8 pixels as u16x8 lanes; output u16x8 luma.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn luma8(r: __m128i, g: __m128i, b: __m128i) -> __m128i {
+        unsafe {
+            let r = _mm256_cvtepu16_epi32(r);
+            let g = _mm256_cvtepu16_epi32(g);
+            let b = _mm256_cvtepu16_epi32(b);
+            let acc = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(r, _mm256_set1_epi32(1225)),
+                    _mm256_mullo_epi32(g, _mm256_set1_epi32(2404)),
+                ),
+                _mm256_mullo_epi32(b, _mm256_set1_epi32(467)),
+            );
+            let acc = _mm256_add_epi32(
+                _mm256_mullo_epi32(acc, _mm256_set1_epi32(1023)),
+                _mm256_set1_epi32(522_240),
+            );
+            let t = _mm256_srli_epi32::<12>(acc);
+            let m = _mm256_set1_epi64x(8_421_505);
+            let even = _mm256_srli_epi64::<31>(_mm256_mul_epu32(t, m));
+            let odd = _mm256_srli_epi64::<31>(_mm256_mul_epu32(_mm256_srli_epi64::<32>(t), m));
+            let y32 = _mm256_or_si256(even, _mm256_slli_epi64::<32>(odd));
+            let packed = _mm256_packus_epi32(y32, y32);
+            let packed = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
+            _mm256_castsi256_si128(packed)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
+        unsafe {
+            let n = y_plane.len();
+            let mut i = 0;
+            while i + 16 <= n {
+                let (r, g, b) = load16(pixels.as_ptr().add(i * channels), channels);
+                let lo = luma8(
+                    _mm_cvtepu8_epi16(r),
+                    _mm_cvtepu8_epi16(g),
+                    _mm_cvtepu8_epi16(b),
+                );
+                let hi = luma8(
+                    _mm_cvtepu8_epi16(_mm_srli_si128::<8>(r)),
+                    _mm_cvtepu8_epi16(_mm_srli_si128::<8>(g)),
+                    _mm_cvtepu8_epi16(_mm_srli_si128::<8>(b)),
+                );
+                _mm_storeu_si128(y_plane.as_mut_ptr().add(i).cast(), lo);
+                _mm_storeu_si128(y_plane.as_mut_ptr().add(i + 8).cast(), hi);
+                i += 16;
+            }
+            for (j, y) in y_plane.iter_mut().enumerate().skip(i) {
+                let p = j * channels;
+                *y = super::luma_px(pixels[p], pixels[p + 1], pixels[p + 2]);
+            }
+        }
+    }
+
+    /// One chroma row from a full row pair (the dispatcher guarantees
+    /// both rows exist; the odd-height bottom row never reaches here).
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn chroma_row_pair(
+        row0: &[u8],
+        row1: &[u8],
+        w: usize,
+        channels: usize,
+        cb_row: &mut [u16],
+        cr_row: &mut [u16],
+    ) {
+        // The same f32 constants the scalar reference spells inline.
+        const CB1: f32 = 0.5 / (1.0 - 0.114);
+        const CR1: f32 = 0.5 / (1.0 - 0.299);
+        const SCALE: f32 = 1023.0 / 255.0;
+        unsafe {
+            let cw = w.div_ceil(2);
+            let ones = _mm_set1_epi8(1);
+            let four = _mm256_set1_ps(4.0);
+            let half = _mm256_set1_ps(0.5);
+            let v512 = _mm256_set1_ps(512.0);
+            let vmax = _mm256_set1_epi32(1023);
+            let zero = _mm256_setzero_si256();
+            // Pairwise horizontal sums of both rows: the 2x2 sums for 8
+            // chroma columns as u16x8 (max 1020), then the scalar f32
+            // chain mirrored lane-wise.
+            let pair16 = |x: __m128i| unsafe { _mm_maddubs_epi16(x, ones) };
+            let mut cx = 0usize;
+            // Vector path: 8 chroma columns = 16 source pixels, every
+            // block a full 2x2 (n = 4).
+            while cx * 2 + 16 <= w {
+                let p0 = row0.as_ptr().add(cx * 2 * channels);
+                let p1 = row1.as_ptr().add(cx * 2 * channels);
+                let (r0, g0, b0) = load16(p0, channels);
+                let (r1, g1, b1) = load16(p1, channels);
+                let rs = _mm_add_epi16(pair16(r0), pair16(r1));
+                let gs = _mm_add_epi16(pair16(g0), pair16(g1));
+                let bs = _mm_add_epi16(pair16(b0), pair16(b1));
+                let to_f = |s: __m128i| unsafe {
+                    _mm256_div_ps(_mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(s)), four)
+                };
+                let (r, g, b) = (to_f(rs), to_f(gs), to_f(bs));
+                let y = _mm256_add_ps(
+                    _mm256_add_ps(
+                        _mm256_mul_ps(r, _mm256_set1_ps(0.299)),
+                        _mm256_mul_ps(g, _mm256_set1_ps(0.587)),
+                    ),
+                    _mm256_mul_ps(b, _mm256_set1_ps(0.114)),
+                );
+                let chan = |base: __m256, c1: f32| unsafe {
+                    let v = _mm256_add_ps(
+                        _mm256_mul_ps(
+                            _mm256_mul_ps(_mm256_sub_ps(base, y), _mm256_set1_ps(c1)),
+                            _mm256_set1_ps(SCALE),
+                        ),
+                        v512,
+                    );
+                    // round-half-away == floor(v + 0.5) for v >= 0,
+                    // then the scalar clamp(0, 1023).
+                    let i32s = _mm256_cvttps_epi32(_mm256_floor_ps(_mm256_add_ps(v, half)));
+                    let i32s = _mm256_min_epi32(_mm256_max_epi32(i32s, zero), vmax);
+                    let p = _mm256_packus_epi32(i32s, i32s);
+                    _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b11_01_10_00>(p))
+                };
+                let cb = chan(b, CB1);
+                let cr = chan(r, CR1);
+                _mm_storeu_si128(cb_row.as_mut_ptr().add(cx).cast(), cb);
+                _mm_storeu_si128(cr_row.as_mut_ptr().add(cx).cast(), cr);
+                cx += 8;
+            }
+            // Right-edge columns take the scalar reference block.
+            for cx in cx..cw {
+                let (cb, cr) = super::chroma_block_rows(row0, Some(row1), channels, cx, w);
+                cb_row[cx] = cb;
+                cr_row[cx] = cr;
             }
         }
     }
@@ -349,11 +653,42 @@ pub fn encode_avif(
     } else {
         None
     };
+    Ok(finish_avif(&color, alpha.as_deref(), w, h))
+}
+
+/// Encode pre-filled 10-bit 4:2:0 planes (no alpha) — the entry for the
+/// pipeline's fused AVIF path, which fills the planes row by row while
+/// the JPEG decode is still running. The planes must come from the row
+/// conversion API at (w, h), so output is byte-identical to
+/// [`encode_avif`] on the same pixels.
+pub(crate) fn encode_avif_from_planes(
+    y_plane: &[u16],
+    cb_plane: &[u16],
+    cr_plane: &[u16],
+    w: usize,
+    h: usize,
+    p: &AvifParams,
+) -> Result<Vec<u8>> {
+    let color = encode_svt(
+        y_plane,
+        cb_plane,
+        cr_plane,
+        w,
+        h,
+        quality_to_qp(p.quality),
+        false,
+        p,
+    )?;
+    Ok(finish_avif(&color, None, w, h))
+}
+
+/// Assemble the AVIF container around the encoded AV1 item(s).
+fn finish_avif(color: &[u8], alpha: Option<&[u8]>, w: usize, h: usize) -> Vec<u8> {
     let mut fy = avif_serialize::Aviffy::new();
     fy.matrix_coefficients(avif_serialize::constants::MatrixCoefficients::Bt601)
         .full_color_range(true)
         .set_chroma_subsampling((true, true));
-    Ok(fy.to_vec(&color, alpha.as_deref(), w as u32, h as u32, 10))
+    fy.to_vec(color, alpha, w as u32, h as u32, 10)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -912,6 +1247,115 @@ mod tests {
             .collect()
     }
 
+    /// Manual micro-benchmark: kernel-vs-scalar conversion cost.
+    /// cargo test --release --features avif bench_yuv -- --ignored --nocapture
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "manual micro-benchmark"]
+    fn bench_yuv_kernels() {
+        let (w, h) = (512usize, 340usize);
+        let px = pixel_samples(w * h * 3, 42);
+        let mut y = vec![0u16; w * h];
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (mut cb, mut cr) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
+        let iters = 3000u32;
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3 / iters as f64;
+
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            luma_rows_scalar(&px, 3, &mut y);
+            std::hint::black_box(&y);
+        }
+        eprintln!("luma scalar(auto-vec):  {:.4} ms/frame", ms(t));
+
+        if avx2_enc::detect() {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                unsafe { avx2_enc::luma_rows(&px, 3, &mut y) };
+                std::hint::black_box(&y);
+            }
+            eprintln!("luma avx2 intrinsics:   {:.4} ms/frame", ms(t));
+        }
+
+        let rb = w * 3;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            for cy in 0..ch {
+                let row0 = &px[cy * 2 * rb..][..rb];
+                let row1 = (cy * 2 + 1 < h).then(|| &px[(cy * 2 + 1) * rb..][..rb]);
+                for cx in 0..cw {
+                    let (b, r) = chroma_block_rows(row0, row1, 3, cx, w);
+                    cb[cy * cw + cx] = b;
+                    cr[cy * cw + cx] = r;
+                }
+            }
+            std::hint::black_box((&cb, &cr));
+        }
+        eprintln!("chroma scalar blocks:   {:.4} ms/frame", ms(t));
+
+        if avx2_enc::detect() {
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                for cy in 0..ch {
+                    let row0 = &px[cy * 2 * rb..][..rb];
+                    if cy * 2 + 1 < h {
+                        let row1 = &px[(cy * 2 + 1) * rb..][..rb];
+                        unsafe {
+                            avx2_enc::chroma_row_pair(
+                                row0,
+                                row1,
+                                w,
+                                3,
+                                &mut cb[cy * cw..][..cw],
+                                &mut cr[cy * cw..][..cw],
+                            )
+                        };
+                    }
+                }
+                std::hint::black_box((&cb, &cr));
+            }
+            eprintln!("chroma avx2 intrinsics: {:.4} ms/frame", ms(t));
+        }
+    }
+
+    /// Frame-level scalar chroma reference, built from the row-pair
+    /// block the vector paths must match.
+    fn chroma_frame_scalar(px: &[u8], w: usize, h: usize, channels: usize) -> (Vec<u16>, Vec<u16>) {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (mut cb, mut cr) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
+        let rb = w * channels;
+        for cy in 0..ch {
+            let row0 = &px[cy * 2 * rb..][..rb];
+            let row1 = (cy * 2 + 1 < h).then(|| &px[(cy * 2 + 1) * rb..][..rb]);
+            for cx in 0..cw {
+                let (b, r) = chroma_block_rows(row0, row1, channels, cx, w);
+                cb[cy * cw + cx] = b;
+                cr[cy * cw + cx] = r;
+            }
+        }
+        (cb, cr)
+    }
+
+    /// The fused AVIF path converts row by row instead of over the full
+    /// frame; the vector main loops restart (and re-tail) per row, so
+    /// pin that chunking never changes values.
+    #[test]
+    fn row_wise_luma_matches_full_frame() {
+        let (w, h, channels) = (61usize, 9, 3);
+        let px = pixel_samples(w * h * channels, 11);
+        let mut full = vec![0u16; w * h];
+        luma_rows(&px, channels, &mut full);
+        let mut rows = vec![0u16; w * h];
+        for y in 0..h {
+            luma_rows(
+                &px[y * w * channels..][..w * channels],
+                channels,
+                &mut rows[y * w..][..w],
+            );
+        }
+        assert_eq!(full, rows);
+    }
+
     /// The NEON luma path replaces `acc / 1044480` with
     /// `((acc >> 12) * 8421505) >> 31`; prove both identities it stacks
     /// (factor split and magic-multiply /255) over the full domain the
@@ -923,6 +1367,83 @@ mod tests {
             let reference = acc / 1_044_480;
             let vectorized = (((acc >> 12) as u64 * 8_421_505) >> 31) as u32;
             assert_eq!(reference, vectorized, "x={x}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_luma_rows_match_scalar_bit_exactly() {
+        if !avx2_enc::detect() {
+            return;
+        }
+        // Odd lengths exercise the scalar tail after the 16-wide loop.
+        for (n, channels, seed) in [(1024, 3, 1), (1013, 3, 2), (1024, 4, 3), (777, 4, 4)] {
+            let px = pixel_samples(n * channels, seed);
+            let mut scalar = vec![0u16; n];
+            let mut vector = vec![0u16; n];
+            luma_rows_scalar(&px, channels, &mut scalar);
+            unsafe { avx2_enc::luma_rows(&px, channels, &mut vector) };
+            assert_eq!(scalar, vector, "n={n} channels={channels}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_chroma_rows_match_scalar_bit_exactly() {
+        if !avx2_enc::detect() {
+            return;
+        }
+        for (w, h, channels, seed) in [
+            (128, 64, 3, 5),
+            (127, 63, 3, 6),
+            (17, 5, 3, 7),
+            (130, 62, 4, 8),
+            (33, 7, 4, 9),
+        ] {
+            let px = pixel_samples(w * h * channels, seed);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let (cb_s, cr_s) = chroma_frame_scalar(&px, w, h, channels);
+            let (mut cb_v, mut cr_v) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
+            chroma_rows(&px, w, h, channels, &mut cb_v, &mut cr_v);
+            assert_eq!(cb_s, cb_v, "cb {w}x{h} channels={channels}");
+            assert_eq!(cr_s, cr_v, "cr {w}x{h} channels={channels}");
+        }
+    }
+
+    /// The AVX2 chroma path rounds with floor(x + 0.5) instead of the
+    /// scalar ties-away `round()` (valid for x >= 0). Sweep uniform 2x2
+    /// blocks across the color cube to hunt rounding-boundary
+    /// disagreements the randomized tests might miss.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_chroma_rounding_matches_on_uniform_sweep() {
+        if !avx2_enc::detect() {
+            return;
+        }
+        // 16 blocks per 32x2 image; r dense, b stepped, g coarse.
+        let (w, h) = (32usize, 2usize);
+        for g in [0u8, 37, 128, 219, 255] {
+            for b0 in (0..256usize).step_by(3) {
+                let mut px = vec![0u8; w * h * 3];
+                for blk in 0..16 {
+                    let r = ((b0 + blk * 16) % 256) as u8;
+                    let b = ((b0 + blk) % 256) as u8;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let p = (dy * w + blk * 2 + dx) * 3;
+                            px[p] = r;
+                            px[p + 1] = g;
+                            px[p + 2] = b;
+                        }
+                    }
+                }
+                let cw = w / 2;
+                let (cb_s, cr_s) = chroma_frame_scalar(&px, w, h, 3);
+                let (mut cb_v, mut cr_v) = (vec![0u16; cw], vec![0u16; cw]);
+                chroma_rows(&px, w, h, 3, &mut cb_v, &mut cr_v);
+                assert_eq!(cb_s, cb_v, "cb g={g} b0={b0}");
+                assert_eq!(cr_s, cr_v, "cr g={g} b0={b0}");
+            }
         }
     }
 
@@ -960,16 +1481,9 @@ mod tests {
         ] {
             let px = pixel_samples(w * h * channels, seed);
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-            let (mut cb_s, mut cr_s) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
-            for cy in 0..ch {
-                for cx in 0..cw {
-                    let (cb, cr) = chroma_block(&px, w, h, channels, cx, cy);
-                    cb_s[cy * cw + cx] = cb;
-                    cr_s[cy * cw + cx] = cr;
-                }
-            }
+            let (cb_s, cr_s) = chroma_frame_scalar(&px, w, h, channels);
             let (mut cb_n, mut cr_n) = (vec![0u16; cw * ch], vec![0u16; cw * ch]);
-            unsafe { neon_enc::chroma_rows(&px, w, h, channels, &mut cb_n, &mut cr_n) };
+            chroma_rows(&px, w, h, channels, &mut cb_n, &mut cr_n);
             assert_eq!(cb_s, cb_n, "cb {w}x{h} channels={channels}");
             assert_eq!(cr_s, cr_n, "cr {w}x{h} channels={channels}");
         }
