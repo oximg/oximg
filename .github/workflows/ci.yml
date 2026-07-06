@@ -68,3 +68,61 @@ jobs:
         run: cargo test --release --features avif
       - name: Build all targets
         run: cargo build --release --all-targets --features avif
+
+  # The declared rust-version must actually build: cargo-install users
+  # on the MSRV toolchain hit whatever this job would have caught.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake nasm pkg-config
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (default features, MSRV)
+        run: cargo check --release --all-targets
+
+  # Coverage is informational (no threshold yet): the number is most
+  # useful over pipeline/'s knob-gated branches.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake nasm pkg-config libdav1d-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache SVT-AV1
+        id: svt-cache
+        uses: actions/cache@v4
+        with:
+          path: svt-install
+          key: svt-av1-${{ env.SVT_AV1_REV }}-amd64
+      - name: Build SVT-AV1
+        if: steps.svt-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git svt
+          git -C svt fetch --depth 1 origin "$SVT_AV1_REV"
+          git -C svt checkout "$SVT_AV1_REV"
+          cmake -S svt -B svt/build -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_APPS=OFF -DBUILD_TESTING=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/svt-install" -DCMAKE_INSTALL_LIBDIR=lib
+          make -C svt/build -j"$(nproc)" install
+          rm -rf svt
+      - name: Install SVT-AV1
+        run: |
+          sudo cp -r svt-install/* /usr/local/
+          sudo ldconfig
+      - name: Coverage summary
+        run: cargo llvm-cov --release --features avif --summary-only

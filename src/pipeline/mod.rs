@@ -317,6 +317,38 @@ impl std::fmt::Display for UpstreamFault {
     }
 }
 
+/// Read wrapper that fails with [`std::io::ErrorKind::FileTooLarge`]
+/// once more than `cap` bytes are produced. Silently truncating (what
+/// `Read::take` alone did) surfaced as a misleading decode error; the
+/// distinct kind lets the HTTP layer answer 413. Exactly-cap-sized
+/// sources are fine: the post-cap probe read distinguishes EOF from
+/// more data.
+struct CappedReader<R> {
+    inner: R,
+    remaining: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for CappedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    "source exceeds OXIMG_MAX_SOURCE_BYTES",
+                )),
+            };
+        }
+        let want = buf
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..want])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
 /// Remote-source variant: stream the HTTP response body straight into the
 /// decoder — decoding overlaps the download and the source is never
 /// buffered whole, same as the file path.
@@ -333,7 +365,27 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
             .context("fetch source")
             .context(UpstreamFault),
     })?;
-    let reader = std::io::Read::take(resp.into_body().into_reader(), max_source_bytes());
+    // Content-Length lets us refuse before decoding a byte; the capped
+    // reader below backstops chunked (or lying) origins. Streaming
+    // decoders may translate the mid-read error into their own decode
+    // failure, but buffered formats surface it precisely.
+    let cap = max_source_bytes();
+    if let Some(len) = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && len > cap
+    {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("source is {len} bytes, over the {cap}-byte limit"),
+        )));
+    }
+    let reader = CappedReader {
+        inner: resp.into_body().into_reader(),
+        remaining: cap,
+    };
     process_reader(reader, p)
 }
 

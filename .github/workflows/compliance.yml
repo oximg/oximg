@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Advisories land on their own schedule; a quiet repo must still
+  # hear about them.
+  schedule:
+    - cron: "17 6 * * *"
 
 jobs:
   compliance:

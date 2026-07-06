@@ -2,6 +2,8 @@
 name = "oximg"
 version = "0.4.2"
 edition = "2024"
+# Let-chains; verified by the CI msrv job.
+rust-version = "1.88"
 description = "High-performance image compression: library, CLI, and self-hostable server (PoC)."
 license = "Apache-2.0"
 readme = "README.md"

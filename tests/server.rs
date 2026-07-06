@@ -628,6 +628,21 @@ fn error_statuses_are_honest() {
         404,
         "origin 404 passes through"
     );
+    drop(s);
+
+    // An over-cap source is 413, not a misleading decode error.
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_MAX_SOURCE_BYTES", "1000".into()),
+    ]);
+    assert_eq!(
+        s.status_of("/resize/100/100/photo.jpg"),
+        413,
+        "over-cap remote source"
+    );
     // Text served as an image is undecodable client input: 422 with a
     // message (LICENSE is a fixture-relative text file? use README).
     assert_eq!(s.status_of("/resize/100/100/list.txt"), 422);

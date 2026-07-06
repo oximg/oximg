@@ -521,6 +521,10 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         Some(io) if io.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, "image not found".to_string())
         }
+        Some(io) if io.kind() == std::io::ErrorKind::FileTooLarge => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "source image exceeds the configured size limit".to_string(),
+        ),
         // Upstream and server faults answer with generic bodies — the
         // detail (full context chain) goes to stderr, where an
         // operator can see it, instead of to the client.

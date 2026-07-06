@@ -10,6 +10,18 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- An over-limit remote source now answers 413 (via the origin's
+  Content-Length up front, with a capped reader backstopping chunked
+  or lying origins) instead of being silently truncated at
+  `OXIMG_MAX_SOURCE_BYTES` and surfacing as a baffling decode error.
+- The crate declares its MSRV (`rust-version = "1.88"`) and CI
+  enforces it, alongside two more CI additions: a daily scheduled
+  advisory scan (a quiet repo must still hear about RUSTSEC entries)
+  and an informational coverage job (cargo-llvm-cov over the avif
+  feature set).
+
 ## [0.4.2] - 2026-07-06
 
 Operability and engineering-health release: honest failure statuses
