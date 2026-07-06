@@ -12,6 +12,12 @@ HTTP interface without notice.
 
 ### Changed
 
+- Release automation: tag pushes now gate crates.io/npm publishing on a
+  test job (plus a tag-vs-Cargo.toml version check) instead of
+  publishing unconditionally, and the GitHub Release is created
+  automatically from the CHANGELOG section for the tag. The Homebrew
+  tap is still bumped by hand (separate repo; the local
+  build-from-source check is a useful gate).
 - The HTTP server stack (axum, tokio, ureq, hmac, sha2) is now behind a
   `server` cargo feature, on by default so `cargo build`/`cargo
   install` still produce the `oximg` binary. Library users can depend
