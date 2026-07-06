@@ -169,6 +169,8 @@ fn error_mapping() {
     assert_eq!(s.status_of("/resize/9000/9000/photo.jpg"), 400);
     assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
     assert_eq!(s.status_of("/resize/100/100/..%2Fsecret"), 400);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg%3Fx=1"), 400);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg%23frag"), 400);
 }
 
 #[test]
@@ -643,6 +645,13 @@ fn error_statuses_are_honest() {
                     );
                     return;
                 }
+                if path.starts_with("moved") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 301 Moved Permanently\r\nLocation: http://127.0.0.1:1/pwned\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
                 match std::fs::read(format!("{fixtures}/{path}")) {
                     Ok(data) => {
                         let _ = write!(
@@ -671,6 +680,11 @@ fn error_statuses_are_honest() {
         s.status_of("/resize/100/100/boom.jpg"),
         502,
         "origin 5xx is the upstream's fault"
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/moved.jpg"),
+        502,
+        "origin redirects are refused, not followed"
     );
     assert_eq!(
         s.status_of("/resize/100/100/missing.jpg"),

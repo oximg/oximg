@@ -376,7 +376,10 @@ async fn serve_resize_inner(
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
     }
-    if file.contains(['/', '\\']) || file.contains("..") {
+    if file.contains(['/', '\\', '?', '#'])
+        || file.contains("..")
+        || file.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
         return Err((StatusCode::BAD_REQUEST, "invalid filename".into()));
     }
     let (base, explicit) = split_format(&file)?;

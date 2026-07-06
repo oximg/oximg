@@ -287,6 +287,12 @@ fn http_agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(30)))
+            // No redirects: the operator points OXIMG_SOURCE_BASE_URL
+            // at the right place, and an origin that can be induced to
+            // redirect (e.g. object-store website endpoints honoring
+            // user-settable redirect metadata) must not turn this
+            // fetcher into an SSRF proxy.
+            .max_redirects(0)
             .build()
             .into()
     })
@@ -385,6 +391,13 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
             std::io::ErrorKind::FileTooLarge,
             format!("source is {len} bytes, over the {cap}-byte limit"),
         )));
+    }
+    if resp.status().is_redirection() {
+        return Err(anyhow::anyhow!(
+            "origin answered {} (redirects are not followed)",
+            resp.status()
+        )
+        .context(UpstreamFault));
     }
     let reader = CappedReader {
         inner: resp.into_body().into_reader(),
