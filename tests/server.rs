@@ -153,6 +153,32 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
     }
 }
 
+/// A set-but-undecodable signing key must refuse to boot — never
+/// serve unsigned.
+#[test]
+fn invalid_signing_config_refuses_to_boot() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+    cmd.env("PORT", "47133")
+        .env("OXIMG_KEY", "not-hex-at-all")
+        .env("OXIMG_SALT", "cafebabe")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn oximg");
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        panic!("server kept running with an undecodable OXIMG_KEY");
+    };
+    assert!(!status.success(), "exit must be non-zero, got {status}");
+}
+
 #[test]
 fn signing_gate() {
     let key = "deadbeef".repeat(8);

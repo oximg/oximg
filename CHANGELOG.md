@@ -10,6 +10,27 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- URL signing now fails closed: a set-but-undecodable `OXIMG_KEY` or
+  `OXIMG_SALT` (typo'd hex, half-configured pair) refuses to boot with
+  a fatal error instead of silently serving every unsigned URL, which
+  is what it previously did — in one combination without so much as a
+  warning. Unset or empty values still mean "signing off".
+- A request panicking at exactly the wrong moment could poison the
+  request-coalescing lock; the cleanup guard then panicked inside its
+  `Drop` during unwind, aborting the whole process. Both lock sites
+  now treat a poisoned map as what it is — structurally intact — and
+  carry on.
+
+### Changed
+
+- CI now runs the full suite in both feature configurations on both
+  architectures: an arm64 job exercises the NEON kernels that ship to
+  Graviton/Apple silicon, and an `--features avif` matrix leg builds
+  the pinned SVT-AV1 revision (cached) so the AVIF pipeline and its
+  tests — previously covered only by a Docker smoke — gate every push.
+
 ## [0.4.1] - 2026-07-06
 
 Animated sources render instead of failing, and the metadata paths

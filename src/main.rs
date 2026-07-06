@@ -65,27 +65,37 @@ struct Signing {
 }
 
 impl Signing {
-    fn from_env() -> Option<Self> {
-        let decode = |name: &str| -> Option<Vec<u8>> {
-            let v = std::env::var(name).ok()?;
-            let v = v.trim();
-            if v.is_empty() || v.len() % 2 != 0 {
-                return None;
+    /// A security knob must fail closed: any set-but-undecodable
+    /// key/salt is a fatal configuration error, never a silently
+    /// unsigned server. Unset or empty values mean "signing off".
+    fn from_env() -> Result<Option<Self>, String> {
+        Self::from_values(
+            std::env::var("OXIMG_KEY").ok().as_deref(),
+            std::env::var("OXIMG_SALT").ok().as_deref(),
+        )
+    }
+
+    fn from_values(key: Option<&str>, salt: Option<&str>) -> Result<Option<Self>, String> {
+        fn decode(name: &str, v: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+            let Some(v) = v.map(str::trim).filter(|v| !v.is_empty()) else {
+                return Ok(None);
+            };
+            if v.len() % 2 != 0 {
+                return Err(format!("{name} is not valid hex (odd length)"));
             }
             (0..v.len())
                 .step_by(2)
-                .map(|i| u8::from_str_radix(&v[i..i + 2], 16).ok())
-                .collect()
-        };
-        match (decode("OXIMG_KEY"), decode("OXIMG_SALT")) {
-            (Some(key), Some(salt)) => Some(Signing { key, salt }),
-            (None, None) => None,
-            _ => {
-                eprintln!(
-                    "oximg: OXIMG_KEY and OXIMG_SALT must both be set (hex); signing disabled"
-                );
-                None
-            }
+                .map(|i| {
+                    u8::from_str_radix(&v[i..i + 2], 16)
+                        .map_err(|_| format!("{name} is not valid hex"))
+                })
+                .collect::<Result<Vec<u8>, String>>()
+                .map(Some)
+        }
+        match (decode("OXIMG_KEY", key)?, decode("OXIMG_SALT", salt)?) {
+            (Some(key), Some(salt)) => Ok(Some(Signing { key, salt })),
+            (None, None) => Ok(None),
+            _ => Err("OXIMG_KEY and OXIMG_SALT must both be set to enable signing".into()),
         }
     }
 
@@ -165,7 +175,12 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         ),
         resize_threads: env_or("OXIMG_PAR", 1),
         inflight: Arc::new(Mutex::new(HashMap::new())),
-        signing: Signing::from_env().map(Arc::new),
+        signing: Signing::from_env()
+            .unwrap_or_else(|e| {
+                eprintln!("oximg: fatal: {e}");
+                std::process::exit(2);
+            })
+            .map(Arc::new),
         auto_format: auto_format_from_env().into(),
     };
     if app.signing.is_some() {
@@ -356,7 +371,15 @@ struct FlightGuard {
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
-        self.map.lock().unwrap().remove(&self.key);
+        // A poisoned lock only means another request panicked while
+        // holding it; the map itself (URL -> leader slot) stays
+        // structurally sound, so clean up rather than panicking inside
+        // a Drop — which during unwind would abort the whole process.
+        let mut map = match self.map.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.remove(&self.key);
     }
 }
 
@@ -367,7 +390,13 @@ impl Drop for FlightGuard {
 async fn singleflight(app: &App, key: FlightKey) -> FlightResult {
     for _ in 0..3 {
         let leader_tx = {
-            let mut map = app.inflight.lock().unwrap();
+            let mut map = match app.inflight.lock() {
+                Ok(g) => g,
+                // See FlightGuard::drop: the map survives a poisoning
+                // panic intact; refusing every future request over one
+                // is strictly worse.
+                Err(poisoned) => poisoned.into_inner(),
+            };
             match map.get(&key) {
                 Some(rx) => Err(rx.clone()),
                 None => {
@@ -496,6 +525,32 @@ mod tests {
             key: hex(&"deadbeef".repeat(8)),
             salt: hex(&"cafebabe".repeat(8)),
         }
+    }
+
+    /// Every from_values state: signing on, off, and — the security
+    /// property — fail-closed on anything set but undecodable.
+    #[test]
+    fn signing_config_fails_closed() {
+        // both valid → on
+        assert!(
+            Signing::from_values(Some("deadbeef"), Some("cafebabe"))
+                .unwrap()
+                .is_some()
+        );
+        // both unset (or set-but-empty/whitespace) → off
+        assert!(Signing::from_values(None, None).unwrap().is_none());
+        assert!(
+            Signing::from_values(Some(""), Some("  "))
+                .unwrap()
+                .is_none()
+        );
+        // undecodable values must be fatal, not silently unsigned
+        assert!(Signing::from_values(Some("xyz!"), Some("cafebabe")).is_err());
+        assert!(Signing::from_values(Some("abc"), Some("cafebabe")).is_err()); // odd length
+        assert!(Signing::from_values(Some("xyz!"), Some("also-bad")).is_err());
+        // half-configured is fatal too
+        assert!(Signing::from_values(Some("deadbeef"), None).is_err());
+        assert!(Signing::from_values(None, Some("cafebabe")).is_err());
     }
 
     #[test]
