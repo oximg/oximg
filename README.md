@@ -203,7 +203,10 @@ require imgproxy-style signed URLs —
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
-download), `OXIMG_MAX_SOURCE_BYTES` (64MiB), `QUALITY`
+download), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
+413), `OXIMG_MAX_SRC_PIXELS` (64,000,000; decoded-size cap enforced
+after each format's header parse, before any pixel allocation —
+compressed size does not bound decoded size), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
 (55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `OXIMG_AVIF_SPEED`
 (SVT preset, 8; setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes

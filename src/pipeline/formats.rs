@@ -19,6 +19,10 @@ pub(super) fn process_png<R: std::io::Read>(
     let mut decoder = png::Decoder::new(std::io::Cursor::new(&s.srcbuf[..]));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut png_reader = decoder.read_info().context("parse PNG")?;
+    {
+        let hdr = png_reader.info();
+        check_src_pixels(hdr.width as usize, hdr.height as usize)?;
+    }
     // eXIf orientation (raw TIFF per the PNG spec; a stray JPEG-style
     // prefix is tolerated like browsers do). Only chunks ahead of the
     // image data are seen — the orientation must steer the resize box,
@@ -314,6 +318,7 @@ pub(super) fn webp_decode_into_chunk8(
             "animated WebP is unsupported"
         );
         let (src_w, src_h) = (config.input.width as usize, config.input.height as usize);
+        check_src_pixels(src_w, src_h)?;
         let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
 
         // The stored-space resize target: fit the *displayed* frame,

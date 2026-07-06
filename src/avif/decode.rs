@@ -340,6 +340,7 @@ pub(super) fn picture_to_rgb(
 ) -> Result<(usize, usize)> {
     use dav1d_sys as d;
     let (w, h) = (pic.p.w as usize, pic.p.h as usize);
+    crate::pipeline::check_src_pixels(w, h)?;
     let bpc = pic.p.bpc as u32;
     ensure!(matches!(bpc, 8 | 10 | 12), "unsupported bit depth {bpc}");
     let seq = unsafe { &*pic.seq_hdr };

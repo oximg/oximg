@@ -50,6 +50,10 @@ pub(crate) struct Config {
     pub avif_decode_threads: std::os::raw::c_int,
     /// OXIMG_MAX_SOURCE_BYTES: remote-source download cap.
     pub max_source_bytes: u64,
+    /// OXIMG_MAX_SRC_PIXELS: decoded-size cap (w*h), enforced after
+    /// each format's header parse and before any pixel-sized
+    /// allocation — compressed-size caps do not bound decoded size.
+    pub max_src_pixels: u64,
 }
 
 /// The knob inventory, pinned to the README by `knobs_are_documented`.
@@ -72,6 +76,7 @@ const KNOBS: &[&str] = &[
     "OXIMG_AVIF_SPEED",
     "OXIMG_AVIF_DECODE_THREADS",
     "OXIMG_MAX_SOURCE_BYTES",
+    "OXIMG_MAX_SRC_PIXELS",
     "OXIMG_OVERLAP",
 ];
 
@@ -135,6 +140,7 @@ pub(crate) fn validate() -> Result<(), String> {
     num("OXIMG_AVIF_SPEED", 0i64, 13)?;
     num("OXIMG_AVIF_DECODE_THREADS", 1i64, 64)?;
     num("OXIMG_MAX_SOURCE_BYTES", 1u64, u64::MAX)?;
+    num("OXIMG_MAX_SRC_PIXELS", 1u64, u64::MAX)?;
     if let Some(v) = set("OXIMG_FLATTEN_BG") {
         let t = v.trim().trim_start_matches('#');
         if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -190,6 +196,7 @@ pub(crate) fn config() -> &'static Config {
         avif_decode_threads: parsed("OXIMG_AVIF_DECODE_THREADS")
             .unwrap_or(if cfg!(target_arch = "x86_64") { 2 } else { 1 }),
         max_source_bytes: parsed("OXIMG_MAX_SOURCE_BYTES").unwrap_or(64 * 1024 * 1024),
+        max_src_pixels: parsed("OXIMG_MAX_SRC_PIXELS").unwrap_or(64_000_000),
     })
 }
 

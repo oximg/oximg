@@ -681,6 +681,20 @@ fn target_supports_icc(target: ImageFormat) -> bool {
 /// is bounded tighter still by `meta::SCAN_CAP`.
 pub(crate) const ICC_CAP: usize = 4 * 1024 * 1024;
 
+/// Reject a source whose decoded size exceeds OXIMG_MAX_SRC_PIXELS
+/// *before* any pixel-sized allocation: compressed-size caps do not
+/// bound decoded size — a ~2MB flat-color 50000x50000 PNG would
+/// otherwise force a 7.5GB allocation.
+pub(crate) fn check_src_pixels(w: usize, h: usize) -> Result<()> {
+    let cap = crate::config::config().max_src_pixels;
+    let px = (w as u64).saturating_mul(h as u64);
+    anyhow::ensure!(
+        px <= cap,
+        "source is {w}x{h} ({px} pixels), over the OXIMG_MAX_SRC_PIXELS limit ({cap})"
+    );
+    Ok(())
+}
+
 mod encode;
 mod formats;
 mod fuse;

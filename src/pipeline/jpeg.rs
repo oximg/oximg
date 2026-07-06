@@ -120,6 +120,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     let t0 = std::time::Instant::now();
 
     let (src_w, src_h) = dec.size();
+    check_src_pixels(src_w, src_h)?;
     // The target box constrains the *displayed* frame; for the
     // axis-swapping orientations the resize target (still in stored
     // orientation — the rotation happens on the resized frame) is the

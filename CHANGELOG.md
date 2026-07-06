@@ -10,6 +10,14 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- `OXIMG_MAX_SRC_PIXELS` (default 64MP): a decoded-size cap enforced
+  after each format's header parse and — for AVIF — again before the
+  RGB allocation, closing the decompression-bomb hole where a ~2MB
+  flat-color 50000×50000 PNG (well under the compressed-size cap)
+  forced a 7.5GB allocation and an OOM kill.
+
 ### Changed
 
 - Runtime knobs fail closed at server startup, matching the signing

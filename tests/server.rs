@@ -187,6 +187,22 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
     }
 }
 
+/// The decoded-pixel cap rejects decompression bombs before any
+/// pixel-sized allocation, across formats.
+#[test]
+fn src_pixel_cap_rejects_before_allocation() {
+    // photo.jpg is 200x150 = 30000 px; tiny.jpg is 40x30 = 1200.
+    let s = Server::start(&[("OXIMG_MAX_SRC_PIXELS", "10000".into())]);
+    assert_eq!(s.status_of("/resize/100/100/tiny.jpg"), 200);
+    for name in ["photo.jpg", "rgb.png", "photo.webp", "photo.avif"] {
+        assert_eq!(
+            s.status_of(&format!("/resize/100/100/{name}")),
+            422,
+            "{name} must be rejected by the pixel cap"
+        );
+    }
+}
+
 /// Set-but-invalid runtime knobs refuse to boot: a typo in a limit
 /// must not silently fail open to the default.
 #[test]
