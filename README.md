@@ -197,6 +197,17 @@ still-image path:
 docker build -t oximg .
 ```
 
+**As a library**: the `oximg::pipeline` module is usable without the
+HTTP server — `process`/`process_path` take a `Params` and return the
+re-encoded bytes plus their format, `probe` reads just the header. See
+[`examples/`](examples/):
+
+```sh
+cargo run --release --example thumbnail -- photo.jpg 300 200 out.jpg
+cargo run --release --example transcode -- photo.jpg 800 800 webp out.webp
+cargo run --release --example probe     -- photo.webp
+```
+
 URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
 require imgproxy-style signed URLs —
 `/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`.

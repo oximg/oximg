@@ -12,6 +12,10 @@ HTTP interface without notice.
 
 ### Added
 
+- Library-usage examples (`examples/thumbnail`, `transcode`, `probe`)
+  showing `pipeline::process`/`process_path`/`probe` with `Params`
+  outside the HTTP server — the existing examples were all internal
+  benchmark tooling — plus a "As a library" README section.
 - `oximg --version` / `--help` (and `-V`/`-h`): dependency-free flag
   handling that prints the version — what a bug report should cite —
   and exits without binding a port; an unknown argument is a usage
