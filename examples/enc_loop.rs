@@ -38,7 +38,7 @@ fn main() -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let mut total = 0usize;
     for _ in 0..iters {
-        total += oximg::avif::encode_avif(rgb, w, h, 3, &p)?.len();
+        total += oximg::avif::encode_avif(rgb, w, h, 3, &p, None)?.len();
     }
     eprintln!(
         "{:.2} ms/encode (bytes {})",

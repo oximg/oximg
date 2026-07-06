@@ -12,13 +12,28 @@ HTTP interface without notice.
 
 ### Added
 
+- AVIF ICC in both directions — neither avif-parse nor avif-serialize
+  exposes ICC in any released version, so both run on a bounded
+  ISOBMFF walk of our own: extraction resolves the primary item's
+  `ipma` associations to its `colr` (`prof`/`ricc`) property, and
+  embedding splices a `colr` (`prof`) property into the serialized
+  container (sizes and `iloc` offsets re-patched; the property surgery
+  is proven by re-extraction before shipping, and anything the patcher
+  does not fully recognize is refused whole — the unprofiled bytes are
+  served instead). The nclx `colr` stays alongside: matrix
+  coefficients still describe the YUV→RGB step, the profile governs
+  the resulting RGB. Extraction is pinned against a committed
+  avifenc-authored fixture; the splice was verified readable by
+  libavif 1.0.4's avifdec and is pinned by decode roundtrips in the
+  suite. Profiles ride the fused YUV path (byte-identical to the
+  serial path, tested) — no fusing penalty for profiled AVIF targets.
+
 - ICC profile pass-through (on by default; `OXIMG_ICC=0` strips): the
   source's profile — JPEG APP2 `ICC_PROFILE` chain (reassembled with
   libjpeg's chunk rules by the same bounded header scan that reads the
   orientation), PNG `iCCP`, WebP `ICCP` — is carried byte-for-byte
   into any profile-capable output, across format conversion included.
-  Pixels are never color-converted. AVIF is the documented gap in both
-  directions (CICP-only serializer, no source-side colr parsing).
+  Pixels are never color-converted.
   Profiled JPEG sources take the one-shot encode path (the profile
   must precede the incremental encoder's scanlines). The header scan
   now spans every pre-frame segment — the same span libjpeg's marker

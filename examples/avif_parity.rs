@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let t = std::time::Instant::now();
-    let out = oximg::avif::encode_avif(rgb, w, h, 3, &p)?;
+    let out = oximg::avif::encode_avif(rgb, w, h, 3, &p, None)?;
     eprintln!(
         "{}x{} q{} -> {} bytes in {:.1}ms",
         w,

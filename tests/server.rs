@@ -365,7 +365,8 @@ fn oriented_bytes_do_not_depend_on_overlap_gate() {
 
 /// ICC pass-through is on by default and OXIMG_ICC=0 strips it; the
 /// profiled source serves fine either way, and profiled bytes stay
-/// independent of the overlap gate (they force the pixel fuse).
+/// independent of the overlap gate (non-AVIF targets take the pixel
+/// fuse; AVIF targets splice the profile after the encode).
 #[test]
 fn icc_default_kill_switch_and_gate_independence() {
     let dir = std::env::temp_dir().join(format!("oximg-icc-{}", std::process::id()));
@@ -407,6 +408,29 @@ fn icc_default_kill_switch_and_gate_independence() {
     assert_eq!(status, 200);
     assert_eq!(common::jpeg_icc(&body), None, "kill switch: no profile");
     drop(off);
+
+    // AVIF sources honor the same gate (their extraction runs through
+    // a separate code path in process_avif).
+    #[cfg(feature = "avif")]
+    {
+        let fx = common::fake_icc(900); // the icc.avif fixture's blob
+        let on = Server::start(47129, &[]);
+        let (_, _, body) = on.get("/resize/100/100/icc.avif@jpg").unwrap();
+        assert_eq!(
+            common::jpeg_icc(&body).as_deref(),
+            Some(&fx[..]),
+            "avif source: profile passes through by default"
+        );
+        drop(on);
+        let off = Server::start(47130, &[("OXIMG_ICC", "0".into())]);
+        let (_, _, body) = off.get("/resize/100/100/icc.avif@jpg").unwrap();
+        assert_eq!(
+            common::jpeg_icc(&body),
+            None,
+            "avif source: kill switch strips it"
+        );
+        drop(off);
+    }
 
     // The knobs are independent: rotation off, profile still carried.
     let display = common::corner_base(240, 180, 60);

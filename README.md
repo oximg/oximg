@@ -75,12 +75,10 @@ format (the tag itself is not forwarded, so nothing double-rotates).
 `OXIMG_AUTO_ROTATE=0` restores the raw stored orientation.
 
 **ICC profiles**: a source's color profile (JPEG APP2 chain, PNG
-`iCCP`, WebP `ICCP`) passes through byte-for-byte into any
-profile-capable output format, across format conversion included.
-Pixels are never color-converted — wide-gamut images keep rendering
-the way the original did. AVIF is the gap in both directions (the
-serializer speaks CICP only, and AVIF-source profiles are not read
-yet). `OXIMG_ICC=0` strips profiles instead.
+`iCCP`, WebP `ICCP`, AVIF `colr`) passes through byte-for-byte into
+any output format, across format conversion included. Pixels are
+never color-converted — wide-gamut images keep rendering the way the
+original did. `OXIMG_ICC=0` strips profiles instead.
 
 ## Pipeline
 
@@ -235,9 +233,6 @@ default).
 - EXIF orientation for non-JPEG sources (WebP EXIF chunks, AVIF
   irot/imir, PNG eXIf); JPEG sources auto-rotate
 - Animated AVIF sources
-- ICC for AVIF (either direction: profiles are not read from AVIF
-  sources, and AVIF outputs carry CICP only); JPEG/PNG/WebP profiles
-  pass through
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
 

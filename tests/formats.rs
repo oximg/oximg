@@ -343,15 +343,15 @@ fn opaque_rgba_avif_drops_the_alpha_item() {
         alpha_quality: 55,
         ..Default::default()
     };
-    let from_rgba = oximg::avif::encode_avif(&rgba, w, h, 4, &params).unwrap();
-    let from_rgb = oximg::avif::encode_avif(&rgb, w, h, 3, &params).unwrap();
+    let from_rgba = oximg::avif::encode_avif(&rgba, w, h, 4, &params, None).unwrap();
+    let from_rgb = oximg::avif::encode_avif(&rgb, w, h, 3, &params, None).unwrap();
     assert_eq!(from_rgba, from_rgb, "opaque RGBA must match the RGB encode");
     let (_, _, _, channels) = oximg::avif::decode_avif(&from_rgba).unwrap();
     assert_eq!(channels, 3, "no alpha item expected");
 
     // One transparent pixel is enough to keep the alpha item.
     rgba[3] = 254;
-    let with_alpha = oximg::avif::encode_avif(&rgba, w, h, 4, &params).unwrap();
+    let with_alpha = oximg::avif::encode_avif(&rgba, w, h, 4, &params, None).unwrap();
     let (_, _, _, channels) = oximg::avif::decode_avif(&with_alpha).unwrap();
     assert_eq!(channels, 4, "alpha item must survive");
 }
@@ -519,9 +519,8 @@ fn jpeg_icc_roundtrips_to_every_icc_target() {
     }
 }
 
-/// PNG and WebP sources carry their profiles too (same-format and to
-/// JPEG), and the AVIF target — which cannot embed ICC yet — still
-/// converts profiled sources cleanly.
+/// PNG and WebP sources carry their profiles too (same-format, to
+/// JPEG, and — with the avif feature — into a spliced AVIF `colr`).
 #[test]
 fn png_and_webp_icc_sources_roundtrip() {
     let icc = common::fake_icc(1200);
@@ -568,14 +567,105 @@ fn png_and_webp_icc_sources_roundtrip() {
         );
     }
 
-    // AVIF target: profile dropped (CICP-only serializer), request OK.
+    // AVIF target: the profile is spliced into the container as a
+    // `colr` (prof) property.
+    #[cfg(feature = "avif")]
+    {
+        let p = Params {
+            output: Some(ImageFormat::Avif),
+            ..params(100)
+        };
+        let (out, fmt) = pipeline::process(&png, &p).unwrap();
+        assert_eq!(fmt, ImageFormat::Avif);
+        assert_eq!(dims_of(&out), (100, 75));
+        assert_eq!(
+            oximg::avif::extract_icc(&out).as_deref(),
+            Some(&icc[..]),
+            "png → avif carries the profile"
+        );
+    }
+}
+
+/// A libavif-authored (avifenc --icc) fixture: our container walk must
+/// read a third-party writer's property layout, not just its own.
+#[cfg(feature = "avif")]
+#[test]
+fn libavif_authored_icc_is_extracted() {
+    let src = fixture("icc.avif");
+    let icc = common::fake_icc(900); // the exact blob avifenc embedded
+    assert_eq!(
+        oximg::avif::extract_icc(&src).as_deref(),
+        Some(&icc[..]),
+        "extractor must read libavif's layout"
+    );
     let p = Params {
-        output: Some(ImageFormat::Avif),
+        output: Some(ImageFormat::Jpeg),
         ..params(100)
     };
-    let (out, fmt) = pipeline::process(&png, &p).unwrap();
+    let (out, _) = pipeline::process(&src, &p).unwrap();
+    assert_eq!(
+        common::jpeg_icc(&out).as_deref(),
+        Some(&icc[..]),
+        "libavif source → jpeg carries the profile"
+    );
+}
+
+/// AVIF is profile-capable in both directions: a profiled JPEG
+/// converts to a profiled AVIF (through the fused YUV path — ICC does
+/// not force the pixel fuse for AVIF targets), and an ICC-bearing AVIF
+/// source carries its profile to every target, including back into
+/// AVIF.
+#[cfg(feature = "avif")]
+#[test]
+fn avif_icc_both_directions() {
+    let icc = common::fake_icc(1100);
+    let px = common::corner_base(240, 180, 60);
+    let app2 = common::app2_icc_payloads(&icc, 60_000).remove(0);
+    let jpeg = common::jpeg_with_markers(&px, 240, 180, &[(2, &app2)]);
+    let p = Params {
+        output: Some(ImageFormat::Avif),
+        ..params(120)
+    };
+    let (avif_out, fmt) = pipeline::process(&jpeg, &p).unwrap();
     assert_eq!(fmt, ImageFormat::Avif);
-    assert_eq!(dims_of(&out), (100, 75));
+    assert_eq!(dims_of(&avif_out), (120, 90));
+    assert_eq!(
+        oximg::avif::extract_icc(&avif_out).as_deref(),
+        Some(&icc[..]),
+        "jpeg → avif carries the profile"
+    );
+
+    // Round two: that AVIF as a *source*.
+    for (target, check) in [
+        (
+            ImageFormat::Avif,
+            oximg::avif::extract_icc as fn(&[u8]) -> Option<Vec<u8>>,
+        ),
+        (
+            ImageFormat::Jpeg,
+            common::jpeg_icc as fn(&[u8]) -> Option<Vec<u8>>,
+        ),
+        (
+            ImageFormat::Png,
+            common::png_icc as fn(&[u8]) -> Option<Vec<u8>>,
+        ),
+        (
+            ImageFormat::Webp,
+            common::webp_icc as fn(&[u8]) -> Option<Vec<u8>>,
+        ),
+    ] {
+        let p = Params {
+            output: Some(target),
+            ..params(100)
+        };
+        let (out, fmt) = pipeline::process(&avif_out, &p).unwrap();
+        assert_eq!(fmt, target);
+        assert_eq!(
+            check(&out).as_deref(),
+            Some(&icc[..]),
+            "avif source → {target:?}"
+        );
+    }
 }
 
 /// The RGBA PNG decode path (no fused fast path) carries the profile

@@ -608,6 +608,7 @@ pub fn encode_avif(
     h: usize,
     channels: usize,
     p: &AvifParams,
+    icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     ensure!(
         channels == 3 || channels == 4,
@@ -654,7 +655,7 @@ pub fn encode_avif(
     } else {
         None
     };
-    Ok(finish_avif(&color, alpha.as_deref(), w, h))
+    Ok(finish_avif(&color, alpha.as_deref(), w, h, icc))
 }
 
 /// Start a color (non-alpha) encoder session for the pipeline's fused
@@ -673,19 +674,34 @@ pub(crate) fn encode_avif_with_session(
     y_plane: &[u16],
     cb_plane: &[u16],
     cr_plane: &[u16],
+    icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let (w, h) = (session.w, session.h);
     let color = session.encode(y_plane, cb_plane, cr_plane)?;
-    Ok(finish_avif(&color, None, w, h))
+    Ok(finish_avif(&color, None, w, h, icc))
 }
 
-/// Assemble the AVIF container around the encoded AV1 item(s).
-fn finish_avif(color: &[u8], alpha: Option<&[u8]>, w: usize, h: usize) -> Vec<u8> {
+/// Assemble the AVIF container around the encoded AV1 item(s); with a
+/// profile, splice the `colr` (`prof`) property in afterwards
+/// (avif-serialize speaks CICP only). The nclx `colr` stays alongside
+/// it — matrix coefficients still describe the YUV→RGB step, while
+/// the ICC profile governs the resulting RGB, exactly as in JPEG.
+fn finish_avif(
+    color: &[u8],
+    alpha: Option<&[u8]>,
+    w: usize,
+    h: usize,
+    icc: Option<&[u8]>,
+) -> Vec<u8> {
     let mut fy = avif_serialize::Aviffy::new();
     fy.matrix_coefficients(avif_serialize::constants::MatrixCoefficients::Bt601)
         .full_color_range(true)
         .set_chroma_subsampling((true, true));
-    fy.to_vec(color, alpha, w as u32, h as u32, 10)
+    let out = fy.to_vec(color, alpha, w as u32, h as u32, 10);
+    if let Some(patched) = icc.and_then(|icc| embed_icc(&out, icc)) {
+        return patched;
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,6 +962,374 @@ fn read_avif_container(data: &[u8]) -> Result<avif_parse::AvifData> {
             Err(anyhow::anyhow!("AVIF container parse panicked: {msg}"))
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// ICC (`colr` of type `prof`) support. Neither avif-parse (2.1.0) nor
+// avif-serialize (0.8.9) exposes ICC in any released version, so both
+// directions run on a bounded ISOBMFF walk of our own: extraction
+// resolves the primary item's property associations; embedding splices
+// a `colr` property into an avif-serialize container and patches the
+// affected box sizes and item locations, then proves the result by
+// re-extracting (any mismatch falls back to the unprofiled bytes).
+
+/// Read one box header at `i` within `end`: returns
+/// `(fourcc, payload_range, box_end)`. `None` on truncation or a size
+/// that cannot frame its own header.
+fn next_box(buf: &[u8], i: usize, end: usize) -> Option<([u8; 4], std::ops::Range<usize>, usize)> {
+    let size = u32::from_be_bytes(buf.get(i..i.checked_add(4)?)?.try_into().ok()?) as usize;
+    let typ: [u8; 4] = buf.get(i + 4..i + 8)?.try_into().ok()?;
+    let (hdr, sz) = match size {
+        0 => (8, end.checked_sub(i)?), // box extends to the end
+        1 => {
+            let big = u64::from_be_bytes(buf.get(i + 8..i + 16)?.try_into().ok()?);
+            (16, usize::try_from(big).ok()?)
+        }
+        s => (8, s),
+    };
+    let box_end = i.checked_add(sz)?;
+    if sz < hdr || box_end > end {
+        return None;
+    }
+    Some((typ, i + hdr..box_end, box_end))
+}
+
+/// First child box of `range` with the given fourcc:
+/// `(payload_range, box_range)`.
+fn find_box(
+    buf: &[u8],
+    range: std::ops::Range<usize>,
+    fourcc: &[u8; 4],
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut i = range.start;
+    while i + 8 <= range.end {
+        let (typ, payload, box_end) = next_box(buf, i, range.end)?;
+        if typ == *fourcc {
+            return Some((payload, i..box_end));
+        }
+        i = box_end;
+    }
+    None
+}
+
+/// The `meta` payload (past the FullBox version/flags) of an AVIF file.
+fn meta_payload(avif: &[u8]) -> Option<std::ops::Range<usize>> {
+    let (meta, _) = find_box(avif, 0..avif.len(), b"meta")?;
+    Some(meta.start.checked_add(4)?..meta.end)
+}
+
+/// The primary item id from `pitm`.
+fn primary_item_id(avif: &[u8], meta: std::ops::Range<usize>) -> Option<u32> {
+    let (pitm, _) = find_box(avif, meta, b"pitm")?;
+    let p = avif.get(pitm.clone())?;
+    Some(if *p.first()? == 0 {
+        u16::from_be_bytes(p.get(4..6)?.try_into().ok()?) as u32
+    } else {
+        u32::from_be_bytes(p.get(4..8)?.try_into().ok()?)
+    })
+}
+
+/// Walk an `ipma` payload, calling `f(item_id, prop_index)` for every
+/// association; returns the byte width of association entries and, for
+/// `item`, the offsets of its association-count byte and entry end.
+struct IpmaEntry {
+    count_pos: usize,
+    entry_end: usize,
+    wide: bool,
+}
+
+fn ipma_walk(p: &[u8], item: u32, mut f: impl FnMut(u32, usize)) -> Option<IpmaEntry> {
+    let version = *p.first()?;
+    let wide = p.get(3)? & 1 == 1;
+    let entry_count = u32::from_be_bytes(p.get(4..8)?.try_into().ok()?);
+    let mut off = 8usize;
+    let mut found = None;
+    // Still images carry a handful of items; 64 bounds hostile counts.
+    for _ in 0..entry_count.min(64) {
+        let item_id = if version < 1 {
+            let v = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as u32;
+            off += 2;
+            v
+        } else {
+            let v = u32::from_be_bytes(p.get(off..off + 4)?.try_into().ok()?);
+            off += 4;
+            v
+        };
+        let count_pos = off;
+        let assoc_count = *p.get(off)? as usize;
+        off += 1;
+        for _ in 0..assoc_count {
+            let idx = if wide {
+                let v = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) & 0x7FFF;
+                off += 2;
+                v as usize
+            } else {
+                let v = (*p.get(off)? & 0x7F) as usize;
+                off += 1;
+                v
+            };
+            f(item_id, idx);
+        }
+        if item_id == item {
+            found = Some(IpmaEntry {
+                count_pos,
+                entry_end: off,
+                wide,
+            });
+        }
+    }
+    found
+}
+
+/// Extract the primary item's ICC profile (`colr` box of colour type
+/// `prof`/`ricc`) from an AVIF container. `None` for a missing profile
+/// or anything malformed — never an error.
+pub fn extract_icc(avif: &[u8]) -> Option<Vec<u8>> {
+    let meta = meta_payload(avif)?;
+    let primary = primary_item_id(avif, meta.clone())?;
+    let (iprp, _) = find_box(avif, meta, b"iprp")?;
+    let (ipco, _) = find_box(avif, iprp.clone(), b"ipco")?;
+    // ipco children in order; association indices are 1-based.
+    let mut props: Vec<([u8; 4], std::ops::Range<usize>)> = Vec::new();
+    let mut i = ipco.start;
+    // 1024 comfortably covers wide (15-bit) association indices seen
+    // in practice while bounding hostile property counts.
+    while i + 8 <= ipco.end && props.len() < 1024 {
+        let (typ, payload, box_end) = next_box(avif, i, ipco.end)?;
+        props.push((typ, payload));
+        i = box_end;
+    }
+    let (ipma, _) = find_box(avif, iprp, b"ipma")?;
+    let mut icc = None;
+    ipma_walk(avif.get(ipma)?, primary, |item_id, idx| {
+        if item_id != primary || icc.is_some() || idx == 0 {
+            return;
+        }
+        if let Some((typ, payload)) = props.get(idx - 1)
+            && typ == b"colr"
+        {
+            let c = &avif[payload.clone()];
+            if (c.get(0..4) == Some(b"prof".as_slice()) || c.get(0..4) == Some(b"ricc".as_slice()))
+                && c.len() > 4
+                && c.len() - 4 <= crate::pipeline::ICC_CAP
+            {
+                icc = Some(c[4..].to_vec());
+            }
+        }
+    })?;
+    icc
+}
+
+/// Splice `icc` into an AVIF container as a `colr` (`prof`) property
+/// associated with the primary item: the property is appended to
+/// `ipco` (existing 1-based indices keep their meaning), one
+/// association is appended to the primary item's `ipma` entry, the
+/// enclosing box sizes grow accordingly, and absolute `iloc` offsets
+/// shift by the inserted length. The property surgery is proven by
+/// re-extraction before the result ships; the `iloc` patch is *not*
+/// covered by that proof (extraction reads properties, not item
+/// data), so anything the patcher does not fully recognize — exotic
+/// versions, oversized item tables — is refused outright rather than
+/// partially patched. `None` always means "leave the container
+/// unprofiled". In production the input is always our own
+/// serializer's output (see `finish_avif`); the layout-agnostic
+/// parsing is defense against that dependency evolving, and the
+/// decode-roundtrip tests pin the layout actually in use.
+pub(crate) fn embed_icc(avif: &[u8], icc: &[u8]) -> Option<Vec<u8>> {
+    let meta_pl = meta_payload(avif)?;
+    let (_, meta_box) = find_box(avif, 0..avif.len(), b"meta")?;
+    let primary = primary_item_id(avif, meta_pl.clone())?;
+    let (iprp_pl, iprp_box) = find_box(avif, meta_pl.clone(), b"iprp")?;
+    let (ipco_pl, ipco_box) = find_box(avif, iprp_pl.clone(), b"ipco")?;
+    let mut prop_count = 0usize;
+    let mut i = ipco_pl.start;
+    while i + 8 <= ipco_pl.end {
+        let (_, _, box_end) = next_box(avif, i, ipco_pl.end)?;
+        prop_count += 1;
+        i = box_end;
+    }
+    let (ipma_pl, ipma_box) = find_box(avif, iprp_pl, b"ipma")?;
+    let entry = ipma_walk(avif.get(ipma_pl.clone())?, primary, |_, _| {})?;
+    let new_idx = prop_count + 1;
+    if new_idx > if entry.wide { 0x7FFF } else { 0x7F } {
+        return None;
+    }
+
+    // colr box: size + "colr" + "prof" + profile bytes.
+    let colr_len = 12 + icc.len();
+    let mut colr = Vec::with_capacity(colr_len);
+    colr.extend(u32::try_from(colr_len).ok()?.to_be_bytes());
+    colr.extend_from_slice(b"colr");
+    colr.extend_from_slice(b"prof");
+    colr.extend_from_slice(icc);
+    // avif-serialize writes narrow associations today, so the wide arm
+    // is reachable only if that changes; the extractor's wide arm, by
+    // contrast, runs on arbitrary third-party sources.
+    let assoc: Vec<u8> = if entry.wide {
+        (new_idx as u16).to_be_bytes().to_vec()
+    } else {
+        vec![new_idx as u8]
+    };
+
+    // Two insertion points, in file order (ipco precedes ipma inside
+    // iprp in every writer we consume, but nothing below assumes it).
+    let ins_colr = ipco_pl.end;
+    let ins_assoc = ipma_pl.start + entry.entry_end;
+    let (first, second) = if ins_colr <= ins_assoc {
+        ((ins_colr, &colr), (ins_assoc, &assoc))
+    } else {
+        ((ins_assoc, &assoc), (ins_colr, &colr))
+    };
+    let delta = colr.len() + assoc.len();
+    let mut out = Vec::with_capacity(avif.len() + delta);
+    out.extend_from_slice(&avif[..first.0]);
+    out.extend_from_slice(first.1);
+    out.extend_from_slice(&avif[first.0..second.0]);
+    out.extend_from_slice(second.1);
+    out.extend_from_slice(&avif[second.0..]);
+
+    // A position in the original maps into `out` shifted by whatever
+    // was inserted before it.
+    let shift = |pos: usize| -> usize {
+        pos + if pos >= second.0 {
+            delta
+        } else if pos >= first.0 {
+            first.1.len()
+        } else {
+            0
+        }
+    };
+    // Grow the enclosing box sizes (size field = first 4 bytes of the
+    // box; all four are ordinary compact-size boxes here).
+    for (bx, grow) in [
+        (&meta_box, delta),
+        (&iprp_box, delta),
+        (&ipco_box, colr.len()),
+        (&ipma_box, assoc.len()),
+    ] {
+        let at = shift(bx.start);
+        let old = u32::from_be_bytes(out.get(at..at + 4)?.try_into().ok()?);
+        let new = old.checked_add(u32::try_from(grow).ok()?)?;
+        out.get_mut(at..at + 4)?.copy_from_slice(&new.to_be_bytes());
+    }
+    // One more association on the primary item's entry.
+    let count_at = shift(ipma_pl.start + entry.count_pos);
+    let c = *out.get(count_at)?;
+    if c == u8::MAX {
+        return None;
+    }
+    *out.get_mut(count_at)? = c + 1;
+    // Absolute iloc offsets move by however much landed before them.
+    patch_iloc(avif, &mut out, meta_pl, &shift, |pos| {
+        if pos >= second.0 {
+            delta as u64
+        } else if pos >= first.0 {
+            first.1.len() as u64
+        } else {
+            0
+        }
+    })?;
+
+    // Prove the surgery before shipping it.
+    (extract_icc(&out).as_deref() == Some(icc)).then_some(out)
+}
+
+/// Add `value_delta(original_target)` to every absolute file offset in
+/// the `iloc` box (construction method 0). Offset *fields* are located
+/// on the original buffer and patched through `shift`.
+fn patch_iloc(
+    avif: &[u8],
+    out: &mut [u8],
+    meta: std::ops::Range<usize>,
+    shift: &dyn Fn(usize) -> usize,
+    value_delta: impl Fn(usize) -> u64,
+) -> Option<()> {
+    let (iloc, _) = find_box(avif, meta, b"iloc")?;
+    let p = avif.get(iloc.clone())?;
+    let version = *p.first()?;
+    let mut off = 4usize;
+    let sizes = *p.get(off)?;
+    let (offset_size, length_size) = ((sizes >> 4) as usize, (sizes & 0xF) as usize);
+    let sizes2 = *p.get(off + 1)?;
+    let base_offset_size = (sizes2 >> 4) as usize;
+    let index_size = if version >= 1 {
+        (sizes2 & 0xF) as usize
+    } else {
+        0
+    };
+    off += 2;
+    if ![0, 4, 8].contains(&offset_size) || ![0, 4, 8].contains(&base_offset_size) {
+        return None;
+    }
+    let item_count = if version < 2 {
+        let v = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as u32;
+        off += 2;
+        v
+    } else {
+        let v = u32::from_be_bytes(p.get(off..off + 4)?.try_into().ok()?);
+        off += 4;
+        v
+    };
+    // Patch an offset field of `size` bytes at iloc-payload offset `at`.
+    let patch = |out: &mut [u8], at: usize, size: usize| -> Option<()> {
+        if size == 0 {
+            return Some(());
+        }
+        let val = if size == 4 {
+            u32::from_be_bytes(p.get(at..at + 4)?.try_into().ok()?) as u64
+        } else {
+            u64::from_be_bytes(p.get(at..at + 8)?.try_into().ok()?)
+        };
+        let target = usize::try_from(val).ok()?;
+        let new = val.checked_add(value_delta(target))?;
+        let dst = shift(iloc.start + at);
+        if size == 4 {
+            out.get_mut(dst..dst + 4)?
+                .copy_from_slice(&u32::try_from(new).ok()?.to_be_bytes());
+        } else {
+            out.get_mut(dst..dst + 8)?
+                .copy_from_slice(&new.to_be_bytes());
+        }
+        Some(())
+    };
+    // embed_icc only ever patches our own serializer's output (a
+    // handful of items); anything bigger is refused outright, because
+    // a *partially* patched iloc would not be caught by the caller's
+    // re-extraction check (which reads properties, not item data).
+    if item_count > 64 {
+        return None;
+    }
+    for _ in 0..item_count {
+        off += if version < 2 { 2 } else { 4 }; // item_id
+        let method = if version >= 1 {
+            let m = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) & 0xF;
+            off += 2;
+            m
+        } else {
+            0
+        };
+        off += 2; // data_reference_index
+        let base_at = off;
+        off += base_offset_size;
+        if method == 0 && base_offset_size > 0 {
+            patch(out, base_at, base_offset_size)?;
+        }
+        let extent_count = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as usize;
+        off += 2;
+        if extent_count > 64 {
+            return None;
+        }
+        for _ in 0..extent_count {
+            off += index_size;
+            let ext_at = off;
+            off += offset_size;
+            off += length_size;
+            if method == 0 && base_offset_size == 0 {
+                patch(out, ext_at, offset_size)?;
+            }
+        }
+    }
+    Some(())
 }
 
 /// Container-level probe: dimensions from the primary item's AV1
@@ -1293,6 +1677,110 @@ fn picture_to_rgb(pic: &dav1d_sys::Dav1dPicture, out: &mut Vec<u8>) -> Result<(u
 mod tests {
     use super::*;
 
+    /// Embed → extract must be the identity, the patched container must
+    /// decode to the same pixels, and the growth must be exactly the
+    /// colr box plus one association byte.
+    #[test]
+    fn icc_embed_extract_roundtrip() {
+        let rgb = pixel_samples(64 * 48 * 3, 7);
+        let plain = encode_avif(&rgb, 64, 48, 3, &AvifParams::default(), None).unwrap();
+        assert_eq!(extract_icc(&plain), None, "no profile without embedding");
+
+        let icc: Vec<u8> = (0..900u32).map(|i| (i % 251) as u8).collect();
+        let profiled = encode_avif(&rgb, 64, 48, 3, &AvifParams::default(), Some(&icc)).unwrap();
+        assert_eq!(extract_icc(&profiled).as_deref(), Some(&icc[..]));
+        assert_eq!(
+            profiled.len(),
+            plain.len() + 12 + icc.len() + 1,
+            "growth = colr box + one association"
+        );
+        let (a, aw, ah, _) = decode_avif(&plain).unwrap();
+        let (b, bw, bh, _) = decode_avif(&profiled).unwrap();
+        assert_eq!((aw, ah), (bw, bh));
+        assert_eq!(a, b, "profile splice must not disturb the image data");
+        assert_eq!(probe_avif(&profiled).unwrap(), (64, 48));
+    }
+
+    /// Alpha adds a second item whose iloc entry must shift correctly
+    /// too.
+    #[test]
+    fn icc_embed_survives_alpha_items() {
+        let mut rgba = pixel_samples(48 * 32 * 4, 11);
+        rgba[3] = 128; // ensure a transparent pixel keeps the alpha item
+        let icc: Vec<u8> = (0..300u32).map(|i| (i * 7 % 251) as u8).collect();
+        let profiled = encode_avif(&rgba, 48, 32, 4, &AvifParams::default(), Some(&icc)).unwrap();
+        assert_eq!(extract_icc(&profiled).as_deref(), Some(&icc[..]));
+        let (_, w, h, ch) = decode_avif(&profiled).unwrap();
+        assert_eq!((w, h, ch), (48, 32, 4), "alpha item survives the splice");
+    }
+
+    /// Simple compact box for hand-built container tests.
+    fn fbox(typ: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut v = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// The extractor must read layouts our own serializer never
+    /// writes: version-1 `pitm`/`ipma` (u32 item ids), wide (15-bit)
+    /// associations, and essential-flagged narrow associations.
+    #[test]
+    fn icc_extract_reads_wide_and_versioned_layouts() {
+        let icc = [0xAB_u8; 96];
+        let mut colr = b"prof".to_vec();
+        colr.extend_from_slice(&icc);
+        // A filler property first, so colr is property index 2.
+        let ipco = fbox(
+            b"ipco",
+            &[fbox(b"free", &[0u8; 4]), fbox(b"colr", &colr)].concat(),
+        );
+
+        // Wide + version 1: item id 7 as u32, association as u16.
+        let mut ipma_pl = vec![1, 0, 0, 1];
+        ipma_pl.extend(1u32.to_be_bytes()); // entry_count
+        ipma_pl.extend(7u32.to_be_bytes()); // item_id
+        ipma_pl.push(1); // association count
+        ipma_pl.extend(2u16.to_be_bytes()); // wide index 2
+        let iprp = fbox(b"iprp", &[ipco.clone(), fbox(b"ipma", &ipma_pl)].concat());
+        let mut pitm_pl = vec![1, 0, 0, 0];
+        pitm_pl.extend(7u32.to_be_bytes());
+        let meta_pl = [vec![0, 0, 0, 0], fbox(b"pitm", &pitm_pl), iprp].concat();
+        let avif = fbox(b"meta", &meta_pl);
+        assert_eq!(extract_icc(&avif).as_deref(), Some(&icc[..]), "wide/v1");
+
+        // Narrow + version 0 with the essential bit set on the index.
+        let mut ipma_pl = vec![0, 0, 0, 0];
+        ipma_pl.extend(1u32.to_be_bytes());
+        ipma_pl.extend(7u16.to_be_bytes());
+        ipma_pl.push(1);
+        ipma_pl.push(0x80 | 2); // essential + index 2
+        let iprp = fbox(b"iprp", &[ipco, fbox(b"ipma", &ipma_pl)].concat());
+        let mut pitm_pl = vec![0, 0, 0, 0];
+        pitm_pl.extend(7u16.to_be_bytes());
+        let meta_pl = [vec![0, 0, 0, 0], fbox(b"pitm", &pitm_pl), iprp].concat();
+        let avif = fbox(b"meta", &meta_pl);
+        assert_eq!(
+            extract_icc(&avif).as_deref(),
+            Some(&icc[..]),
+            "narrow/essential"
+        );
+    }
+
+    /// The extractor never errors on hostile input, and the embedder
+    /// declines rather than corrupts.
+    #[test]
+    fn icc_walkers_are_fail_safe() {
+        let rgb = pixel_samples(32 * 24 * 3, 3);
+        let plain = encode_avif(&rgb, 32, 24, 3, &AvifParams::default(), None).unwrap();
+        for cut in [0, 8, 40, plain.len() / 2] {
+            assert_eq!(extract_icc(&plain[..cut]), None);
+        }
+        assert_eq!(extract_icc(b"not an avif at all"), None);
+        assert!(embed_icc(b"garbage", &[1, 2, 3]).is_none());
+        assert!(embed_icc(&plain[..40], &[1, 2, 3]).is_none());
+    }
+
     /// Deterministic pseudo-random pixels covering 0 and 255 exactly.
     fn pixel_samples(n: usize, seed: u32) -> Vec<u8> {
         let mut s = seed;
@@ -1560,7 +2048,7 @@ mod tests {
                 [x.wrapping_mul(2), y.wrapping_mul(2), x ^ y]
             })
             .collect();
-        let out = encode_avif(&rgb, w, h, 3, &AvifParams::default()).unwrap();
+        let out = encode_avif(&rgb, w, h, 3, &AvifParams::default(), None).unwrap();
         assert!(out.len() > 100, "suspiciously small: {}", out.len());
         // container sanity: ftyp avif brand near the start
         assert_eq!(&out[4..12], b"ftypavif", "not an avif container");
@@ -1586,7 +2074,7 @@ mod tests {
             quality: 85,
             ..AvifParams::default()
         };
-        let encoded = encode_avif(&rgb, w, h, 3, &params).unwrap();
+        let encoded = encode_avif(&rgb, w, h, 3, &params, None).unwrap();
         let (decoded, dw, dh, channels) = decode_avif(&encoded).unwrap();
         assert_eq!((dw, dh, channels), (w, h, 3));
         assert_eq!(decoded.len(), rgb.len());
@@ -1602,7 +2090,7 @@ mod tests {
     #[test]
     fn probe_reports_dimensions_without_decoding() {
         let rgb = vec![128u8; 96 * 64 * 3];
-        let encoded = encode_avif(&rgb, 96, 64, 3, &AvifParams::default()).unwrap();
+        let encoded = encode_avif(&rgb, 96, 64, 3, &AvifParams::default(), None).unwrap();
         assert_eq!(probe_avif(&encoded).unwrap(), (96, 64));
     }
 
@@ -1628,7 +2116,7 @@ mod tests {
             alpha_quality: 85,
             ..AvifParams::default()
         };
-        let encoded = encode_avif(&rgba, w, h, 4, &params).unwrap();
+        let encoded = encode_avif(&rgba, w, h, 4, &params, None).unwrap();
         let (decoded, dw, dh, channels) = decode_avif(&encoded).unwrap();
         assert_eq!((dw, dh, channels), (w, h, 4));
         let a_se: f64 = rgba

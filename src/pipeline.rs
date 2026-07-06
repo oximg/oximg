@@ -319,7 +319,9 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
                 {
                     Fuse::Off
-                } else if !orientation.is_upright() || icc.is_some() {
+                } else if !orientation.is_upright()
+                    || (icc.is_some() && target != ImageFormat::Avif)
+                {
                     // Rotation happens on the resized frame before the
                     // one-shot encode — incompatible with streaming rows
                     // into jpegli or into the YUV planes, so oriented
@@ -328,9 +330,12 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     // recover the jpegli/YUV overlap for the flip-only
                     // orientations (2-4); oriented traffic is a small
                     // minority, so correctness ships first.
-                    // ICC likewise: the profile must be written before
-                    // the incremental encoder's first scanline, so
-                    // profiled sources take the one-shot encode.
+                    // ICC likewise for jpegli targets: the profile must
+                    // be written before the incremental encoder's first
+                    // scanline, so profiled sources take the one-shot
+                    // encode. (AVIF is exempt — its profile is spliced
+                    // into the container after the encode, so it rides
+                    // the Yuv fuse.)
                     // TODO(icc-fuse): thread the profile into the fused
                     // jpegli worker to recover the overlap.
                     Fuse::Pixels
@@ -382,7 +387,13 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                         // inside the decode overlap; only the encode
                         // itself remains. The plane vectors are truncated
                         // to exactly this frame by the fused branch.
-                        crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16)?
+                        crate::avif::encode_avif_with_session(
+                            session,
+                            &s.y16,
+                            &s.cb16,
+                            &s.cr16,
+                            icc.as_deref(),
+                        )?
                     }
                 }
             }
@@ -1482,20 +1493,24 @@ fn icc_passthrough() -> bool {
     *I.get_or_init(|| std::env::var("OXIMG_ICC").as_deref() != Ok("0"))
 }
 
-/// Targets that can carry an ICC profile. AVIF is the gap: our
-/// serializer speaks CICP only (TODO(avif-icc)).
+/// Targets that can carry an ICC profile — all of them when the avif
+/// feature is on (AVIF embeds via the container splice in
+/// `avif::embed_icc`).
 fn target_supports_icc(target: ImageFormat) -> bool {
-    matches!(
-        target,
-        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Webp
-    )
+    match target {
+        ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Webp => true,
+        #[cfg(feature = "avif")]
+        ImageFormat::Avif => true,
+        #[cfg(not(feature = "avif"))]
+        ImageFormat::Avif => false,
+    }
 }
 
 /// Profiles larger than this are dropped rather than copied into every
 /// resized output (real-world profiles top out around 2-3MB for
 /// LUT-based print profiles; web images carry a few KB). The JPEG scan
 /// is bounded tighter still by `meta::SCAN_CAP`.
-const ICC_CAP: usize = 4 * 1024 * 1024;
+pub(crate) const ICC_CAP: usize = 4 * 1024 * 1024;
 
 fn process_png<R: std::io::Read>(
     s: &mut Scratch,
@@ -1710,6 +1725,13 @@ fn process_avif<R: std::io::Read>(
 
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
+    // avif-parse exposes no colr boxes; the profile comes from our own
+    // bounded container walk (see avif::extract_icc).
+    let icc = if icc_passthrough() && target_supports_icc(target) {
+        crate::avif::extract_icc(&s.srcbuf)
+    } else {
+        None
+    };
     let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
@@ -1718,9 +1740,7 @@ fn process_avif<R: std::io::Read>(
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
-    // TODO(avif-icc-src): avif-parse exposes no colr boxes, so an ICC
-    // profile in an AVIF source is not carried to any target yet.
-    let out = encode_output(s, dst_w, dst_h, channels, target, p, None)?;
+    let out = encode_output(s, dst_w, dst_h, channels, target, p, icc.as_deref())?;
     if timing {
         eprintln!(
             "timing avif decode({src_w}x{src_h})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -2162,10 +2182,7 @@ fn encode_output(
             icc,
         ),
         // Fully opaque RGBA drops its alpha item inside encode_avif
-        // (skipping the second SVT session entirely). ICC is never
-        // extracted for AVIF targets (avif-serialize carries color via
-        // CICP only); `icc` is None here by construction.
-        // TODO(avif-icc): embed the profile once the serializer can.
+        // (skipping the second SVT session entirely).
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
             let quality = avif_quality();
@@ -2181,6 +2198,7 @@ fn encode_output(
                 dst_h,
                 channels,
                 &params,
+                icc,
             )
         }
         #[cfg(not(feature = "avif"))]
@@ -2435,6 +2453,11 @@ mod tests {
     /// conversion of the same pixels exactly.
     #[cfg(feature = "avif")]
     fn run_jpeg_avif(jpeg: &[u8], yuv_fuse: bool) -> Vec<u8> {
+        run_jpeg_avif_icc(jpeg, yuv_fuse, None)
+    }
+
+    #[cfg(feature = "avif")]
+    fn run_jpeg_avif_icc(jpeg: &[u8], yuv_fuse: bool, icc: Option<&[u8]>) -> Vec<u8> {
         let params = test_avif_params();
         let fuse = if yuv_fuse {
             Fuse::Yuv { params }
@@ -2454,12 +2477,18 @@ mod tests {
         )
         .unwrap()
         {
-            Decoded::Pixels { dst_w, dst_h } => {
-                crate::avif::encode_avif(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, 3, &params)
-                    .unwrap()
-            }
+            Decoded::Pixels { dst_w, dst_h } => crate::avif::encode_avif(
+                &s.out8[..dst_w * dst_h * 3],
+                dst_w,
+                dst_h,
+                3,
+                &params,
+                icc,
+            )
+            .unwrap(),
             Decoded::YuvPlanes { session } => {
-                crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16).unwrap()
+                crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16, icc)
+                    .unwrap()
             }
             Decoded::Encoded(_) => panic!("avif run must not hit the jpegli fuse"),
         }
@@ -2481,6 +2510,14 @@ mod tests {
                 "{w}x{h} gray={gray}"
             );
         }
+        // With a profile the parity must hold too — the fused session
+        // path and the one-shot path splice the identical colr.
+        let jpeg = make_test_jpeg(321, 243, false);
+        let icc: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
+        let serial = run_jpeg_avif_icc(&jpeg, false, Some(&icc));
+        let fused = run_jpeg_avif_icc(&jpeg, true, Some(&icc));
+        assert_eq!(serial, fused, "profiled fused/serial parity");
+        assert_eq!(crate::avif::extract_icc(&fused).as_deref(), Some(&icc[..]));
     }
 
     #[cfg(feature = "avif")]
