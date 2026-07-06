@@ -648,6 +648,113 @@ fn error_statuses_are_honest() {
     assert_eq!(s.status_of("/resize/100/100/list.txt"), 422);
 }
 
+/// The existing coalescing test only proves identical bytes — it
+/// passes even if singleflight is completely broken. This one proves
+/// the flight actually coalesces: a slow origin counts its fetches,
+/// and N concurrent identical requests must produce exactly one.
+/// Error results are shared the same way (one upstream failure, N
+/// identical 502s, still one fetch).
+#[test]
+fn singleflight_coalesces_to_one_origin_fetch() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&fetches);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .trim_start_matches('/');
+                use std::io::Write;
+                // Slow responses widen the window in which followers
+                // must coalesce behind the in-flight leader.
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                if path.starts_with("boom") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                match std::fs::read(format!("{fixtures}/{path}")) {
+                    Ok(data) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    Err(_) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    let s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{origin_port}"),
+    )]);
+
+    // 8 identical requests fired together: one origin fetch, identical
+    // bytes for everyone.
+    let results: Vec<Vec<u8>> = std::thread::scope(|sc| {
+        (0..8)
+            .map(|_| sc.spawn(|| s.get("/resize/120/120/photo.jpg").unwrap().2))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "concurrent identical requests must coalesce to one origin fetch"
+    );
+    for r in &results[1..] {
+        assert_eq!(r, &results[0]);
+    }
+
+    // Same for a failing flight: one fetch, shared 502s.
+    let statuses: Vec<u16> = std::thread::scope(|sc| {
+        (0..8)
+            .map(|_| sc.spawn(|| s.status_of("/resize/120/120/boom.jpg")))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        2,
+        "the failing flight must also fetch exactly once"
+    );
+    assert!(
+        statuses.iter().all(|&st| st == 502),
+        "shared 502s: {statuses:?}"
+    );
+}
+
 #[test]
 fn remote_source_mode_streams_from_http_origin() {
     // origin: a second oximg? No — a minimal static file server thread.
