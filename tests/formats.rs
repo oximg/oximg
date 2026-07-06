@@ -91,10 +91,22 @@ fn alpha_survives_and_does_not_bleed() {
     assert!(px(w - 2, mid)[3] > 230, "right edge should stay opaque");
 }
 
+/// Animated WebP sources render their first frame (full-canvas first
+/// frames only — a partial one would need compositing and still gets
+/// the clean animation error).
 #[test]
-fn animated_webp_is_rejected_cleanly() {
-    let err = pipeline::process(&fixture("animated.webp"), &params(100)).unwrap_err();
-    assert!(format!("{err:#}").contains("animated"), "got: {err:#}");
+fn animated_webp_renders_first_frame() {
+    // animated.webp: two full-canvas 64x48 frames.
+    let (out, fmt) = pipeline::process(&fixture("animated.webp"), &params(100)).unwrap();
+    assert_eq!(fmt, ImageFormat::Webp);
+    assert_eq!(dims_of(&out), (64, 48), "no upscale past the source");
+    let p = Params {
+        output: Some(ImageFormat::Jpeg),
+        ..params(32)
+    };
+    let (out, fmt) = pipeline::process(&fixture("animated.webp"), &p).unwrap();
+    assert_eq!(fmt, ImageFormat::Jpeg);
+    assert_eq!(dims_of(&out), (32, 24), "cross-format first frame");
 }
 
 #[test]

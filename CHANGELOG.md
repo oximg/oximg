@@ -12,13 +12,16 @@ HTTP interface without notice.
 
 ### Added
 
-- Animated AVIF sources render their first frame instead of being
-  rejected — MIAF requires image sequences to carry a valid still
-  primary item, so the bounded container walk assembles its `iloc`
-  extents and hands them to dav1d directly (avif-parse still declines
-  sequences); `probe` falls back to the still item's `ispe`.
-  Orientation and ICC metadata apply to that first frame like any
-  still source. Alpha tracks are not decoded.
+- Animated AVIF and WebP sources render their first frame instead of
+  being rejected. AVIF: MIAF requires image sequences to carry a valid
+  still primary item, so the bounded container walk assembles its
+  `iloc` extents and hands them to dav1d directly (avif-parse still
+  declines sequences); `probe` falls back to the still item's `ispe`;
+  alpha tracks are not decoded. WebP: the demuxer's first frame is
+  decoded when it covers the full canvas (virtually every real file —
+  partial first frames would need compositing and keep the clean
+  animation error). Orientation and ICC metadata apply to the first
+  frame like any still source.
 
 ### Changed
 

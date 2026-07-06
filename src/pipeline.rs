@@ -1722,6 +1722,15 @@ fn process_webp<R: std::io::Read>(
     let orientation = exif
         .and_then(|d| crate::meta::Orientation::from_exif_payload(&d))
         .unwrap_or(crate::meta::Orientation::UPRIGHT);
+    // Animated sources render their first frame, like other image
+    // proxies: swap the container for the frame's bitstream (metadata
+    // was already read from the full container above). A first frame
+    // that does not cover the canvas keeps the original bytes and
+    // fails with the animation error below, as before.
+    if let Some(frame) = webp_first_frame(&s.srcbuf) {
+        s.srcbuf.clear();
+        s.srcbuf.extend_from_slice(&frame);
+    }
     let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, orientation, p)?;
     let _ = (src_w, src_h);
     let t_dec = t0.elapsed();
@@ -2207,6 +2216,54 @@ fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
         let out = std::slice::from_raw_parts(assembled.bytes, assembled.size).to_vec();
         wp::WebPDataClear(&mut assembled);
         Ok(out)
+    }
+}
+
+/// First frame of an animated WebP as a standalone-decodable
+/// bitstream — only when it covers the full canvas at zero offset
+/// (true of virtually every real file; a partial first frame would
+/// need canvas compositing, so those stay rejected). `None` for
+/// non-animated input.
+fn webp_first_frame(srcbuf: &[u8]) -> Option<Vec<u8>> {
+    use libwebp_sys as wp;
+    unsafe {
+        let data = wp::WebPData {
+            bytes: srcbuf.as_ptr(),
+            size: srcbuf.len(),
+        };
+        let dmux = wp::WebPDemuxInternal(
+            &data,
+            0,
+            std::ptr::null_mut(),
+            wp::WEBP_DEMUX_ABI_VERSION as _,
+        );
+        if dmux.is_null() {
+            return None;
+        }
+        let flags = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FORMAT_FLAGS);
+        const ANIMATION_FLAG: u32 = 0x02;
+        if flags & ANIMATION_FLAG == 0 {
+            wp::WebPDemuxDelete(dmux);
+            return None;
+        }
+        let cw = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_CANVAS_WIDTH);
+        let ch = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_CANVAS_HEIGHT);
+        let mut iter: wp::WebPIterator = std::mem::zeroed();
+        let ok = wp::WebPDemuxGetFrame(dmux, 1, &mut iter);
+        let out = (ok != 0
+            && iter.complete != 0
+            && iter.x_offset == 0
+            && iter.y_offset == 0
+            && iter.width as u32 == cw
+            && iter.height as u32 == ch
+            && !iter.fragment.bytes.is_null()
+            && iter.fragment.size > 0)
+            .then(|| std::slice::from_raw_parts(iter.fragment.bytes, iter.fragment.size).to_vec());
+        if ok != 0 {
+            wp::WebPDemuxReleaseIterator(&mut iter);
+        }
+        wp::WebPDemuxDelete(dmux);
+        out
     }
 }
 
