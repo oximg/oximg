@@ -6,6 +6,35 @@
 //! implementation rather than mirroring it.
 #![allow(dead_code)]
 
+use oximg::pipeline::{self, Encoder, Params};
+
+/// Read a committed fixture by name.
+pub fn fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
+}
+
+/// Square-box params at the jpegli default (q80, single-threaded,
+/// source format).
+pub fn params(max: u32) -> Params {
+    Params {
+        max_width: max,
+        max_height: max,
+        encoder: Encoder::Jpegli,
+        ..Default::default()
+    }
+}
+
+/// Output dimensions via the pipeline's own header probe.
+pub fn dims_of(bytes: &[u8]) -> (usize, usize) {
+    let (_, w, h) = pipeline::probe(bytes).unwrap();
+    (w, h)
+}
+
+
 /// Minimal little-endian Exif APP1 payload carrying one orientation tag.
 pub fn app1_orientation(o: u16) -> Vec<u8> {
     let mut v = b"Exif\0\0".to_vec();

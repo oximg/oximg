@@ -10,6 +10,14 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- The 1,100-line `tests/formats.rs` is split by domain into
+  `formats.rs` (core same/cross-format matrix), `formats_avif.rs`,
+  `formats_orientation.rs`, and `formats_icc.rs`; the shared
+  `fixture`/`params`/`dims_of` helpers move into `tests/common`. Same
+  tests, same coverage — navigation only.
+
 ### Fixed
 
 - `qcli`'s PPM reader no longer panics (out-of-bounds index) on a
