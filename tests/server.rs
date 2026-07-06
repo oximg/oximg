@@ -187,6 +187,39 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
     }
 }
 
+/// Set-but-invalid runtime knobs refuse to boot: a typo in a limit
+/// must not silently fail open to the default.
+#[test]
+fn invalid_knobs_refuse_to_boot() {
+    for (k, v) in [
+        ("OXIMG_MAX_SOURCE_BYTES", "512k"),
+        ("OXIMG_AUTO_ROTATE", "false"),
+        ("OXIMG_WEBP_QUALITY", "150"),
+        ("OXIMG_OVERLAP", "yes"),
+        ("QUALITY", "eighty"),
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .env(k, v)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let mut status = None;
+        for _ in 0..200 {
+            if let Ok(Some(s)) = child.try_wait() {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let Some(status) = status else {
+            let _ = child.kill();
+            panic!("server booted despite {k}={v}");
+        };
+        assert!(!status.success(), "{k}={v} must exit non-zero");
+    }
+}
+
 /// A set-but-undecodable signing key must refuse to boot — never
 /// serve unsigned.
 #[test]

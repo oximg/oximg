@@ -79,6 +79,71 @@ fn parsed<T: std::str::FromStr>(name: &str) -> Option<T> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
+/// Strict startup validation for the server binary: every knob that
+/// is *set* must parse and sit in range — a typo in a limit must not
+/// silently fail open to a default (the fail-closed precedent set by
+/// the signing config). The library-facing `config()` stays lenient
+/// so embedding never aborts a host process over env noise.
+pub(crate) fn validate() -> Result<(), String> {
+    fn set(name: &str) -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+    }
+    fn num<T: std::str::FromStr + PartialOrd + Copy + std::fmt::Display>(
+        name: &str,
+        lo: T,
+        hi: T,
+    ) -> Result<(), String> {
+        if let Some(v) = set(name) {
+            let parsed: T = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("{name}={v:?} is not a valid number"))?;
+            if parsed < lo || parsed > hi {
+                return Err(format!("{name}={v:?} is out of range ({lo}..={hi})"));
+            }
+        }
+        Ok(())
+    }
+    fn one_of(name: &str, allowed: &[&str]) -> Result<(), String> {
+        if let Some(v) = set(name)
+            && !allowed.contains(&v.trim())
+        {
+            return Err(format!("{name}={v:?} must be one of {allowed:?}"));
+        }
+        Ok(())
+    }
+    // Booleans only accept 0/1 — "false" reading as *enabled* is the
+    // trap this exists to catch.
+    for b in [
+        "OXIMG_AUTO_ROTATE",
+        "OXIMG_ICC",
+        "OXIMG_JPEG_PROGRESSIVE",
+        "OXIMG_WEBP_DECODE_THREADS",
+    ] {
+        one_of(b, &["0", "1"])?;
+    }
+    one_of("OXIMG_OVERLAP", &["0", "1", "auto"])?;
+    one_of("OXIMG_RESIZE", &["srgb", "linear"])?;
+    one_of("OXIMG_RESIZE_BACKEND", &["fir", "kernel"])?;
+    one_of("OXIMG_PNG_EFFORT", &["fastest", "fast", "balanced", "high"])?;
+    one_of("OXIMG_LOG", &["error", "request"])?;
+    num("OXIMG_DCT_MARGIN", 1.0f64, 8.0)?;
+    num("OXIMG_WEBP_QUALITY", 0.0f32, 100.0)?;
+    num("OXIMG_WEBP_EFFORT", 0i64, 6)?;
+    num("OXIMG_AVIF_QUALITY", 0i64, 100)?;
+    num("OXIMG_AVIF_ALPHA_QUALITY", 0i64, 100)?;
+    num("OXIMG_AVIF_SPEED", 0i64, 13)?;
+    num("OXIMG_AVIF_DECODE_THREADS", 1i64, 64)?;
+    num("OXIMG_MAX_SOURCE_BYTES", 1u64, u64::MAX)?;
+    if let Some(v) = set("OXIMG_FLATTEN_BG") {
+        let t = v.trim().trim_start_matches('#');
+        if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("OXIMG_FLATTEN_BG={v:?} must be RRGGBB hex"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| Config {

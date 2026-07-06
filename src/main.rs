@@ -141,14 +141,24 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Startup setting: unset means the default, set-but-unparseable is a
+/// fatal configuration error (fail closed, like the signing config).
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(v) if v.trim().is_empty() => default,
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            eprintln!("oximg: fatal: {key}={v:?} is not a valid value");
+            std::process::exit(2);
+        }),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
+    if let Err(e) = oximg::config_validate() {
+        eprintln!("oximg: fatal: {e}");
+        std::process::exit(2);
+    }
     let workers = std::thread::available_parallelism()?.get();
     // Cap the blocking pool at CPU slots + a little IO headroom: this
     // bounds the number of thread-local scratch copies (tokio's default of

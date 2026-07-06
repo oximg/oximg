@@ -10,6 +10,17 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Runtime knobs fail closed at server startup, matching the signing
+  config: any set-but-unparseable or out-of-range OXIMG_* value (and
+  `PORT`/`QUALITY`/`OXIMG_PAR`) refuses to boot with a fatal error
+  instead of silently falling back to a default — a typo'd
+  `OXIMG_MAX_SOURCE_BYTES=512k` previously failed *open* to 64MiB, and
+  boolean knobs set to `false` read as *enabled* (only `0` disables).
+  Library embedders keep lenient defaults; `oximg::config_validate()`
+  opts into the strict behavior.
+
 ## [0.4.3] - 2026-07-06
 
 Hardening the workshop as much as the product: honest 413s, an
