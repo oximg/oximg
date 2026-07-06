@@ -20,6 +20,16 @@ HTTP interface without notice.
 
 ### Changed
 
+- The Docker runtime image runs as an unprivileged user (uid 10001)
+  instead of root — the server decodes attacker-supplied bytes
+  through four C codec stacks over FFI and needs no privilege to bind
+  its high port or read the (typically read-only) images mount — and
+  ships a `HEALTHCHECK` that TCP-probes `/health`.
+- The remote-source fetcher no longer follows redirects (an origin
+  that can be induced to redirect must not become an SSRF proxy — 3xx
+  answers are refused as 502), and filenames reject `?`, `#`, and
+  control characters so they cannot smuggle a query string or fragment
+  into the origin URL.
 - Runtime knobs fail closed at server startup, matching the signing
   config: any set-but-unparseable or out-of-range OXIMG_* value (and
   `PORT`/`QUALITY`/`OXIMG_PAR`) refuses to boot with a fatal error

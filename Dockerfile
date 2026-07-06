@@ -35,6 +35,18 @@ LABEL org.opencontainers.image.title="oximg" \
       org.opencontainers.image.description="High-performance image compression and resizing: JPEG, PNG, WebP, AVIF. Linear-light Lanczos, per-architecture SIMD." \
       org.opencontainers.image.source="https://github.com/oximg/oximg" \
       org.opencontainers.image.licenses="Apache-2.0"
+# The server decodes attacker-supplied bytes through four C codec
+# stacks over FFI; run it as an unprivileged user. It only binds a
+# high port and reads a (typically ro-mounted) IMAGES_DIR, so nothing
+# needs root. The default /images is created up front so a run with no
+# volume mount still starts.
+RUN useradd --system --uid 10001 --user-group --no-create-home oximg \
+    && mkdir -p /images && chown oximg:oximg /images
+USER oximg
 ENV IMAGES_DIR=/images PORT=8081
 EXPOSE 8081
+# TCP-connect probe against the listen port (no curl/wget in the slim
+# image); PORT is baked into the shell at build time.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/${PORT} && printf "GET /health HTTP/1.0\r\n\r\n" >&3 && grep -q "200 OK" <&3'
 CMD ["oximg"]
