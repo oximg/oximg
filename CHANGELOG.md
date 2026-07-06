@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-06
+
+Animated sources render instead of failing, and the metadata paths
+shipped in 0.4.0 got their performance polish: profiled and oriented
+sources now pay little to nothing for correctness.
+
 ### Added
 
 - Animated AVIF and WebP sources render their first frame instead of
@@ -277,7 +283,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/oximg/oximg/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/oximg/oximg/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/oximg/oximg/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/oximg/oximg/compare/v0.1.0...v0.2.0

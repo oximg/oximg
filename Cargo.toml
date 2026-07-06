@@ -1,6 +1,6 @@
 [package]
 name = "oximg"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "High-performance image compression: library, CLI, and self-hostable server (PoC)."
 license = "Apache-2.0"
