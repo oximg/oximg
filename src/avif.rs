@@ -177,6 +177,7 @@ fn chroma_block_rows(
 /// division identity, same f32 order for chroma, no FMA contraction) so
 /// output is bit-identical — asserted exhaustively in tests.
 #[cfg(target_arch = "aarch64")]
+#[allow(unused_unsafe)] // see avx2_enc: toolchain-dependent lint
 mod neon_enc {
     use std::arch::aarch64::*;
 
@@ -309,6 +310,11 @@ mod neon_enc {
 /// BT.601 offsets map the extremes to 512 +/- 511.5), and for
 /// non-negative x the two are equal, ties included.
 #[cfg(target_arch = "x86_64")]
+// Newer toolchains let closures inside #[target_feature] fns call
+// intrinsics without an inner `unsafe {}`; older ones require it.
+// Keep the blocks (they are load-bearing on the older compilers) and
+// silence the newer compilers' unused_unsafe instead.
+#[allow(unused_unsafe)]
 mod avx2_enc {
     use std::arch::x86_64::*;
 
