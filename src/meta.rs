@@ -54,6 +54,9 @@ impl Orientation {
     /// libheif's rendering of the AVIF fixtures (avifdec does not
     /// apply the transforms; libheif — ImageMagick, most viewers —
     /// does).
+    // Callers live behind the avif feature; the unit tests pin the
+    // table unconditionally.
+    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
     pub(crate) fn from_rot_mirror(angle_ccw: u8, mirror: Option<u8>) -> Orientation {
         Orientation(match (angle_ccw & 3, mirror.map(|m| m & 1)) {
             (0, None) => 1,
