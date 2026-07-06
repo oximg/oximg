@@ -12,6 +12,13 @@ HTTP interface without notice.
 
 ### Fixed
 
+- Local sources that exist but cannot be read (permission denied, or a
+  directory where a file was expected) now answer 500, and a remote
+  origin whose body dies mid-stream (reset, truncated, timed out)
+  answers 502 — both previously fell through to 422, blaming the
+  client for a server or upstream fault. Mid-stream kinds are only
+  treated as upstream in remote-source mode, so a genuinely truncated
+  local upload stays a 422.
 - A fused-path worker failure (encode error, session setup) now
   surfaces the worker's real, ServerFault-marked error as a 500
   instead of the decode loop's generic "fuse worker exited early"

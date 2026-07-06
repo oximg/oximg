@@ -189,6 +189,16 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
     }
 }
 
+/// A local source that exists but cannot be read (here: a directory
+/// where a file was expected) is a 500, not a 422 blaming the client.
+#[test]
+fn unreadable_local_source_is_server_error() {
+    let dir = std::env::temp_dir().join(format!("oximg-eisdir-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("isdir.jpg")).unwrap();
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+    assert_eq!(s.status_of("/resize/100/100/isdir.jpg"), 500);
+}
+
 /// The decoded-pixel cap rejects decompression bombs before any
 /// pixel-sized allocation, across formats.
 #[test]
@@ -652,6 +662,17 @@ fn error_statuses_are_honest() {
                     );
                     return;
                 }
+                if path.starts_with("truncated") {
+                    // Promise a large PNG, deliver a valid header, then
+                    // drop the connection mid-body: the buffered reader
+                    // hits UnexpectedEof.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR");
+                    return;
+                }
                 match std::fs::read(format!("{fixtures}/{path}")) {
                     Ok(data) => {
                         let _ = write!(
@@ -685,6 +706,11 @@ fn error_statuses_are_honest() {
         s.status_of("/resize/100/100/moved.jpg"),
         502,
         "origin redirects are refused, not followed"
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/truncated.png"),
+        502,
+        "an origin body dying mid-stream is the upstream's fault"
     );
     assert_eq!(
         s.status_of("/resize/100/100/missing.jpg"),
