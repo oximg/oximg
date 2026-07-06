@@ -232,7 +232,8 @@ default).
 ## Not yet implemented (out of PoC scope)
 
 - JXL output (the `@jxl` token is reserved and returns a clear error)
-- Animated AVIF sources
+- Animated output (animated AVIF *sources* render their first frame,
+  like other image proxies; animated WebP is still rejected)
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
 

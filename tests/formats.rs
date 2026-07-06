@@ -986,6 +986,61 @@ fn orientation_edge_paths() {
     assert_eq!(dims_of(&out), (133, 100), "png too (no scaler, exact)");
 }
 
+/// Animated AVIF sources render their first frame (the still primary
+/// item MIAF requires them to carry), like other image proxies —
+/// previously a clean rejection. Metadata composes: orientation and
+/// ICC on an animated source apply to that first frame.
+#[cfg(feature = "avif")]
+#[test]
+fn animated_avif_renders_first_frame() {
+    // anim.avif: three 120x90 solid frames (red, blue, green), 2fps.
+    let src = fixture("anim.avif");
+    assert_eq!(
+        pipeline::probe(&src).unwrap(),
+        (ImageFormat::Avif, 120, 90),
+        "probe falls back to the still item's ispe"
+    );
+    for target in [ImageFormat::Jpeg, ImageFormat::Webp, ImageFormat::Avif] {
+        let p = Params {
+            output: Some(target),
+            ..params(100)
+        };
+        let (out, fmt) = pipeline::process(&src, &p).unwrap();
+        assert_eq!(fmt, target);
+        assert_eq!(dims_of(&out), (100, 75), "{target:?}");
+    }
+    // First frame is solid red: check via the JPEG target.
+    let p = Params {
+        output: Some(ImageFormat::Jpeg),
+        ..params(100)
+    };
+    let (out, _) = pipeline::process(&src, &p).unwrap();
+    let (w, h, corners) = common::corner_classes(&out);
+    assert_eq!((w, h), (100, 75));
+    assert_eq!(corners, ['R', 'R', 'R', 'R'], "first frame is the red one");
+
+    // anim_meta.avif: same frames with --irot 1 and an ICC profile.
+    let src = fixture("anim_meta.avif");
+    let (out, _) = pipeline::process(
+        &src,
+        &Params {
+            output: Some(ImageFormat::Jpeg),
+            ..params(100)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        dims_of(&out),
+        (75, 100),
+        "irot applies to the animated source's first frame"
+    );
+    assert_eq!(
+        common::jpeg_icc(&out).as_deref(),
+        Some(&common::fake_icc(900)[..]),
+        "profile passes through from the animated source"
+    );
+}
+
 /// avifenc-authored irot/imir fixtures must display exactly as
 /// libheif renders them (ground truth captured via ImageMagick's heic
 /// delegate, which applies transformative properties): the corner

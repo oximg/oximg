@@ -1389,10 +1389,153 @@ fn patch_iloc(
     Some(())
 }
 
+/// Does the container declare an image sequence (`avis` brand)?
+/// MIAF requires such files to also carry a valid still primary item,
+/// which is what the first-frame fallbacks below read.
+fn is_animated_brand(data: &[u8]) -> bool {
+    match find_box(data, 0..data.len(), b"ftyp") {
+        Some((pl, _)) => data[pl].chunks(4).any(|b| b == b"avis"),
+        None => false,
+    }
+}
+
+/// The raw AV1 payload of the primary item, assembled from its `iloc`
+/// extents (construction method 0 — absolute file offsets). Bounds-
+/// checked throughout; `None` on anything the walk does not fully
+/// recognize.
+fn primary_item_bytes(avif: &[u8]) -> Option<Vec<u8>> {
+    let meta = meta_payload(avif)?;
+    let primary = primary_item_id(avif, meta.clone())?;
+    let (iloc, _) = find_box(avif, meta, b"iloc")?;
+    let p = avif.get(iloc)?;
+    let version = *p.first()?;
+    let sizes = *p.get(4)?;
+    let (offset_size, length_size) = ((sizes >> 4) as usize, (sizes & 0xF) as usize);
+    let sizes2 = *p.get(5)?;
+    let base_offset_size = (sizes2 >> 4) as usize;
+    let index_size = if version >= 1 {
+        (sizes2 & 0xF) as usize
+    } else {
+        0
+    };
+    if ![0, 4, 8].contains(&offset_size)
+        || ![0, 4, 8].contains(&length_size)
+        || ![0, 4, 8].contains(&base_offset_size)
+    {
+        return None;
+    }
+    let mut off = 6usize;
+    let read_u = |off: &mut usize, size: usize| -> Option<u64> {
+        let v = match size {
+            0 => 0,
+            4 => u32::from_be_bytes(p.get(*off..*off + 4)?.try_into().ok()?) as u64,
+            8 => u64::from_be_bytes(p.get(*off..*off + 8)?.try_into().ok()?),
+            _ => return None,
+        };
+        *off += size;
+        Some(v)
+    };
+    let item_count = if version < 2 {
+        let v = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as u32;
+        off += 2;
+        v
+    } else {
+        let v = u32::from_be_bytes(p.get(off..off + 4)?.try_into().ok()?);
+        off += 4;
+        v
+    };
+    for _ in 0..item_count.min(64) {
+        let item_id = if version < 2 {
+            let v = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as u32;
+            off += 2;
+            v
+        } else {
+            let v = u32::from_be_bytes(p.get(off..off + 4)?.try_into().ok()?);
+            off += 4;
+            v
+        };
+        let method = if version >= 1 {
+            let m = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) & 0xF;
+            off += 2;
+            m
+        } else {
+            0
+        };
+        off += 2; // data_reference_index
+        let base = read_u(&mut off, base_offset_size)?;
+        let extent_count = u16::from_be_bytes(p.get(off..off + 2)?.try_into().ok()?) as usize;
+        off += 2;
+        if extent_count > 64 {
+            return None;
+        }
+        let mut out: Option<Vec<u8>> = (item_id == primary && method == 0).then(Vec::new);
+        for _ in 0..extent_count {
+            off += index_size;
+            let ext_off = read_u(&mut off, offset_size)?;
+            let ext_len = read_u(&mut off, length_size)?;
+            if let Some(out) = out.as_mut() {
+                let start = usize::try_from(base.checked_add(ext_off)?).ok()?;
+                let len = usize::try_from(ext_len).ok()?;
+                out.extend_from_slice(avif.get(start..start.checked_add(len)?)?);
+            }
+        }
+        if let Some(out) = out {
+            return (!out.is_empty()).then_some(out);
+        }
+    }
+    None
+}
+
+/// The primary item's `ispe` dimensions via the property associations.
+fn primary_ispe(avif: &[u8]) -> Option<(usize, usize)> {
+    let meta = meta_payload(avif)?;
+    let primary = primary_item_id(avif, meta.clone())?;
+    let (iprp, _) = find_box(avif, meta, b"iprp")?;
+    let (ipco, _) = find_box(avif, iprp.clone(), b"ipco")?;
+    let mut props: Vec<([u8; 4], std::ops::Range<usize>)> = Vec::new();
+    let mut i = ipco.start;
+    while i + 8 <= ipco.end && props.len() < 1024 {
+        let (typ, payload, box_end) = next_box(avif, i, ipco.end)?;
+        props.push((typ, payload));
+        i = box_end;
+    }
+    let (ipma, _) = find_box(avif, iprp, b"ipma")?;
+    let mut dims = None;
+    ipma_walk(avif.get(ipma)?, primary, |item_id, idx| {
+        if item_id != primary || dims.is_some() || idx == 0 {
+            return;
+        }
+        if let Some((typ, payload)) = props.get(idx - 1)
+            && typ == b"ispe"
+        {
+            let p = &avif[payload.clone()];
+            if let (Some(w), Some(h)) = (p.get(4..8), p.get(8..12)) {
+                let w = u32::from_be_bytes(w.try_into().unwrap()) as usize;
+                let h = u32::from_be_bytes(h.try_into().unwrap()) as usize;
+                if w > 0 && h > 0 {
+                    dims = Some((w, h));
+                }
+            }
+        }
+    })?;
+    dims
+}
+
 /// Container-level probe: dimensions from the primary item's AV1
-/// sequence header, no pixel decoding.
+/// sequence header, no pixel decoding. Animated containers fall back
+/// to the still primary item's `ispe`.
 pub fn probe_avif(data: &[u8]) -> Result<(usize, usize)> {
-    let avif = read_avif_container(data)?;
+    let avif = match read_avif_container(data) {
+        Ok(a) => a,
+        Err(e) => {
+            if is_animated_brand(data)
+                && let Some(dims) = primary_ispe(data)
+            {
+                return Ok(dims);
+            }
+            return Err(e);
+        }
+    };
     let meta = avif
         .primary_item_metadata()
         .context("parse AV1 sequence header")?;
@@ -1415,7 +1558,22 @@ pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize, usize)> {
 
 /// Like [`decode_avif`], but reuses `out` as the pixel buffer.
 pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize, usize)> {
-    let avif = read_avif_container(data)?;
+    let avif = match read_avif_container(data) {
+        Ok(a) => a,
+        Err(e) => {
+            // Animated AVIF: avif-parse rejects sequences outright, but
+            // MIAF requires them to carry a valid still primary item —
+            // decode that (first-frame rendering, like other image
+            // proxies). Alpha tracks are not decoded.
+            if is_animated_brand(data)
+                && let Some(item) = primary_item_bytes(data)
+            {
+                let (w, h) = with_decoded_picture(&item, |pic| picture_to_rgb(pic, out))?;
+                return Ok((w, h, 3));
+            }
+            return Err(e);
+        }
+    };
     let (w, h) = with_decoded_picture(&avif.primary_item, |pic| picture_to_rgb(pic, out))?;
     let Some(alpha_item) = avif.alpha_item.as_deref() else {
         return Ok((w, h, 3));

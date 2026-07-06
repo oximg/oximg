@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- Animated AVIF sources render their first frame instead of being
+  rejected — MIAF requires image sequences to carry a valid still
+  primary item, so the bounded container walk assembles its `iloc`
+  extents and hands them to dav1d directly (avif-parse still declines
+  sequences); `probe` falls back to the still item's `ispe`.
+  Orientation and ICC metadata apply to that first frame like any
+  still source. Alpha tracks are not decoded.
+
 ### Changed
 
 - Profiled JPEG sources targeting jpegli (the default same-format
