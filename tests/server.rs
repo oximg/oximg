@@ -393,6 +393,12 @@ fn oriented_bytes_do_not_depend_on_overlap_gate() {
     let a = fused.get("/resize/120/120/rotated.jpg").unwrap().2;
     let b = serial.get("/resize/120/120/rotated.jpg").unwrap().2;
     assert_eq!(a, b, "oriented fused and serial bytes must match");
+    #[cfg(feature = "avif")]
+    {
+        let a = fused.get("/resize/120/120/rotated.jpg@avif").unwrap().2;
+        let b = serial.get("/resize/120/120/rotated.jpg@avif").unwrap().2;
+        assert_eq!(a, b, "preheated-session and serial AVIF bytes must match");
+    }
 }
 
 /// ICC pass-through is on by default and OXIMG_ICC=0 strips it; the

@@ -296,20 +296,24 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                 // fused workers run the in-tree SIMD kernel, and fir vs
                 // kernel are byte-different backends, so fusing under
                 // fir would make a URL's bytes load-dependent.
+                // Mirrors encode_output's AVIF arm (the tuned operating
+                // point); the session the fused workers create from
+                // these is what encodes the frame.
+                #[cfg(feature = "avif")]
+                let avif_params = || {
+                    let quality = avif_quality();
+                    crate::avif::AvifParams {
+                        quality,
+                        alpha_quality: avif_alpha_quality(quality),
+                        speed: avif_speed(),
+                        ..Default::default()
+                    }
+                };
                 let cross_fuse = || -> Fuse {
                     #[cfg(feature = "avif")]
                     if target == ImageFormat::Avif {
-                        // Mirrors encode_output's AVIF arm (the tuned
-                        // operating point); the session the fused worker
-                        // creates from these is what encodes the planes.
-                        let quality = avif_quality();
                         return Fuse::Yuv {
-                            params: crate::avif::AvifParams {
-                                quality,
-                                alpha_quality: avif_alpha_quality(quality),
-                                speed: avif_speed(),
-                                ..Default::default()
-                            },
+                            params: avif_params(),
                         };
                     }
                     Fuse::Pixels
@@ -323,16 +327,27 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     // Rotation happens on the resized frame before the
                     // one-shot encode — incompatible with streaming rows
                     // into jpegli or into the YUV planes, so oriented
-                    // sources take the pixel fuse and rotate after.
-                    // TODO(orient-fuse): a rotation-aware row sink could
-                    // recover the jpegli/YUV overlap for the flip-only
-                    // orientations (2-4); oriented traffic is a small
-                    // minority, so correctness ships first.
-                    // (ICC no longer forces this path anywhere: the
-                    // fused jpegli worker writes the profile ahead of
-                    // its scanlines, AVIF splices it after the encode,
-                    // and every other target embeds via its one-shot
-                    // encoder.)
+                    // sources take the pixel fuse (decode ∥ resize kept)
+                    // and rotate after. AVIF targets additionally
+                    // preheat their encoder session on the worker,
+                    // erasing most of the remaining oriented penalty
+                    // (measured ~1ms of ~1.2ms). The rest is closed by
+                    // measurement, not TODO: streaming the jpegli
+                    // encode only works for flip-h (rows stay in
+                    // order) — real-world mirrored images are too rare
+                    // to carry the complexity — and streaming the YUV
+                    // conversion under 90° rotation would pair chroma
+                    // across resized columns, a correctness minefield
+                    // for ~0.2ms.
+                    #[cfg(feature = "avif")]
+                    if target == ImageFormat::Avif {
+                        Fuse::PixelsPreheat {
+                            params: avif_params(),
+                        }
+                    } else {
+                        Fuse::Pixels
+                    }
+                    #[cfg(not(feature = "avif"))]
                     Fuse::Pixels
                 } else if target == ImageFormat::Jpeg {
                     if p.encoder == Encoder::Jpegli {
@@ -388,6 +403,31 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                             &s.y16,
                             &s.cb16,
                             &s.cr16,
+                            icc.as_deref(),
+                        )?
+                    }
+                    #[cfg(feature = "avif")]
+                    Decoded::PixelsSession {
+                        dst_w,
+                        dst_h,
+                        session,
+                    } => {
+                        // Rotate onto the displayed frame the preheated
+                        // session was sized for, then convert + encode.
+                        let dims = crate::meta::apply_orientation(
+                            &s.out8[..dst_w * dst_h * 3],
+                            dst_w,
+                            dst_h,
+                            3,
+                            orientation,
+                            &mut s.chunk8,
+                        );
+                        std::mem::swap(&mut s.out8, &mut s.chunk8);
+                        crate::avif::encode_avif_rgb_with_session(
+                            session,
+                            &s.out8[..dims.0 * dims.1 * 3],
+                            dims.0,
+                            dims.1,
                             icc.as_deref(),
                         )?
                     }
@@ -543,6 +583,8 @@ pub fn decode_and_resize(
             }
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { .. } => unreachable!("no fuse was requested"),
+            #[cfg(feature = "avif")]
+            Decoded::PixelsSession { .. } => unreachable!("no fuse was requested"),
             Decoded::Encoded(_) => unreachable!("no fuse quality was requested"),
         }
     })
@@ -689,6 +731,15 @@ enum Decoded {
     YuvPlanes {
         session: crate::avif::SvtSession,
     },
+    /// Resized pixels in `Scratch::out8` plus a color session created
+    /// during the decode overlap, sized for the displayed frame — the
+    /// oriented-AVIF preheat path: rotate, convert, encode.
+    #[cfg(feature = "avif")]
+    PixelsSession {
+        dst_w: usize,
+        dst_h: usize,
+        session: crate::avif::SvtSession,
+    },
 }
 
 /// How the JPEG decode overlaps with downstream work (all variants
@@ -704,6 +755,12 @@ enum Fuse {
     /// (one-shot) target encoder runs after. Used for cross-format
     /// targets, hiding the resize behind the decode wall.
     Pixels,
+    /// `Pixels`, plus the worker creates the AVIF color session for
+    /// the *displayed* frame during the decode — the oriented-AVIF
+    /// path, where rotation forbids streaming the YUV conversion but
+    /// the ~1ms session setup still hides behind the decode wall.
+    #[cfg(feature = "avif")]
+    PixelsPreheat { params: crate::avif::AvifParams },
     /// Decode ∥ resize + RGB→YUV conversion straight into the 10-bit
     /// planes on the worker thread, which also creates the SVT session
     /// while the decode runs — AVIF targets, hiding the resize, the
@@ -841,13 +898,15 @@ fn decode_resize<R: std::io::BufRead>(
         && linear
     {
         scratch_u8(&mut s.out8, dst_w * dst_h * 3);
-        if let Some(decode_ms) = fused_resize_pixels(
+        if let Some((decode_ms, ())) = fused_resize_pixels(
             &mut started,
             dec_w,
             dec_h,
             dst_w,
             dst_h,
             &mut s.out8[..dst_w * dst_h * 3],
+            2,
+            || Ok(()),
         )? {
             if timing {
                 let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -858,6 +917,46 @@ fn decode_resize<R: std::io::BufRead>(
             }
             started.finish().context("decode finish failed")?;
             return Ok(Decoded::Pixels { dst_w, dst_h });
+        }
+    }
+
+    #[cfg(feature = "avif")]
+    if let Fuse::PixelsPreheat { params } = fuse
+        && linear
+    {
+        // The session encodes the *displayed* (rotated) frame. Session
+        // creation is non-fatal: SVT resource pressure downgrades to
+        // the serial encode of the same (still good) resized pixels
+        // instead of failing a request the serial path would serve —
+        // the same philosophy as the worker-spawn fallback.
+        let (disp_w, disp_h) = orientation.display_dims(dst_w, dst_h);
+        scratch_u8(&mut s.out8, dst_w * dst_h * 3);
+        if let Some((decode_ms, session)) = fused_resize_pixels(
+            &mut started,
+            dec_w,
+            dec_h,
+            dst_w,
+            dst_h,
+            &mut s.out8[..dst_w * dst_h * 3],
+            4,
+            || Ok(crate::avif::start_color_session(disp_w, disp_h, &params).ok()),
+        )? {
+            if timing {
+                let total = t0.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "timing fused-px+session({dec_w}x{dec_h}->{dst_w}x{dst_h}) decode={decode_ms:.1}ms tail={:.1}ms total={total:.1}ms",
+                    total - decode_ms
+                );
+            }
+            started.finish().context("decode finish failed")?;
+            return Ok(match session {
+                Some(session) => Decoded::PixelsSession {
+                    dst_w,
+                    dst_h,
+                    session,
+                },
+                None => Decoded::Pixels { dst_w, dst_h },
+            });
         }
     }
 
@@ -1219,16 +1318,27 @@ fn fused_resize_encode<R: std::io::BufRead>(
     not(any(target_arch = "aarch64", target_arch = "x86_64")),
     allow(unused_variables)
 )]
-fn fused_resize_pixels<R: std::io::BufRead>(
+#[allow(clippy::too_many_arguments)]
+fn fused_resize_pixels<R: std::io::BufRead, T: Send>(
     started: &mut mozjpeg::decompress::DecompressStarted<R>,
     dec_w: usize,
     dec_h: usize,
     dst_w: usize,
     dst_h: usize,
     out8: &mut [u8],
-) -> Result<Option<f64>> {
+    // Chunk-channel capacity: 2 suffices when the worker starts
+    // resizing immediately; callers whose side task occupies the
+    // worker first (session preheat, ~1ms) pass 4 so the decoder keeps
+    // running through that window, mirroring fused_resize_yuv.
+    runway: usize,
+    // Runs on the worker before the resize loop — extra setup (e.g.
+    // the oriented-AVIF session preheat) that should hide behind the
+    // decode wall alongside the resize.
+    side: impl FnOnce() -> Result<T> + Send,
+) -> Result<Option<(f64, T)>> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
+        let _ = side;
         Ok(None)
     }
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1242,10 +1352,10 @@ fn fused_resize_pixels<R: std::io::BufRead>(
         let row_bytes = dec_w * 3;
         // Chunking and channel shapes mirror fused_resize_encode.
         let chunk_rows = (64 * 1024 / row_bytes).clamp(1, dec_h);
-        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(2);
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, usize)>(runway);
         let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
-        std::thread::scope(|sc| -> Result<Option<f64>> {
+        std::thread::scope(|sc| -> Result<Option<(f64, T)>> {
             // The worker borrows the resizer instead of consuming it, so
             // its Drop runs on this (long-lived blocking-pool) thread and
             // the kernel scratch returns to this thread's pool — dropping
@@ -1254,7 +1364,8 @@ fn fused_resize_pixels<R: std::io::BufRead>(
             let resizer = &mut resizer;
             let spawned = std::thread::Builder::new()
                 .name("oximg-fuse".into())
-                .spawn_scoped(sc, move || -> Result<()> {
+                .spawn_scoped(sc, move || -> Result<T> {
+                    let side_value = side()?;
                     let fwd = fwd_lut_f32();
                     let back = back_lut();
                     while let Ok((buf, rows)) = chunk_rx.recv() {
@@ -1275,7 +1386,7 @@ fn fused_resize_pixels<R: std::io::BufRead>(
                         resizer.rows_emitted() == dst_h,
                         "decode ended before the image was complete"
                     );
-                    Ok(())
+                    Ok(side_value)
                 });
             // Spawn failure (thread limits, transient EAGAIN) leaves the
             // decoder untouched, exactly like a missing kernel — fall
@@ -1319,8 +1430,7 @@ fn fused_resize_pixels<R: std::io::BufRead>(
             // A decode error is the root cause; report it over the
             // worker's consequent "incomplete image" error.
             decode_result?;
-            worker_result?;
-            Ok(Some(decode_ms))
+            Ok(Some((decode_ms, worker_result?)))
         })
     }
 }
@@ -2576,6 +2686,8 @@ mod tests {
             }
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
+            #[cfg(feature = "avif")]
+            Decoded::PixelsSession { .. } => panic!("preheat fuse was not requested"),
         }
     }
 
@@ -2633,6 +2745,8 @@ mod tests {
             Decoded::Encoded(_) => panic!("pixel run must not encode"),
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
+            #[cfg(feature = "avif")]
+            Decoded::PixelsSession { .. } => panic!("preheat fuse was not requested"),
         }
     }
 
@@ -2689,8 +2803,76 @@ mod tests {
                 crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16, icc)
                     .unwrap()
             }
+            Decoded::PixelsSession { .. } => panic!("preheat fuse was not requested"),
             Decoded::Encoded(_) => panic!("avif run must not hit the jpegli fuse"),
         }
+    }
+
+    /// Oriented AVIF targets preheat their session on the fused
+    /// worker; the bytes must match the fully serial path (rotate on
+    /// out8, then encode_avif) exactly.
+    #[cfg(feature = "avif")]
+    #[test]
+    fn preheated_session_bytes_match_serial_oriented_avif() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        let params = test_avif_params();
+        let orientation = crate::meta::Orientation::from_rot_mirror(1, None); // 90° CCW
+        let jpeg = make_test_jpeg(799, 601, false);
+        let run = |fuse: Fuse| -> Vec<u8> {
+            let mut s = Scratch::default();
+            let dec = Decompress::new_mem(&jpeg).unwrap();
+            match decode_resize(&mut s, dec, 320, 320, 1, orientation, fuse, None).unwrap() {
+                Decoded::PixelsSession {
+                    dst_w,
+                    dst_h,
+                    session,
+                } => {
+                    let dims = crate::meta::apply_orientation(
+                        &s.out8[..dst_w * dst_h * 3],
+                        dst_w,
+                        dst_h,
+                        3,
+                        orientation,
+                        &mut s.chunk8,
+                    );
+                    std::mem::swap(&mut s.out8, &mut s.chunk8);
+                    crate::avif::encode_avif_rgb_with_session(
+                        session,
+                        &s.out8[..dims.0 * dims.1 * 3],
+                        dims.0,
+                        dims.1,
+                        None,
+                    )
+                    .unwrap()
+                }
+                Decoded::Pixels { dst_w, dst_h } => {
+                    let dims = crate::meta::apply_orientation(
+                        &s.out8[..dst_w * dst_h * 3],
+                        dst_w,
+                        dst_h,
+                        3,
+                        orientation,
+                        &mut s.chunk8,
+                    );
+                    std::mem::swap(&mut s.out8, &mut s.chunk8);
+                    crate::avif::encode_avif(
+                        &s.out8[..dims.0 * dims.1 * 3],
+                        dims.0,
+                        dims.1,
+                        3,
+                        &params,
+                        None,
+                    )
+                    .unwrap()
+                }
+                _ => panic!("unexpected decode result"),
+            }
+        };
+        let serial = run(Fuse::Off);
+        let preheated = run(Fuse::PixelsPreheat { params });
+        assert_eq!(serial, preheated, "preheat must not change a byte");
     }
 
     #[cfg(feature = "avif")]

@@ -681,6 +681,30 @@ pub(crate) fn encode_avif_with_session(
     Ok(finish_avif(&color, None, w, h, icc))
 }
 
+/// Encode interleaved RGB8 with an already-created color session —
+/// the oriented-target preheat path. Same conversion scratch, same
+/// encode as [`encode_avif`] on 3-channel input, so the output is
+/// byte-identical to the serial path (asserted in tests).
+pub(crate) fn encode_avif_rgb_with_session(
+    session: SvtSession,
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    ensure!(pixels.len() >= w * h * 3, "pixel buffer too small");
+    ensure!(
+        (session.w, session.h) == (w, h),
+        "preheated session dims mismatch"
+    );
+    let color = ENC_SCRATCH.with(|s| {
+        let (y_plane, cb_plane, cr_plane) = &mut *s.borrow_mut();
+        rgb_to_yuv420_10bit(pixels, w, h, 3, y_plane, cb_plane, cr_plane);
+        session.encode(y_plane, cb_plane, cr_plane)
+    })?;
+    Ok(finish_avif(&color, None, w, h, icc))
+}
+
 /// Assemble the AVIF container around the encoded AV1 item(s); with a
 /// profile, splice the `colr` (`prof`) property in afterwards
 /// (avif-serialize speaks CICP only). The nclx `colr` stays alongside

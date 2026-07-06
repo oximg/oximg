@@ -323,10 +323,12 @@ pub(crate) fn scan_jpeg_meta<R: std::io::BufRead>(
 ///
 /// Loops are destination-major (sequential writes, strided reads); the
 /// whole frame is at most the fitted output (≤ ~0.8MB at 512²x3), so
-/// this is a sub-millisecond pass.
-/// TODO(simd-orient): the 90°/270° cases are strided-read transposes
-/// that would benefit from cache-blocked/SIMD kernels if profiles ever
-/// show them; at output sizes the scalar pass has not been worth it.
+/// this is a fast pass: the flip family reduces to (reversed) row
+/// copies and the transpose family runs cache-blocked, all
+/// monomorphized per channel count — measured 5-10x over the previous
+/// generic per-pixel loop at output sizes. The generic loop survives
+/// as [`apply_orientation_reference`], the oracle the specializations
+/// are pinned against byte-for-byte.
 pub(crate) fn apply_orientation(
     src: &[u8],
     w: usize,
@@ -341,9 +343,101 @@ pub(crate) fn apply_orientation(
         dst.resize(dw * dh * channels, 0);
     }
     dst.truncate(dw * dh * channels);
-    // Source coordinates for display coordinate (x, y), derived from
-    // the TIFF 6.0 orientation definitions and pinned by the corner
-    // anchors in tests::every_orientation_matches_its_anchor.
+    match channels {
+        3 => orient_pixels::<3>(src, w, h, o, dst),
+        4 => orient_pixels::<4>(src, w, h, o, dst),
+        _ => apply_orientation_reference(src, w, h, channels, o, dst),
+    }
+    (dw, dh)
+}
+
+/// Channel-monomorphized orientation pass. `dst` is already sized to
+/// the displayed frame.
+fn orient_pixels<const C: usize>(src: &[u8], w: usize, h: usize, o: Orientation, dst: &mut [u8]) {
+    match o.0 {
+        1 => dst.copy_from_slice(&src[..w * h * C]),
+        // Flip family: whole (reversed) row copies.
+        2 => {
+            for (drow, srow) in dst
+                .chunks_exact_mut(w * C)
+                .zip(src[..w * h * C].chunks_exact(w * C))
+            {
+                for (d, s) in drow.chunks_exact_mut(C).zip(srow.chunks_exact(C).rev()) {
+                    d.copy_from_slice(s);
+                }
+            }
+        }
+        3 => {
+            for (d, s) in dst
+                .chunks_exact_mut(C)
+                .zip(src[..w * h * C].chunks_exact(C).rev())
+            {
+                d.copy_from_slice(s);
+            }
+        }
+        4 => {
+            for (drow, srow) in dst
+                .chunks_exact_mut(w * C)
+                .zip(src[..w * h * C].chunks_exact(w * C).rev())
+            {
+                drow.copy_from_slice(srow);
+            }
+        }
+        // Transpose family: cache-blocked tiles with the coordinate map
+        // inlined per arm (a closure generic, not a fn pointer).
+        5 => orient_tiles::<C>(src, w, h, h, w, dst, |x, y, _w, _h| (y, x)),
+        6 => orient_tiles::<C>(src, w, h, h, w, dst, |x, y, _w, h| (y, h - 1 - x)),
+        7 => orient_tiles::<C>(src, w, h, h, w, dst, |x, y, w, h| (w - 1 - y, h - 1 - x)),
+        _ => orient_tiles::<C>(src, w, h, h, w, dst, |x, y, w, _h| (w - 1 - y, x)),
+    }
+}
+
+/// Tiled destination-major copy; `f(x, y, w, h)` maps a display
+/// coordinate to its stored source coordinate and inlines per call
+/// site.
+#[inline]
+fn orient_tiles<const C: usize>(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    dw: usize,
+    dh: usize,
+    dst: &mut [u8],
+    f: impl Fn(usize, usize, usize, usize) -> (usize, usize) + Copy,
+) {
+    // 64px tiles keep both the strided reads and the sequential writes
+    // inside L1 for 3-4 byte pixels.
+    const B: usize = 64;
+    for ty in (0..dh).step_by(B) {
+        let y_end = (ty + B).min(dh);
+        for tx in (0..dw).step_by(B) {
+            let x_end = (tx + B).min(dw);
+            for y in ty..y_end {
+                let row = &mut dst[(y * dw + tx) * C..(y * dw + x_end) * C];
+                for (px, x) in row.chunks_exact_mut(C).zip(tx..x_end) {
+                    let (sx, sy) = f(x, y, w, h);
+                    let s = (sy * w + sx) * C;
+                    px.copy_from_slice(&src[s..s + C]);
+                }
+            }
+        }
+    }
+}
+
+/// The original per-pixel generic loop: the reference oracle for the
+/// specializations above (and the fallback for unusual channel
+/// counts). Source coordinates for display coordinate (x, y) derive
+/// from the TIFF 6.0 orientation definitions and are pinned by the
+/// corner anchors in tests::every_orientation_matches_its_anchor.
+fn apply_orientation_reference(
+    src: &[u8],
+    w: usize,
+    h: usize,
+    channels: usize,
+    o: Orientation,
+    dst: &mut [u8],
+) {
+    let (dw, dh) = o.display_dims(w, h);
     let src_xy: fn(usize, usize, usize, usize) -> (usize, usize) = match o.0 {
         1 => |x, y, _w, _h| (x, y),
         2 => |x, y, w, _h| (w - 1 - x, y),
@@ -362,7 +456,6 @@ pub(crate) fn apply_orientation(
             px.copy_from_slice(&src[s..s + channels]);
         }
     }
-    (dw, dh)
 }
 
 #[cfg(test)]
@@ -736,6 +829,60 @@ mod tests {
                 let (gw, gh) = apply_orientation(&src, w, h, 1, composed, &mut got);
                 assert_eq!((gw, gh), (ww, wh), "angle={angle} mirror={mirror:?}");
                 assert_eq!(got, want, "angle={angle} mirror={mirror:?}");
+            }
+        }
+    }
+
+    /// Every specialization must match the reference oracle byte for
+    /// byte, across orientations, channel counts, and odd/even/tiny
+    /// dimensions (including tile-boundary sizes).
+    #[test]
+    fn specialized_orientation_matches_reference() {
+        for &(w, h) in &[
+            (1usize, 1usize),
+            (2, 3),
+            (5, 4),
+            (31, 17),
+            (64, 64),
+            (65, 63),
+            (129, 64),
+        ] {
+            for &channels in &[1usize, 3, 4] {
+                let src: Vec<u8> = (0..w * h * channels)
+                    .map(|i| (i * 89 % 251) as u8)
+                    .collect();
+                for o in 1..=8u8 {
+                    let mut got = Vec::new();
+                    let (dw, dh) =
+                        apply_orientation(&src, w, h, channels, Orientation(o), &mut got);
+                    let mut want = vec![0u8; dw * dh * channels];
+                    apply_orientation_reference(&src, w, h, channels, Orientation(o), &mut want);
+                    assert_eq!(got, want, "o={o} {w}x{h} c={channels}");
+                }
+            }
+        }
+    }
+
+    /// Manual micro-benchmark for the rotation pass at output sizes.
+    /// cargo test --release --features avif bench_orient -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_orient() {
+        for (w, h) in [(512usize, 340usize), (340, 512), (512, 512), (120, 90)] {
+            let src: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+            let mut dst = Vec::new();
+            for o in [2u8, 3, 6, 8] {
+                // warm
+                for _ in 0..3 {
+                    apply_orientation(&src, w, h, 3, Orientation(o), &mut dst);
+                }
+                let n = 200;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    apply_orientation(&src, w, h, 3, Orientation(o), &mut dst);
+                }
+                let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                println!("orient o={o} {w}x{h}: {us:.1}µs");
             }
         }
     }

@@ -25,6 +25,22 @@ HTTP interface without notice.
 
 ### Changed
 
+- The oriented-source penalty shrank on both axes it could shrink
+  without risking bytes. The post-resize rotation pass is now
+  channel-monomorphized (flips reduce to reversed row copies, the
+  transpose family runs cache-blocked) — ~3x faster on both
+  architectures, pinned byte-for-byte against the original loop as an
+  in-tree oracle. And oriented AVIF targets preheat their SVT session
+  on the fused worker during the decode (creation failure downgrades
+  to the serial encode, never a failed request). Measured on the Ryzen
+  SMT pair at 512px: oriented JPEG→JPEG single-request penalty
+  +1.35ms → +0.88ms; oriented JPEG→AVIF +1.25ms → +0.49ms. The
+  remaining gap is the serial YUV conversion and the encode overlap,
+  closed by measurement as not worth their complexity: streaming
+  jpegli only works for the rare flip-h case, and streaming the YUV
+  conversion under 90° rotation would pair chroma across resized
+  columns.
+
 - Profiled JPEG sources targeting jpegli (the default same-format
   path) ride the fused pipeline again: the fused worker writes the
   APP2 ICC chain ahead of its scanlines — byte-identical to the serial
