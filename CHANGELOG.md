@@ -12,6 +12,13 @@ HTTP interface without notice.
 
 ### Added
 
+- BENCH.md gains a "Metadata sources" section with measured
+  oriented/profiled competitive cells (oximg leads imgproxy +21% to
+  +51%, the gap widening on metadata sources because imgproxy applies
+  and strips ICC profiles where oximg passes them through), and both
+  BENCH.md and QUALITY.md now stamp the 0.4.x metadata work's
+  measurement provenance (byte-transparent for metadata-free sources;
+  quality-neutral by construction).
 - Library-usage examples (`examples/thumbnail`, `transcode`, `probe`)
   showing `pipeline::process`/`process_path`/`probe` with `Params`
   outside the HTTP server — the existing examples were all internal

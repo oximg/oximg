@@ -510,12 +510,60 @@ this table establishes is the safe envelope: on 4 cores, oximg
 sustains its full throughput with zero failures at any connection
 count a real deployment will see, and degrades by latency only.
 
+## Metadata sources (orientation / ICC)
+
+The dataset above carries no orientation tags or ICC profiles. Real
+traffic does — phone photos are almost always EXIF-oriented, and
+print/design assets carry ICC profiles — so these cells measure the
+same harness over variants of the DIV2K set with an orientation-6 EXIF
+tag or a real sRGB profile (sRGB2014.icc) spliced into each JPEG (byte
+surgery, no recompression; see
+[bench/metadata_cells.sh](bench/metadata_cells.sh)). Ryzen 7 8745HS,
+`cpuset: "0,1"`, 2 VUs, oximg 0.4.4 vs imgproxy at its defaults, two
+interleaved rounds each (both shown; averaged for the delta).
+
+req/s, oximg vs imgproxy:
+
+| Cell | oximg (r1, r2) | imgproxy (r1, r2) | oximg lead |
+|---|---|---|---|
+| clean JPEG→JPEG (baseline) | 194.0, 200.5 | 163.3, 162.7 | **+21%** |
+| oriented JPEG→JPEG | 190.1, 197.5 | 156.4, 157.8 | **+23%** |
+| profiled JPEG→JPEG | 195.3, 199.7 | 130.8, 130.6 | **+51%** |
+| oriented JPEG→AVIF | 115.1, 115.8 | 101.6, 100.6 | **+14%** |
+| profiled JPEG→AVIF | 119.3, 117.4 | 92.1, 91.6 | **+29%** |
+
+- oximg's own metadata cost is in the noise: orientation is a
+  post-resize rotation on the small output frame (a channel-
+  monomorphized pass, ~0.1 ms) and ICC is a byte-for-byte
+  pass-through (no pixel work), so its cells sit within a round of the
+  clean baseline.
+- imgproxy's lead *widens* on metadata sources because it does more
+  work: it applies the ICC profile — a full color transform to sRGB —
+  and then strips it, which on this real profile costs ~20% of its
+  JPEG throughput (163 → 131) and clips every out-of-gamut color in
+  the process. oximg passes the profile through untouched, so a
+  wide-gamut source stays wide-gamut *and* costs nothing (see
+  [quality/QUALITY.md](bench/quality/QUALITY.md) on the fidelity
+  difference). The orientation gap is smaller but same-signed:
+  imgproxy's saturated oriented-JPEG cell drops ~3.4% under its clean
+  baseline, oximg's ~1.5%.
+- These are single-box numbers (not the AWS grid); they measure the
+  *relative* metadata cost, which is what a real deployment's
+  phone-photo / design-asset traffic pays.
+
 ## Notes
 
 - Measurement provenance: the official-harness tables (local Ryzen and
-  AWS) reflect the current code; the oximg rows were re-measured after
-  each significant pipeline change, and competitor rows are re-measured
-  whenever the environment changes (same-box anchors bound
+  AWS) were measured at the 0.3.0 cross-format + fused-overlap state
+  (2026-07-05). The metadata work since (0.4.x: EXIF/AVIF orientation,
+  ICC pass-through, animated first-frame) is byte-transparent for
+  metadata-free sources — the benchmark dataset carries no orientation
+  tags or ICC profiles (verified) and its output is byte-identical
+  across 0.3.0→0.4.x (18/18 URL hash matrix) — so these throughput
+  cells are unchanged by it. Sources that *do* carry metadata are
+  measured separately in "Metadata sources" below. The oximg rows were
+  re-measured after each significant pipeline change, and competitor
+  rows whenever the environment changes (same-box anchors bound
   instance-to-instance variance at ~3%). The earlier sustained-load,
   macOS, and gist-reproduction sections are historical measurements of
   the JPEG path and predate the format expansion; their competitor

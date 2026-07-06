@@ -161,6 +161,26 @@ Conclusions the defaults rest on:
   anchor by +16% — BENCH.md). The default stays 8: quality per byte is
   the shipped identity, and the benchmarked cells are measured there.
 
+## Metadata (orientation, ICC) — quality-neutral by construction
+
+The 0.4.x metadata handling does not move any score here, and does not
+need its own measured table:
+
+- **Orientation** (EXIF, AVIF irot/imir) rotates the already-resized
+  pixels; because Lanczos is separable, resize-then-rotate is exactly
+  rotate-then-resize, so a corrected image scores identically to the
+  same scene shot upright. The scored corpus carries no orientation
+  tags, so Group A/B numbers are unaffected.
+- **ICC pass-through** copies the profile bytes unchanged and never
+  color-converts the pixels — SSIMULACRA2 (which scores in a fixed
+  working space) sees identical pixels with or without it. The
+  quality *difference* it makes is on wide-gamut sources at display
+  time, not in this metric: the common proxy default normalizes to
+  sRGB and strips the profile, permanently clipping out-of-gamut
+  colors (a Display P3 photo loses its saturated reds/greens);
+  pass-through preserves them. That is a fidelity property, verified
+  by round-trip byte-equality of the profile rather than a score.
+
 ## Notes
 
 - The linear-light reference is produced by ImageMagick (also a
