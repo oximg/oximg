@@ -170,6 +170,7 @@ mod tests {
                 let name = &rest[..end];
                 // main.rs startup settings are documented separately.
                 let startup = [
+                    "OXIMG_LOG",
                     "OXIMG_KEY",
                     "OXIMG_SALT",
                     "OXIMG_SOURCE_BASE_URL",

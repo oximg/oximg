@@ -292,6 +292,31 @@ fn max_source_bytes() -> u64 {
     crate::config::config().max_source_bytes
 }
 
+/// Marker attached (as anyhow context) to failures that are the
+/// server's fault — encoding, worker infrastructure — as opposed to
+/// undecodable client input. The HTTP layer maps these to 500 with a
+/// generic body instead of 422 with error text.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerFault;
+
+impl std::fmt::Display for ServerFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("internal image-processing error")
+    }
+}
+
+/// Marker for remote-origin failures (transport errors, non-404 error
+/// statuses): the HTTP layer answers 502, not 422 — the client's
+/// request was fine, the upstream wasn't.
+#[derive(Debug, Clone, Copy)]
+pub struct UpstreamFault;
+
+impl std::fmt::Display for UpstreamFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream image fetch failed")
+    }
+}
+
 /// Remote-source variant: stream the HTTP response body straight into the
 /// decoder — decoding overlaps the download and the source is never
 /// buffered whole, same as the file path.
@@ -302,7 +327,11 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
             std::io::ErrorKind::NotFound,
             "source returned 404",
         )),
-        other => anyhow::Error::new(other).context("fetch source"),
+        // Origin 5xx/4xx and transport failures are the upstream's
+        // fault, not the request's.
+        other => anyhow::Error::new(other)
+            .context("fetch source")
+            .context(UpstreamFault),
     })?;
     let reader = std::io::Read::take(resp.into_body().into_reader(), max_source_bytes());
     process_reader(reader, p)

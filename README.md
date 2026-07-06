@@ -225,7 +225,9 @@ x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_PNG_EFFORT` (`fast`; `fastest`/`balanced`/`high` trade PNG size
 against encode time), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
 libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
-per-stage timing lines to stderr),
+per-stage timing lines to stderr), `OXIMG_LOG` (`error`: one stderr
+line per failed request, always on; `request` also logs successes,
+with a request id and wall time),
 `OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
 second thread, cutting single-request latency ~20%; the default `auto`
 fuses while `2 x active requests <= visible CPUs` and falls back to

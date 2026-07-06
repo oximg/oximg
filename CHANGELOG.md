@@ -10,6 +10,23 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Failure statuses are honest and failures are finally visible
+  server-side. Server faults (encode failures, worker infrastructure)
+  answer 500 and remote-origin failures answer 502 — both with generic
+  bodies, the full error chain going to stderr instead of the client —
+  while undecodable input keeps its 422 with a message; a processing
+  panic is a 500, not the previous 422. Every failed request logs one
+  structured stderr line (request id, status, wall time, path);
+  `OXIMG_LOG=request` extends that to successes. Pipeline modules were
+  reorganized (`pipeline/`, `avif/` — the attacker-facing ISOBMFF
+  walker now isolated in a zero-unsafe module), the fused decode-loop
+  scaffolding deduplicated, and every runtime knob unified in one
+  once-cached config with a test that pins each knob to its README
+  entry (which surfaced four undocumented ones). Byte-for-byte
+  identical outputs across the whole series (18/18 URL matrix).
+
 ### Fixed
 
 - URL signing now fails closed: a set-but-undecodable `OXIMG_KEY` or

@@ -35,6 +35,8 @@ type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>
 
 #[derive(Clone)]
 struct App {
+    /// OXIMG_LOG=request also logs successes; failures always log.
+    log_requests: bool,
     images_dir: Arc<PathBuf>,
     // When set (OXIMG_SOURCE_BASE_URL), sources are fetched from
     // `<base>/<file>` over HTTP instead of the local filesystem. The base
@@ -175,6 +177,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         ),
         resize_threads: env_or("OXIMG_PAR", 1),
         inflight: Arc::new(Mutex::new(HashMap::new())),
+        log_requests: std::env::var("OXIMG_LOG").as_deref() == Ok("request"),
         signing: Signing::from_env()
             .unwrap_or_else(|e| {
                 eprintln!("oximg: fatal: {e}");
@@ -321,7 +324,36 @@ fn negotiate(auto: &[ImageFormat], accept: &AcceptHeader) -> Option<ImageFormat>
         .find(|f| accept.contains(f.content_type()))
 }
 
+/// Logging wrapper: one structured stderr line per failure (always)
+/// or per request (OXIMG_LOG=request), with a process-unique id so
+/// concurrent requests interleave legibly.
 async fn serve_resize(
+    app: App,
+    w: u32,
+    h: u32,
+    file: String,
+    accept: AcceptHeader,
+) -> Result<Response, (StatusCode, String)> {
+    static REQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let req = REQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let log_requests = app.log_requests;
+    let t0 = std::time::Instant::now();
+    let path = format!("/resize/{w}/{h}/{file}");
+    let result = serve_resize_inner(app, w, h, file, accept).await;
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    match &result {
+        Err((status, msg)) => {
+            eprintln!("oximg: req={req} status={status} ms={ms:.1} path={path:?} err={msg:?}");
+        }
+        Ok(_) if log_requests => {
+            eprintln!("oximg: req={req} status=200 ms={ms:.1} path={path:?}");
+        }
+        Ok(_) => {}
+    }
+    result
+}
+
+async fn serve_resize_inner(
     app: App,
     w: u32,
     h: u32,
@@ -475,16 +507,36 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         }
     })
     .await
-    .map_err(|_| {
+    .map_err(|e| {
+        eprintln!("oximg: error status=500 file={file:?} panic={e}");
         (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "image processing panicked (broken image?)".to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image processing failed".to_string(),
         )
     })?
     .map_err(|e| match e.downcast_ref::<std::io::Error>() {
         Some(io) if io.kind() == std::io::ErrorKind::NotFound => {
             (StatusCode::NOT_FOUND, "image not found".to_string())
         }
+        // Upstream and server faults answer with generic bodies — the
+        // detail (full context chain) goes to stderr, where an
+        // operator can see it, instead of to the client.
+        _ if e.downcast_ref::<pipeline::UpstreamFault>().is_some() => {
+            eprintln!("oximg: error status=502 file={file:?} err={e:#}");
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream image fetch failed".to_string(),
+            )
+        }
+        _ if e.downcast_ref::<pipeline::ServerFault>().is_some() => {
+            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal image-processing error".to_string(),
+            )
+        }
+        // Everything else is undecodable client input: the top-level
+        // message (not the chain) is safe and useful to return.
         _ => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
     })?;
 

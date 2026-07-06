@@ -554,6 +554,78 @@ fn fir_backend_disables_fusing_for_stable_bytes() {
     }
 }
 
+/// Failure statuses are honest: an origin failure is 502 (the client's
+/// request was fine), an origin 404 passes through as 404, and
+/// undecodable input stays 422.
+#[test]
+fn error_statuses_are_honest() {
+    // Origin that 500s on "boom*", 404s on missing, serves otherwise.
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .trim_start_matches('/');
+                use std::io::Write;
+                if path.starts_with("boom") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                match std::fs::read(format!("{fixtures}/{path}")) {
+                    Ok(data) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    Err(_) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    let s = Server::start(
+        47134,
+        &[(
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        )],
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/boom.jpg"),
+        502,
+        "origin 5xx is the upstream's fault"
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/missing.jpg"),
+        404,
+        "origin 404 passes through"
+    );
+    // Text served as an image is undecodable client input: 422 with a
+    // message (LICENSE is a fixture-relative text file? use README).
+    assert_eq!(s.status_of("/resize/100/100/list.txt"), 422);
+}
+
 #[test]
 fn remote_source_mode_streams_from_http_origin() {
     // origin: a second oximg? No — a minimal static file server thread.

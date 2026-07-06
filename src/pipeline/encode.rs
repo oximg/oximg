@@ -264,6 +264,21 @@ pub(super) fn encode_output(
     p: &Params,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // By this point the input decoded fine: anything that fails now is
+    // the server's problem, not the client's.
+    encode_output_inner(s, dst_w, dst_h, channels, target, p, icc).context(ServerFault)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_output_inner(
+    s: &mut Scratch,
+    dst_w: usize,
+    dst_h: usize,
+    channels: usize,
+    target: ImageFormat,
+    p: &Params,
+    icc: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     match target {
         ImageFormat::Jpeg => {
             if channels == 4 {

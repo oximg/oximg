@@ -569,7 +569,8 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
                     &s.cb16,
                     &s.cr16,
                     icc.as_deref(),
-                )?
+                )
+                .context(ServerFault)?
             }
             #[cfg(feature = "avif")]
             Decoded::PixelsSession {
@@ -594,7 +595,8 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
                     dims.0,
                     dims.1,
                     icc.as_deref(),
-                )?
+                )
+                .context(ServerFault)?
             }
         }
     })

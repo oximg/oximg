@@ -112,7 +112,7 @@ fn fused_decode_loop<R: std::io::BufRead, T: Send>(
 
         let worker_result = worker
             .join()
-            .map_err(|_| anyhow::anyhow!("fuse worker panicked"))?;
+            .map_err(|_| anyhow::anyhow!("fuse worker panicked").context(ServerFault))?;
         // A decode error is the root cause; report it over the worker's
         // consequent "incomplete image" error.
         decode_result?;
@@ -196,7 +196,9 @@ pub(super) fn fused_resize_encode<R: std::io::BufRead>(
                         enc_result = enc.write_scanlines(&row8);
                     }
                 });
-                enc_result.context("fused encode failed")
+                enc_result
+                    .context("fused encode failed")
+                    .context(ServerFault)
             })?;
             // Channel closed: either the decoder delivered everything or
             // it failed mid-image; only a complete image may be finished
@@ -205,7 +207,9 @@ pub(super) fn fused_resize_encode<R: std::io::BufRead>(
                 resizer.rows_emitted() == dst_h,
                 "decode ended before the image was complete"
             );
-            enc.finish().context("fused encode finish failed")
+            enc.finish()
+                .context("fused encode finish failed")
+                .context(ServerFault)
         })?;
         Ok(out.map(|(decode_ms, bytes)| (bytes, decode_ms)))
     }
