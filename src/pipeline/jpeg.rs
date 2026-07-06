@@ -116,7 +116,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     // the other fuse variants embed via their one-shot encoders.
     icc: Option<&[u8]>,
 ) -> Result<Decoded> {
-    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let timing = crate::config::config().timing;
     let t0 = std::time::Instant::now();
 
     let (src_w, src_h) = dec.size();
@@ -281,7 +281,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
         // produce identical bytes on every architecture.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if parallel <= 1
-            && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir")
+            && !crate::config::config().fir_backend
             && let Ok(mut resizer) =
                 crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
         {
@@ -486,10 +486,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             }
             Fuse::Pixels
         };
-        let fuse = if p.parallel > 1
-            || !overlap_gate()
-            || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
-        {
+        let fuse = if p.parallel > 1 || !overlap_gate() || crate::config::config().fir_backend {
             Fuse::Off
         } else if !orientation.is_upright() {
             // Rotation happens on the resized frame before the

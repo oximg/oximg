@@ -166,10 +166,7 @@ pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize,
 /// (measured -6% requests/s on Graviton3) — single-threaded decoding
 /// is the default there. OXIMG_AVIF_DECODE_THREADS overrides.
 pub(super) fn dav1d_threads() -> std::os::raw::c_int {
-    std::env::var("OXIMG_AVIF_DECODE_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(if cfg!(target_arch = "x86_64") { 2 } else { 1 })
+    crate::config::config().avif_decode_threads
 }
 
 /// Run one dav1d session over a single-frame AV1 stream and hand the

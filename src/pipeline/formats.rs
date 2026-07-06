@@ -10,7 +10,7 @@ pub(super) fn process_png<R: std::io::Read>(
     target: ImageFormat,
     p: &Params,
 ) -> Result<Vec<u8>> {
-    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let timing = crate::config::config().timing;
     let t0 = std::time::Instant::now();
     s.srcbuf.clear();
     reader
@@ -192,7 +192,7 @@ pub(super) fn process_webp<R: std::io::Read>(
     // decode at >= margin x target, then hand the remainder to linear-light
     // Lanczos. libwebp's scaler alone (scale straight to target) is what
     // costs other servers their score.
-    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let timing = crate::config::config().timing;
     let t0 = std::time::Instant::now();
     // One mux parse serves both metadata chunks: the ICC profile and
     // the EXIF orientation (raw TIFF or JPEG-style prefixed; writers
@@ -250,7 +250,7 @@ pub(super) fn process_avif<R: std::io::Read>(
         .read_to_end(&mut s.srcbuf)
         .context("read AVIF source")?;
 
-    let timing = std::env::var("OXIMG_TIMING").is_ok();
+    let timing = crate::config::config().timing;
     let t0 = std::time::Instant::now();
     // avif-parse exposes neither colr nor irot/imir; both come from
     // our own bounded container walk.
@@ -341,7 +341,7 @@ pub(super) fn webp_decode_into_chunk8(
         // reconstruction across two threads (the same setting libvips
         // ships); like band-parallel resize this briefly exceeds the CPU
         // slot without oversubscribing on average.
-        if std::env::var("OXIMG_WEBP_DECODE_THREADS").as_deref() != Ok("0") {
+        if crate::config::config().webp_decode_threads {
             config.options.use_threads = 1;
         }
         config.output.colorspace = if channels == 4 {

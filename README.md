@@ -222,6 +222,10 @@ the portable fast_image_resize convolution instead of the platform
 kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
 x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
+`OXIMG_PNG_EFFORT` (`fast`; `fastest`/`balanced`/`high` trade PNG size
+against encode time), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
+libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
+per-stage timing lines to stderr),
 `OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
 second thread, cutting single-request latency ~20%; the default `auto`
 fuses while `2 x active requests <= visible CPUs` and falls back to

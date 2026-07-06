@@ -1,5 +1,6 @@
 pub mod pipeline;
 
+pub(crate) mod config;
 pub(crate) mod meta;
 pub(crate) mod resize_kernel;
 

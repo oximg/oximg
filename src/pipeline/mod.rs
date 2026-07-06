@@ -128,10 +128,7 @@ fn dct_scale_num(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, margin:
 }
 
 fn dct_margin() -> f64 {
-    std::env::var("OXIMG_DCT_MARGIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.7)
+    crate::config::config().dct_margin
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -292,10 +289,7 @@ fn http_agent() -> &'static ureq::Agent {
 }
 
 fn max_source_bytes() -> u64 {
-    std::env::var("OXIMG_MAX_SOURCE_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64 * 1024 * 1024)
+    crate::config::config().max_source_bytes
 }
 
 /// Remote-source variant: stream the HTTP response body straight into the
@@ -410,7 +404,7 @@ fn resize_bands(
         // kernel (1.33x over fir on the benchmark shape; see
         // examples/resize_bench_x86.rs).
         #[cfg(target_arch = "x86_64")]
-        if std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir") {
+        if !crate::config::config().fir_backend {
             if px == PixelType::U16x3 {
                 return resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h);
             }
@@ -422,7 +416,7 @@ fn resize_bands(
         }
         #[cfg(target_arch = "aarch64")]
         if matches!(px, PixelType::U16x3 | PixelType::U16x4)
-            && std::env::var("OXIMG_RESIZE_BACKEND").as_deref() != Ok("fir")
+            && !crate::config::config().fir_backend
             && std::arch::is_aarch64_feature_detected!("neon")
         {
             return crate::resize_neon::resize_u16_neon(
@@ -556,22 +550,20 @@ fn overlap_gate() -> bool {
 }
 
 fn linear_light() -> bool {
-    std::env::var("OXIMG_RESIZE").as_deref() != Ok("srgb")
+    crate::config::config().linear_light
 }
 
 /// OXIMG_AUTO_ROTATE: apply EXIF orientation (default on; "0"
 /// disables, which also skips the pre-decode segment scan entirely).
 fn auto_rotate() -> bool {
-    static A: OnceLock<bool> = OnceLock::new();
-    *A.get_or_init(|| std::env::var("OXIMG_AUTO_ROTATE").as_deref() != Ok("0"))
+    crate::config::config().auto_rotate
 }
 
 /// OXIMG_ICC: carry the source's ICC profile into the output (default
 /// on; "0" disables and skips profile extraction entirely). Pixels are
 /// never color-converted — the profile bytes are passed through.
 fn icc_passthrough() -> bool {
-    static I: OnceLock<bool> = OnceLock::new();
-    *I.get_or_init(|| std::env::var("OXIMG_ICC").as_deref() != Ok("0"))
+    crate::config::config().icc_passthrough
 }
 
 /// Targets that can carry an ICC profile — all of them when the avif

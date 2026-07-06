@@ -214,7 +214,7 @@ impl SvtSession {
         aux_alpha: bool,
         p: &AvifParams,
     ) -> Result<SvtSession> {
-        let timing = std::env::var("OXIMG_TIMING").is_ok();
+        let timing = crate::config::config().timing;
         let t0 = std::time::Instant::now();
         unsafe {
             let mut handle: *mut svt::EbComponentType = std::ptr::null_mut();
@@ -296,7 +296,7 @@ impl SvtSession {
     ) -> Result<Vec<u8>> {
         let (w, h) = (self.w, self.h);
         let cw = w.div_ceil(2);
-        let timing = std::env::var("OXIMG_TIMING").is_ok();
+        let timing = crate::config::config().timing;
         let t0 = std::time::Instant::now();
         unsafe {
             let mut io: svt::EbSvtIOFormat = std::mem::zeroed();

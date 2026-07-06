@@ -5,14 +5,7 @@
 use super::*;
 
 pub(super) fn png_compression() -> png::Compression {
-    match std::env::var("OXIMG_PNG_EFFORT").as_deref() {
-        Ok("fastest") => png::Compression::Fastest,
-        // Balanced spends ~15ms/request more than Fast to shave ~14% of
-        // the file; Fast still undercuts libvips' default output size.
-        Ok("balanced") => png::Compression::Balanced,
-        Ok("high") => png::Compression::High,
-        _ => png::Compression::Fast,
-    }
+    crate::config::config().png_compression
 }
 
 pub(super) fn encode_png(
@@ -53,18 +46,14 @@ pub(super) fn encode_png(
 /// scores several SSIMULACRA2 points higher (see bench/quality).
 #[cfg(feature = "avif")]
 pub(super) fn avif_quality() -> u8 {
-    std::env::var("OXIMG_AVIF_QUALITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(55)
+    crate::config::config().avif_quality
 }
 
 /// Alpha-item quality; defaults to the color quality.
 #[cfg(feature = "avif")]
 pub(super) fn avif_alpha_quality(color_quality: u8) -> u8 {
-    std::env::var("OXIMG_AVIF_ALPHA_QUALITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    crate::config::config()
+        .avif_alpha_quality
         .unwrap_or(color_quality)
 }
 
@@ -74,24 +63,15 @@ pub(super) fn avif_alpha_quality(color_quality: u8) -> u8 {
 /// wide).
 #[cfg(feature = "avif")]
 pub(super) fn avif_speed() -> i8 {
-    std::env::var("OXIMG_AVIF_SPEED")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
+    crate::config::config().avif_speed
 }
 
 pub(super) fn webp_quality() -> f32 {
-    std::env::var("OXIMG_WEBP_QUALITY")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(75.0)
+    crate::config::config().webp_quality
 }
 
 pub(super) fn webp_effort() -> i32 {
-    std::env::var("OXIMG_WEBP_EFFORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
+    crate::config::config().webp_effort
 }
 
 pub(super) fn encode_webp(
@@ -333,23 +313,7 @@ pub(super) fn encode_output(
 /// OXIMG_FLATTEN_BG: background for alpha -> JPEG flattening, as RRGGBB
 /// hex; default white.
 pub(super) fn flatten_bg() -> [u8; 3] {
-    static BG: OnceLock<[u8; 3]> = OnceLock::new();
-    *BG.get_or_init(|| {
-        std::env::var("OXIMG_FLATTEN_BG")
-            .ok()
-            .and_then(|v| {
-                let v = v.trim().trim_start_matches('#');
-                // is_ascii keeps the byte-offset slicing below from
-                // panicking on multi-byte values; malformed input falls
-                // back to white either way.
-                if v.len() != 6 || !v.is_ascii() {
-                    return None;
-                }
-                let c = |i| u8::from_str_radix(&v[i..i + 2], 16).ok();
-                Some([c(0)?, c(2)?, c(4)?])
-            })
-            .unwrap_or([255, 255, 255])
-    })
+    crate::config::config().flatten_bg
 }
 
 /// Composite the straight-alpha RGBA8 pixels in `out8` onto the
@@ -438,8 +402,7 @@ pub(super) fn icc_app2_chunks(icc: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ 
 /// larger output, but the entropy pass at finish_compress shrinks,
 /// which is the fused path's only serial tail.
 pub(super) fn jpegli_progressive() -> bool {
-    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var("OXIMG_JPEG_PROGRESSIVE").as_deref() != Ok("0"))
+    crate::config::config().jpegli_progressive
 }
 
 pub(super) fn encode_jpegli(
