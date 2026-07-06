@@ -16,7 +16,8 @@ HTTP interface without notice.
   Content-Length up front, with a capped reader backstopping chunked
   or lying origins) instead of being silently truncated at
   `OXIMG_MAX_SOURCE_BYTES` and surfacing as a baffling decode error.
-- The crate declares its MSRV (`rust-version = "1.88"`) and CI
+- The crate declares its MSRV (`rust-version = "1.89"`, bounded by
+  pic-scale) and CI
   enforces it, alongside two more CI additions: a daily scheduled
   advisory scan (a quiet repo must still hear about RUSTSEC entries)
   and an informational coverage job (cargo-llvm-cov over the avif
