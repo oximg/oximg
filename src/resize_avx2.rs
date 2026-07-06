@@ -38,6 +38,10 @@ impl Avx2 {
     }
 }
 
+// SAFETY (method bodies): each unsafe block only dispatches to the matching
+// #[target_feature(enable = "avx2,fma")] fn below under the trait method's
+// documented preconditions (`horiz_x3` as a one-row `horiz_rows_x3::<1>`
+// batch); the trait contract's `detect()` check guarantees the features.
 impl RowKernel for Avx2 {
     const STAGE3_FLOATS_PER_PIXEL: usize = 4;
     const HORIZ_BATCH: usize = 4;
@@ -119,6 +123,8 @@ pub fn resize_u16_avx2(
 /// Widen eight contiguous u16 samples to f32 (exact: u16 < 2^24).
 #[inline]
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: caller must ensure AVX2+FMA and 8 readable u16s at `p`
+// (unaligned load; no alignment requirement).
 unsafe fn widen8(p: *const u16) -> std::arch::x86_64::__m256 {
     unsafe {
         use std::arch::x86_64::*;
@@ -134,6 +140,10 @@ unsafe fn widen8(p: *const u16) -> std::arch::x86_64::__m256 {
 /// exact (u16 < 2^24), so the convolution sees the same operand values
 /// as widening on the fly.
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA, `row.len() >= 3 * w`, `stage.len() >= 4 * w`.
+// The vector loop stops at `x + 3 <= w`, so its 16-byte loads end at u16
+// index 3x + 8 <= 3w - 1 and its 8-f32 stores at 4x + 8 <= 4w - 4; the
+// scalar tail is bounds-checked.
 unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
     unsafe {
         use std::arch::x86_64::*;
@@ -167,6 +177,8 @@ unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
 /// Convert one u16 RGBA row to f32, keeping the interleaved layout (a
 /// pixel stays one f32x4 lane group).
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA and `stage.len() >= row.len()`; the vector loop
+// reads and writes [i, i + 8) only while `i + 8 <= row.len()`.
 unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
     unsafe {
         use std::arch::x86_64::*;
@@ -191,6 +203,11 @@ unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
 /// window's coefficient loads and broadcasts shared across all `N`
 /// rows. Per-row math is unchanged, so batching changes no value.
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA. Stage loads read pixels [start, start + padded)
+// of each row r < N; `start + sizes <= src_w` and `padded <= w.stride`
+// (Windows invariants), so each `stage[r * row_stride..]` row must hold
+// (src_w + w.stride) * 4 readable f32. Coefficient loads stay inside the
+// checked `padded`-long subslice; ring writes are bounds-checked.
 unsafe fn horiz_rows_x3<const N: usize>(
     stage: &[f32],
     row_stride: usize,
@@ -255,6 +272,11 @@ unsafe fn horiz_rows_x3<const N: usize>(
 /// reduction sums (even taps) + (odd taps) — a different tree than
 /// NEON's single accumulator, bounded by the f64 ground-truth tests.
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA. Stage loads read pixels [start, start + padded);
+// `start + sizes <= src_w` and `padded <= w.stride` (Windows invariants), so
+// `stage` must hold (src_w + w.stride) * 4 readable f32 for `w`'s source
+// width. Coefficient loads stay inside the checked `padded`-long subslice;
+// ring writes are bounds-checked.
 unsafe fn horiz_row_x4(
     stage: &[f32],
     w: &Windows,
@@ -311,6 +333,10 @@ unsafe fn horiz_row_x4(
 /// across every tap (the tap-order additions per element are unchanged
 /// from a per-tap memory accumulator).
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA, `acc.len() >= dst_w`, and
+// `off + dst_w <= plane.len()` for every `off` in `offs`: tile loads read
+// `plane[off + x .. off + x + 32]` with `x + 32 <= dst_w` (narrower in the
+// tails), and `acc` stores end at or below `dst_w`.
 unsafe fn vert_accumulate(
     plane: &[f32],
     coeffs: &[f32],
@@ -373,6 +399,8 @@ unsafe fn vert_accumulate(
 /// so a 64-bit-lane permute restores element order.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: caller must ensure AVX2+FMA and 8 readable f32s at `p`
+// (unaligned load; no alignment requirement).
 unsafe fn narrow8(p: *const f32) -> [u16; 8] {
     unsafe {
         use std::arch::x86_64::*;
@@ -389,6 +417,9 @@ unsafe fn narrow8(p: *const f32) -> [u16; 8] {
 /// planes. The interleave itself is scalar: the store stage touches
 /// each output value once and is noise next to the convolutions.
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA and `acc.len() >= 3 * dst_w`: each `split_at`
+// plane then holds `dst_w` f32s, keeping the `narrow8` reads at
+// `x + 8 <= dst_w` in bounds. `out` writes are bounds-checked.
 unsafe fn store_row_x3(acc: &[f32], dst_w: usize, out: &mut [u16]) {
     unsafe {
         let (r, rest) = acc.split_at(dst_w);
@@ -415,6 +446,9 @@ unsafe fn store_row_x3(acc: &[f32], dst_w: usize, out: &mut [u16]) {
 }
 
 #[target_feature(enable = "avx2,fma")]
+// SAFETY: requires AVX2+FMA and `acc.len() >= 4 * dst_w`: `narrow8` reads
+// `acc[c * dst_w + x ..][..8]` with `x + 8 <= dst_w` and `c <= 3`. `out`
+// writes are bounds-checked.
 unsafe fn store_row_x4(acc: &[f32], dst_w: usize, out: &mut [u16]) {
     unsafe {
         let mut x = 0usize;
@@ -524,6 +558,9 @@ mod tests {
     #[test]
     fn rejects_empty_dimensions() {
         let src = [0u16; 12];
+        // SAFETY (both casts): u16 arrays viewed as bytes — same allocation,
+        // `len * 2` bytes, u8 has alignment 1 and no invalid bit patterns; `dst` is
+        // not touched while `dst_bytes` is live.
         let src_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len() * 2) };
         let mut dst = [0u16; 12];

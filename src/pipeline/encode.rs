@@ -88,6 +88,11 @@ pub(super) fn encode_webp(
     }
 }
 
+// SAFETY: zeroed config/pic/writer are libwebp's documented pre-init states,
+// with both Init ABI checks enforced. The import reads h rows of w*channels
+// bytes; callers pass exactly w*h*channels (sliced in encode_output). `writer`
+// outlives WebPEncode via custom_ptr, mem[..size] is live until the final
+// WebPMemoryWriterClear, and pic/writer are each freed exactly once per path.
 pub(super) fn encode_webp_bare(
     pixels: &[u8],
     w: usize,
@@ -132,6 +137,10 @@ pub(super) fn encode_webp_bare(
 /// Re-container an encoded WebP with an `ICCP` chunk via WebPMux (the
 /// mux sets the required VP8X flags itself). Only profiled sources pay
 /// for the extra assembly copy.
+// SAFETY: the WebPData views borrow `webp` and `icc`, both outliving every mux
+// call (`icc` is copied in via copy_data=1; the mux borrowing `webp` is deleted
+// before return on every path). On WEBP_MUX_OK, assembled.bytes[..size] is a
+// mux-allocated buffer copied out before the single WebPDataClear frees it.
 pub(super) fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
     use libwebp_sys as wp;
     unsafe {
@@ -169,6 +178,10 @@ pub(super) fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
 /// (true of virtually every real file; a partial first frame would
 /// need canvas compositing, so those stay rejected). `None` for
 /// non-animated input.
+// SAFETY: the demuxer borrows `srcbuf` (no copy) and is deleted exactly once
+// on every path before return, so its internal pointers stay valid while read.
+// A zeroed WebPIterator is the documented pre-GetFrame state; fragment.bytes
+// is null/size-checked and copied out while the demuxer is still alive.
 pub(super) fn webp_first_frame(srcbuf: &[u8]) -> Option<Vec<u8>> {
     use libwebp_sys as wp;
     unsafe {
@@ -214,6 +227,10 @@ pub(super) fn webp_first_frame(srcbuf: &[u8]) -> Option<Vec<u8>> {
 
 /// Extract the ICCP and/or EXIF chunks from a WebP container in one
 /// mux parse.
+// SAFETY: the mux borrows `srcbuf` (copy_data=0) and lives until the single
+// WebPMuxDelete at the end. A zeroed WebPData is a valid out-param; chunk
+// data points into mux/srcbuf memory and is null/size-checked and copied to
+// an owned Vec while the mux is still alive.
 pub(super) fn webp_metadata(
     srcbuf: &[u8],
     want_icc: bool,

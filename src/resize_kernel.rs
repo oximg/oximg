@@ -168,12 +168,18 @@ pub(crate) trait RowKernel {
     /// Runtime CPU feature check for this kernel.
     fn detect() -> bool;
     /// Stage one u16 RGB row as f32 in this kernel's 3-channel layout.
+    // SAFETY: caller must have verified `Self::detect()` and pass
+    // `row.len() >= 3 * w` and `stage.len() >= w * Self::STAGE3_FLOATS_PER_PIXEL`.
     unsafe fn stage_x3(row: &[u16], stage: &mut [f32], w: usize);
     /// Stage one u8 RGB row as f32 through a 256-entry lookup table
     /// (fusing e.g. the sRGB -> linear transfer into staging, so no
     /// separate full-image pass or u16 intermediate is needed). The
     /// table holds exact f32 images of the u16 LUT values, making this
     /// bit-identical to `lut[v] as u16` followed by [`RowKernel::stage_x3`].
+    // SAFETY: caller contract as for `stage_x3` (`Self::detect()` verified,
+    // `row.len() >= 3 * w`, `stage.len() >= w * Self::STAGE3_FLOATS_PER_PIXEL`).
+    // The default body's `get_unchecked` indices are bounded by exactly those
+    // lengths, and the `lut` index is a u8, always < 256.
     unsafe fn stage_x3_u8(row: &[u8], lut: &[f32; 256], stage: &mut [f32], w: usize) {
         unsafe {
             if Self::STAGE3_FLOATS_PER_PIXEL == 4 {
@@ -196,8 +202,14 @@ pub(crate) trait RowKernel {
         }
     }
     /// Convert one u16 RGBA row to f32, keeping the interleaved layout.
+    // SAFETY: caller must have verified `Self::detect()` and pass
+    // `stage.len() >= row.len()`.
     unsafe fn stage_x4(row: &[u16], stage: &mut [f32]);
     /// Horizontally convolve one staged 3-channel row into ring `slot`.
+    // SAFETY: caller must have verified `Self::detect()`; `w` = windows for
+    // `src_w -> dst_w`; `stage` holds (src_w + w.stride) * STAGE3_FLOATS_PER_PIXEL
+    // f32 laid out by `stage_x3` (the padded tap-blocks read into the slack);
+    // `slot + dst_w <= plane` and `ring.len() >= 3 * plane`.
     unsafe fn horiz_x3(
         stage: &[f32],
         src_w: usize,
@@ -208,6 +220,10 @@ pub(crate) trait RowKernel {
         dst_w: usize,
     );
     /// Horizontally convolve one staged 4-channel row into ring `slot`.
+    // SAFETY: caller must have verified `Self::detect()`; `w` = windows for
+    // `src_w -> dst_w`; `stage` holds (src_w + w.stride) * 4 f32 laid out by
+    // `stage_x4` (the padded tap-blocks read into the slack);
+    // `slot + dst_w <= plane` and `ring.len() >= 4 * plane`.
     unsafe fn horiz_x4(
         stage: &[f32],
         w: &Windows,
@@ -217,10 +233,17 @@ pub(crate) trait RowKernel {
         dst_w: usize,
     );
     /// acc[x] = sum over taps of coeff * ring_row[x], taps ascending.
+    // SAFETY: caller must have verified `Self::detect()` and guarantee
+    // `off + dst_w <= plane.len()` for every `off` in `offs` and
+    // `acc.len() >= dst_w`.
     unsafe fn vert(plane: &[f32], coeffs: &[f32], offs: &[usize], dst_w: usize, acc: &mut [f32]);
     /// Round-to-nearest f32 -> u16 with saturation, interleaving 3 planes.
+    // SAFETY: caller must have verified `Self::detect()` and pass
+    // `acc.len() >= 3 * dst_w` (three planar rows) and `out.len() >= 3 * dst_w`.
     unsafe fn store_x3(acc: &[f32], dst_w: usize, out: &mut [u16]);
     /// Round-to-nearest f32 -> u16 with saturation, interleaving 4 planes.
+    // SAFETY: caller must have verified `Self::detect()` and pass
+    // `acc.len() >= 4 * dst_w` (four planar rows) and `out.len() >= 4 * dst_w`.
     unsafe fn store_x4(acc: &[f32], dst_w: usize, out: &mut [u16]);
 
     /// Rows the driver batches per horizontal pass. A batched pass
@@ -233,6 +256,10 @@ pub(crate) trait RowKernel {
     /// offset `slots[i]`. Each row's math is identical to
     /// [`RowKernel::horiz_x3`], so batching cannot change any value.
     #[allow(clippy::too_many_arguments)]
+    // SAFETY: caller contract as for `horiz_x3`, per row: for each i < n,
+    // `stage[i * row_stride..]` and ring slot `slots[i]` must satisfy the
+    // `horiz_x3` preconditions. The default body forwards exactly those
+    // per-row preconditions.
     unsafe fn horiz_x3_batch(
         stage: &[f32],
         row_stride: usize,
@@ -252,6 +279,10 @@ pub(crate) trait RowKernel {
     }
     /// 4-channel counterpart of [`RowKernel::horiz_x3_batch`].
     #[allow(clippy::too_many_arguments)]
+    // SAFETY: caller contract as for `horiz_x4`, per row: for each i < n,
+    // `stage[i * row_stride..]` and ring slot `slots[i]` must satisfy the
+    // `horiz_x4` preconditions. The default body forwards exactly those
+    // per-row preconditions.
     unsafe fn horiz_x4_batch(
         stage: &[f32],
         row_stride: usize,
@@ -580,8 +611,12 @@ pub(crate) fn resize_u16<K: RowKernel>(
     dst_h: usize,
     channels: usize,
 ) -> Result<()> {
+    // SAFETY: sound for any input — `align_to` only reinterprets the middle
+    // bytes, and every bit pattern is a valid u16.
     let (pre, src, post) = unsafe { src_bytes.align_to::<u16>() };
     ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 src");
+    // SAFETY: as above; `align_to_mut` reborrows `dst_bytes` exclusively, and
+    // u16 permits any bit pattern.
     let (pre, dst, post) = unsafe { dst_bytes.align_to_mut::<u16>() };
     ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 dst");
     ensure!(src.len() >= src_w * src_h * channels, "src too small");
@@ -634,6 +669,9 @@ pub(crate) mod testkit {
         px
     }
 
+    // SAFETY (both raw-slice casts below): a `&[u16]`/`&mut [u16]` viewed as
+    // bytes — same allocation, `len * 2` bytes, u8 has alignment 1 and no invalid
+    // bit patterns; `dst` is not touched while `dst_bytes` is live.
     pub(crate) fn kernel_resize<K: RowKernel>(
         src: &[u16],
         sw: usize,
@@ -811,6 +849,8 @@ pub(crate) mod testkit {
         }
     }
 
+    // SAFETY (raw-slice cast below): `&[u16]` viewed as bytes — same allocation,
+    // `len * 2` bytes, u8 has alignment 1 and no invalid bit patterns.
     fn fir_resize(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize, ch: usize) -> Vec<u16> {
         use fast_image_resize::images::{Image, ImageRef};
         use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};

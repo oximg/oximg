@@ -22,6 +22,10 @@ use anyhow::Result;
 /// Marker type implementing [`RowKernel`] with NEON intrinsics.
 pub(crate) struct Neon;
 
+// SAFETY (method bodies): each unsafe block only dispatches to the matching
+// #[target_feature(enable = "neon")] fn below under the trait method's
+// documented preconditions; the trait contract's `detect()` check guarantees
+// NEON is present.
 impl RowKernel for Neon {
     fn detect() -> bool {
         std::arch::is_aarch64_feature_detected!("neon")
@@ -86,6 +90,10 @@ pub fn resize_u16_neon(
 /// showed up as ~25% of kernel time in perf annotate), while TBL on a
 /// three-register table is cheap.
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON, `row.len() >= 3 * w`, `stage.len() >= 3 * w`. The
+// vector loop's 48-byte loads cover u16 indices [3x, 3x + 24) and each plane
+// store writes f32 [x, x + 8) of a `w`-long split, with `x + 8 <= w`; the
+// scalar tail is bounds-checked.
 unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
     unsafe {
         use std::arch::aarch64::*;
@@ -130,6 +138,8 @@ unsafe fn stage_row_x3(row: &[u16], stage: &mut [f32], w: usize) {
 /// Convert one u16 RGBA row to f32, keeping the interleaved layout (a
 /// pixel stays one f32x4 lane group).
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON and `stage.len() >= row.len()`; the vector loop reads
+// and writes [i, i + 8) only while `i + 8 <= row.len()`.
 unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
     unsafe {
         use std::arch::aarch64::*;
@@ -154,6 +164,11 @@ unsafe fn stage_row_x4(row: &[u16], stage: &mut [f32]) {
 /// per output pixel, 8-tap blocks accumulate each channel in a f32x4
 /// register (same FMA sequence as widening from u16 directly).
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON. Each plane pointer (base stage + {0, src_w, 2*src_w})
+// reads f32 [start, start + padded); `start + sizes <= src_w` and
+// `padded <= w.stride` (Windows invariants), so `stage` must hold at least
+// 3 * src_w + w.stride readable f32. Coefficient loads stay inside the checked
+// `padded`-long subslice; ring writes are bounds-checked.
 unsafe fn horiz_row_x3(
     stage: &[f32],
     src_w: usize,
@@ -205,6 +220,11 @@ unsafe fn horiz_row_x3(
 /// row: each pixel is a natural f32x4 lane group; four taps share one
 /// coefficient vector via lane-indexed FMA (same sequence as before).
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON. Stage loads read pixels [start, start + padded);
+// `start + sizes <= src_w` and `padded <= w.stride` (Windows invariants), so
+// `stage` must hold (src_w + w.stride) * 4 readable f32 for `w`'s source
+// width. Coefficient loads stay inside the checked `padded`-long subslice;
+// ring writes are bounds-checked.
 unsafe fn horiz_row_x4(
     stage: &[f32],
     w: &Windows,
@@ -257,6 +277,10 @@ unsafe fn horiz_row_x4(
 /// across every tap (the tap-order additions per element are unchanged
 /// from a per-tap memory accumulator).
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON, `acc.len() >= dst_w`, and
+// `off + dst_w <= plane.len()` for every `off` in `offs`: tile loads read
+// `plane[off + x .. off + x + 16]` with `x + 16 <= dst_w` (narrower in the
+// tails), and `acc` stores end at or below `dst_w`.
 unsafe fn vert_accumulate(
     plane: &[f32],
     coeffs: &[f32],
@@ -309,6 +333,10 @@ unsafe fn vert_accumulate(
 /// (negative converts to 0, overflow narrows to 65535), interleaving
 /// three planes.
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON, `acc.len() >= 3 * dst_w` (three `dst_w`-long
+// planes), and `out.len() >= 3 * dst_w`: each iteration reads plane f32s
+// [x, x + 8) and `vst3q_u16` writes out[3x .. 3x + 24], with `x + 8 <= dst_w`;
+// the scalar tail is bounds-checked.
 unsafe fn store_row_x3(acc: &[f32], dst_w: usize, out: &mut [u16]) {
     unsafe {
         use std::arch::aarch64::*;
@@ -337,6 +365,10 @@ unsafe fn store_row_x3(acc: &[f32], dst_w: usize, out: &mut [u16]) {
 }
 
 #[target_feature(enable = "neon")]
+// SAFETY: requires NEON, `acc.len() >= 4 * dst_w`, and `out.len() >= 4 * dst_w`:
+// each iteration reads `acc[c * dst_w + x ..][..8]` and `vst4q_u16` writes
+// out[4x .. 4x + 32], with `x + 8 <= dst_w`; the scalar tail is
+// bounds-checked.
 unsafe fn store_row_x4(acc: &[f32], dst_w: usize, out: &mut [u16]) {
     unsafe {
         use std::arch::aarch64::*;
@@ -419,6 +451,9 @@ mod tests {
     #[test]
     fn rejects_empty_dimensions() {
         let src = [0u16; 12];
+        // SAFETY (both casts): u16 arrays viewed as bytes — same allocation,
+        // `len * 2` bytes, u8 has alignment 1 and no invalid bit patterns; `dst` is
+        // not touched while `dst_bytes` is live.
         let src_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(src.as_ptr().cast(), src.len() * 2) };
         let mut dst = [0u16; 12];

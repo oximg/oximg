@@ -293,6 +293,11 @@ pub(super) fn webp_decode_into_chunk8(
     p: &Params,
 ) -> Result<(usize, usize, usize, usize, usize)> {
     use libwebp_sys as w;
+    // SAFETY: FFI cluster reading only `s.srcbuf`, which is live for the whole
+    // block. A zeroed WebPDecoderConfig is libwebp's documented pre-init state and
+    // the WebPInitDecoderConfig ABI check is enforced; `output.u.RGBA` is the arm
+    // libwebp fills for MODE_RGB/MODE_RGBA. WebPFreeDecBuffer runs exactly once on
+    // both the error and success paths.
     unsafe {
         let mut config: w::WebPDecoderConfig = std::mem::zeroed();
         anyhow::ensure!(
@@ -361,6 +366,10 @@ pub(super) fn webp_decode_into_chunk8(
         // Every row is copied below before the buffer is read.
         scratch_u8(&mut s.chunk8, dec_h * row);
         for y in 0..dec_h {
+            // SAFETY: after VP8_STATUS_OK the output buffer holds dec_h rows spaced
+            // `stride` bytes apart, each with dec_w * channels (= row) valid bytes, per
+            // the WebPRGBABuffer contract; y < dec_h keeps every read in bounds, and the
+            // buffer is not freed until after this loop.
             let src_row = std::slice::from_raw_parts(buf.rgba.add(y * stride), row);
             s.chunk8[y * row..(y + 1) * row].copy_from_slice(src_row);
         }

@@ -207,6 +207,10 @@ pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
             let _ = r.next_row();
             Ok((format, dims.0, dims.1))
         }
+        // SAFETY: a zeroed WebPBitstreamFeatures is a valid out-param (plain C data);
+        // WebPGetFeatures reads at most `bytes.len()` bytes from the live slice and
+        // writes only `features`. The status check also rejects libwebp's internal
+        // ABI-version mismatch, so the fields are read only after a successful parse.
         ImageFormat::Webp => unsafe {
             use libwebp_sys as w;
             let mut features: w::WebPBitstreamFeatures = std::mem::zeroed();
@@ -440,10 +444,16 @@ fn scratch_u8(buf: &mut Vec<u8>, len: usize) -> &mut [u8] {
 }
 
 fn u16_as_bytes(buf: &[u16]) -> &[u8] {
+    // SAFETY: the byte view covers exactly the memory of `buf` (len * 2 bytes,
+    // one allocation), u8 needs no alignment, every u16 is valid as two u8s, and
+    // the output lifetime is tied to the input borrow.
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 2) }
 }
 
 fn u16_as_bytes_mut(buf: &mut [u16]) -> &mut [u8] {
+    // SAFETY: as in u16_as_bytes; additionally the &mut borrow makes this the
+    // only live view of the memory, and any byte pattern written through it is
+    // a valid [u16].
     unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast(), buf.len() * 2) }
 }
 
@@ -553,8 +563,13 @@ fn resize_u16x3_picscale(
     dst_h: usize,
 ) -> Result<()> {
     use pic_scale::{ImageStore, ImageStoreMut, ResamplingFunction, Scaler, ThreadingPolicy};
+    // SAFETY: transmuting byte pairs to u16 is valid for every bit pattern;
+    // align_to confines the view to the aligned middle, and the ensure! below
+    // rejects any misaligned head/tail.
     let (pre, src16, post) = unsafe { src_bytes.align_to::<u16>() };
     anyhow::ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 src");
+    // SAFETY: same argument as the src view; the &mut slice guarantees exclusive
+    // access and any u16 written back is valid as bytes.
     let (pre, dst16, post) = unsafe { dst_bytes.align_to_mut::<u16>() };
     anyhow::ensure!(pre.is_empty() && post.is_empty(), "unaligned u16 dst");
     let src_store = ImageStore::<u16, 3>::from_slice(src16, src_w, src_h)

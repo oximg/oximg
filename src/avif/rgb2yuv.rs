@@ -49,10 +49,18 @@ pub(super) fn rgb_to_yuv420_10bit(
 pub(crate) fn luma_rows(pixels: &[u8], channels: usize, y_plane: &mut [u16]) {
     #[cfg(target_arch = "aarch64")]
     if crate::yuv::neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel needs
+        // `pixels` to hold y_plane.len() whole pixels with channels 3 or 4;
+        // all call sites pass exactly that (rgb_to_yuv420_10bit slices
+        // w*h*channels with channels validated in encode_avif; the fused
+        // path passes one dst_w*3 row against a dst_w luma slice).
         return unsafe { neon_enc::luma_rows(pixels, channels, y_plane) };
     }
     #[cfg(target_arch = "x86_64")]
     if avx2_enc::detect() {
+        // SAFETY: AVX2 verified by the runtime check above. Same memory
+        // contract as the NEON arm: `pixels` holds y_plane.len() whole pixels,
+        // channels 3 or 4 — guaranteed by the same callers.
         return unsafe { avx2_enc::luma_rows(pixels, channels, y_plane) };
     }
     luma_rows_scalar(pixels, channels, y_plane);
@@ -112,10 +120,17 @@ pub(crate) fn chroma_row_pair(
     if let Some(row1) = row1 {
         #[cfg(target_arch = "aarch64")]
         if crate::yuv::neon() {
+            // SAFETY: NEON verified by the runtime check above. The kernel needs
+            // w pixels in each row, w.div_ceil(2)-long chroma rows, and channels
+            // 3 or 4 — the lengths this fn's doc requires and which both callers
+            // (chroma_rows and the fused pipeline path) slice exactly.
             return unsafe { neon_enc::chroma_row_pair(row0, row1, w, channels, cb_row, cr_row) };
         }
         #[cfg(target_arch = "x86_64")]
         if avx2_enc::detect() {
+            // SAFETY: AVX2 verified by the runtime check above. Same contract as
+            // the NEON arm: w pixels per row, w.div_ceil(2)-long chroma rows,
+            // channels 3 or 4.
             return unsafe { avx2_enc::chroma_row_pair(row0, row1, w, channels, cb_row, cr_row) };
         }
     }
@@ -197,6 +212,9 @@ pub(super) mod neon_enc {
     /// this path's t <= 260992. Proven exhaustively in
     /// tests::luma_divider_identity_is_exact.
     #[inline]
+    // SAFETY: caller must have NEON enabled (the sole caller, luma_rows,
+    // is #[target_feature(enable = "neon")]). Register-only — the
+    // intrinsics' feature requirement is the entire contract.
     unsafe fn luma4(r: uint16x4_t, g: uint16x4_t, b: uint16x4_t) -> uint16x4_t {
         unsafe {
             let acc = vmlal_n_u16(vmlal_n_u16(vmull_n_u16(r, 1225), g, 2404), b, 467);
@@ -213,6 +231,10 @@ pub(super) mod neon_enc {
         unsafe {
             let n = y_plane.len();
             let mut i = 0;
+            // SAFETY (fn contract): caller guarantees NEON is available and that
+            // `pixels` holds y_plane.len() whole pixels with channels 3 or 4. The
+            // loop bound keeps load8 within pixels ((i+8)*channels <= n*channels)
+            // and the 8-lane store within y_plane; the tail is bounds-checked.
             while i + 8 <= n {
                 let (r, g, b) = load8(pixels.as_ptr().add(i * channels), channels);
                 let (r, g, b) = (vmovl_u8(r), vmovl_u8(g), vmovl_u8(b));
@@ -251,6 +273,10 @@ pub(super) mod neon_enc {
             let v512 = vdupq_n_f32(512.0);
             let vmax = vdupq_n_s32(1023);
             let mut cx = 0usize;
+            // SAFETY (fn contract): caller guarantees NEON is available, rows
+            // holding w pixels each, cb_row/cr_row w.div_ceil(2) long, channels 3
+            // or 4. The loop bound keeps load8 within both rows (cx*2 + 8 <= w
+            // pixels) and the 4-lane stores within cb/cr (cx + 4 <= w/2 <= cw).
             // Vector path: 4 chroma columns = 8 source pixels, every
             // block a full 2x2 (n = 4).
             while cx * 2 + 8 <= w {
@@ -432,6 +458,9 @@ pub(super) mod avx2_enc {
     /// Input: 8 pixels as u16x8 lanes; output u16x8 luma.
     #[inline]
     #[target_feature(enable = "avx2")]
+    // SAFETY: caller must have AVX2 enabled (all callers are
+    // #[target_feature(enable = "avx2")] fns). Register-only — the
+    // intrinsics' feature requirement is the entire contract.
     unsafe fn luma8(r: __m128i, g: __m128i, b: __m128i) -> __m128i {
         unsafe {
             let r = _mm256_cvtepu16_epi32(r);
@@ -464,6 +493,10 @@ pub(super) mod avx2_enc {
         unsafe {
             let n = y_plane.len();
             let mut i = 0;
+            // SAFETY (fn contract): caller guarantees AVX2 is available and that
+            // `pixels` holds y_plane.len() whole pixels with channels 3 or 4. The
+            // loop bound keeps load16 within pixels ((i+16)*channels <= n*channels)
+            // and both 8-lane stores within y_plane; the tail is bounds-checked.
             while i + 16 <= n {
                 let (r, g, b) = load16(pixels.as_ptr().add(i * channels), channels);
                 let lo = luma8(
@@ -515,6 +548,10 @@ pub(super) mod avx2_enc {
             // chain mirrored lane-wise.
             let pair16 = |x: __m128i| unsafe { _mm_maddubs_epi16(x, ones) };
             let mut cx = 0usize;
+            // SAFETY (fn contract): caller guarantees AVX2 is available, rows
+            // holding w pixels each, cb_row/cr_row w.div_ceil(2) long, channels 3
+            // or 4. The loop bound keeps load16 within both rows (cx*2 + 16 <= w
+            // pixels) and the 8-lane stores within cb/cr (cx + 8 <= w/2 <= cw).
             // Vector path: 8 chroma columns = 16 source pixels, every
             // block a full 2x2 (n = 4).
             while cx * 2 + 16 <= w {

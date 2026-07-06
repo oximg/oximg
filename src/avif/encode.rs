@@ -196,6 +196,10 @@ pub(crate) struct SvtSession {
 unsafe impl Send for SvtSession {}
 
 impl Drop for SvtSession {
+    // SAFETY: `handle` came from a successful svt_av1_enc_init_handle and is released
+    // exactly once — SvtSession is not Clone and encode() consumes it by move. Deinit
+    // of a handle that never reached enc_init is the same teardown libavif's
+    // codec_svt.c performs, which this session setup mirrors.
     fn drop(&mut self) {
         unsafe {
             svt::svt_av1_enc_deinit(self.handle);
@@ -207,6 +211,10 @@ impl Drop for SvtSession {
 impl SvtSession {
     /// init_handle + parameters + enc_init, mirroring libavif's
     /// codec_svt.c for a single still image.
+    // SAFETY: FFI cluster. `config` is a zeroed repr(C) struct that init_handle
+    // immediately fills with defaults; every pointer passed (handle, config, the
+    // tune CStrings) is a live local for the duration of its call, and the `session`
+    // guard deinits the handle on every exit path once init_handle has succeeded.
     pub(crate) fn create(
         w: usize,
         h: usize,
@@ -288,6 +296,10 @@ impl SvtSession {
 
     /// Send the planes, flush, and drain the AV1 payload; the session
     /// is consumed (deinit on drop).
+    // SAFETY: FFI cluster over zeroed repr(C) structs. SVT reads exactly w*h luma and
+    // ceil(w/2)*ceil(h/2) chroma u16s via `io`: every caller sizes the planes so (relied
+    // on, not re-checked), the borrows outlive send→EOS→drain, and the *mut casts never
+    // mutate (encoder input is read-only). Packet buffers live until release_out_buffer.
     pub(crate) fn encode(
         self,
         y_plane: &[u16],

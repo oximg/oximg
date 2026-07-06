@@ -171,6 +171,10 @@ pub(super) fn dav1d_threads() -> std::os::raw::c_int {
 
 /// Run one dav1d session over a single-frame AV1 stream and hand the
 /// decoded picture to `f`.
+// SAFETY: FFI cluster. `settings`/`data`/`pic` are zeroed C structs passed as
+// live stack locals (dav1d_default_settings fills `settings` before use); the
+// wrapped `av1` borrow outlives every decoder reference to it — all refs drop
+// via the guards below, in reverse declaration order, before this fn returns.
 pub(super) fn with_decoded_picture<T>(
     av1: &[u8],
     f: impl FnOnce(&dav1d_sys::Dav1dPicture) -> Result<T>,
@@ -187,6 +191,8 @@ pub(super) fn with_decoded_picture<T>(
         struct Ctx(*mut d::Dav1dContext);
         impl Drop for Ctx {
             fn drop(&mut self) {
+                // SAFETY: self.0 was returned by a successful dav1d_open (checked above) and
+                // is closed exactly once — the guard is a local that never escapes.
                 unsafe { d::dav1d_close(&mut self.0) }
             }
         }
@@ -194,6 +200,8 @@ pub(super) fn with_decoded_picture<T>(
 
         // Borrow the OBU buffer; it outlives the decoder, so the free
         // callback (which dav1d requires to be non-null) is a no-op.
+        // SAFETY: nothing to uphold — deliberately a no-op; the wrapped bytes are a
+        // Rust borrow released by its owner, never by dav1d.
         unsafe extern "C" fn no_free(_buf: *const u8, _cookie: *mut std::ffi::c_void) {}
         let mut data: d::Dav1dData = std::mem::zeroed();
         ensure!(
@@ -209,6 +217,9 @@ pub(super) fn with_decoded_picture<T>(
         struct Data(*mut d::Dav1dData);
         impl Drop for Data {
             fn drop(&mut self) {
+                // SAFETY: self.0 points at the enclosing fn's `data`, a stack local this guard
+                // (declared after it) predeceases. dav1d empties `data` (nulling .data) once
+                // send_data fully consumes it, so the check unrefs a held reference exactly once.
                 unsafe {
                     if !(*self.0).data.is_null() {
                         d::dav1d_data_unref(self.0);
@@ -236,6 +247,8 @@ pub(super) fn with_decoded_picture<T>(
         struct Pic(*mut d::Dav1dPicture);
         impl Drop for Pic {
             fn drop(&mut self) {
+                // SAFETY: this guard is created only after dav1d_get_picture returned 0, so `pic`
+                // (a stack local that outlives the guard) holds a real reference; unref runs once.
                 unsafe { d::dav1d_picture_unref(self.0) }
             }
         }
@@ -246,6 +259,9 @@ pub(super) fn with_decoded_picture<T>(
 }
 
 /// Extract the alpha plane (the luma of the auxiliary image) as u8.
+// SAFETY (`seq_hdr` deref): `pic` is always a picture filled by a successful
+// dav1d_get_picture (with_decoded_picture is this module's only producer), which
+// sets `seq_hdr` non-null and keeps the header alive for the picture's lifetime.
 pub(super) fn picture_to_alpha(
     pic: &dav1d_sys::Dav1dPicture,
     w: usize,
@@ -282,6 +298,11 @@ pub(super) fn picture_to_alpha(
 
 /// Borrow one row of a dav1d plane as typed samples. Plane 0 uses the
 /// luma stride; planes 1/2 share the chroma stride. Strides are bytes.
+// SAFETY (raw row borrow): callers must derive `y`/`len` from pic's own dims and
+// layout (both callers do) so ptr + y*stride + len stays inside the plane, with
+// hbd == (bpc > 8). dav1d's default allocator — in use, the settings are defaults —
+// gives 64-byte-aligned planes and even byte strides at >8 bpc, so the u16 cast
+// and stride/2 are exact.
 pub(super) fn plane_row(
     pic: &dav1d_sys::Dav1dPicture,
     plane: usize,
@@ -310,6 +331,9 @@ pub(super) fn plane_row(
 }
 
 /// Convert a decoded dav1d picture (planar YUV) to interleaved RGB8.
+// SAFETY (`seq_hdr` deref): same argument as picture_to_alpha — `pic` comes from
+// a successful dav1d_get_picture, which keeps a non-null `seq_hdr` alive for the
+// picture's lifetime.
 pub(super) fn picture_to_rgb(
     pic: &dav1d_sys::Dav1dPicture,
     out: &mut Vec<u8>,

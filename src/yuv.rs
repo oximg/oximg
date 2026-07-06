@@ -49,6 +49,10 @@ impl Row<'_> {
 pub(crate) fn chroma_blend(near: Row, other: Row, out: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     if neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel reads
+        // out.len() samples from `near` and `other`; every call site
+        // (avif::decode and this module's tests) passes all three at the same
+        // chroma width.
         return unsafe { neon::chroma_blend(near, other, out) };
     }
     chroma_blend_scalar(near, other, out);
@@ -78,6 +82,9 @@ fn chroma_blend_scalar(near: Row, other: Row, out: &mut [f32]) {
 pub(crate) fn chroma_widen(row: Row, out: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     if neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel reads
+        // out.len() samples from `row`; every call site passes `row` and `out`
+        // at the same chroma width.
         return unsafe { neon::chroma_widen(row, out) };
     }
     chroma_widen_scalar(row, out);
@@ -106,6 +113,10 @@ pub(crate) fn chroma_upsample_h(mid: &[f32], out: &mut [f32]) {
     debug_assert_eq!(mid.len(), out.len().div_ceil(2));
     #[cfg(target_arch = "aarch64")]
     if neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel needs
+        // no length precondition: its loop conditions bound every raw load and
+        // store against mid.len()/out.len(), and edges and tail take the
+        // bounds-checked scalar path.
         return unsafe { neon::chroma_upsample_h(mid, out) };
     }
     chroma_upsample_h_scalar(mid, out, 0);
@@ -134,6 +145,9 @@ pub(crate) fn yuv_row_to_rgb(y: Row, cb: &[f32], cr: &[f32], c: &Csc, out: &mut 
     debug_assert!(y.len() >= out.len() / 3);
     #[cfg(target_arch = "aarch64")]
     if neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel reads
+        // out.len()/3 samples from y (debug-asserted above), cb, and cr; every
+        // call site passes all three at row width w with `out` w*3 long.
         return unsafe { neon::yuv_row_to_rgb(y, cb, cr, c, out) };
     }
     yuv_row_to_rgb_scalar(y, cb, cr, c, out, 0);
@@ -184,6 +198,9 @@ fn yuv_px_scalar(ys: impl Iterator<Item = f32>, cb: &[f32], cr: &[f32], c: &Csc,
 pub(crate) fn alpha_row(src: Row, off: f32, mul: f32, out: &mut [u8]) {
     #[cfg(target_arch = "aarch64")]
     if neon() {
+        // SAFETY: NEON verified by the runtime check above. The kernel reads
+        // out.len() samples from `src`; every call site passes `src` and `out`
+        // at the same row width.
         return unsafe { neon::alpha_row(src, off, mul, out) };
     }
     alpha_row_scalar(src, off, mul, out);
@@ -244,6 +261,9 @@ mod neon {
     /// conversion saturates negatives to zero, and the narrowing steps
     /// saturate above 255).
     #[inline]
+    // SAFETY: caller must have NEON enabled (all callers are
+    // #[target_feature(enable = "neon")] fns). Register-only — the
+    // intrinsics' feature requirement is the entire contract.
     unsafe fn round_u8x8(lo: float32x4_t, hi: float32x4_t, half: float32x4_t) -> uint8x8_t {
         unsafe {
             let lo = vcvtq_u32_f32(vaddq_f32(lo, half));
@@ -253,6 +273,10 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
+    // SAFETY: caller must ensure NEON is available and that `near` and
+    // `other` each hold at least out.len() samples: load8 reads 8 samples
+    // at i only while i + 8 <= out.len(), the stores stay within `out` by
+    // the same bound, and the tail is bounds-checked indexing.
     pub(super) unsafe fn chroma_blend(near: Row, other: Row, out: &mut [f32]) {
         unsafe {
             let three = vdupq_n_f32(3.0);
@@ -276,6 +300,9 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
+    // SAFETY: caller must ensure NEON is available and that `row` holds at
+    // least out.len() samples; the vector loop loads and stores only while
+    // i + 8 <= out.len(), and the tail is bounds-checked indexing.
     pub(super) unsafe fn chroma_widen(row: Row, out: &mut [f32]) {
         unsafe {
             let n = out.len();
@@ -293,6 +320,10 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
+    // SAFETY: caller must ensure NEON is available; no other precondition.
+    // The loop conditions bound every raw access: loads reach
+    // mid[j-1 .. j+5] only while j >= 1 and j + 5 <= mid.len(), and the
+    // vst2q store writes out[2j .. 2j+8] only while 2j + 8 <= out.len().
     pub(super) unsafe fn chroma_upsample_h(mid: &[f32], out: &mut [f32]) {
         unsafe {
             let cw = mid.len();
@@ -318,6 +349,10 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
+    // SAFETY: caller must ensure NEON is available and that y, cb, and cr
+    // each hold at least out.len()/3 samples. The vector loop reads 8 from
+    // each and writes 24 bytes at x*3 only while x + 8 <= out.len()/3, so
+    // every raw access stays in bounds; the tail is the scalar path.
     pub(super) unsafe fn yuv_row_to_rgb(y: Row, cb: &[f32], cr: &[f32], c: &Csc, out: &mut [u8]) {
         unsafe {
             let w = out.len() / 3;
@@ -369,6 +404,9 @@ mod neon {
     }
 
     #[target_feature(enable = "neon")]
+    // SAFETY: caller must ensure NEON is available and that `src` holds at
+    // least out.len() samples; vector loads and stores run only while
+    // i + 8 <= out.len(), and the tail is bounds-checked indexing.
     pub(super) unsafe fn alpha_row(src: Row, off: f32, mul: f32, out: &mut [u8]) {
         unsafe {
             let offv = vdupq_n_f32(off);
