@@ -1,6 +1,6 @@
 [package]
 name = "oximg"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 # Bounded by pic-scale (1.89); verified by the CI msrv job.
 rust-version = "1.89"

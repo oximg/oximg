@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-06
+
+Security hardening for untrusted-input deployments: a decompression-
+bomb cap, fail-closed configuration, an SSRF-resistant fetcher, and a
+non-root container.
+
 ### Added
 
 - `OXIMG_MAX_SRC_PIXELS` (default 64MP): a decoded-size cap enforced
@@ -387,7 +393,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.3...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/oximg/oximg/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/oximg/oximg/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oximg/oximg/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oximg/oximg/compare/v0.4.0...v0.4.1
