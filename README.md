@@ -246,11 +246,29 @@ default).
 
 ## Not yet implemented (out of PoC scope)
 
+- CMYK / YCCK JPEG sources — decode currently errors on them (no
+  CMYK→RGB conversion); see Roadmap
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output (animated AVIF and WebP *sources* render their
   first frame, like other image proxies)
 - Private S3 sources (public/presigned HTTP origins work), caching
 - Production-grade load testing
+
+## Roadmap
+
+Rough order, subject to change (experimental PoC):
+
+- **CMYK/YCCK JPEG input** → linear-light RGB, honoring an embedded
+  ICC profile when present and falling back to a naive conversion
+  otherwise. Print-workflow assets are the common source of these.
+- **JXL output** once a maintained encoder binding stabilizes (the
+  `@jxl` token is already reserved).
+- **Response caching** (keyed on the resolved URL + format) and
+  private-origin support (presigned S3 already works via HTTP).
+- **0.5.0 library-API cleanup**: `Params` gains `Default` +
+  `#[non_exhaustive]`, the server-only dependencies move behind a
+  feature so library users do not compile the HTTP stack, and the
+  raw codec bindings stop being part of the public surface.
 
 ## Status
 
