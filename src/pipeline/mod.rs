@@ -308,6 +308,9 @@ pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, Imag
     process_reader(file, p)
 }
 
+/// Remote-source HTTP client (the `server` feature). ureq and the rest
+/// of the HTTP stack are not compiled for library-only builds.
+#[cfg(feature = "server")]
 fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -324,6 +327,7 @@ fn http_agent() -> &'static ureq::Agent {
     })
 }
 
+#[cfg(feature = "server")]
 fn max_source_bytes() -> u64 {
     crate::config::config().max_source_bytes
 }
@@ -343,10 +347,13 @@ impl std::fmt::Display for ServerFault {
 
 /// Marker for remote-origin failures (transport errors, non-404 error
 /// statuses): the HTTP layer answers 502, not 422 — the client's
-/// request was fine, the upstream wasn't.
+/// request was fine, the upstream wasn't. Only produced on the
+/// remote-source path, so it lives behind the `server` feature.
+#[cfg(feature = "server")]
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamFault;
 
+#[cfg(feature = "server")]
 impl std::fmt::Display for UpstreamFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("upstream image fetch failed")
@@ -359,11 +366,13 @@ impl std::fmt::Display for UpstreamFault {
 /// distinct kind lets the HTTP layer answer 413. Exactly-cap-sized
 /// sources are fine: the post-cap probe read distinguishes EOF from
 /// more data.
+#[cfg(feature = "server")]
 struct CappedReader<R> {
     inner: R,
     remaining: u64,
 }
 
+#[cfg(feature = "server")]
 impl<R: std::io::Read> std::io::Read for CappedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.remaining == 0 {
@@ -387,7 +396,9 @@ impl<R: std::io::Read> std::io::Read for CappedReader<R> {
 
 /// Remote-source variant: stream the HTTP response body straight into the
 /// decoder — decoding overlaps the download and the source is never
-/// buffered whole, same as the file path.
+/// buffered whole, same as the file path. Requires the `server`
+/// feature (the HTTP client stack).
+#[cfg(feature = "server")]
 pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     let resp = http_agent().get(url).call().map_err(|e| match e {
         // Preserve source 404s so the HTTP layer can pass them through.

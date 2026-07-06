@@ -199,8 +199,11 @@ docker build -t oximg .
 
 **As a library**: the `oximg::pipeline` module is usable without the
 HTTP server — `process`/`process_path` take a `Params` and return the
-re-encoded bytes plus their format, `probe` reads just the header. See
-[`examples/`](examples/):
+re-encoded bytes plus their format, `probe` reads just the header.
+Depend on it with `default-features = false` to drop the entire HTTP
+stack (axum, tokio, ureq, hmac, sha2); add `features = ["avif"]` for
+AVIF. `process_url` (remote HTTP sources) needs the `server` feature.
+See [`examples/`](examples/):
 
 ```sh
 cargo run --release --example thumbnail -- photo.jpg 300 200 out.jpg

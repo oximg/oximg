@@ -48,7 +48,9 @@ pub(crate) struct Config {
     /// 2 on x86-64 (SMT absorbs the second thread), 1 elsewhere.
     #[cfg(feature = "avif")]
     pub avif_decode_threads: std::os::raw::c_int,
-    /// OXIMG_MAX_SOURCE_BYTES: remote-source download cap.
+    /// OXIMG_MAX_SOURCE_BYTES: remote-source download cap. Read only
+    /// on the remote-source path, which is behind the `server` feature.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub max_source_bytes: u64,
     /// OXIMG_MAX_SRC_PIXELS: decoded-size cap (w*h), enforced after
     /// each format's header parse and before any pixel-sized

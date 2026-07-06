@@ -68,6 +68,10 @@ jobs:
         run: cargo test --release --features avif
       - name: Build all targets
         run: cargo build --release --all-targets --features avif
+      # The library must build without the HTTP stack (no server feature).
+      - name: Check (library only)
+        if: matrix.arch == 'amd64'
+        run: cargo clippy --release --no-default-features --features avif -- -D warnings
 
   # The declared rust-version must actually build: cargo-install users
   # on the MSRV toolchain hit whatever this job would have caught.

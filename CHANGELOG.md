@@ -12,6 +12,14 @@ HTTP interface without notice.
 
 ### Changed
 
+- The HTTP server stack (axum, tokio, ureq, hmac, sha2) is now behind a
+  `server` cargo feature, on by default so `cargo build`/`cargo
+  install` still produce the `oximg` binary. Library users can depend
+  with `default-features = false` and get just the `pipeline` API
+  (`process`/`process_path`/`probe`/`encode`) without compiling the
+  web stack — a much smaller dependency tree. `process_url` (remote
+  HTTP sources) requires the `server` feature. **Breaking** for anyone
+  who disabled default features and expected the server deps.
 - Public-API surface trimmed (0.5.0 cleanup): the pregenerated
   SVT-AV1 bindings (`oximg::svt`, hundreds of raw FFI items) are now
   crate-internal, and the SIMD resize kernels (`resize_neon` /
