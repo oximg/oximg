@@ -319,9 +319,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     || std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir")
                 {
                     Fuse::Off
-                } else if !orientation.is_upright()
-                    || (icc.is_some() && target != ImageFormat::Avif)
-                {
+                } else if !orientation.is_upright() {
                     // Rotation happens on the resized frame before the
                     // one-shot encode — incompatible with streaming rows
                     // into jpegli or into the YUV planes, so oriented
@@ -330,14 +328,11 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     // recover the jpegli/YUV overlap for the flip-only
                     // orientations (2-4); oriented traffic is a small
                     // minority, so correctness ships first.
-                    // ICC likewise for jpegli targets: the profile must
-                    // be written before the incremental encoder's first
-                    // scanline, so profiled sources take the one-shot
-                    // encode. (AVIF is exempt — its profile is spliced
-                    // into the container after the encode, so it rides
-                    // the Yuv fuse.)
-                    // TODO(icc-fuse): thread the profile into the fused
-                    // jpegli worker to recover the overlap.
+                    // (ICC no longer forces this path anywhere: the
+                    // fused jpegli worker writes the profile ahead of
+                    // its scanlines, AVIF splices it after the encode,
+                    // and every other target embeds via its one-shot
+                    // encoder.)
                     Fuse::Pixels
                 } else if target == ImageFormat::Jpeg {
                     if p.encoder == Encoder::Jpegli {
@@ -360,6 +355,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
                     p.parallel,
                     orientation,
                     fuse,
+                    icc.as_deref(),
                 )? {
                     Decoded::Encoded(out) => out,
                     Decoded::Pixels { dst_w, dst_h } => {
@@ -528,7 +524,7 @@ pub fn decode_and_resize(
             crate::meta::Orientation::UPRIGHT
         };
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        match decode_resize(s, dec, max_w, max_h, parallel, orientation, Fuse::Off)? {
+        match decode_resize(s, dec, max_w, max_h, parallel, orientation, Fuse::Off, None)? {
             Decoded::Pixels { dst_w, dst_h } => {
                 if orientation.is_upright() {
                     Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
@@ -774,6 +770,7 @@ fn overlap_gate() -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_resize<R: std::io::BufRead>(
     s: &mut Scratch,
     mut dec: Decompress<R>,
@@ -782,6 +779,9 @@ fn decode_resize<R: std::io::BufRead>(
     parallel: usize,
     orientation: crate::meta::Orientation,
     fuse: Fuse,
+    // Written ahead of the scanlines by the fused jpegli encoder;
+    // the other fuse variants embed via their one-shot encoders.
+    icc: Option<&[u8]>,
 ) -> Result<Decoded> {
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
@@ -824,7 +824,7 @@ fn decode_resize<R: std::io::BufRead>(
     if let Fuse::Jpegli { quality } = fuse
         && linear
         && let Some((out, decode_ms)) =
-            fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality)?
+            fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality, icc)?
     {
         if timing {
             let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -1074,6 +1074,7 @@ fn fused_resize_encode<R: std::io::BufRead>(
     dst_w: usize,
     dst_h: usize,
     quality: f32,
+    icc: Option<&[u8]>,
 ) -> Result<Option<(Vec<u8>, f64)>> {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
@@ -1120,6 +1121,14 @@ fn fused_resize_encode<R: std::io::BufRead>(
                         comp.set_progressive_mode();
                     }
                     let mut enc = comp.start_compress(Vec::with_capacity(64 * 1024))?;
+                    // Same chunker, same position as encode_jpegli: the
+                    // profile precedes the scanlines, so fused output
+                    // stays byte-identical to the serial encoder.
+                    if let Some(icc) = icc {
+                        for chunk in icc_app2_chunks(icc) {
+                            enc.write_marker(jpegli::Marker::APP(2), &chunk);
+                        }
+                    }
 
                     while let Ok((buf, rows)) = chunk_rx.recv() {
                         for r in 0..rows {
@@ -2467,6 +2476,10 @@ mod tests {
     }
 
     fn run_jpeg(jpeg: &[u8], fuse_quality: Option<f32>) -> Vec<u8> {
+        run_jpeg_icc(jpeg, fuse_quality, None)
+    }
+
+    fn run_jpeg_icc(jpeg: &[u8], fuse_quality: Option<f32>, icc: Option<&[u8]>) -> Vec<u8> {
         let p = Params {
             max_width: 320,
             max_height: 320,
@@ -2489,6 +2502,7 @@ mod tests {
             1,
             crate::meta::Orientation::UPRIGHT,
             fuse,
+            icc,
         )
         .unwrap()
         {
@@ -2501,11 +2515,44 @@ mod tests {
                     fuse_quality.is_none(),
                     "fused path was requested but not taken"
                 );
-                encode(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p).unwrap()
+                encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p, icc).unwrap()
             }
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
         }
+    }
+
+    /// The fused jpegli encoder writes the ICC chain ahead of its
+    /// scanlines exactly like the serial encoder does — profiled
+    /// same-format JPEG keeps its bytes fuse-independent.
+    #[test]
+    fn fused_jpegli_bytes_match_serial_with_icc() {
+        if !fuse_kernel_available() {
+            return;
+        }
+        let jpeg = make_test_jpeg(799, 601, false);
+        let icc: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let serial = run_jpeg_icc(&jpeg, None, Some(&icc));
+        let fused = run_jpeg_icc(&jpeg, Some(80.0), Some(&icc));
+        assert_eq!(serial, fused, "profiled fused/serial parity");
+        // 70KB spans two APP2 chunks; both must survive intact.
+        let mut chunks: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut i = 2;
+        while i + 4 <= fused.len() && fused[i] == 0xFF {
+            let m = fused[i + 1];
+            if m == 0xDA || m == 0xD9 {
+                break;
+            }
+            let len = u16::from_be_bytes([fused[i + 2], fused[i + 3]]) as usize;
+            let body = &fused[i + 4..i + 2 + len];
+            if m == 0xE2 && body.starts_with(b"ICC_PROFILE\0") {
+                chunks.push((body[12], body[14..].to_vec()));
+            }
+            i += 2 + len;
+        }
+        chunks.sort_by_key(|(seq, _)| *seq);
+        let got: Vec<u8> = chunks.into_iter().flat_map(|(_, d)| d).collect();
+        assert_eq!(got, icc, "profile reassembles from the fused output");
     }
 
     /// Resized RGB pixels via the given fuse mode (Off = the serial
@@ -2521,6 +2568,7 @@ mod tests {
             1,
             crate::meta::Orientation::UPRIGHT,
             fuse,
+            None,
         )
         .unwrap()
         {
@@ -2567,6 +2615,7 @@ mod tests {
             1,
             crate::meta::Orientation::UPRIGHT,
             fuse,
+            None,
         )
         .unwrap()
         {
@@ -2630,6 +2679,7 @@ mod tests {
                 Fuse::Yuv {
                     params: test_avif_params(),
                 },
+                None,
             );
         }
     }
@@ -2722,6 +2772,7 @@ mod tests {
                 1,
                 crate::meta::Orientation::UPRIGHT,
                 Fuse::Pixels,
+                None,
             );
         }
     }
@@ -2751,6 +2802,7 @@ mod tests {
                 1,
                 crate::meta::Orientation::UPRIGHT,
                 Fuse::Jpegli { quality: p.quality },
+                None,
             );
         }
     }

@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Profiled JPEG sources targeting jpegli (the default same-format
+  path) ride the fused pipeline again: the fused worker writes the
+  APP2 ICC chain ahead of its scanlines — byte-identical to the serial
+  encoder, tested — instead of falling back to the one-shot encode.
+  Measured on the Ryzen SMT pair: profiled-JPEG single-request p50
+  8.8 → 7.6 ms (-13%). This closes the TODO(icc-fuse) gap: no
+  metadata forces a fusing penalty anywhere except rotation itself.
+
 ## [0.4.0] - 2026-07-05
 
 Theme: correctness metadata. Every source format's orientation is
