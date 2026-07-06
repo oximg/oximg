@@ -207,8 +207,11 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    // Report the *bound* port: PORT=0 asks the OS for a free one (the
+    // test harness relies on this line to discover it).
+    let bound = listener.local_addr()?.port();
     eprintln!(
-        "oximg listening on :{port} (images: {}, workers: {workers})",
+        "oximg listening on :{bound} (images: {}, workers: {workers})",
         images_dir.display()
     );
     axum::serve(listener, router).await?;

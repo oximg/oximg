@@ -13,17 +13,51 @@ struct Server {
 }
 
 impl Server {
-    fn start(port: u16, envs: &[(&str, String)]) -> Server {
+    /// Spawns the binary on an OS-assigned port (PORT=0) and discovers
+    /// it from the "listening on" stderr line — hardcoded ports sat in
+    /// the ephemeral range, where a parallel test's outbound client
+    /// connection could occupy them as a source port at exactly the
+    /// wrong moment (observed as CI-only bind failures).
+    fn start(envs: &[(&str, String)]) -> Server {
         let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
-        cmd.env("PORT", port.to_string())
+        cmd.env("PORT", "0")
             .env("IMAGES_DIR", fixtures)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("spawn oximg");
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let stderr = child.stderr.take().expect("stderr piped");
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut port = None;
+        let mut line = String::new();
+        use std::io::BufRead;
+        // The listening line is the first thing a healthy server prints.
+        for _ in 0..100 {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // stderr closed: the process is exiting
+                Ok(_) => {
+                    if let Some(rest) = line.strip_prefix("oximg listening on :") {
+                        port = rest.split_whitespace().next().and_then(|p| p.parse().ok());
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Keep draining stderr (request logs) so the pipe never fills
+        // and blocks the server.
+        std::thread::spawn(move || {
+            let mut sink = std::io::sink();
+            let _ = std::io::copy(&mut reader.into_inner(), &mut sink);
+        });
+        let Some(port) = port else {
+            let status = child.wait().ok();
+            panic!("server exited before becoming healthy: {status:?}");
+        };
         let mut server = Server { child, port };
         // Generous deadline: loaded CI runners can take seconds to page in
         // a release binary alongside the parallel test processes.
@@ -102,7 +136,7 @@ impl Drop for Server {
 
 #[test]
 fn serves_each_format_with_matching_content_type() {
-    let s = Server::start(47101, &[]);
+    let s = Server::start(&[]);
     for (file, ct) in [
         ("photo.jpg", "image/jpeg"),
         ("rgb.png", "image/png"),
@@ -120,7 +154,7 @@ fn serves_each_format_with_matching_content_type() {
 #[cfg(feature = "avif")]
 #[test]
 fn serves_avif_with_matching_content_type() {
-    let s = Server::start(47106, &[]);
+    let s = Server::start(&[]);
     let (status, ct, body) = s.get("/resize/100/100/photo.avif").unwrap();
     assert_eq!(status, 200);
     assert_eq!(ct, "image/avif");
@@ -130,7 +164,7 @@ fn serves_avif_with_matching_content_type() {
 
 #[test]
 fn error_mapping() {
-    let s = Server::start(47102, &[]);
+    let s = Server::start(&[]);
     assert_eq!(s.status_of("/resize/0/100/photo.jpg"), 400);
     assert_eq!(s.status_of("/resize/9000/9000/photo.jpg"), 400);
     assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
@@ -139,7 +173,7 @@ fn error_mapping() {
 
 #[test]
 fn concurrent_identical_requests_coalesce_to_identical_bytes() {
-    let s = Server::start(47103, &[]);
+    let s = Server::start(&[]);
     let results: Vec<Vec<u8>> = std::thread::scope(|sc| {
         (0..12)
             .map(|_| sc.spawn(|| s.get("/resize/120/120/photo.jpg").unwrap().2))
@@ -158,7 +192,7 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
 #[test]
 fn invalid_signing_config_refuses_to_boot() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
-    cmd.env("PORT", "47133")
+    cmd.env("PORT", "0")
         .env("OXIMG_KEY", "not-hex-at-all")
         .env("OXIMG_SALT", "cafebabe")
         .stdout(std::process::Stdio::null())
@@ -183,7 +217,7 @@ fn invalid_signing_config_refuses_to_boot() {
 fn signing_gate() {
     let key = "deadbeef".repeat(8);
     let salt = "cafebabe".repeat(8);
-    let s = Server::start(47104, &[("OXIMG_KEY", key), ("OXIMG_SALT", salt)]);
+    let s = Server::start(&[("OXIMG_KEY", key), ("OXIMG_SALT", salt)]);
     // unsigned path is rejected while signing is enabled
     assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 403);
     assert_eq!(s.status_of("/AAAA/resize/100/100/photo.jpg"), 403);
@@ -201,7 +235,7 @@ fn signing_gate() {
 
 #[test]
 fn explicit_format_token_transcodes() {
-    let s = Server::start(47107, &[]);
+    let s = Server::start(&[]);
     let (status, ct, body) = s.get("/resize/100/100/photo.jpg@webp").unwrap();
     assert_eq!(status, 200);
     assert_eq!(ct, "image/webp");
@@ -216,7 +250,7 @@ fn explicit_format_token_transcodes() {
 
 #[test]
 fn format_token_error_mapping() {
-    let s = Server::start(47108, &[]);
+    let s = Server::start(&[]);
     // Unknown suffix falls through as a filename -> 404, not 400.
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@bogus"), 404);
     // Reserved for a future encoder: clear 400 instead of a silent 404.
@@ -229,7 +263,7 @@ fn format_token_error_mapping() {
 fn signed_urls_cover_the_format_token() {
     let key = "deadbeef".repeat(8);
     let salt = "cafebabe".repeat(8);
-    let s = Server::start(47109, &[("OXIMG_KEY", key), ("OXIMG_SALT", salt)]);
+    let s = Server::start(&[("OXIMG_KEY", key), ("OXIMG_SALT", salt)]);
     // Precomputed with python hmac for this key/salt over
     // "/resize/100/100/photo.jpg@webp" (same method as signing_gate's
     // vector, which pins the scheme).
@@ -251,7 +285,7 @@ fn signed_urls_cover_the_format_token() {
 #[test]
 fn accept_negotiation_and_vary() {
     // Negotiation off (default): no Vary header, format follows source.
-    let s = Server::start(47110, &[]);
+    let s = Server::start(&[]);
     let (_, ct, vary, _) = s
         .get_accept("/resize/100/100/photo.jpg", Some("image/webp,*/*"))
         .unwrap();
@@ -260,7 +294,7 @@ fn accept_negotiation_and_vary() {
 
     // Negotiation on: Accept steers the format; Vary is emitted on
     // every response (config-static), including non-negotiated ones.
-    let s = Server::start(47111, &[("OXIMG_AUTO_FORMAT", "webp".into())]);
+    let s = Server::start(&[("OXIMG_AUTO_FORMAT", "webp".into())]);
     let (_, ct, vary, body) = s
         .get_accept("/resize/100/100/photo.jpg", Some("image/webp,*/*"))
         .unwrap();
@@ -284,7 +318,7 @@ fn accept_negotiation_and_vary() {
 
 #[test]
 fn mixed_format_requests_do_not_cross_coalesce() {
-    let s = Server::start(47112, &[]);
+    let s = Server::start(&[]);
     let (jpegs, webps): (Vec<_>, Vec<_>) = std::thread::scope(|sc| {
         let j: Vec<_> = (0..6)
             .map(|_| sc.spawn(|| s.get("/resize/120/120/photo.jpg").unwrap()))
@@ -315,8 +349,8 @@ fn mixed_format_requests_do_not_cross_coalesce() {
 /// the overlap gate.
 #[test]
 fn forced_overlap_cross_format_matches_serial() {
-    let fused = Server::start(47113, &[("OXIMG_OVERLAP", "1".into())]);
-    let serial = Server::start(47114, &[("OXIMG_OVERLAP", "0".into())]);
+    let fused = Server::start(&[("OXIMG_OVERLAP", "1".into())]);
+    let serial = Server::start(&[("OXIMG_OVERLAP", "0".into())]);
     let mut urls = vec![
         "/resize/100/100/photo.jpg@webp",
         "/resize/100/100/photo.jpg@png",
@@ -362,7 +396,7 @@ fn oriented_images_dir(tag: &str) -> String {
 #[test]
 fn auto_rotate_default_and_kill_switch() {
     let dir = oriented_images_dir("kill");
-    let on = Server::start(47121, &[("IMAGES_DIR", dir.clone())]);
+    let on = Server::start(&[("IMAGES_DIR", dir.clone())]);
     let (status, _, body) = on.get("/resize/120/120/rotated.jpg").unwrap();
     assert_eq!(status, 200);
     let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
@@ -376,21 +410,18 @@ fn auto_rotate_default_and_kill_switch() {
     {
         // orient_irot1.avif (fixtures dir is also served) stores
         // 240x180 landscape displaying portrait.
-        let fx = Server::start(47131, &[]);
+        let fx = Server::start(&[]);
         let (_, _, body) = fx.get("/resize/120/120/orient_irot1.avif@jpg").unwrap();
         let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
         assert_eq!((w, h), (90, 120), "avif default: irot applied");
     }
     drop(on);
 
-    let off = Server::start(
-        47122,
-        &[
-            ("IMAGES_DIR", dir),
-            ("OXIMG_AUTO_ROTATE", "0".into()),
-            ("OXIMG_ICC", "0".into()),
-        ],
-    );
+    let off = Server::start(&[
+        ("IMAGES_DIR", dir),
+        ("OXIMG_AUTO_ROTATE", "0".into()),
+        ("OXIMG_ICC", "0".into()),
+    ]);
     for name in ["rotated.jpg", "rotated.png"] {
         let (_, _, body) = off.get(&format!("/resize/120/120/{name}")).unwrap();
         let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
@@ -399,7 +430,7 @@ fn auto_rotate_default_and_kill_switch() {
     drop(off);
     #[cfg(feature = "avif")]
     {
-        let off = Server::start(47132, &[("OXIMG_AUTO_ROTATE", "0".into())]);
+        let off = Server::start(&[("OXIMG_AUTO_ROTATE", "0".into())]);
         let (_, _, body) = off.get("/resize/120/120/orient_irot1.avif@jpg").unwrap();
         let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
         assert_eq!((w, h), (120, 90), "avif kill switch: stored orientation");
@@ -411,11 +442,8 @@ fn auto_rotate_default_and_kill_switch() {
 #[test]
 fn oriented_bytes_do_not_depend_on_overlap_gate() {
     let dir = oriented_images_dir("gate");
-    let fused = Server::start(
-        47123,
-        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())],
-    );
-    let serial = Server::start(47124, &[("IMAGES_DIR", dir), ("OXIMG_OVERLAP", "0".into())]);
+    let fused = Server::start(&[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())]);
+    let serial = Server::start(&[("IMAGES_DIR", dir), ("OXIMG_OVERLAP", "0".into())]);
     let a = fused.get("/resize/120/120/rotated.jpg").unwrap().2;
     let b = serial.get("/resize/120/120/rotated.jpg").unwrap().2;
     assert_eq!(a, b, "oriented fused and serial bytes must match");
@@ -442,10 +470,7 @@ fn icc_default_kill_switch_and_gate_independence() {
     std::fs::write(dir.join("profiled.jpg"), jpeg).unwrap();
     let dir = dir.to_str().unwrap().to_string();
 
-    let on = Server::start(
-        47125,
-        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())],
-    );
+    let on = Server::start(&[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "1".into())]);
     let (status, _, body) = on.get("/resize/120/120/profiled.jpg").unwrap();
     assert_eq!(status, 200);
     assert_eq!(
@@ -456,18 +481,12 @@ fn icc_default_kill_switch_and_gate_independence() {
     let fused_bytes = body;
     drop(on);
 
-    let serial = Server::start(
-        47127,
-        &[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "0".into())],
-    );
+    let serial = Server::start(&[("IMAGES_DIR", dir.clone()), ("OXIMG_OVERLAP", "0".into())]);
     let (_, _, body) = serial.get("/resize/120/120/profiled.jpg").unwrap();
     assert_eq!(body, fused_bytes, "profiled bytes are gate-independent");
     drop(serial);
 
-    let off = Server::start(
-        47126,
-        &[("IMAGES_DIR", dir.clone()), ("OXIMG_ICC", "0".into())],
-    );
+    let off = Server::start(&[("IMAGES_DIR", dir.clone()), ("OXIMG_ICC", "0".into())]);
     let (status, _, body) = off.get("/resize/120/120/profiled.jpg").unwrap();
     assert_eq!(status, 200);
     assert_eq!(common::jpeg_icc(&body), None, "kill switch: no profile");
@@ -478,7 +497,7 @@ fn icc_default_kill_switch_and_gate_independence() {
     #[cfg(feature = "avif")]
     {
         let fx = common::fake_icc(900); // the icc.avif fixture's blob
-        let on = Server::start(47129, &[]);
+        let on = Server::start(&[]);
         let (_, _, body) = on.get("/resize/100/100/icc.avif@jpg").unwrap();
         assert_eq!(
             common::jpeg_icc(&body).as_deref(),
@@ -486,7 +505,7 @@ fn icc_default_kill_switch_and_gate_independence() {
             "avif source: profile passes through by default"
         );
         drop(on);
-        let off = Server::start(47130, &[("OXIMG_ICC", "0".into())]);
+        let off = Server::start(&[("OXIMG_ICC", "0".into())]);
         let (_, _, body) = off.get("/resize/100/100/icc.avif@jpg").unwrap();
         assert_eq!(
             common::jpeg_icc(&body),
@@ -503,10 +522,7 @@ fn icc_default_kill_switch_and_gate_independence() {
     let app2 = common::app2_icc_payloads(&icc, 60_000).remove(0);
     let both = common::jpeg_with_markers(&stored, sw, sh, &[(1, &app1), (2, &app2)]);
     std::fs::write(std::path::Path::new(&dir).join("both.jpg"), both).unwrap();
-    let no_rot = Server::start(
-        47128,
-        &[("IMAGES_DIR", dir), ("OXIMG_AUTO_ROTATE", "0".into())],
-    );
+    let no_rot = Server::start(&[("IMAGES_DIR", dir), ("OXIMG_AUTO_ROTATE", "0".into())]);
     let (_, _, body) = no_rot.get("/resize/120/120/both.jpg").unwrap();
     let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
     assert_eq!((w, h), (90, 120), "rotation off: stored orientation");
@@ -522,15 +538,9 @@ fn icc_default_kill_switch_and_gate_independence() {
 /// gate.
 #[test]
 fn preset_bytes_do_not_depend_on_overlap_gate() {
-    for (port_a, port_b, preset) in [(47117, 47118, "fast"), (47119, 47120, "small")] {
-        let fused = Server::start(
-            port_a,
-            &[("OXIMG_OVERLAP", "1".into()), ("PRESET", preset.into())],
-        );
-        let serial = Server::start(
-            port_b,
-            &[("OXIMG_OVERLAP", "0".into()), ("PRESET", preset.into())],
-        );
+    for preset in ["fast", "small"] {
+        let fused = Server::start(&[("OXIMG_OVERLAP", "1".into()), ("PRESET", preset.into())]);
+        let serial = Server::start(&[("OXIMG_OVERLAP", "0".into()), ("PRESET", preset.into())]);
         let a = fused.get("/resize/100/100/photo.jpg").unwrap().2;
         let b = serial.get("/resize/100/100/photo.jpg").unwrap().2;
         assert_eq!(a, b, "PRESET={preset}: fused and serial bytes must match");
@@ -545,8 +555,8 @@ fn preset_bytes_do_not_depend_on_overlap_gate() {
 #[test]
 fn fir_backend_disables_fusing_for_stable_bytes() {
     let fir = ("OXIMG_RESIZE_BACKEND", "fir".to_string());
-    let fused = Server::start(47115, &[("OXIMG_OVERLAP", "1".into()), fir.clone()]);
-    let serial = Server::start(47116, &[("OXIMG_OVERLAP", "0".into()), fir]);
+    let fused = Server::start(&[("OXIMG_OVERLAP", "1".into()), fir.clone()]);
+    let serial = Server::start(&[("OXIMG_OVERLAP", "0".into()), fir]);
     for url in ["/resize/100/100/photo.jpg@png", "/resize/100/100/photo.jpg"] {
         let a = fused.get(url).unwrap().2;
         let b = serial.get(url).unwrap().2;
@@ -604,13 +614,10 @@ fn error_statuses_are_honest() {
         }
     });
 
-    let s = Server::start(
-        47134,
-        &[(
-            "OXIMG_SOURCE_BASE_URL",
-            format!("http://127.0.0.1:{origin_port}"),
-        )],
-    );
+    let s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{origin_port}"),
+    )]);
     assert_eq!(
         s.status_of("/resize/100/100/boom.jpg"),
         502,
@@ -666,13 +673,10 @@ fn remote_source_mode_streams_from_http_origin() {
         }
     });
 
-    let s = Server::start(
-        47105,
-        &[(
-            "OXIMG_SOURCE_BASE_URL",
-            format!("http://127.0.0.1:{origin_port}"),
-        )],
-    );
+    let s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{origin_port}"),
+    )]);
     let (status, ct, body) = s.get("/resize/100/100/photo.webp").unwrap();
     assert_eq!(status, 200);
     assert_eq!(ct, "image/webp");
