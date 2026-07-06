@@ -12,6 +12,13 @@ HTTP interface without notice.
 
 ### Changed
 
+- Public-API surface trimmed (0.5.0 cleanup): the pregenerated
+  SVT-AV1 bindings (`oximg::svt`, hundreds of raw FFI items) are now
+  crate-internal, and the SIMD resize kernels (`resize_neon` /
+  `resize_avx2`) are gated behind a new `bench-internals` feature used
+  only by the resize benchmarks — so the default public API no longer
+  varies by target architecture. No item removed here had an external
+  consumer.
 - `pipeline::Params` derives `Clone`/`Debug` and implements `Default`
   (re-encode at source size and format, jpegli q80, single-threaded),
   so callers can write `Params { max_width, max_height,

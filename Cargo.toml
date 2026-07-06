@@ -40,6 +40,9 @@ pic-scale = "0.7"
 [features]
 default = []
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
+# Re-exposes the internal SIMD resize kernels for the resize_bench
+# examples; not part of the public API.
+bench-internals = []
 
 # Benchmark/dev tools live under bench/tools/ (kept out of examples/,
 # which is library-usage only) but stay runnable as `cargo run
@@ -55,10 +58,12 @@ path = "bench/tools/decode_bench.rs"
 [[example]]
 name = "resize_bench"
 path = "bench/tools/resize_bench.rs"
+required-features = ["bench-internals"]
 
 [[example]]
 name = "resize_bench_x86"
 path = "bench/tools/resize_bench_x86.rs"
+required-features = ["bench-internals"]
 
 [[example]]
 name = "avif_parity"
