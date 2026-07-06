@@ -10,6 +10,17 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- `oximg --version` / `--help` (and `-V`/`-h`): dependency-free flag
+  handling that prints the version — what a bug report should cite —
+  and exits without binding a port; an unknown argument is a usage
+  error. All real configuration stays in the environment.
+- `SECURITY.md`: a disclosure policy for a service whose core surface
+  is parsing untrusted images through four C codec stacks — private
+  reporting via GitHub, supported-version and scope statements, and
+  the "attach the input image that triggers it" ask.
+
 ### Fixed
 
 - Local sources that exist but cannot be read (permission denied, or a

@@ -155,6 +155,32 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Minimal, dependency-free flag handling: the server takes all its
+    // real configuration from the environment, so the only CLI is
+    // --version/--help (the version is what a bug report should cite).
+    // The server takes all its real configuration from the
+    // environment, so the only CLI is --version/--help.
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("-V" | "--version") => {
+            println!("oximg {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("-h" | "--help") => {
+            println!(
+                "oximg {}\n\n\
+                 A fast image resize/transcode server. All configuration is via\n\
+                 environment variables (PORT, IMAGES_DIR, OXIMG_*); see the README.\n\n\
+                 Usage: oximg [--version] [--help]",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+        Some(other) => {
+            eprintln!("oximg: unknown argument {other:?} (try --help)");
+            std::process::exit(2);
+        }
+    }
     if let Err(e) = oximg::config_validate() {
         eprintln!("oximg: fatal: {e}");
         std::process::exit(2);

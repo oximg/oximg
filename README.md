@@ -186,6 +186,7 @@ reservation that points here.
 cargo build --release            # JPEG, PNG, WebP
 cargo build --release --features avif   # + AVIF (needs SVT-AV1 >= 4.1, dav1d)
 IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg
+./target/release/oximg --version   # all config is via env; the only flags
 ```
 
 The Docker build needs no system dependencies — it compiles a pinned

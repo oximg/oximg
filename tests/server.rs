@@ -189,6 +189,28 @@ fn concurrent_identical_requests_coalesce_to_identical_bytes() {
     }
 }
 
+/// --version prints the crate version and exits 0 without binding a
+/// port (the flag a bug report is asked to cite).
+#[test]
+fn version_flag_prints_and_exits() {
+    let out = Command::new(env!("CARGO_BIN_EXE_oximg"))
+        .arg("--version")
+        .output()
+        .expect("run oximg --version");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        format!("oximg {}", env!("CARGO_PKG_VERSION"))
+    );
+    // An unknown flag is a usage error, not a boot.
+    let bad = Command::new(env!("CARGO_BIN_EXE_oximg"))
+        .arg("--nonsense")
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+}
+
 /// A local source that exists but cannot be read (here: a directory
 /// where a file was expected) is a 500, not a 422 blaming the client.
 #[test]
