@@ -10,7 +10,34 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-05
+
+Theme: correctness metadata. Every source format's orientation is
+honored and every color profile survives — rotated phone photos come
+out upright and wide-gamut images keep rendering the way the original
+did, in any output format.
+
 ### Added
+
+- EXIF auto-rotation for JPEG sources (on by default;
+  `OXIMG_AUTO_ROTATE=0` disables): the orientation tag steers the
+  target box (it fits the *displayed* frame) and the pixels are
+  rotated after the resize on the small output frame — Lanczos is
+  separable, so resize-then-rotate is exactly rotate-then-resize at a
+  fraction of the cost, and every streaming decode/resize path stays
+  untouched. Oriented sources take the pixel-fuse path (rotation is
+  incompatible with streaming rows into the incremental encoders);
+  untagged, profile-less sources are byte-identical to 0.3.0 and pay
+  no measurable cost. Applies before cross-format encoding, so a
+  rotated phone photo converts upright into any target format. Tag semantics deliberately
+  match Chrome and Firefox: the *first* Exif APP1 decides (an
+  orientation-less one pins upright) and only strict `SHORT/count==1`
+  entries rotate, so oximg output always agrees with how browsers
+  render the original. The tag is read by a bounded in-tree scan of
+  the leading JPEG segments (hard-capped at 256KB) rather than
+  libjpeg marker saving, whose memory would scale with
+  attacker-supplied APP1 counts; `qcli resize` honors the same
+  rotation.
 
 - Auto-rotation for the remaining source formats: PNG `eXIf`, WebP
   `EXIF` chunks (raw-TIFF or JPEG-style prefixed payloads — writers
@@ -23,6 +50,19 @@ HTTP interface without notice.
   The WebP decode-scaler picks its decode size from the *displayed*
   fit, so axis-swapping orientations under non-square boxes cannot
   under-decode. `OXIMG_AUTO_ROTATE=0` covers all formats.
+
+- ICC profile pass-through (on by default; `OXIMG_ICC=0` strips): the
+  source's profile — JPEG APP2 `ICC_PROFILE` chain (reassembled with
+  libjpeg's chunk rules by the same bounded header scan that reads the
+  orientation), PNG `iCCP`, WebP `ICCP` — is carried byte-for-byte
+  into any profile-capable output, across format conversion included.
+  Pixels are never color-converted.
+  Profiled JPEG sources take the one-shot encode path (the profile
+  must precede the incremental encoder's scanlines). The header scan
+  now spans every pre-frame segment — the same span libjpeg's marker
+  saving covers — so an Exif tag placed after the tables (which
+  browsers honor) now rotates too, where 0.3.x-era scanning would
+  have missed it.
 
 - AVIF ICC in both directions — neither avif-parse nor avif-serialize
   exposes ICC in any released version, so both run on a bounded
@@ -39,39 +79,6 @@ HTTP interface without notice.
   libavif 1.0.4's avifdec and is pinned by decode roundtrips in the
   suite. Profiles ride the fused YUV path (byte-identical to the
   serial path, tested) — no fusing penalty for profiled AVIF targets.
-
-- ICC profile pass-through (on by default; `OXIMG_ICC=0` strips): the
-  source's profile — JPEG APP2 `ICC_PROFILE` chain (reassembled with
-  libjpeg's chunk rules by the same bounded header scan that reads the
-  orientation), PNG `iCCP`, WebP `ICCP` — is carried byte-for-byte
-  into any profile-capable output, across format conversion included.
-  Pixels are never color-converted.
-  Profiled JPEG sources take the one-shot encode path (the profile
-  must precede the incremental encoder's scanlines). The header scan
-  now spans every pre-frame segment — the same span libjpeg's marker
-  saving covers — so an Exif tag placed after the tables (which
-  browsers honor) now rotates too, where 0.3.x-era scanning would
-  have missed it.
-
-- EXIF auto-rotation for JPEG sources (on by default;
-  `OXIMG_AUTO_ROTATE=0` disables): the orientation tag steers the
-  target box (it fits the *displayed* frame) and the pixels are
-  rotated after the resize on the small output frame — Lanczos is
-  separable, so resize-then-rotate is exactly rotate-then-resize at a
-  fraction of the cost, and every streaming decode/resize path stays
-  untouched. Oriented sources take the pixel-fuse path (rotation is
-  incompatible with streaming rows into the incremental encoders);
-  untagged, profile-less sources are byte-identical to 0.3.0 and pay
-  no measurable cost. Applies before cross-format encoding, so a rotated phone photo
-  converts upright into any target format. Tag semantics deliberately
-  match Chrome and Firefox: the *first* Exif APP1 decides (an
-  orientation-less one pins upright) and only strict `SHORT/count==1`
-  entries rotate, so oximg output always agrees with how browsers
-  render the original. The tag is read by a bounded in-tree scan of
-  the leading JPEG segments (hard-capped at 256KB) rather than
-  libjpeg marker saving, whose memory would scale with
-  attacker-supplied APP1 counts; `qcli resize` honors the same
-  rotation.
 
 ### Changed
 
@@ -231,7 +238,8 @@ HTTP interface without notice.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/oximg/oximg/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/oximg/oximg/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/oximg/oximg/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/oximg/oximg/releases/tag/v0.1.0
