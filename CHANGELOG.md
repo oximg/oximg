@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-06
+
+Hardening the workshop as much as the product: honest 413s, an
+enforced MSRV, scheduled advisory scans, and a repository that now
+carries its own verification story — the benchmark methodology and
+harness, fixture regeneration recipes, a test that proves request
+coalescing actually coalesces, and a SAFETY contract on every unsafe
+boundary (8 → 81 comments).
+
 ### Changed
 
 - An over-limit remote source now answers 413 (via the origin's
@@ -22,6 +31,13 @@ HTTP interface without notice.
   advisory scan (a quiet repo must still hear about RUSTSEC entries)
   and an informational coverage job (cargo-llvm-cov over the avif
   feature set).
+- In-repo verification story: `bench/METHODOLOGY.md` plus
+  parameterized harness scripts (byte-identity gate, interleaved A/B,
+  same-binary toggle discriminator, metadata competitive cells),
+  fixture provenance and regeneration (`tests/fixtures/README.md`,
+  `regen.sh`), a singleflight test that counts origin fetches (the old
+  coalescing test passed even with coalescing broken), and SAFETY
+  contracts on every unsafe fn and FFI cluster.
 
 ## [0.4.2] - 2026-07-06
 
@@ -342,7 +358,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.2...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/oximg/oximg/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oximg/oximg/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oximg/oximg/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/oximg/oximg/compare/v0.3.0...v0.4.0

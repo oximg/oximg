@@ -1,6 +1,6 @@
 {
   "name": "@oximg/oximg",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Name reservation for oximg — fast image compression and resizing in Rust (JPEG, PNG, WebP, AVIF). See https://github.com/oximg/oximg",
   "repository": { "type": "git", "url": "git+https://github.com/oximg/oximg.git" },
   "homepage": "https://github.com/oximg/oximg",
