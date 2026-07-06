@@ -79,8 +79,14 @@ stored orientation.
 **ICC profiles**: a source's color profile (JPEG APP2 chain, PNG
 `iCCP`, WebP `ICCP`, AVIF `colr`) passes through byte-for-byte into
 any output format, across format conversion included. Pixels are
-never color-converted — wide-gamut images keep rendering the way the
-original did. `OXIMG_ICC=0` strips profiles instead.
+never color-converted. This matters for wide-gamut sources: the
+common proxy default is to normalize pixels to sRGB and strip the
+profile, which permanently clips every color outside the sRGB gamut —
+a Display P3 phone photo loses exactly the saturated reds and greens
+that made it worth shooting in P3. oximg keeps the pixels and the
+profile as they were, so wide-gamut images render on a wide-gamut
+display the way the original did (and identically everywhere else).
+`OXIMG_ICC=0` opts into stripping instead.
 
 ## Pipeline
 
