@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- `pipeline::Params` derives `Clone`/`Debug` and implements `Default`
+  (re-encode at source size and format, jpegli q80, single-threaded),
+  so callers can write `Params { max_width, max_height,
+  ..Default::default() }` and only name the fields they care about —
+  which keeps their build working if a later version adds a field.
+  `Encoder` implements `Default` (`Jpegli`). The examples model the
+  `..Default::default()` form.
+
 ## [0.4.5] - 2026-07-06
 
 Two error-path bugfixes and the project's outward-facing docs: a

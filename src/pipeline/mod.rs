@@ -55,10 +55,11 @@ fn back_lut() -> &'static [u8; 65536] {
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Encoder {
     /// jpegli: trellis-class compression at roughly half the CPU of
     /// mozjpeg's trellis path. The default.
+    #[default]
     Jpegli,
     /// mozjpeg fastest profile + optimized Huffman: libjpeg-turbo-class
     /// output at the lowest encode cost.
@@ -78,6 +79,14 @@ impl Encoder {
     }
 }
 
+/// Resize + re-encode parameters for [`process`] and friends.
+///
+/// Construct with `..Default::default()` and only set the fields you
+/// care about — that keeps your build working if a future minor
+/// version adds a field. (The struct keeps public fields rather than
+/// `#[non_exhaustive]`, which would forbid struct-literal construction
+/// across the crate boundary entirely, `..Default` included.)
+#[derive(Clone, Debug)]
 pub struct Params {
     pub max_width: u32,
     pub max_height: u32,
@@ -91,6 +100,23 @@ pub struct Params {
     /// Output format; None re-encodes in the sniffed source format
     /// (the original contract, byte-identical to before this field).
     pub output: Option<ImageFormat>,
+}
+
+impl Default for Params {
+    /// Re-encode at the source's own size and format, jpegli q80,
+    /// single-threaded. The dimension defaults are `u32::MAX`, i.e. no
+    /// downscale bound — the pipeline never upscales, so this yields
+    /// the original dimensions until a caller sets a smaller box.
+    fn default() -> Self {
+        Params {
+            max_width: u32::MAX,
+            max_height: u32::MAX,
+            quality: 80.0,
+            encoder: Encoder::Jpegli,
+            parallel: 1,
+            output: None,
+        }
+    }
 }
 
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).

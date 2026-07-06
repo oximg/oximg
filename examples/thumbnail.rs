@@ -7,7 +7,7 @@
 //! in. The source is never upscaled and its aspect ratio is preserved
 //! (the box is a bound, not a target).
 
-use oximg::pipeline::{self, Encoder, Params};
+use oximg::pipeline::{self, Params};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -16,13 +16,13 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     };
 
+    // Set only what this task needs; ..Default::default() fills the
+    // rest (q80 jpegli, single-threaded, source format) and keeps
+    // compiling if the library adds a field later.
     let params = Params {
         max_width: max_w.parse()?,
         max_height: max_h.parse()?,
-        quality: 80.0,
-        encoder: Encoder::Jpegli, // ignored for PNG/WebP output
-        parallel: 1,
-        output: None, // re-encode in the source's own format
+        ..Default::default()
     };
 
     // process_path streams the decode straight from the file. For bytes

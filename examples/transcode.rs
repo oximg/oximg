@@ -8,7 +8,7 @@
 //! applied, so a rotated phone JPEG converts upright into WebP with its
 //! ICC intact. `avif` targets require the `avif` cargo feature.
 
-use oximg::pipeline::{self, Encoder, ImageFormat, Params};
+use oximg::pipeline::{self, ImageFormat, Params};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -23,10 +23,8 @@ fn main() -> anyhow::Result<()> {
     let params = Params {
         max_width: max_w.parse()?,
         max_height: max_h.parse()?,
-        quality: 80.0,
-        encoder: Encoder::Jpegli,
-        parallel: 1,
         output: Some(target),
+        ..Default::default()
     };
 
     let src = std::fs::read(input)?;
