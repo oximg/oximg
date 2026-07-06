@@ -72,6 +72,16 @@ jobs:
       - name: Check (library only)
         if: matrix.arch == 'amd64'
         run: cargo clippy --release --no-default-features --features avif -- -D warnings
+      # Runtime smoke for the examples/tools — they compile under
+      # --all-targets above, but nothing ran them, so a broken CLI path
+      # (arg handling, read_ppm) would slip through.
+      - name: Examples smoke
+        if: matrix.arch == 'amd64'
+        run: |
+          cargo run --release --example probe -- tests/fixtures/photo.webp
+          cargo run --release --example thumbnail -- tests/fixtures/photo.jpg 64 64 /tmp/t.jpg
+          cargo run --release --example transcode --features avif -- tests/fixtures/photo.jpg 64 64 avif /tmp/t.avif
+          cargo run --release --example qcli --features avif -- transcode tests/fixtures/photo.jpg 64 64 webp /tmp/q.webp
 
   # The declared rust-version must actually build: cargo-install users
   # on the MSRV toolchain hit whatever this job would have caught.

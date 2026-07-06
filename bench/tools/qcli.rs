@@ -28,8 +28,9 @@ fn read_ppm(path: &str) -> anyhow::Result<(Vec<u8>, usize, usize)> {
         while pos < data.len() && (data[pos] as char).is_whitespace() {
             pos += 1;
         }
+        anyhow::ensure!(pos < data.len(), "truncated PPM header");
         if data[pos] == b'#' {
-            while data[pos] != b'\n' {
+            while pos < data.len() && data[pos] != b'\n' {
                 pos += 1;
             }
             continue;
@@ -41,6 +42,7 @@ fn read_ppm(path: &str) -> anyhow::Result<(Vec<u8>, usize, usize)> {
         fields.push(std::str::from_utf8(&data[start..pos])?.to_string());
     }
     pos += 1; // single whitespace after maxval
+    anyhow::ensure!(pos <= data.len(), "truncated PPM header");
     anyhow::ensure!(fields[0] == "P6" && fields[3] == "255", "unsupported PPM");
     let (w, h): (usize, usize) = (fields[1].parse()?, fields[2].parse()?);
     anyhow::ensure!(data.len() - pos >= w * h * 3, "truncated PPM");

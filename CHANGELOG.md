@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- `qcli`'s PPM reader no longer panics (out-of-bounds index) on a
+  malformed header — an all-whitespace file, a comment with no
+  trailing newline, or a truncated header — returning a clean error
+  instead. A CI smoke step now also *runs* the examples and tools
+  (probe/thumbnail/transcode/qcli) against a fixture, so a broken CLI
+  path is caught even though they already compiled.
+
 ## [0.5.0] - 2026-07-06
 
 First minor bump: a small, contained set of library-API changes plus
