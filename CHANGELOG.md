@@ -10,6 +10,14 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-06
+
+Operability and engineering-health release: honest failure statuses
+with server-side logging, a fail-closed signing config, CI that
+finally gates both architectures and both feature sets, and a module
+reorganization that isolates the attacker-facing container parser —
+all byte-identical on the wire for successful requests.
+
 ### Changed
 
 - Failure statuses are honest and failures are finally visible
@@ -321,7 +329,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.1...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/oximg/oximg/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/oximg/oximg/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/oximg/oximg/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/oximg/oximg/compare/v0.2.0...v0.3.0
