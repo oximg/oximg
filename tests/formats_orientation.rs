@@ -3,11 +3,10 @@
 
 mod common;
 
-use common::{dims_of, params};
 #[cfg(feature = "avif")]
 use common::fixture;
+use common::{dims_of, params};
 use oximg::pipeline::{self, ImageFormat, Params};
-
 
 /// Every EXIF orientation must display upright: sources are built by
 /// applying the *inverse* transform (an implementation independent of
@@ -29,7 +28,6 @@ fn every_exif_orientation_displays_upright() {
     }
 }
 
-
 /// An orientation-1 tag and no tag at all must produce identical
 /// output bytes (the marker changes nothing but the source file).
 #[test]
@@ -41,7 +39,6 @@ fn orientation_one_matches_untagged_bytes() {
     let (b, _) = pipeline::process(&untagged, &params(120)).unwrap();
     assert_eq!(a, b);
 }
-
 
 /// Orientation applies before the cross-format encode, so a rotated
 /// source converts with corrected dimensions in any target format.
@@ -58,7 +55,6 @@ fn orientation_applies_to_cross_format_targets() {
     assert_eq!(fmt, ImageFormat::Webp);
     assert_eq!(dims_of(&out), (120, 90));
 }
-
 
 /// The *first* Exif APP1 decides, matching Chrome and Firefox: a
 /// non-Exif APP1 (XMP) before it must not mask it, and an
@@ -88,7 +84,6 @@ fn first_exif_app1_wins_across_multiple_app1_segments() {
     );
 }
 
-
 /// The library decode API (qcli's path) honors rotation exactly like
 /// the server: display-fit dims and upright pixels.
 #[test]
@@ -110,7 +105,6 @@ fn decode_and_resize_honors_orientation() {
         ['R', 'G', 'B', 'W']
     );
 }
-
 
 /// PNG `eXIf` and WebP `EXIF` orientations display upright, for every
 /// orientation value, through the same corner cross-check as JPEG.
@@ -193,7 +187,6 @@ fn png_and_webp_orientations_display_upright() {
     let (out, _) = pipeline::process(&webp_src, &params(120)).unwrap();
     assert_eq!(dims_of(&out), (120, 90), "prefixed EXIF payload");
 }
-
 
 /// Orientation coverage beyond plain RGB and square boxes: grayscale
 /// PNG (channel expansion shares the rotation scratch buffer), RGBA
@@ -354,7 +347,6 @@ fn orientation_edge_paths() {
     let (out, _) = pipeline::process(&png_src, &p).unwrap();
     assert_eq!(dims_of(&out), (133, 100), "png too (no scaler, exact)");
 }
-
 
 /// avifenc-authored irot/imir fixtures must display exactly as
 /// libheif renders them (ground truth captured via ImageMagick's heic

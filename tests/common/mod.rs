@@ -34,7 +34,6 @@ pub fn dims_of(bytes: &[u8]) -> (usize, usize) {
     (w, h)
 }
 
-
 /// Minimal little-endian Exif APP1 payload carrying one orientation tag.
 pub fn app1_orientation(o: u16) -> Vec<u8> {
     let mut v = b"Exif\0\0".to_vec();

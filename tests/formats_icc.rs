@@ -5,7 +5,6 @@ mod common;
 use common::{dims_of, fixture, params};
 use oximg::pipeline::{self, Encoder, ImageFormat, Params};
 
-
 /// A JPEG source's ICC profile survives into every profile-capable
 /// target, byte for byte — including a profile large enough to span
 /// multiple APP2 chunks, and under every JPEG encoder.
@@ -55,7 +54,6 @@ fn jpeg_icc_roundtrips_to_every_icc_target() {
         }
     }
 }
-
 
 /// PNG and WebP sources carry their profiles too (same-format, to
 /// JPEG, and — with the avif feature — into a spliced AVIF `colr`).
@@ -124,7 +122,6 @@ fn png_and_webp_icc_sources_roundtrip() {
     }
 }
 
-
 /// A libavif-authored (avifenc --icc) fixture: our container walk must
 /// read a third-party writer's property layout, not just its own.
 #[cfg(feature = "avif")]
@@ -148,7 +145,6 @@ fn libavif_authored_icc_is_extracted() {
         "libavif source → jpeg carries the profile"
     );
 }
-
 
 /// AVIF is profile-capable in both directions: a profiled JPEG
 /// converts to a profiled AVIF (through the fused YUV path — ICC does
@@ -208,7 +204,6 @@ fn avif_icc_both_directions() {
     }
 }
 
-
 /// The RGBA PNG decode path (no fused fast path) carries the profile
 /// too, and a profile past ICC_CAP is dropped, not copied into every
 /// output.
@@ -244,7 +239,6 @@ fn png_general_arm_and_icc_cap() {
     );
 }
 
-
 /// Profile-less sources must not grow profiles, whatever the target.
 #[test]
 fn icc_less_sources_stay_profile_free() {
@@ -268,7 +262,6 @@ fn icc_less_sources_stay_profile_free() {
         }
     }
 }
-
 
 /// Rotation and profile pass-through compose: an oriented, profiled
 /// source comes out upright with the profile intact.

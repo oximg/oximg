@@ -8,7 +8,6 @@ mod common;
 use common::{dims_of, fixture, params};
 use oximg::pipeline::{self, ImageFormat, Params};
 
-
 #[cfg(feature = "avif")]
 #[test]
 fn avif_resizes_in_avif() {
@@ -17,7 +16,6 @@ fn avif_resizes_in_avif() {
     assert!(!out.is_empty());
     assert_eq!(dims_of(&out), (100, 75));
 }
-
 
 #[cfg(feature = "avif")]
 #[test]
@@ -34,7 +32,6 @@ fn avif_alpha_survives_and_does_not_bleed() {
     assert!(px(w - 2, mid)[3] > 230, "right edge should stay opaque");
 }
 
-
 #[cfg(feature = "avif")]
 #[test]
 fn avif_garbage_and_truncation_error_instead_of_panicking() {
@@ -46,7 +43,6 @@ fn avif_garbage_and_truncation_error_instead_of_panicking() {
         );
     }
 }
-
 
 /// Fully opaque RGBA must not pay for an AVIF alpha item: the output
 /// drops to 3 channels and is byte-identical to encoding the same
@@ -81,7 +77,6 @@ fn opaque_rgba_avif_drops_the_alpha_item() {
     assert_eq!(channels, 4, "alpha item must survive");
 }
 
-
 #[cfg(feature = "avif")]
 #[test]
 fn avif_alpha_survives_cross_format_to_png() {
@@ -96,7 +91,6 @@ fn avif_alpha_survives_cross_format_to_png() {
         .unwrap();
     assert_eq!(r.info().color_type, png::ColorType::Rgba);
 }
-
 
 /// Animated AVIF sources render their first frame (the still primary
 /// item MIAF requires them to carry), like other image proxies —

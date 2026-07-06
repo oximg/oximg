@@ -32,7 +32,6 @@ fn every_source_shape_resizes_in_its_own_format() {
     }
 }
 
-
 #[test]
 fn png_and_webp_outputs_have_expected_dims() {
     for name in ["rgb.png", "rgba.png", "photo.webp", "alpha.webp"] {
@@ -41,13 +40,11 @@ fn png_and_webp_outputs_have_expected_dims() {
     }
 }
 
-
 #[test]
 fn never_upscales() {
     let (out, _) = pipeline::process(&fixture("tiny.jpg"), &params(500)).unwrap();
     assert_eq!(dims_of(&out), (40, 30));
 }
-
 
 #[test]
 fn alpha_survives_and_does_not_bleed() {
@@ -71,7 +68,6 @@ fn alpha_survives_and_does_not_bleed() {
     assert!(px(w - 2, mid)[3] > 230, "right edge should stay opaque");
 }
 
-
 /// Animated WebP sources render their first frame (full-canvas first
 /// frames only — a partial one would need compositing and still gets
 /// the clean animation error).
@@ -89,7 +85,6 @@ fn animated_webp_renders_first_frame() {
     assert_eq!(fmt, ImageFormat::Jpeg);
     assert_eq!(dims_of(&out), (32, 24), "cross-format first frame");
 }
-
 
 #[test]
 fn garbage_and_truncation_error_instead_of_panicking() {
@@ -118,7 +113,6 @@ fn garbage_and_truncation_error_instead_of_panicking() {
     }
 }
 
-
 /// All 200x150 fixtures and their source formats.
 fn all_fixtures() -> Vec<(&'static str, ImageFormat)> {
     let mut v = vec![
@@ -141,7 +135,6 @@ fn all_fixtures() -> Vec<(&'static str, ImageFormat)> {
     v
 }
 
-
 /// The refactor pin: requesting the source's own format must reproduce
 /// the default (sniff-and-match) output byte for byte — including
 /// through the fused JPEG gate, whose condition gained a target check.
@@ -162,7 +155,6 @@ fn explicit_same_format_is_byte_identical() {
         assert_eq!(implicit.0, explicit.0, "{name}: bytes must be identical");
     }
 }
-
 
 #[test]
 fn cross_format_matrix() {
@@ -185,7 +177,6 @@ fn cross_format_matrix() {
         }
     }
 }
-
 
 /// rgba.png is transparent at the left edge; flattening onto the
 /// default white background must leave that region near-white in the
@@ -210,7 +201,6 @@ fn rgba_to_jpeg_flattens_onto_white() {
     }
 }
 
-
 /// Cross-format must route alpha through targets that support it:
 /// WebP-with-alpha -> PNG keeps the transparent/opaque edges intact.
 #[test]
@@ -233,7 +223,6 @@ fn cross_format_alpha_survives_webp_to_png() {
     assert!(alpha(w - 2) > 230, "right edge should stay opaque");
 }
 
-
 #[test]
 fn rgba_to_webp_keeps_alpha_channel() {
     let p = Params {
@@ -250,7 +239,6 @@ fn rgba_to_webp_keeps_alpha_channel() {
     }
 }
 
-
 #[test]
 fn cross_format_never_upscales() {
     let p = Params {
@@ -260,7 +248,6 @@ fn cross_format_never_upscales() {
     let (out, _) = pipeline::process(&fixture("tiny.jpg"), &p).unwrap();
     assert_eq!(dims_of(&out), (40, 30));
 }
-
 
 /// Mid-stream JPEG truncation degrades gracefully on the same-format
 /// path (libjpeg fills the tail); the cross-format dispatch must keep
@@ -278,7 +265,6 @@ fn truncated_jpeg_to_webp_degrades_gracefully() {
     assert_eq!(dims_of(&out), (100, 75));
 }
 
-
 #[cfg(not(feature = "avif"))]
 #[test]
 fn avif_output_errors_cleanly_without_the_feature() {
@@ -289,7 +275,6 @@ fn avif_output_errors_cleanly_without_the_feature() {
     let err = pipeline::process(&fixture("rgb.png"), &p).unwrap_err();
     assert!(format!("{err:#}").contains("not enabled"), "got: {err:#}");
 }
-
 
 #[test]
 fn jpeg_presets_all_produce_decodable_output() {
