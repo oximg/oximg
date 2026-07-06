@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-06
+
+Two error-path bugfixes and the project's outward-facing docs: a
+security policy, `--version`, real library examples, and benchmark
+tables that finally document the metadata-source cells and their own
+provenance.
+
 ### Added
 
 - BENCH.md gains a "Metadata sources" section with measured
@@ -432,7 +439,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.4...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/oximg/oximg/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/oximg/oximg/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/oximg/oximg/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/oximg/oximg/compare/v0.4.1...v0.4.2
