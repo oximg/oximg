@@ -82,6 +82,11 @@ fn fused_decode_loop<R: std::io::BufRead, T: Send>(
         // Decode loop on the request thread: read a chunk, hand it to
         // the worker, reuse buffers the worker has drained.
         let t_decode = std::time::Instant::now();
+        // Set when the loop stops *only* because the worker's receiver
+        // was dropped (worker already failed/returned). In that case
+        // the worker holds the root cause; a genuine decode error does
+        // not set it and stays the root cause instead.
+        let mut worker_gone = false;
         let decode_result = (|| -> Result<()> {
             let mut remaining = dec_h;
             while remaining > 0 {
@@ -101,8 +106,12 @@ fn fused_decode_loop<R: std::io::BufRead, T: Send>(
                 let rows = got / row_bytes;
                 remaining -= rows;
                 if chunk_tx.send((buf, rows)).is_err() {
-                    // Worker died; its join below reports the real error.
-                    anyhow::bail!("fuse worker exited early");
+                    // Worker vanished; its join below carries the real
+                    // (often ServerFault-marked) error. Backstop this
+                    // sentinel as a ServerFault too, in case the worker
+                    // somehow returned Ok.
+                    worker_gone = true;
+                    return Err(anyhow::anyhow!("fuse worker exited early").context(ServerFault));
                 }
             }
             Ok(())
@@ -113,10 +122,21 @@ fn fused_decode_loop<R: std::io::BufRead, T: Send>(
         let worker_result = worker
             .join()
             .map_err(|_| anyhow::anyhow!("fuse worker panicked").context(ServerFault))?;
-        // A decode error is the root cause; report it over the worker's
-        // consequent "incomplete image" error.
-        decode_result?;
-        Ok(Some((decode_ms, worker_result?)))
+        // Error priority. When the decoder stopped only because the
+        // worker vanished, the worker's error is the root cause and
+        // must win — surfacing the generic "exited early" sentinel
+        // there both hid the real message and dropped its ServerFault
+        // marker (a 500 became a 422). A genuine decode error, on the
+        // other hand, outranks the worker's consequent "incomplete
+        // image".
+        if worker_gone {
+            let value = worker_result?;
+            decode_result?; // only the send-fail sentinel reaches here
+            Ok(Some((decode_ms, value)))
+        } else {
+            decode_result?;
+            Ok(Some((decode_ms, worker_result?)))
+        }
     })
 }
 

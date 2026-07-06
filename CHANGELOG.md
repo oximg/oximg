@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- A fused-path worker failure (encode error, session setup) now
+  surfaces the worker's real, ServerFault-marked error as a 500
+  instead of the decode loop's generic "fuse worker exited early"
+  sentinel — which both hid the cause and, lacking the marker, was
+  mapped to 422, making the status depend on the overlap gate. A
+  genuine decode error still outranks the worker's consequent
+  incomplete-image error.
+
 ## [0.4.4] - 2026-07-06
 
 Security hardening for untrusted-input deployments: a decompression-
