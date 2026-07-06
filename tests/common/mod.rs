@@ -257,6 +257,59 @@ pub fn png_with_icc(px: &[u8], w: usize, h: usize, icc: &[u8]) -> Vec<u8> {
     png_with_icc_color(px, w, h, icc, png::ColorType::Rgb)
 }
 
+/// Raw little-endian TIFF payload with one orientation entry — what
+/// PNG `eXIf` and (per spec) WebP `EXIF` chunks carry.
+pub fn tiff_orientation(o: u16) -> Vec<u8> {
+    app1_orientation(o)[6..].to_vec()
+}
+
+/// Encode RGB pixels as a PNG carrying an `eXIf` orientation chunk.
+pub fn png_with_orientation(px: &[u8], w: usize, h: usize, o: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut info = png::Info::with_size(w as u32, h as u32);
+    info.exif_metadata = Some(std::borrow::Cow::Owned(tiff_orientation(o)));
+    let mut enc = png::Encoder::with_info(&mut out, info).unwrap();
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer.write_image_data(px).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// Wrap a bare (VP8/VP8L) WebP of known canvas size in a VP8X
+/// container carrying an `EXIF` chunk (placed after the image data,
+/// where the spec puts it) — RIFF surgery independent of libwebp's
+/// mux.
+pub fn webp_with_exif(webp: &[u8], w: usize, h: usize, exif: &[u8]) -> Vec<u8> {
+    assert_eq!(&webp[0..4], b"RIFF");
+    assert_eq!(&webp[8..12], b"WEBP");
+    assert!(
+        &webp[12..16] == b"VP8 " || &webp[12..16] == b"VP8L",
+        "helper expects a bare container"
+    );
+    let push_chunk = |chunks: &mut Vec<u8>, four: &[u8; 4], body: &[u8]| {
+        chunks.extend_from_slice(four);
+        chunks.extend((body.len() as u32).to_le_bytes());
+        chunks.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            chunks.push(0);
+        }
+    };
+    let mut chunks = Vec::new();
+    let mut vp8x = vec![0x08u8, 0, 0, 0]; // EXIF flag
+    vp8x.extend(&((w - 1) as u32).to_le_bytes()[..3]);
+    vp8x.extend(&((h - 1) as u32).to_le_bytes()[..3]);
+    push_chunk(&mut chunks, b"VP8X", &vp8x);
+    chunks.extend_from_slice(&webp[12..]); // image data
+    push_chunk(&mut chunks, b"EXIF", exif);
+    let mut out = b"RIFF".to_vec();
+    out.extend(((chunks.len() + 4) as u32).to_le_bytes());
+    out.extend(b"WEBP");
+    out.extend(chunks);
+    out
+}
+
 /// Wrap a bare (VP8/VP8L) WebP of known canvas size in a VP8X
 /// container carrying an ICCP chunk — RIFF surgery independent of
 /// libwebp's mux.

@@ -1120,6 +1120,63 @@ pub fn extract_icc(avif: &[u8]) -> Option<Vec<u8>> {
     icc
 }
 
+/// The primary item's `irot`/`imir` transforms composed as an
+/// EXIF-style orientation. MIAF-conformant writers associate the
+/// rotation before the mirror and HEIF applies transforms in
+/// association order, so both orders are honored: mirror-first files
+/// (non-MIAF but spec-legal, and rendered that way by libheif) use the
+/// dihedral identity `rot_a ∘ mirror = mirror ∘ rot_{-a}` to reduce to
+/// the rotation-first table. Upright on anything absent or malformed.
+pub(crate) fn extract_orientation(avif: &[u8]) -> crate::meta::Orientation {
+    fn inner(avif: &[u8]) -> Option<(u8, Option<u8>, bool)> {
+        let meta = meta_payload(avif)?;
+        let primary = primary_item_id(avif, meta.clone())?;
+        let (iprp, _) = find_box(avif, meta, b"iprp")?;
+        let (ipco, _) = find_box(avif, iprp.clone(), b"ipco")?;
+        let mut props: Vec<([u8; 4], std::ops::Range<usize>)> = Vec::new();
+        let mut i = ipco.start;
+        while i + 8 <= ipco.end && props.len() < 1024 {
+            let (typ, payload, box_end) = next_box(avif, i, ipco.end)?;
+            props.push((typ, payload));
+            i = box_end;
+        }
+        let (ipma, _) = find_box(avif, iprp, b"ipma")?;
+        let mut angle = 0u8;
+        let mut mirror: Option<u8> = None;
+        let mut saw_irot = false;
+        let mut mirror_first = false;
+        ipma_walk(avif.get(ipma)?, primary, |item_id, idx| {
+            if item_id != primary || idx == 0 {
+                return;
+            }
+            let Some((typ, payload)) = props.get(idx - 1) else {
+                return;
+            };
+            match typ {
+                b"irot" if !saw_irot => {
+                    if let Some(&a) = avif[payload.clone()].first() {
+                        angle = a & 3;
+                        saw_irot = true;
+                    }
+                }
+                b"imir" if mirror.is_none() => {
+                    mirror = avif[payload.clone()].first().map(|m| m & 1);
+                    mirror_first = mirror.is_some() && !saw_irot;
+                }
+                _ => {}
+            }
+        })?;
+        Some((angle, mirror, mirror_first && saw_irot))
+    }
+    match inner(avif) {
+        Some((angle, mirror, mirror_first)) => {
+            let angle = if mirror_first { (4 - angle) & 3 } else { angle };
+            crate::meta::Orientation::from_rot_mirror(angle, mirror)
+        }
+        None => crate::meta::Orientation::UPRIGHT,
+    }
+}
+
 /// Splice `icc` into an AVIF container as a `colr` (`prof`) property
 /// associated with the primary item: the property is appended to
 /// `ipco` (existing 1-based indices keep their meaning), one
@@ -1764,6 +1821,51 @@ mod tests {
             extract_icc(&avif).as_deref(),
             Some(&icc[..]),
             "narrow/essential"
+        );
+    }
+
+    /// HEIF applies transformative properties in association order.
+    /// MIAF writers put irot before imir (the rotation-first table);
+    /// a spec-legal mirror-first file must reduce via the dihedral
+    /// identity instead — pinned against libheif 1.23's rendering of
+    /// exactly this byte layout (association bytes swapped on the
+    /// irot1+imir1 fixture: libheif shows mirror-then-rotation).
+    #[test]
+    fn orientation_honors_association_order() {
+        let build = |first: (&[u8; 4], u8), second: (&[u8; 4], u8)| -> Vec<u8> {
+            let ipco = fbox(
+                b"ipco",
+                &[fbox(first.0, &[first.1]), fbox(second.0, &[second.1])].concat(),
+            );
+            let mut ipma_pl = vec![0, 0, 0, 0];
+            ipma_pl.extend(1u32.to_be_bytes());
+            ipma_pl.extend(7u16.to_be_bytes());
+            ipma_pl.push(2); // two associations, in ipco order
+            ipma_pl.push(0x80 | 1);
+            ipma_pl.push(0x80 | 2);
+            let iprp = fbox(b"iprp", &[ipco, fbox(b"ipma", &ipma_pl)].concat());
+            let mut pitm_pl = vec![0, 0, 0, 0];
+            pitm_pl.extend(7u16.to_be_bytes());
+            let meta_pl = [vec![0, 0, 0, 0], fbox(b"pitm", &pitm_pl), iprp].concat();
+            fbox(b"meta", &meta_pl)
+        };
+        // MIAF order: rotation then mirror → EXIF 7 (transverse).
+        let rot_first = build((b"irot", 1), (b"imir", 1));
+        assert_eq!(
+            extract_orientation(&rot_first),
+            crate::meta::Orientation::from_rot_mirror(1, Some(1))
+        );
+        // Mirror first: libheif renders mirror-then-rotation, which the
+        // identity rot_a ∘ mirror = mirror ∘ rot_{-a} maps to the
+        // rotation-first table at the negated angle → EXIF 5.
+        let mirror_first = build((b"imir", 1), (b"irot", 1));
+        assert_eq!(
+            extract_orientation(&mirror_first),
+            crate::meta::Orientation::from_rot_mirror(3, Some(1))
+        );
+        assert_ne!(
+            extract_orientation(&rot_first),
+            extract_orientation(&mirror_first)
         );
     }
 

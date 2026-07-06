@@ -1527,6 +1527,23 @@ fn process_png<R: std::io::Read>(
     let mut decoder = png::Decoder::new(std::io::Cursor::new(&s.srcbuf[..]));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut png_reader = decoder.read_info().context("parse PNG")?;
+    // eXIf orientation (raw TIFF per the PNG spec; a stray JPEG-style
+    // prefix is tolerated like browsers do). Only chunks ahead of the
+    // image data are seen — the orientation must steer the resize box,
+    // so it has to be known before decoding. The registration allows
+    // post-IDAT placement, but Chrome and Firefox also honor only
+    // pre-IDAT eXIf, so serving those unrotated is browser parity, and
+    // fail-safe besides.
+    let orientation = if auto_rotate() {
+        png_reader
+            .info()
+            .exif_metadata
+            .as_ref()
+            .and_then(|d| crate::meta::Orientation::from_exif_payload(d))
+            .unwrap_or(crate::meta::Orientation::UPRIGHT)
+    } else {
+        crate::meta::Orientation::UPRIGHT
+    };
     // iCCP profile (the png crate has already inflated it), bytes
     // passed through untouched.
     let icc: Option<Vec<u8>> = if icc_passthrough() && target_supports_icc(target) {
@@ -1553,6 +1570,9 @@ fn process_png<R: std::io::Read>(
             && !hdr.interlaced
             && (src_w, src_h) != (dst_w, dst_h)
             && linear_light()
+            // Oriented PNGs are rare; they take the general arm below
+            // rather than teaching the row-streaming path to rotate.
+            && orientation.is_upright()
         {
             let fwd = fwd_lut();
             // Fully filled row by row; the row-count check below rejects
@@ -1626,7 +1646,7 @@ fn process_png<R: std::io::Read>(
 
     let t_decode = t0.elapsed();
     let t1 = std::time::Instant::now();
-    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
+    let (dst_w, dst_h) = resize_pixels_oriented(s, channels, src_w, src_h, orientation, p)?;
     let t_resize = t1.elapsed();
     let t2 = std::time::Instant::now();
     let out = encode_output(s, dst_w, dst_h, channels, target, p, icc.as_deref());
@@ -1682,17 +1702,23 @@ fn process_webp<R: std::io::Read>(
     // costs other servers their score.
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    let icc = if icc_passthrough() && target_supports_icc(target) {
-        webp_icc(&s.srcbuf)
-    } else {
-        None
-    };
-    let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, p)?;
+    // One mux parse serves both metadata chunks: the ICC profile and
+    // the EXIF orientation (raw TIFF or JPEG-style prefixed; writers
+    // disagree, browsers accept both).
+    let (icc, exif) = webp_metadata(
+        &s.srcbuf,
+        icc_passthrough() && target_supports_icc(target),
+        auto_rotate(),
+    );
+    let orientation = exif
+        .and_then(|d| crate::meta::Orientation::from_exif_payload(&d))
+        .unwrap_or(crate::meta::Orientation::UPRIGHT);
+    let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, orientation, p)?;
     let _ = (src_w, src_h);
     let t_dec = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let (dst_w, dst_h) = resize_pixels(s, channels, dec_w, dec_h, p)?;
+    let (dst_w, dst_h) = resize_pixels_oriented(s, channels, dec_w, dec_h, orientation, p)?;
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
@@ -1725,18 +1751,23 @@ fn process_avif<R: std::io::Read>(
 
     let timing = std::env::var("OXIMG_TIMING").is_ok();
     let t0 = std::time::Instant::now();
-    // avif-parse exposes no colr boxes; the profile comes from our own
-    // bounded container walk (see avif::extract_icc).
+    // avif-parse exposes neither colr nor irot/imir; both come from
+    // our own bounded container walk.
     let icc = if icc_passthrough() && target_supports_icc(target) {
         crate::avif::extract_icc(&s.srcbuf)
     } else {
         None
     };
+    let orientation = if auto_rotate() {
+        crate::avif::extract_orientation(&s.srcbuf)
+    } else {
+        crate::meta::Orientation::UPRIGHT
+    };
     let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let (dst_w, dst_h) = resize_pixels(s, channels, src_w, src_h, p)?;
+    let (dst_w, dst_h) = resize_pixels_oriented(s, channels, src_w, src_h, orientation, p)?;
     let t_resize = t1.elapsed();
 
     let t2 = std::time::Instant::now();
@@ -1757,6 +1788,7 @@ fn process_avif<R: std::io::Read>(
 /// (src_w, src_h, channels, decoded_w, decoded_h).
 fn webp_decode_into_chunk8(
     s: &mut Scratch,
+    orientation: crate::meta::Orientation,
     p: &Params,
 ) -> Result<(usize, usize, usize, usize, usize)> {
     use libwebp_sys as w;
@@ -1778,7 +1810,17 @@ fn webp_decode_into_chunk8(
         let (src_w, src_h) = (config.input.width as usize, config.input.height as usize);
         let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
 
-        let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        // The stored-space resize target: fit the *displayed* frame,
+        // swap back for axis-swapping orientations. Deciding the decode
+        // scale from the unoriented fit would under-decode sources
+        // whose displayed aspect fits the box differently.
+        let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
+        let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
+        let (dst_w, dst_h) = if orientation.swaps_axes() {
+            (fit_h, fit_w)
+        } else {
+            (fit_w, fit_h)
+        };
         let need_w = ((dst_w as f64) * dct_margin()).ceil() as usize;
         let (dec_w, dec_h) = if need_w < src_w {
             let scale = need_w as f64 / src_w as f64;
@@ -1826,18 +1868,57 @@ fn webp_decode_into_chunk8(
     }
 }
 
-/// Resize the fully decoded pixels in `chunk8` (3 or 4 channels) into
-/// `out8`, returning the output dimensions. RGB follows the same
-/// linear-light path as JPEG; alpha images are premultiplied before
-/// resampling and unpremultiplied after.
-fn resize_pixels(
+/// Resize the fully decoded pixels in `chunk8` honoring an EXIF-style
+/// orientation: the box fits the *displayed* frame, the resize runs in
+/// the stored orientation, and the pixels rotate afterwards on the
+/// small output frame — the same strategy as the JPEG arm, shared by
+/// the PNG/WebP/AVIF full-frame paths.
+fn resize_pixels_oriented(
     s: &mut Scratch,
     channels: usize,
     src_w: usize,
     src_h: usize,
+    orientation: crate::meta::Orientation,
     p: &Params,
 ) -> Result<(usize, usize)> {
-    let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+    let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
+    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
+    let (dst_w, dst_h) = if orientation.swaps_axes() {
+        (fit_h, fit_w)
+    } else {
+        (fit_w, fit_h)
+    };
+    resize_pixels_to(s, channels, src_w, src_h, dst_w, dst_h, p.parallel)?;
+    if orientation.is_upright() {
+        return Ok((dst_w, dst_h));
+    }
+    // chunk8 held the decoded source; it is free once the resize is
+    // done, so rotate into it and swap it in as out8.
+    let dims = crate::meta::apply_orientation(
+        &s.out8[..dst_w * dst_h * channels],
+        dst_w,
+        dst_h,
+        channels,
+        orientation,
+        &mut s.chunk8,
+    );
+    std::mem::swap(&mut s.out8, &mut s.chunk8);
+    Ok(dims)
+}
+
+/// Resize the fully decoded pixels in `chunk8` (3 or 4 channels) into
+/// `out8` at exactly `dst_w`x`dst_h`. RGB follows the same
+/// linear-light path as JPEG; alpha images are premultiplied before
+/// resampling and unpremultiplied after.
+fn resize_pixels_to(
+    s: &mut Scratch,
+    channels: usize,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    parallel: usize,
+) -> Result<(usize, usize)> {
     let src_len = src_w * src_h * channels;
     if (src_w, src_h) == (dst_w, dst_h) {
         scratch_u8(&mut s.out8, src_len);
@@ -1882,7 +1963,7 @@ fn resize_pixels(
             } else {
                 PixelType::U16x3
             },
-            p.parallel,
+            parallel,
             &mut s.resizer,
         )?;
         scratch_u8(&mut s.out8, dst_len);
@@ -1930,7 +2011,7 @@ fn resize_pixels(
             } else {
                 PixelType::U8x3
             },
-            p.parallel,
+            parallel,
             &mut s.resizer,
         )?;
         if channels == 4 {
@@ -2120,9 +2201,17 @@ fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
-/// Extract the ICCP chunk from a WebP container, if any.
-fn webp_icc(srcbuf: &[u8]) -> Option<Vec<u8>> {
+/// Extract the ICCP and/or EXIF chunks from a WebP container in one
+/// mux parse.
+fn webp_metadata(
+    srcbuf: &[u8],
+    want_icc: bool,
+    want_exif: bool,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
     use libwebp_sys as wp;
+    if !want_icc && !want_exif {
+        return (None, None);
+    }
     unsafe {
         let data = wp::WebPData {
             bytes: srcbuf.as_ptr(),
@@ -2130,19 +2219,23 @@ fn webp_icc(srcbuf: &[u8]) -> Option<Vec<u8>> {
         };
         let mux = wp::WebPMuxCreateInternal(&data, 0, wp::WEBP_MUX_ABI_VERSION as _);
         if mux.is_null() {
-            return None;
+            return (None, None);
         }
-        let mut chunk: wp::WebPData = std::mem::zeroed();
-        let rc = wp::WebPMuxGetChunk(mux, c"ICCP".as_ptr(), &mut chunk);
         // The chunk data points into `srcbuf`/mux internals: copy out
         // before the mux is deleted.
-        let out = (rc == wp::WebPMuxError::WEBP_MUX_OK
-            && !chunk.bytes.is_null()
-            && chunk.size > 0
-            && chunk.size <= ICC_CAP)
-            .then(|| std::slice::from_raw_parts(chunk.bytes, chunk.size).to_vec());
+        let get = |fourcc: &std::ffi::CStr| -> Option<Vec<u8>> {
+            let mut chunk: wp::WebPData = std::mem::zeroed();
+            let rc = wp::WebPMuxGetChunk(mux, fourcc.as_ptr(), &mut chunk);
+            (rc == wp::WebPMuxError::WEBP_MUX_OK
+                && !chunk.bytes.is_null()
+                && chunk.size > 0
+                && chunk.size <= ICC_CAP)
+                .then(|| std::slice::from_raw_parts(chunk.bytes, chunk.size).to_vec())
+        };
+        let icc = if want_icc { get(c"ICCP") } else { None };
+        let exif = if want_exif { get(c"EXIF") } else { None };
         wp::WebPMuxDelete(mux);
-        out
+        (icc, exif)
     }
 }
 

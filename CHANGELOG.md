@@ -12,6 +12,18 @@ HTTP interface without notice.
 
 ### Added
 
+- Auto-rotation for the remaining source formats: PNG `eXIf`, WebP
+  `EXIF` chunks (raw-TIFF or JPEG-style prefixed payloads — writers
+  disagree, browsers accept both, so does oximg), and AVIF
+  `irot`/`imir` transforms, composed in MIAF's mandated order
+  (rotation, then mirror) into the same rotate-after-resize path JPEG
+  uses. The AVIF mapping is pinned against libheif's rendering of
+  avifenc-authored fixtures (avifdec itself does not apply the
+  transforms, libheif — what ImageMagick and most viewers use — does).
+  The WebP decode-scaler picks its decode size from the *displayed*
+  fit, so axis-swapping orientations under non-square boxes cannot
+  under-decode. `OXIMG_AUTO_ROTATE=0` covers all formats.
+
 - AVIF ICC in both directions — neither avif-parse nor avif-serialize
   exposes ICC in any released version, so both run on a bounded
   ISOBMFF walk of our own: extraction resolves the primary item's

@@ -314,8 +314,8 @@ fn forced_overlap_cross_format_matches_serial() {
     assert_eq!(&body[8..12], b"WEBP");
 }
 
-/// Write an orientation-6 (90°-rotated) JPEG into a fresh directory
-/// usable as IMAGES_DIR.
+/// Write orientation-6 (90°-rotated) sources of every rotatable
+/// format into a fresh directory usable as IMAGES_DIR.
 fn oriented_images_dir(tag: &str) -> String {
     let dir = std::env::temp_dir().join(format!("oximg-orient-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -323,6 +323,11 @@ fn oriented_images_dir(tag: &str) -> String {
     let (stored, sw, sh) = common::store_for_orientation(&display, 240, 180, 6);
     let jpeg = common::jpeg_with_orientation(&stored, sw, sh, Some(6));
     std::fs::write(dir.join("rotated.jpg"), jpeg).unwrap();
+    std::fs::write(
+        dir.join("rotated.png"),
+        common::png_with_orientation(&stored, sw, sh, 6),
+    )
+    .unwrap();
     dir.to_str().unwrap().to_string()
 }
 
@@ -337,15 +342,42 @@ fn auto_rotate_default_and_kill_switch() {
     let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
     // Stored portrait 180x240 displays as landscape 240x180.
     assert_eq!((w, h), (120, 90), "default: display-oriented fit");
+
+    let (_, _, body) = on.get("/resize/120/120/rotated.png").unwrap();
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (120, 90), "png default: display-oriented fit");
+    #[cfg(feature = "avif")]
+    {
+        // orient_irot1.avif (fixtures dir is also served) stores
+        // 240x180 landscape displaying portrait.
+        let fx = Server::start(47131, &[]);
+        let (_, _, body) = fx.get("/resize/120/120/orient_irot1.avif@jpg").unwrap();
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!((w, h), (90, 120), "avif default: irot applied");
+    }
     drop(on);
 
     let off = Server::start(
         47122,
-        &[("IMAGES_DIR", dir), ("OXIMG_AUTO_ROTATE", "0".into())],
+        &[
+            ("IMAGES_DIR", dir),
+            ("OXIMG_AUTO_ROTATE", "0".into()),
+            ("OXIMG_ICC", "0".into()),
+        ],
     );
-    let (_, _, body) = off.get("/resize/120/120/rotated.jpg").unwrap();
-    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
-    assert_eq!((w, h), (90, 120), "kill switch: stored orientation");
+    for name in ["rotated.jpg", "rotated.png"] {
+        let (_, _, body) = off.get(&format!("/resize/120/120/{name}")).unwrap();
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!((w, h), (90, 120), "{name} kill switch: stored orientation");
+    }
+    drop(off);
+    #[cfg(feature = "avif")]
+    {
+        let off = Server::start(47132, &[("OXIMG_AUTO_ROTATE", "0".into())]);
+        let (_, _, body) = off.get("/resize/120/120/orient_irot1.avif@jpg").unwrap();
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!((w, h), (120, 90), "avif kill switch: stored orientation");
+    }
 }
 
 /// Oriented sources force the pixel fuse; their bytes must still be

@@ -34,14 +34,48 @@ impl Orientation {
     /// also uses APP1) and for anything malformed — a broken tag must
     /// never fail the request, it just means "no orientation here".
     pub(crate) fn from_exif_app1(data: &[u8]) -> Option<Orientation> {
-        parse_exif_orientation(data)
+        parse_tiff_orientation(data.strip_prefix(b"Exif\0\0")?)
+    }
+
+    /// Parse an EXIF payload that may or may not carry the JPEG-style
+    /// `Exif\0\0` prefix: PNG `eXIf` and WebP `EXIF` chunks are raw
+    /// TIFF per their specs, but writers disagree and browsers accept
+    /// both, so we do too.
+    pub(crate) fn from_exif_payload(data: &[u8]) -> Option<Orientation> {
+        parse_tiff_orientation(data.strip_prefix(b"Exif\0\0").unwrap_or(data))
+    }
+
+    /// Compose a CCW quarter-turn rotation applied *first* (HEIF
+    /// `irot` angle) with an optional mirror applied *second* (HEIF
+    /// 2022 `imir` mode: 0 exchanges top/bottom, 1 exchanges
+    /// left/right) into the equivalent EXIF orientation. MIAF fixes
+    /// exactly this application order (rotation, then mirror). Pinned
+    /// against independent transform composition in tests and against
+    /// libheif's rendering of the AVIF fixtures (avifdec does not
+    /// apply the transforms; libheif — ImageMagick, most viewers —
+    /// does).
+    pub(crate) fn from_rot_mirror(angle_ccw: u8, mirror: Option<u8>) -> Orientation {
+        Orientation(match (angle_ccw & 3, mirror.map(|m| m & 1)) {
+            (0, None) => 1,
+            (1, None) => 8,
+            (2, None) => 3,
+            (3, None) => 6,
+            (0, Some(1)) => 2,
+            (1, Some(1)) => 7,
+            (2, Some(1)) => 4,
+            (3, Some(1)) => 5,
+            (0, Some(_)) => 4,
+            (1, Some(_)) => 5,
+            (2, Some(_)) => 2,
+            (3, Some(_)) => 7,
+            _ => unreachable!("angle is masked to 0..=3"),
+        })
     }
 }
 
 /// Walk the TIFF structure far enough to find IFD0 tag 0x0112. Every
 /// read is bounds-checked; `None` on any structural problem.
-fn parse_exif_orientation(data: &[u8]) -> Option<Orientation> {
-    let tiff = data.strip_prefix(b"Exif\0\0")?;
+fn parse_tiff_orientation(tiff: &[u8]) -> Option<Orientation> {
     let big_endian = match tiff.get(0..2)? {
         b"II" => false,
         b"MM" => true,
@@ -667,6 +701,39 @@ mod tests {
             let swap = o >= 5;
             assert_eq!((dw, dh), if swap { (h, w) } else { (w, h) }, "o={o}");
             assert_eq!(dst, want, "o={o}");
+        }
+    }
+
+    /// `from_rot_mirror` must equal composing the rotation and the
+    /// mirror as two independent `apply_orientation` passes, for every
+    /// combination — the table cannot drift from the transform code.
+    #[test]
+    fn rot_mirror_table_matches_composition() {
+        let (w, h) = (4usize, 3usize);
+        let src: Vec<u8> = (0..(w * h) as u8).collect();
+        // irot angle as a pure-rotation orientation, applied first.
+        let rot = [1u8, 8, 3, 6];
+        // imir mode as a pure-mirror orientation, applied second:
+        // 0 = top/bottom (flip vertical), 1 = left/right (flip horizontal).
+        for angle in 0..4u8 {
+            for mirror in [None, Some(0u8), Some(1u8)] {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let (rw, rh) =
+                    apply_orientation(&src, w, h, 1, Orientation(rot[angle as usize]), &mut a);
+                let (want, ww, wh) = match mirror {
+                    None => (a.clone(), rw, rh),
+                    Some(m) => {
+                        let flip = if m == 1 { 2 } else { 4 };
+                        let (fw, fh) = apply_orientation(&a, rw, rh, 1, Orientation(flip), &mut b);
+                        (b.clone(), fw, fh)
+                    }
+                };
+                let composed = Orientation::from_rot_mirror(angle, mirror);
+                let mut got = Vec::new();
+                let (gw, gh) = apply_orientation(&src, w, h, 1, composed, &mut got);
+                assert_eq!((gw, gh), (ww, wh), "angle={angle} mirror={mirror:?}");
+                assert_eq!(got, want, "angle={angle} mirror={mirror:?}");
+            }
         }
     }
 
