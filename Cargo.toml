@@ -41,10 +41,31 @@ pic-scale = "0.7"
 default = []
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
 
+# Benchmark/dev tools live under bench/tools/ (kept out of examples/,
+# which is library-usage only) but stay runnable as `cargo run
+# --example NAME` — run.py and QUALITY.md rely on the example name.
+[[example]]
+name = "qcli"
+path = "bench/tools/qcli.rs"
+
+[[example]]
+name = "decode_bench"
+path = "bench/tools/decode_bench.rs"
+
+[[example]]
+name = "resize_bench"
+path = "bench/tools/resize_bench.rs"
+
+[[example]]
+name = "resize_bench_x86"
+path = "bench/tools/resize_bench_x86.rs"
+
 [[example]]
 name = "avif_parity"
+path = "bench/tools/avif_parity.rs"
 required-features = ["avif"]
 
 [[example]]
 name = "enc_loop"
+path = "bench/tools/enc_loop.rs"
 required-features = ["avif"]
