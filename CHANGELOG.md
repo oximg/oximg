@@ -10,6 +10,14 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-06
+
+First minor bump: a small, contained set of library-API changes plus
+release-process hardening. Breaking only for library consumers who
+disabled default features or wrote exhaustive `Params { .. }`
+literals; the server, the Docker image, and same-URL output bytes are
+unchanged.
+
 ### Changed
 
 - Release automation: tag pushes now gate crates.io/npm publishing on a
@@ -470,7 +478,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.4.5...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/oximg/oximg/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/oximg/oximg/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/oximg/oximg/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/oximg/oximg/compare/v0.4.2...v0.4.3
