@@ -135,6 +135,20 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
 
+    // libjpeg can only convert grayscale/YCbCr/RGB sources to RGB
+    // output; for anything else (CMYK, YCCK, JCS_UNKNOWN) `dec.rgb()`
+    // aborts through the crate's unwinding error manager — a panic
+    // that bypasses the panic hook, not an `Err`. Refuse those up
+    // front with a real error so the HTTP layer classifies them as
+    // undecodable input (422) and library callers get a `Result`.
+    let cs = dec.color_space();
+    anyhow::ensure!(
+        matches!(
+            cs,
+            ColorSpace::JCS_GRAYSCALE | ColorSpace::JCS_YCbCr | ColorSpace::JCS_RGB
+        ),
+        "unsupported JPEG color space {cs:?}"
+    );
     let mut started = dec.rgb().context("decode start failed")?;
     let (dec_w, dec_h) = (started.width(), started.height());
     let row_bytes = dec_w * 3;

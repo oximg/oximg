@@ -514,6 +514,48 @@ fn sniff_detects_formats_by_magic_bytes() {
     assert_eq!(ImageFormat::sniff(b"GIF89a\x00\x00\x00\x00\x00\x00"), None);
 }
 
+/// Deterministic 4-component JPEG source: plain CMYK (Adobe APP14
+/// transform 0) or YCCK (transform 2). The scanlines are written in
+/// libjpeg's stored convention, which is Adobe-inverted (0 = full
+/// ink, 255 = no ink).
+fn make_cmyk_jpeg(w: usize, h: usize, ycck: bool) -> Vec<u8> {
+    let mut px = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            // Smooth gradients survive DCT quantization better than
+            // noise, keeping pixel-level assertions meaningful.
+            px.push((x * 255 / w.max(1)) as u8);
+            px.push((y * 255 / h.max(1)) as u8);
+            px.push(((x + y) * 255 / (w + h)) as u8);
+            px.push(255 - (y * 128 / h.max(1)) as u8);
+        }
+    }
+    let mut comp = Compress::new(ColorSpace::JCS_CMYK);
+    if ycck {
+        comp.set_color_space(ColorSpace::JCS_YCCK);
+    }
+    comp.set_size(w, h);
+    comp.set_quality(95.0);
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_scanlines(&px).unwrap();
+    started.finish().unwrap()
+}
+
+/// CMYK/YCCK sources must surface as a clean `Err` (HTTP 422), never
+/// as the mozjpeg crate's unwinding panic, which bypasses the panic
+/// hook and crosses the library boundary.
+#[test]
+fn cmyk_sources_error_cleanly_instead_of_panicking() {
+    for ycck in [false, true] {
+        let jpeg = make_cmyk_jpeg(64, 48, ycck);
+        let err = decode_and_resize(&jpeg, 32, 32, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported JPEG color space"),
+            "ycck={ycck}: {err:#}"
+        );
+    }
+}
+
 #[test]
 fn dct_scale_picks_smallest_sufficient() {
     // 7360 * 1/8 = 920 >= 500 -> num = 1
