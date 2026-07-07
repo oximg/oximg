@@ -261,9 +261,6 @@ default).
 
 ## Not yet implemented (out of PoC scope)
 
-- CMYK / YCCK JPEG sources decode via the browser-standard naive
-  conversion; an embedded CMYK ICC profile is not yet honored (it is
-  dropped, never passed through) — see Roadmap
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output (animated AVIF and WebP *sources* render their
   first frame, like other image proxies)
@@ -274,9 +271,6 @@ default).
 
 Rough order, subject to change (experimental PoC):
 
-- **CMYK/YCCK JPEG input** → linear-light RGB, honoring an embedded
-  ICC profile when present and falling back to a naive conversion
-  otherwise. Print-workflow assets are the common source of these.
 - **JXL output** once a maintained encoder binding stabilizes (the
   `@jxl` token is already reserved).
 - **Response caching** (keyed on the resolved URL + format) and

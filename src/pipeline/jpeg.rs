@@ -15,15 +15,34 @@ pub fn decode_and_resize(
 ) -> Result<(Vec<u8>, usize, usize)> {
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
-        let orientation = if auto_rotate() {
+        // The ICC scan feeds the CMYK→RGB conversion only (this
+        // helper returns raw pixels, so there is no pass-through);
+        // OXIMG_ICC=0 downgrades CMYK sources to the naive composite
+        // here exactly like the server path.
+        let want_icc = icc_passthrough();
+        let meta = if auto_rotate() || want_icc {
             let mut prefix = Vec::new();
             let mut r = jpeg;
-            crate::meta::scan_jpeg_meta(&mut r, &mut prefix, false).orientation
+            crate::meta::scan_jpeg_meta(&mut r, &mut prefix, want_icc)
+        } else {
+            crate::meta::JpegMeta::NONE
+        };
+        let orientation = if auto_rotate() {
+            meta.orientation
         } else {
             crate::meta::Orientation::UPRIGHT
         };
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        match decode_resize(s, dec, max_w, max_h, parallel, orientation, Fuse::Off, None)? {
+        match decode_resize(
+            s,
+            dec,
+            max_w,
+            max_h,
+            parallel,
+            orientation,
+            Fuse::Off,
+            meta.icc.as_deref(),
+        )? {
             Decoded::Pixels { dst_w, dst_h } => {
                 if orientation.is_upright() {
                     Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
@@ -112,8 +131,10 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     parallel: usize,
     orientation: crate::meta::Orientation,
     fuse: Fuse,
-    // Written ahead of the scanlines by the fused jpegli encoder;
-    // the other fuse variants embed via their one-shot encoders.
+    // The source's profile, dual-purpose by path: the fused jpegli
+    // encoder writes it ahead of its scanlines (the other fuse
+    // variants embed via their one-shot encoders), while the CMYK arm
+    // *consumes* it as the color-conversion input and never emits it.
     icc: Option<&[u8]>,
 ) -> Result<Decoded> {
     let timing = crate::config::config().timing;
@@ -156,7 +177,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             .read_scanlines_into(&mut s.chunk8[..dec_w * dec_h * 4])
             .context("decode failed")?;
         started.finish().context("decode finish failed")?;
-        cmyk_to_rgb_in_chunk8(s, dec_w * dec_h);
+        cmyk_to_rgb_in_chunk8(s, dec_w, dec_h, icc);
         resize_pixels_to(s, 3, dec_w, dec_h, dst_w, dst_h, parallel)?;
         if timing {
             eprintln!(
@@ -462,25 +483,6 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     }
 }
 
-/// Compact the raw 4-channel CMYK samples in `chunk8` (libjpeg's
-/// stored convention, which is Adobe-inverted: 0 = full ink) to RGB
-/// in place. The composite `r = c'·k'/255` on the inverted samples is
-/// the browser-standard rendering for profile-less CMYK (Chrome,
-/// Firefox, and djpeg all use it); the +127 rounding matches
-/// libjpeg-turbo's djpeg exactly, so the committed fixture references
-/// pin this byte-for-byte. Pixel i writes 3i..3i+3 after reading
-/// 4i..4i+4, so the forward pass never clobbers unread input (the
-/// same in-place trick as `flatten_alpha_in_out8`).
-fn cmyk_to_rgb_in_chunk8(s: &mut Scratch, pixels: usize) {
-    for i in 0..pixels {
-        let px: [u8; 4] = s.chunk8[i * 4..i * 4 + 4].try_into().unwrap();
-        let k = px[3] as u32;
-        for (c, &v) in px[..3].iter().enumerate() {
-            s.chunk8[i * 3 + c] = ((v as u32 * k + 127) / 255) as u8;
-        }
-    }
-}
-
 /// The streaming JPEG source path: header pre-scan (orientation +
 /// ICC), DCT shrink-on-load decode, fuse selection, and the
 /// post-resize orientation/ICC application. Split out of the format
@@ -503,7 +505,13 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // is hard-capped (see meta::SCAN_CAP).
         let mut reader = reader;
         let mut scan_prefix = Vec::new();
-        let want_icc = icc_passthrough() && target_supports_icc(target);
+        // Collect the profile whenever OXIMG_ICC is on: pass-through
+        // wants it for profile-capable targets, and the CMYK→RGB
+        // conversion needs it for *every* target — whether the source
+        // is CMYK is unknown until the frame header parses, after
+        // this scan. (OXIMG_ICC=0 therefore also downgrades CMYK
+        // sources to the naive conversion.)
+        let want_icc = icc_passthrough();
         let meta = if auto_rotate() || want_icc {
             crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
         } else {
@@ -517,19 +525,25 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         let icc = meta.icc;
         let reader = std::io::Read::chain(&scan_prefix[..], reader);
         let dec = Decompress::new_reader(reader).context("parse JPEG")?;
-        // A CMYK/YCCK source's embedded profile is a CMYK-class
-        // profile: it describes ink coverage, not the RGB pixels this
-        // request emits, so passing it through would mislabel every
-        // output. Converted output follows the pipeline's convention
-        // for profile-less sources: no profile, sRGB implied.
-        let icc = if matches!(
+        // A CMYK/YCCK source's embedded profile describes ink
+        // coverage, not the RGB pixels this request emits: it feeds
+        // the CMYK→RGB conversion inside `decode_resize` and never
+        // reaches an output, which follows the pipeline's convention
+        // for profile-less sources (no profile, sRGB implied). RGB
+        // sources keep the pass-through, gated on the target's
+        // ability to carry a profile.
+        let cmyk = matches!(
             dec.color_space(),
             ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
-        ) {
+        );
+        let icc_embed = if cmyk || !target_supports_icc(target) {
             None
         } else {
-            icc
+            icc.as_deref()
         };
+        // What decode_resize consumes: the conversion profile on the
+        // CMYK path, the fused-jpegli embed profile otherwise.
+        let icc_dec = if cmyk { icc.as_deref() } else { icc_embed };
         // Fused decode overlap: on unless disabled (see
         // overlap_gate). Band-parallel resize keeps the serial
         // path so OXIMG_PAR semantics are unchanged. Jpegli
@@ -612,7 +626,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             p.parallel,
             orientation,
             fuse,
-            icc.as_deref(),
+            icc_dec,
         )? {
             Decoded::Encoded(out) => out,
             Decoded::Pixels { dst_w, dst_h } => {
@@ -632,7 +646,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
                     std::mem::swap(&mut s.out8, &mut s.chunk8);
                     dims
                 };
-                encode_output(s, dw, dh, 3, target, p, icc.as_deref())?
+                encode_output(s, dw, dh, 3, target, p, icc_embed)?
             }
             #[cfg(feature = "avif")]
             Decoded::YuvPlanes { session } => {
@@ -640,14 +654,8 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
                 // inside the decode overlap; only the encode
                 // itself remains. The plane vectors are truncated
                 // to exactly this frame by the fused branch.
-                crate::avif::encode_avif_with_session(
-                    session,
-                    &s.y16,
-                    &s.cb16,
-                    &s.cr16,
-                    icc.as_deref(),
-                )
-                .context(ServerFault)?
+                crate::avif::encode_avif_with_session(session, &s.y16, &s.cb16, &s.cr16, icc_embed)
+                    .context(ServerFault)?
             }
             #[cfg(feature = "avif")]
             Decoded::PixelsSession {
@@ -671,7 +679,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
                     &s.out8[..dims.0 * dims.1 * 3],
                     dims.0,
                     dims.1,
-                    icc.as_deref(),
+                    icc_embed,
                 )
                 .context(ServerFault)?
             }

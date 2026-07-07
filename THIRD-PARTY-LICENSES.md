@@ -9,7 +9,7 @@ This file is generated — do not edit by hand. Regenerate with:
 
 ## Summary
 
-- **Apache License 2.0** — 105 crate(s)
+- **Apache License 2.0** — 106 crate(s)
 - **MIT License** — 22 crate(s)
 - **BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License** — 5 crate(s)
 - **ISC License** — 3 crate(s)
@@ -674,6 +674,7 @@ Used by:
 ## Apache License 2.0
 
 Used by:
+- [moxcms 0.8.1](https://github.com/awxkee/moxcms.git)
 - [novtb 0.1.13](https://github.com/awxkee/novtb.git)
 - [pic-scale 0.7.9](https://github.com/awxkee/pic-scale)
 - [pxfm 0.1.29](https://github.com/awxkee/pxfm)

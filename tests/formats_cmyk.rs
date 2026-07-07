@@ -107,9 +107,53 @@ fn cmyk_source_honors_exif_orientation() {
     assert_eq!(dims_of(&out), (48, 64));
 }
 
+/// An embedded CMYK-class profile is honored: the conversion runs
+/// through moxcms (relative colorimetric) and must land close to the
+/// committed vips `icc_transform` rendering — an independent CMM
+/// (lcms2) reading the same embedded profile. Tolerances follow the
+/// measured CMM gap (max|Δ|=2, mean 0.55 on this profile class).
+#[test]
+fn embedded_cmyk_profile_is_honored() {
+    let src = fixture("cmyk_icc.jpg");
+    let (want, w, h) = read_ppm(&fixture("cmyk_icc.ppm"));
+    let (got, gw, gh) = decode_and_resize(&src, w as u32, h as u32, 1).unwrap();
+    assert_eq!((gw, gh), (w, h));
+    let (mut worst, mut sum) = (0i32, 0u64);
+    for (a, b) in got.iter().zip(&want) {
+        let d = (*a as i32 - *b as i32).abs();
+        worst = worst.max(d);
+        sum += d as u64;
+    }
+    let mean = sum as f64 / got.len() as f64;
+    assert!(worst <= 3, "max per-channel delta {worst} > 3");
+    assert!(mean <= 1.0, "mean per-channel delta {mean:.3} > 1.0");
+
+    // Divergence guard: the color-managed rendering must differ
+    // loudly from the naive composite of the same samples, or a
+    // silently-ignored profile would sail through the tolerances.
+    let dec = mozjpeg::Decompress::new_mem(&src).unwrap();
+    let mut started = dec.to_colorspace(mozjpeg::ColorSpace::JCS_CMYK).unwrap();
+    let planes: Vec<u8> = started.read_scanlines().unwrap();
+    started.finish().unwrap();
+    let naive: Vec<u8> = planes
+        .chunks_exact(4)
+        .flat_map(|px| {
+            let k = px[3] as u32;
+            [0, 1, 2].map(|c| ((px[c] as u32 * k + 127) / 255) as u8)
+        })
+        .collect();
+    let diverges = got
+        .iter()
+        .zip(&naive)
+        .any(|(a, b)| (*a as i32 - *b as i32).abs() >= 30);
+    assert!(diverges, "ICC rendering is indistinguishable from naive");
+}
+
 /// A CMYK source's embedded profile describes ink, not the RGB the
 /// pipeline emits: it must never pass through to any output target —
 /// the classic interop bug that self-roundtrip suites cannot catch.
+/// `cmyk_icc.jpg` carries a real (consumed) CMYK profile; the spliced
+/// `fake_icc` covers the unparseable-profile fallback.
 #[test]
 fn cmyk_source_profile_never_passes_through() {
     let src = fixture("cmyk_ycck.jpg");
@@ -122,14 +166,16 @@ fn cmyk_source_profile_never_passes_through() {
         profiled.extend(&payload);
     }
     profiled.extend(&src[2..]);
-    for (target, extract) in [
-        (ImageFormat::Jpeg, jpeg_icc as fn(&[u8]) -> Option<Vec<u8>>),
-        (ImageFormat::Png, png_icc),
-        (ImageFormat::Webp, webp_icc),
-    ] {
-        let mut p = params(32);
-        p.output = Some(target);
-        let (out, _) = pipeline::process(&profiled, &p).unwrap();
-        assert_eq!(extract(&out), None, "{target:?} must not carry the profile");
+    for source in [profiled, fixture("cmyk_icc.jpg")] {
+        for (target, extract) in [
+            (ImageFormat::Jpeg, jpeg_icc as fn(&[u8]) -> Option<Vec<u8>>),
+            (ImageFormat::Png, png_icc),
+            (ImageFormat::Webp, webp_icc),
+        ] {
+            let mut p = params(32);
+            p.output = Some(target);
+            let (out, _) = pipeline::process(&source, &p).unwrap();
+            assert_eq!(extract(&out), None, "{target:?} must not carry the profile");
+        }
     }
 }

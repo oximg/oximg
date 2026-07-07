@@ -128,8 +128,11 @@ fn parse_tiff_orientation(tiff: &[u8]) -> Option<Orientation> {
 
 /// Scan cap: EXIF and ICC sit in the pre-frame header in practice; a
 /// source whose header exceeds this is served without rotation or
-/// profile rather than buffered without bound.
-const SCAN_CAP: usize = 256 * 1024;
+/// profile rather than buffered without bound. Sized to fit the LUT
+/// profiles print-workflow CMYK JPEGs actually embed (USWebCoatedSWOP
+/// is ~557KB) — under a 256KB cap those sources would silently lose
+/// their profile and degrade to the naive conversion.
+const SCAN_CAP: usize = 1024 * 1024;
 
 /// Metadata pulled from the JPEG header scan.
 pub(crate) struct JpegMeta {
@@ -599,7 +602,7 @@ mod tests {
     fn scanner_gives_up_losslessly() {
         // Preamble past SCAN_CAP: served unrotated, nothing dropped.
         let mut jpeg = vec![0xFF, 0xD8];
-        for _ in 0..5 {
+        while jpeg.len() <= SCAN_CAP {
             jpeg.extend(seg(0xFE, &vec![0xAB; 60_000]));
         }
         jpeg.extend(seg(0xE1, &app1(6, false)));
@@ -691,6 +694,25 @@ mod tests {
         jpeg.extend(seg(0xDB, &[0u8; 4]));
         jpeg.extend(seg(0xE2, &app2_icc(1, 1, &profile)));
         jpeg.extend(b"\xFF\xDAentropy");
+        assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
+    }
+
+    /// A USWebCoatedSWOP-sized profile (~557KB, the profile real
+    /// print-workflow CMYK JPEGs actually embed) spans nine APP2
+    /// chunks and must survive the scan cap — under a 256KB cap it
+    /// silently degraded to no profile, which for a CMYK source means
+    /// a silently naive conversion.
+    #[test]
+    fn half_megabyte_icc_chain_reassembles() {
+        let profile: Vec<u8> = (0..570_000u32).map(|i| (i % 251) as u8).collect();
+        let chunks: Vec<&[u8]> = profile.chunks(65_000).collect();
+        let count = chunks.len() as u8;
+        let segments: Vec<(u8, Vec<u8>)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (0xE2, app2_icc(i as u8 + 1, count, c)))
+            .collect();
+        let jpeg = jpeg_stream(&segments);
         assert_eq!(scan_icc(&jpeg).1.as_deref(), Some(&profile[..]));
     }
 

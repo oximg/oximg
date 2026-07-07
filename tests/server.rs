@@ -223,6 +223,27 @@ fn cmyk_source_is_served_not_a_500() {
     assert_eq!((w, h), (32, 24));
 }
 
+/// OXIMG_ICC=0 skips profile extraction entirely, which for a CMYK
+/// source means the naive conversion instead of the color-managed
+/// one — visibly different pixels, not just missing metadata.
+#[test]
+fn oximg_icc_zero_downgrades_cmyk_to_naive() {
+    let managed = Server::start(&[]);
+    let naive = Server::start(&[("OXIMG_ICC", "0".into())]);
+    let a = managed.get("/resize/64/64/cmyk_icc.jpg").unwrap().2;
+    let b = naive.get("/resize/64/64/cmyk_icc.jpg").unwrap().2;
+    let (pa, w, h) = oximg::pipeline::decode_and_resize(&a, 64, 64, 1).unwrap();
+    let (pb, ..) = oximg::pipeline::decode_and_resize(&b, 64, 64, 1).unwrap();
+    assert_eq!((w, h), (64, 48));
+    let worst = pa
+        .iter()
+        .zip(&pb)
+        .map(|(x, y)| (*x as i32 - *y as i32).abs())
+        .max()
+        .unwrap();
+    assert!(worst >= 30, "renderings barely differ (max delta {worst})");
+}
+
 /// A local source that exists but cannot be read (here: a directory
 /// where a file was expected) is a 500, not a 422 blaming the client.
 #[test]

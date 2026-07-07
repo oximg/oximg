@@ -57,6 +57,27 @@ on JPEG write; vips is the transform=0 writer. `jpegtran -copy none`
 cannot strip APP14 either — libjpeg re-emits it for CMYK, hence the
 python surgery.)
 
+`cmyk_icc.jpg` additionally embeds a real CMYK ICC profile (spanning
+two APP2 chunks, exercising multi-chunk reassembly): ImageMagick
+converts the corner image *through* the profile and embeds it
+(`magick corner.png -profile sRGB.icc -profile cmyk-strip.icc
+-quality 95`). The profile is libvips' built-in CMYK fallback —
+ArgyllCMS's "Chemical proof" by Graeme W. Gill, **released into the
+public domain** (its `cprt` tag says so verbatim), extracted via
+`vips copy x.jpg 'y.jpg[profile=cmyk]'` and tag-stripped from 961KB
+to 108KB (keep `desc cprt wtpt bkpt A2B0 B2A0`, alias
+`A2B1/A2B2/B2A1/B2A2` to the same data blocks so every rendering
+intent resolves, zero the profile-ID). Its reference
+(`cmyk_icc.ppm`) is `vips icc_transform cmyk_icc.jpg gt.png srgb
+--embedded` — an lcms2 rendering, i.e. an independent CMM reading
+the same embedded profile; `embedded_cmyk_profile_is_honored`
+compares at max≤3/mean≤1 with a ≥30 divergence guard against the
+naive composite. Note this profile's A2B0/A2B1/A2B2 are identical
+(intent-degenerate), so these fixtures cannot catch a
+rendering-intent mixup; oximg pins relative colorimetric in
+`src/pipeline/cmyk.rs` and moxcms applies no intent-specific PCS
+adjustments anyway.
+
 Two invariants the recipes must keep:
 
 - The ICC blob is `fake_icc(900)` from `tests/common/mod.rs` —

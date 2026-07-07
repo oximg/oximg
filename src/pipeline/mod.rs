@@ -745,6 +745,7 @@ pub(crate) fn check_src_pixels(w: usize, h: usize) -> Result<()> {
     Ok(())
 }
 
+mod cmyk;
 mod encode;
 mod formats;
 mod fuse;
@@ -752,6 +753,7 @@ mod jpeg;
 #[cfg(test)]
 mod tests;
 
+use cmyk::*;
 pub use encode::encode;
 use encode::*;
 use formats::*;
