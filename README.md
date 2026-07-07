@@ -261,8 +261,9 @@ default).
 
 ## Not yet implemented (out of PoC scope)
 
-- CMYK / YCCK JPEG sources — decode currently errors on them (no
-  CMYK→RGB conversion); see Roadmap
+- CMYK / YCCK JPEG sources decode via the browser-standard naive
+  conversion; an embedded CMYK ICC profile is not yet honored (it is
+  dropped, never passed through) — see Roadmap
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output (animated AVIF and WebP *sources* render their
   first frame, like other image proxies)

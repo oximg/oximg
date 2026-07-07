@@ -211,21 +211,16 @@ fn version_flag_prints_and_exits() {
     assert!(!bad.status.success());
 }
 
-/// A CMYK JPEG source is refused as undecodable client input — a
-/// clean 422, not the 500 that the mozjpeg unwinding panic used to
-/// turn into.
+/// CMYK/YCCK JPEG sources are served end to end (200 with real
+/// pixels), where the mozjpeg unwinding panic used to produce a 500.
 #[test]
-fn cmyk_source_is_a_client_error_not_a_500() {
-    let dir = std::env::temp_dir().join(format!("oximg-cmyk-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_CMYK);
-    comp.set_size(40, 30);
-    comp.set_quality(90.0);
-    let mut started = comp.start_compress(Vec::new()).unwrap();
-    started.write_scanlines(&vec![128u8; 40 * 30 * 4]).unwrap();
-    std::fs::write(dir.join("cmyk.jpg"), started.finish().unwrap()).unwrap();
-    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
-    assert_eq!(s.status_of("/resize/100/100/cmyk.jpg"), 422);
+fn cmyk_source_is_served_not_a_500() {
+    let s = Server::start(&[]);
+    let (status, ct, body) = s.get("/resize/32/32/cmyk_ycck.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (32, 24));
 }
 
 /// A local source that exists but cannot be read (here: a directory

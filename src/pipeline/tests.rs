@@ -541,18 +541,51 @@ fn make_cmyk_jpeg(w: usize, h: usize, ycck: bool) -> Vec<u8> {
     started.finish().unwrap()
 }
 
-/// CMYK/YCCK sources must surface as a clean `Err` (HTTP 422), never
-/// as the mozjpeg crate's unwinding panic, which bypasses the panic
-/// hook and crosses the library boundary.
+/// CMYK and YCCK sources decode to RGB via the naive composite
+/// (`r = c'·k'/255` on the stored Adobe-inverted samples). The
+/// reference applies the same formula to the raw CMYK planes decoded
+/// by libjpeg itself, pinning oximg's plumbing (YCCK normalization,
+/// in-place 4→3 compaction, the exact-size resize join)
+/// byte-for-byte; independent third-party ground truth lives in
+/// tests/formats_cmyk.rs against committed djpeg references.
 #[test]
-fn cmyk_sources_error_cleanly_instead_of_panicking() {
+fn cmyk_and_ycck_sources_decode_to_naive_rgb() {
     for ycck in [false, true] {
         let jpeg = make_cmyk_jpeg(64, 48, ycck);
-        let err = decode_and_resize(&jpeg, 32, 32, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("unsupported JPEG color space"),
-            "ycck={ycck}: {err:#}"
+        let (rgb, w, h) = decode_and_resize(&jpeg, 64, 48, 1).unwrap();
+        assert_eq!((w, h), (64, 48), "ycck={ycck}");
+        let dec = Decompress::new_mem(&jpeg).unwrap();
+        assert_eq!(
+            dec.color_space(),
+            if ycck {
+                ColorSpace::JCS_YCCK
+            } else {
+                ColorSpace::JCS_CMYK
+            }
         );
+        let mut started = dec.to_colorspace(ColorSpace::JCS_CMYK).unwrap();
+        let planes: Vec<u8> = started.read_scanlines().unwrap();
+        started.finish().unwrap();
+        let want: Vec<u8> = planes
+            .chunks_exact(4)
+            .flat_map(|px| {
+                let k = px[3] as u32;
+                [0, 1, 2].map(|c| ((px[c] as u32 * k + 127) / 255) as u8)
+            })
+            .collect();
+        assert_eq!(rgb, want, "ycck={ycck}");
+    }
+}
+
+/// The resized CMYK path survives both the single-thread linear
+/// kernel and the band-parallel arm (`Decoded::Pixels` join).
+#[test]
+fn cmyk_resize_smoke_across_paths() {
+    let jpeg = make_cmyk_jpeg(97, 61, true);
+    for parallel in [1, 2] {
+        let (rgb, w, h) = decode_and_resize(&jpeg, 48, 48, parallel).unwrap();
+        assert!(w <= 48 && h <= 48 && w > 0 && h > 0, "parallel={parallel}");
+        assert_eq!(rgb.len(), w * h * 3, "parallel={parallel}");
     }
 }
 

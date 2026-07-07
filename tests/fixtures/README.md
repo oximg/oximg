@@ -34,6 +34,29 @@ the point: they pin *our* readers against *their* layouts).
 | `anim_meta.avif` | 〃 plus `--irot 1 --icc <blob>` | metadata on animated sources |
 | `list.txt` | plain text | undecodable-input (422) test |
 
+## CMYK/YCCK fixtures (0.6.0 era, reproducible)
+
+64×48 with 16px corner blocks (same TL=R/TR=G/BL=B/BR=W-on-gray
+layout, authored by ImageMagick, then separated to CMYK by the writer
+named below). The `.ppm` references are `djpeg <fixture>` renderings —
+djpeg's naive CMYK→RGB composite is byte-identical to ImageMagick's
+non-color-managed rendering and is what browsers do for profile-less
+CMYK, so `naive_conversion_matches_djpeg_reference` compares full
+frames at tolerance ≤1. Verified marker facts the tests rely on:
+
+| File | Recipe | Layout |
+|---|---|---|
+| `cmyk_ycck.jpg` | `magick corner.png -colorspace CMYK -quality 95` | Adobe APP14 transform=2 (YCCK), comps 1-4 @1×1 |
+| `cmyk_t0.jpg` | `vips copy cmyk_ycck.jpg 'cmyk_t0.jpg[Q=95,strip]'` | APP14 transform=0 (plain CMYK), comps 'C','M','Y','K' |
+| `cmyk_prog.jpg` | `jpegtran -progressive cmyk_ycck.jpg` | SOF2; exact coefficient twin — shares `cmyk_ycck.ppm` |
+| `cmyk_noadobe.jpg` | python surgery dropping the 0xEE segment from `cmyk_t0.jpg` | no Adobe marker; classified CMYK — shares `cmyk_t0.ppm` |
+| `cmyk_sub.jpg` | `magick … -quality 85 -sampling-factor '2x2,1x1,1x1,2x2'` | YCCK, Y+K @2×2, Cb/Cr @1×1 |
+
+(ImageMagick cannot write transform=0 — it always separates to YCCK
+on JPEG write; vips is the transform=0 writer. `jpegtran -copy none`
+cannot strip APP14 either — libjpeg re-emits it for CMYK, hence the
+python surgery.)
+
 Two invariants the recipes must keep:
 
 - The ICC blob is `fake_icc(900)` from `tests/common/mod.rs` —

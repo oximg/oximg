@@ -135,13 +135,43 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
 
-    // libjpeg can only convert grayscale/YCbCr/RGB sources to RGB
-    // output; for anything else (CMYK, YCCK, JCS_UNKNOWN) `dec.rgb()`
-    // aborts through the crate's unwinding error manager — a panic
-    // that bypasses the panic hook, not an `Err`. Refuse those up
-    // front with a real error so the HTTP layer classifies them as
-    // undecodable input (422) and library callers get a `Result`.
+    // CMYK and YCCK sources (print-workflow JPEGs) take a buffered
+    // serial path: libjpeg itself normalizes YCCK back to CMYK when
+    // asked for JCS_CMYK output (honoring the Adobe APP14 transform it
+    // parsed during the header read), the stored samples are compacted
+    // to RGB in place, and the resize rejoins resize_pixels_to — the
+    // same full-frame machinery the buffered formats (PNG/WebP/AVIF)
+    // feed. The requested fuse is deliberately ignored: every fuse
+    // worker streams 3-byte rows, and these sources are far too rare
+    // to justify 4-channel overlap plumbing (`Decoded::Pixels` is a
+    // fallback every caller already handles).
     let cs = dec.color_space();
+    if matches!(cs, ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK) {
+        let mut started = dec
+            .to_colorspace(ColorSpace::JCS_CMYK)
+            .context("decode start failed")?;
+        let (dec_w, dec_h) = (started.width(), started.height());
+        scratch_u8(&mut s.chunk8, dec_w * dec_h * 4);
+        started
+            .read_scanlines_into(&mut s.chunk8[..dec_w * dec_h * 4])
+            .context("decode failed")?;
+        started.finish().context("decode finish failed")?;
+        cmyk_to_rgb_in_chunk8(s, dec_w * dec_h);
+        resize_pixels_to(s, 3, dec_w, dec_h, dst_w, dst_h, parallel)?;
+        if timing {
+            eprintln!(
+                "timing cmyk({dec_w}x{dec_h}->{dst_w}x{dst_h}) total={:.1}ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return Ok(Decoded::Pixels { dst_w, dst_h });
+    }
+    // libjpeg can only convert grayscale/YCbCr/RGB sources to RGB
+    // output; for anything else (JCS_UNKNOWN) `dec.rgb()` aborts
+    // through the crate's unwinding error manager — a panic that
+    // bypasses the panic hook, not an `Err`. Refuse those up front
+    // with a real error so the HTTP layer classifies them as
+    // undecodable input (422) and library callers get a `Result`.
     anyhow::ensure!(
         matches!(
             cs,
@@ -432,6 +462,25 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     }
 }
 
+/// Compact the raw 4-channel CMYK samples in `chunk8` (libjpeg's
+/// stored convention, which is Adobe-inverted: 0 = full ink) to RGB
+/// in place. The composite `r = c'·k'/255` on the inverted samples is
+/// the browser-standard rendering for profile-less CMYK (Chrome,
+/// Firefox, and djpeg all use it); the +127 rounding matches
+/// libjpeg-turbo's djpeg exactly, so the committed fixture references
+/// pin this byte-for-byte. Pixel i writes 3i..3i+3 after reading
+/// 4i..4i+4, so the forward pass never clobbers unread input (the
+/// same in-place trick as `flatten_alpha_in_out8`).
+fn cmyk_to_rgb_in_chunk8(s: &mut Scratch, pixels: usize) {
+    for i in 0..pixels {
+        let px: [u8; 4] = s.chunk8[i * 4..i * 4 + 4].try_into().unwrap();
+        let k = px[3] as u32;
+        for (c, &v) in px[..3].iter().enumerate() {
+            s.chunk8[i * 3 + c] = ((v as u32 * k + 127) / 255) as u8;
+        }
+    }
+}
+
 /// The streaming JPEG source path: header pre-scan (orientation +
 /// ICC), DCT shrink-on-load decode, fuse selection, and the
 /// post-resize orientation/ICC application. Split out of the format
@@ -468,6 +517,19 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         let icc = meta.icc;
         let reader = std::io::Read::chain(&scan_prefix[..], reader);
         let dec = Decompress::new_reader(reader).context("parse JPEG")?;
+        // A CMYK/YCCK source's embedded profile is a CMYK-class
+        // profile: it describes ink coverage, not the RGB pixels this
+        // request emits, so passing it through would mislabel every
+        // output. Converted output follows the pipeline's convention
+        // for profile-less sources: no profile, sRGB implied.
+        let icc = if matches!(
+            dec.color_space(),
+            ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+        ) {
+            None
+        } else {
+            icc
+        };
         // Fused decode overlap: on unless disabled (see
         // overlap_gate). Band-parallel resize keeps the serial
         // path so OXIMG_PAR semantics are unchanged. Jpegli
