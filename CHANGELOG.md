@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-06
+
+CMYK/YCCK JPEG input, start to finish. No library-API or HTTP-interface
+changes: 4-component sources that previously failed (as an unlogged
+500) now decode; every other source produces the same bytes as 0.5.0
+unless its metadata sits past the old 256KB scan cap (see Changed).
+
 ### Added
 
 - **CMYK/YCCK JPEG input** (print-workflow assets): 4-component JPEG

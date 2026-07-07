@@ -34,7 +34,7 @@ the point: they pin *our* readers against *their* layouts).
 | `anim_meta.avif` | 〃 plus `--irot 1 --icc <blob>` | metadata on animated sources |
 | `list.txt` | plain text | undecodable-input (422) test |
 
-## CMYK/YCCK fixtures (0.6.0 era, reproducible)
+## CMYK/YCCK fixtures (0.5.1 era, reproducible)
 
 64×48 with 16px corner blocks (same TL=R/TR=G/BL=B/BR=W-on-gray
 layout, authored by ImageMagick, then separated to CMYK by the writer
