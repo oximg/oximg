@@ -10,7 +10,35 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **CMYK/YCCK JPEG input** (print-workflow assets): 4-component JPEG
+  sources decode to sRGB instead of failing. With an embedded
+  CMYK-class ICC profile the conversion is color-managed through
+  moxcms (pure Rust) at relative colorimetric — the imgproxy/libvips
+  behavior; otherwise (or with `OXIMG_ICC=0`) it uses the naive
+  composite browsers render, byte-exact with `djpeg`. The CMYK
+  profile is consumed, never passed through to RGB output. Both
+  Adobe APP14 conventions (transform 0 and 2), missing-APP14,
+  progressive, and subsampled sources are covered by fixtures pinned
+  against independent renderers (djpeg, vips/lcms2).
+- `qcli decode <in> <out.ppm>` dumps a source's decoded RGB at full
+  size for manual diffing against third-party decoders.
+
 ### Changed
+
+- The JPEG metadata scan cap rises 256KB → 1MB so real print
+  profiles (USWebCoatedSWOP is ~557KB) survive extraction; headers
+  past the cap still degrade gracefully (no rotation, no profile,
+  naive CMYK).
+
+### Fixed
+
+- A JPEG whose color space has no RGB conversion (CMYK before this
+  release, `JCS_UNKNOWN` still) used to escape as an unwinding panic
+  from the mozjpeg error manager — surfacing as an unlogged 500 from
+  the server and an unwind across the library boundary. It is now a
+  clean error the server classifies as 422.
 
 - The 1,100-line `tests/formats.rs` is split by domain into
   `formats.rs` (core same/cross-format matrix), `formats_avif.rs`,

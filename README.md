@@ -78,7 +78,7 @@ stored orientation.
 
 **ICC profiles**: a source's color profile (JPEG APP2 chain, PNG
 `iCCP`, WebP `ICCP`, AVIF `colr`) passes through byte-for-byte into
-any output format, across format conversion included. Pixels are
+any output format, across format conversion included. RGB pixels are
 never color-converted. This matters for wide-gamut sources: the
 common proxy default is to normalize pixels to sRGB and strip the
 profile, which permanently clips every color outside the sRGB gamut —
@@ -87,6 +87,14 @@ that made it worth shooting in P3. oximg keeps the pixels and the
 profile as they were, so wide-gamut images render on a wide-gamut
 display the way the original did (and identically everywhere else).
 `OXIMG_ICC=0` opts into stripping instead.
+
+**CMYK/YCCK JPEG sources** (print-workflow assets) are the one
+exception, since no browser renders CMYK pixels: they are converted
+to sRGB — through the embedded CMYK profile (moxcms, relative
+colorimetric, like imgproxy/libvips) when one is present, with the
+naive composite browsers use otherwise — and the CMYK profile is
+consumed, never passed through. `OXIMG_ICC=0` skips profile
+extraction entirely, so it also selects the naive conversion.
 
 ## Pipeline
 
@@ -232,7 +240,8 @@ c7i.large, ahead of imgproxy by +16%; see [BENCH.md](BENCH.md) and
 comma-separated `Accept`-negotiation preference list, e.g. `avif,webp`),
 `OXIMG_FLATTEN_BG` (`ffffff`; background for alpha → JPEG flattening),
 `OXIMG_AUTO_ROTATE` (`1`; `0` serves the stored orientation),
-`OXIMG_ICC` (`1`; `0` strips source ICC profiles from outputs; the
+`OXIMG_ICC` (`1`; `0` strips source ICC profiles from outputs and
+converts CMYK sources naively instead of through their profile; the
 shared JPEG header scan is skipped only when both knobs are off),
 `OXIMG_RESIZE=srgb` (resize in
 sRGB space instead of linear light), `OXIMG_RESIZE_BACKEND=fir` (use

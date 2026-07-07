@@ -7,6 +7,9 @@
 //!              (encoder isolation: PPM in, JPEG out, no resize)
 //!   transcode: qcli transcode <in> <max_w> <max_h> <jpg|png|webp|avif> <out>
 //!              (full cross-format pipeline, any supported source)
+//!   decode:    qcli decode <in.jpg> <out.ppm>
+//!              (JPEG decode at source size, no resize/encode — the
+//!              manual-verification hook: diff against djpeg or vips)
 
 use oximg::pipeline;
 use std::fs;
@@ -76,6 +79,15 @@ fn main() -> anyhow::Result<()> {
             if let Some(ppm) = args.get(8) {
                 write_ppm(ppm, &rgb, w, h)?;
             }
+            eprintln!("{w}x{h}");
+        }
+        "decode" => {
+            let (input, out) = (&args[2], &args[3]);
+            // A huge box keeps the source size (fit never upscales;
+            // max 0 would resolve to 1x1).
+            let (rgb, w, h) =
+                pipeline::decode_and_resize(&fs::read(input)?, u32::MAX, u32::MAX, 1)?;
+            write_ppm(out, &rgb, w, h)?;
             eprintln!("{w}x{h}");
         }
         "encode" => {

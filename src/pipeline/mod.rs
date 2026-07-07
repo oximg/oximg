@@ -706,8 +706,11 @@ fn auto_rotate() -> bool {
 }
 
 /// OXIMG_ICC: carry the source's ICC profile into the output (default
-/// on; "0" disables and skips profile extraction entirely). Pixels are
-/// never color-converted — the profile bytes are passed through.
+/// on; "0" disables and skips profile extraction entirely). RGB pixels
+/// are never color-converted — the profile bytes are passed through.
+/// CMYK JPEG sources are the exception: their profile is *consumed*
+/// by the CMYK→sRGB conversion (never emitted), so "0" also selects
+/// the naive conversion there.
 fn icc_passthrough() -> bool {
     crate::config::config().icc_passthrough
 }
