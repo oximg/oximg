@@ -30,7 +30,17 @@ HTTP interface without notice.
 - The JPEG metadata scan cap rises 256KB → 1MB so real print
   profiles (USWebCoatedSWOP is ~557KB) survive extraction; headers
   past the cap still degrade gracefully (no rotation, no profile,
-  naive CMYK).
+  naive CMYK). Note for cache operators: a JPEG whose Exif/ICC sits
+  between 256KB and 1MB into the header was previously served
+  unrotated/profile-less and now isn't — same-URL bytes change
+  across this upgrade for such (rare) sources.
+- Memory note: CMYK decode stages the full frame at 4 bytes/pixel
+  (RGB streams in chunks), and a *progressive* 4-component source
+  additionally makes libjpeg buffer whole-image coefficient arrays
+  (8 B/px, vs 6 B/px for progressive RGB) that `OXIMG_MAX_SRC_PIXELS`
+  does not see — size that cap with progressive CMYK in mind
+  (measured worst case at the 64MP default: ~980MB peak for one
+  request, ~1.65× the equivalent RGB request).
 
 ### Fixed
 

@@ -577,16 +577,59 @@ fn cmyk_and_ycck_sources_decode_to_naive_rgb() {
     }
 }
 
-/// The resized CMYK path survives both the single-thread linear
-/// kernel and the band-parallel arm (`Decoded::Pixels` join).
-#[test]
-fn cmyk_resize_smoke_across_paths() {
-    let jpeg = make_cmyk_jpeg(97, 61, true);
-    for parallel in [1, 2] {
-        let (rgb, w, h) = decode_and_resize(&jpeg, 48, 48, parallel).unwrap();
-        assert!(w <= 48 && h <= 48 && w > 0 && h > 0, "parallel={parallel}");
-        assert_eq!(rgb.len(), w * h * 3, "parallel={parallel}");
+/// Byte-compare a CMYK decode through the pipeline against the same
+/// shared machinery fed a reference decode: raw planes from libjpeg
+/// (same DCT scale the pipeline picks) + the naive composite +
+/// `resize_pixels_to` at the same `parallel`. Same backend on both
+/// sides, so the expectation is exact.
+fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
+    let (got, w, h) = decode_and_resize(jpeg, box_px, box_px, parallel).unwrap();
+
+    let mut dec = Decompress::new_mem(jpeg).unwrap();
+    let (src_w, src_h) = dec.size();
+    dec.scale(dct_scale_num(src_w, src_h, w, h, dct_margin()));
+    let mut started = dec.to_colorspace(ColorSpace::JCS_CMYK).unwrap();
+    let (dec_w, dec_h) = (started.width(), started.height());
+    let planes: Vec<u8> = started.read_scanlines().unwrap();
+    started.finish().unwrap();
+    let mut s = Scratch::default();
+    let chunk = scratch_u8(&mut s.chunk8, dec_w * dec_h * 3);
+    for (d, px) in chunk.chunks_exact_mut(3).zip(planes.chunks_exact(4)) {
+        let k = px[3] as u32;
+        for (c, &v) in px[..3].iter().enumerate() {
+            d[c] = ((v as u32 * k + 127) / 255) as u8;
+        }
     }
+    resize_pixels_to(&mut s, 3, dec_w, dec_h, w, h, parallel).unwrap();
+    assert_eq!(
+        got,
+        &s.out8[..w * h * 3],
+        "box={box_px} parallel={parallel} decode={dec_w}x{dec_h} out={w}x{h}"
+    );
+}
+
+/// A CMYK decode that engages DCT shrink-on-load (num < 8 — the
+/// full-size fixture comparisons never do) must byte-match the
+/// reference-fed machinery: pins chunk8 sizing, the in-place 4→3
+/// compaction, and the resize join at scaled dims.
+#[test]
+fn cmyk_dct_scaled_decode_matches_reference() {
+    // 256x192 in a 64x64 box → fit 64x48; the 1.7 margin wants
+    // ≥109x82 → num=4, a 128x96 scaled decode ahead of the resize.
+    assert_eq!(dct_scale_num(256, 192, 64, 48, 1.7), 4);
+    assert_cmyk_matches_reference(&make_cmyk_jpeg(256, 192, true), 64, 1);
+}
+
+/// The band-parallel arm of the CMYK resize join, pinned the same
+/// way. (parallel=1 and parallel>1 legitimately take different
+/// resize backends — bytes are stable per config, not across
+/// OXIMG_PAR values — so the reference runs at the same parallel.)
+#[test]
+fn cmyk_band_parallel_matches_reference() {
+    let jpeg = make_cmyk_jpeg(97, 61, true);
+    let (_, w, h) = decode_and_resize(&jpeg, 48, 48, 2).unwrap();
+    assert_eq!((w, h), (48, 30));
+    assert_cmyk_matches_reference(&jpeg, 48, 2);
 }
 
 #[test]

@@ -149,6 +149,39 @@ fn embedded_cmyk_profile_is_honored() {
     assert!(diverges, "ICC rendering is indistinguishable from naive");
 }
 
+/// Splice an ICC profile as an APP2 chain right after SOI.
+fn splice_app2(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
+    let mut out = jpeg[..2].to_vec();
+    for payload in app2_icc_payloads(icc, 500) {
+        out.push(0xFF);
+        out.push(0xE2);
+        out.extend(((payload.len() + 2) as u16).to_be_bytes());
+        out.extend(&payload);
+    }
+    out.extend(&jpeg[2..]);
+    out
+}
+
+/// A parseable but non-CMYK-class profile on a CMYK source is bad
+/// metadata, not a conversion recipe: it must never reach the
+/// 4-channel transform, and the pixels must render exactly like the
+/// profile-less baseline (naive). Pins the `DataColorSpace::Cmyk`
+/// class guard in src/pipeline/cmyk.rs, which the unparseable
+/// `fake_icc` case cannot exercise.
+#[test]
+fn non_cmyk_class_profile_falls_back_to_naive() {
+    let src = fixture("cmyk_ycck.jpg");
+    let srgb = moxcms::ColorProfile::new_srgb().encode().unwrap();
+    assert!(
+        moxcms::ColorProfile::new_from_slice(&srgb).is_ok(),
+        "test premise: the spliced profile must be parseable"
+    );
+    let (with_rgb_profile, w, h) = decode_and_resize(&splice_app2(&src, &srgb), 64, 48, 1).unwrap();
+    let (naive, nw, nh) = decode_and_resize(&src, 64, 48, 1).unwrap();
+    assert_eq!((w, h), (nw, nh));
+    assert_eq!(with_rgb_profile, naive, "RGB-class profile must be ignored");
+}
+
 /// A CMYK source's embedded profile describes ink, not the RGB the
 /// pipeline emits: it must never pass through to any output target —
 /// the classic interop bug that self-roundtrip suites cannot catch.
@@ -156,16 +189,7 @@ fn embedded_cmyk_profile_is_honored() {
 /// `fake_icc` covers the unparseable-profile fallback.
 #[test]
 fn cmyk_source_profile_never_passes_through() {
-    let src = fixture("cmyk_ycck.jpg");
-    let icc = fake_icc(600);
-    let mut profiled = src[..2].to_vec();
-    for payload in app2_icc_payloads(&icc, 500) {
-        profiled.push(0xFF);
-        profiled.push(0xE2);
-        profiled.extend(((payload.len() + 2) as u16).to_be_bytes());
-        profiled.extend(&payload);
-    }
-    profiled.extend(&src[2..]);
+    let profiled = splice_app2(&fixture("cmyk_ycck.jpg"), &fake_icc(600));
     for source in [profiled, fixture("cmyk_icc.jpg")] {
         for (target, extract) in [
             (ImageFormat::Jpeg, jpeg_icc as fn(&[u8]) -> Option<Vec<u8>>),
@@ -176,6 +200,17 @@ fn cmyk_source_profile_never_passes_through() {
             p.output = Some(target);
             let (out, _) = pipeline::process(&source, &p).unwrap();
             assert_eq!(extract(&out), None, "{target:?} must not carry the profile");
+        }
+        #[cfg(feature = "avif")]
+        {
+            let mut p = params(32);
+            p.output = Some(ImageFormat::Avif);
+            let (out, _) = pipeline::process(&source, &p).unwrap();
+            assert_eq!(
+                oximg::avif::extract_icc(&out),
+                None,
+                "Avif must not carry the profile"
+            );
         }
     }
 }

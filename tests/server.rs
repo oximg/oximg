@@ -242,6 +242,15 @@ fn oximg_icc_zero_downgrades_cmyk_to_naive() {
         .max()
         .unwrap();
     assert!(worst >= 30, "renderings barely differ (max delta {worst})");
+    // Exact pin, not just divergence: cmyk_icc.jpg is an APP2 splice
+    // of cmyk_ycck.jpg (identical entropy data, identical decoded
+    // pixels), so with the profile ignored the two URLs must produce
+    // byte-identical responses.
+    let twin = naive.get("/resize/64/64/cmyk_ycck.jpg").unwrap().2;
+    assert_eq!(
+        b, twin,
+        "ICC=0 must render exactly like the profile-less twin"
+    );
 }
 
 /// A local source that exists but cannot be read (here: a directory
