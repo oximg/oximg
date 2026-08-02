@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-02
+
+Nested source paths: the adoption blocker for directory-organized
+sources (issue #1) is gone, verified against real production URL
+patterns and bucket data before release. No library API changes; the
+HTTP interface only widens (previously-400 nested URLs now serve).
+
 ### Added
 
 - **Nested source paths** ([#1]): `{file}` in `/resize/{w}/{h}/{file}`
