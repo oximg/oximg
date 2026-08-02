@@ -1104,3 +1104,227 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_connections() {
     let status = s.wait_exit(std::time::Duration::from_secs(10));
     assert!(status.success(), "exited {status}");
 }
+
+/// A temp IMAGES_DIR with a nested tree (and symlinks, for the
+/// containment tests): albums/2026/photo.jpg is a copy of the fixture.
+fn nested_images_dir(tag: &str) -> std::path::PathBuf {
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("oximg-nested-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("albums/2026")).unwrap();
+    std::fs::copy(
+        format!("{fixtures}/photo.jpg"),
+        dir.join("albums/2026/photo.jpg"),
+    )
+    .unwrap();
+    dir
+}
+
+/// Nested source paths resolve under IMAGES_DIR — the issue #1 happy
+/// path — and the @fmt token still rides on the last segment.
+#[test]
+fn nested_paths_resolve_under_images_dir() {
+    let dir = nested_images_dir("happy");
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+    let (status, ct, body) = s.get("/resize/100/100/albums/2026/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+
+    let (status, ct, body) = s.get("/resize/100/100/albums/2026/photo.jpg@webp").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/webp");
+    let (fmt, _, _) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+
+    // An encoded slash decodes to the same nested path (the extractor
+    // decodes before matching — %2F is addressing, not smuggling).
+    let (status, _, enc_body) = s.get("/resize/100/100/albums%2F2026%2Fphoto.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert!(!enc_body.is_empty());
+}
+
+/// Every escape the multi-segment capture must refuse, end to end.
+/// Suspicious characters are percent-encoded so they survive the HTTP
+/// client untouched and exercise the server's own decode+validate.
+#[test]
+fn nested_path_escapes_are_refused() {
+    let dir = nested_images_dir("escapes");
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+    for url in [
+        // traversal components, encoded and mixed
+        "/resize/100/100/albums/%2e%2e/%2e%2e/secret.jpg",
+        "/resize/100/100/%2e%2e%2Fsecret.jpg",
+        "/resize/100/100/albums/2026/%2e%2E/photo.jpg",
+        // '.' component
+        "/resize/100/100/%2e/photo.jpg",
+        // absolute path and empty components
+        "/resize/100/100/%2Fetc%2Fpasswd",
+        "/resize/100/100/albums%2F%2F2026%2Fphoto.jpg",
+        "/resize/100/100/albums%2F2026%2F",
+        // rejected bytes
+        "/resize/100/100/albums%2F2026%5Cphoto.jpg",
+        "/resize/100/100/albums%2Fphoto.jpg%3Fx=1",
+        "/resize/100/100/albums%2Fphoto.jpg%23frag",
+        "/resize/100/100/albums%2Fphoto%00.jpg",
+    ] {
+        assert_eq!(s.status_of(url), 400, "{url}");
+    }
+}
+
+/// Symlink containment: a link that stays inside IMAGES_DIR works; a
+/// link that resolves outside it is refused as 404 — indistinguishable
+/// from an absent file, even though the target exists and is readable.
+#[cfg(unix)]
+#[test]
+fn symlinks_are_contained_to_images_dir() {
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let dir = nested_images_dir("symlink");
+    std::os::unix::fs::symlink("albums/2026/photo.jpg", dir.join("alias.jpg")).unwrap();
+    std::os::unix::fs::symlink(format!("{fixtures}/photo.jpg"), dir.join("escape.jpg")).unwrap();
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+    assert_eq!(
+        s.status_of("/resize/100/100/alias.jpg"),
+        200,
+        "inside-root symlink must serve"
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/escape.jpg"),
+        404,
+        "outside-root symlink must read as absent"
+    );
+}
+
+/// Signing over nested paths: the canonical signed form is the decoded
+/// multi-segment path, so one signature covers the encoded and decoded
+/// spellings of the same source, @fmt is still covered, and a
+/// signature never authorizes a different nested path.
+#[test]
+fn signed_urls_cover_nested_paths() {
+    let dir = nested_images_dir("signed");
+    let key = "deadbeef".repeat(8);
+    let salt = "cafebabe".repeat(8);
+    let s = Server::start(&[
+        ("IMAGES_DIR", dir.to_str().unwrap().to_string()),
+        ("OXIMG_KEY", key),
+        ("OXIMG_SALT", salt),
+    ]);
+    // Precomputed with python hmac over the decoded path
+    // "/resize/100/100/albums/2026/photo.jpg" (same key/salt/scheme as
+    // signing_gate's vector).
+    let sig = "i1gy8Dm1yo32_9FMzrRj8MDG_c0F0kJDV22jAgvUCow";
+    let (status, ct, _) = s
+        .get(&format!("/{sig}/resize/100/100/albums/2026/photo.jpg"))
+        .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    // The same signature verifies the %2F spelling: clients sign the
+    // decoded form, whatever encoding the URL uses.
+    assert_eq!(
+        s.status_of(&format!("/{sig}/resize/100/100/albums%2F2026%2Fphoto.jpg")),
+        200
+    );
+    // Not a different path...
+    assert_eq!(
+        s.status_of(&format!("/{sig}/resize/100/100/albums/2027/photo.jpg")),
+        403
+    );
+    // ...and not a different format either.
+    assert_eq!(
+        s.status_of(&format!("/{sig}/resize/100/100/albums/2026/photo.jpg@webp")),
+        403
+    );
+    // The @webp target has its own precomputed signature.
+    let sig_webp = "1TIbduLRsnsAJc4TDVwcHSeKCe6IpdVwdzs_elu9fG8";
+    let (status, ct, _) = s
+        .get(&format!(
+            "/{sig_webp}/resize/100/100/albums/2026/photo.jpg@webp"
+        ))
+        .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/webp");
+}
+
+/// The remote-source mode with nested paths: the origin must receive
+/// exactly the segments the client addressed — no climbing above the
+/// base prefix, no authority injection, and no double-decode (a
+/// percent-encoded byte in the decoded name reaches the origin
+/// re-encoded, never re-interpreted).
+#[test]
+fn base_url_mode_forwards_nested_paths_verbatim() {
+    use std::sync::{Arc, Mutex};
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            let recorder = Arc::clone(&recorder);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // Raw request-target, exactly as sent on the wire.
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                recorder.lock().unwrap().push(path.clone());
+                use std::io::Write;
+                if path.ends_with(".jpg") && !path.contains("missing") {
+                    let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = stream.write_all(&data);
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            });
+        }
+    });
+
+    let s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{origin_port}/prefix"),
+    )]);
+
+    // Nested path: forwarded verbatim under the base's own prefix.
+    assert_eq!(
+        s.get("/resize/100/100/albums/2026/photo.jpg").unwrap().0,
+        200
+    );
+    // Double-encoded traversal: the extractor decodes %252e to %2e; the
+    // origin must receive that byte sequence re-encoded (%252e again),
+    // NOT a second decode's ".." — the wire-path assertion below is the
+    // real check (this origin happily serves any literal .jpg name).
+    assert_eq!(
+        s.status_of("/resize/100/100/albums%2F%252e%252e%2Fx.jpg"),
+        200
+    );
+    // Climbing and authority injection never reach the origin at all.
+    assert_eq!(
+        s.status_of("/resize/100/100/%2e%2e/%2e%2e/other-bucket/x.jpg"),
+        400
+    );
+    assert_eq!(
+        s.status_of("/resize/100/100/%2F%2Fevil.example%2Fx.jpg"),
+        400
+    );
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.as_slice(),
+        [
+            "/prefix/albums/2026/photo.jpg",
+            "/prefix/albums/%252e%252e/x.jpg",
+        ],
+        "origin saw exactly the addressed segments, nothing else"
+    );
+}
