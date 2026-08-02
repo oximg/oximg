@@ -12,7 +12,7 @@ suitable for trying oximg out, not for production. Tagged releases
 publish immutable version tags; pin one (or a digest):
 
 ```sh
-docker pull ghcr.io/oximg/oximg:0.5.1          # version tag
+docker pull ghcr.io/oximg/oximg:0.6.0          # version tag
 docker pull ghcr.io/oximg/oximg@sha256:...      # or stronger: a digest
 ```
 
@@ -22,7 +22,7 @@ docker pull ghcr.io/oximg/oximg@sha256:...      # or stronger: a digest
 docker run -d --name oximg \
   -p 8081:8081 \
   -v /srv/images:/images:ro \
-  ghcr.io/oximg/oximg:0.5.1
+  ghcr.io/oximg/oximg:0.6.0
 curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
@@ -33,12 +33,14 @@ and a `ro` mount makes that a guarantee instead of a convention.
 
 Set `OXIMG_SOURCE_BASE_URL` and sources are fetched from
 `<base>/<file>` over HTTP(S) (rustls; redirects are refused by design —
-point the base directly at the right host):
+point the base directly at the right host). `<file>` may span
+directories, so an existing bucket or CDN layout
+(`/resize/640/480/albums/2026/photo.jpg`) is addressable as-is:
 
 ```sh
 docker run -d --name oximg -p 8081:8081 \
   -e OXIMG_SOURCE_BASE_URL=https://static.example.com/originals \
-  ghcr.io/oximg/oximg:0.5.1
+  ghcr.io/oximg/oximg:0.6.0
 ```
 
 The fetcher sends no credentials, so the origin must be reachable
@@ -50,7 +52,7 @@ that embeds its own auth).
 ```yaml
 services:
   oximg:
-    image: ghcr.io/oximg/oximg:0.5.1
+    image: ghcr.io/oximg/oximg:0.6.0
     ports:
       - "8081:8081"
     volumes:

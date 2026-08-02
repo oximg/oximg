@@ -18,7 +18,9 @@ while resizing in linear light at measurably higher output quality
 
 - **HTTP resize service**: `GET /resize/{w}/{h}/{file}` fits the source
   within `w x h` (never enlarges) and re-encodes it in its own format.
-  Sources come from a local directory or any HTTP(S) origin
+  `{file}` may span directories (`/resize/300/200/albums/2026/photo.jpg`),
+  so S3-style prefixes and nested trees are addressable as-is. Sources
+  come from a local directory or any HTTP(S) origin
   (`OXIMG_SOURCE_BASE_URL`), where decoding overlaps the download.
   Optional imgproxy-style HMAC URL signing.
 - **Quality-first processing**: resizing happens in linear light on
@@ -264,6 +266,17 @@ more than your slowest expected encode.
 URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
 require imgproxy-style signed URLs —
 `/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`.
+The signed `path` is the percent-decoded form (nested `{file}` included,
+with any `@{fmt}` token), so one signature covers every URL encoding of
+the same source.
+
+**Source paths**: `{file}` is validated component-wise — `.` or `..`
+components, empty components (leading/trailing/double slashes), `\`,
+`?`, `#`, and control bytes answer 400. Local sources additionally
+resolve through a symlink-containment check: a path that escapes
+`IMAGES_DIR` answers 404. Remote sources are re-encoded segment-wise
+before the origin fetch, so a percent in a name is never double-decoded
+upstream.
 
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP

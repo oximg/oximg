@@ -10,6 +10,35 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Nested source paths** ([#1]): `{file}` in `/resize/{w}/{h}/{file}`
+  (and its signed form) now spans path separators, so directory-
+  organized sources — `IMAGES_DIR` trees, S3-style prefixes behind
+  `OXIMG_SOURCE_BASE_URL` — are addressable without flattening
+  (`/resize/640/480/albums/2026/photo.jpg`). Validation is
+  component-wise: `.`/`..` components, empty components (absolute
+  paths, `//`, trailing slash), `\`, `?`, `#`, and control bytes
+  answer 400. The `@{fmt}` token is matched on the last segment only.
+  Signed URLs cover the decoded multi-segment path, so one signature
+  covers every URL encoding of the same source.
+
+### Changed
+
+- Interior dots in a filename (`my..file.jpg`) are now servable — the
+  old flat-namespace guard rejected any name containing `..` as a
+  substring; traversal is refused per component instead.
+- Local sources now resolve through a symlink-containment check: a
+  path under `IMAGES_DIR` that resolves outside it (via a symlink)
+  answers 404. Previously an inside-tree symlink could serve any
+  readable file on the host.
+- Remote source fetches re-encode the path segment-wise (RFC 3986
+  pchar) before hitting the origin: names with spaces or non-ASCII now
+  form valid upstream URLs, and a percent in a name can no longer be
+  double-decoded by the origin into characters validation never saw.
+
+[#1]: https://github.com/oximg/oximg/issues/1
+
 ## [0.6.0] - 2026-08-02
 
 The library-vs-server strategy release: the binary grows a real CLI,
