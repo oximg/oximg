@@ -150,7 +150,11 @@ mod tests {
                 ErrorKind::Internal,
             ),
             // plain message: undecodable client input
-            (anyhow::anyhow!("bogus bytes"), false, ErrorKind::Undecodable),
+            (
+                anyhow::anyhow!("bogus bytes"),
+                false,
+                ErrorKind::Undecodable,
+            ),
             (anyhow::anyhow!("bogus bytes"), true, ErrorKind::Undecodable),
         ] {
             assert_eq!(Error::classify(err, remote).kind(), want, "remote={remote}");
@@ -162,7 +166,10 @@ mod tests {
     #[test]
     fn classification_sees_through_context() {
         let err = io(IoKind::NotFound).context("open source");
-        assert_eq!(Error::classify(err, false).kind(), ErrorKind::SourceNotFound);
+        assert_eq!(
+            Error::classify(err, false).kind(),
+            ErrorKind::SourceNotFound
+        );
     }
 
     /// `{e}` is the top-level message (client-safe), `{e:#}` the chain

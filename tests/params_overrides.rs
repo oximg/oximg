@@ -138,7 +138,10 @@ fn flatten_bg_override_sets_the_composite_background() {
         [rgb[i], rgb[i + 1], rgb[i + 2]]
     };
     let white = center_px(None);
-    assert!(white.iter().all(|&c| c > 240), "default is white: {white:?}");
+    assert!(
+        white.iter().all(|&c| c > 240),
+        "default is white: {white:?}"
+    );
     let red = center_px(Some([255, 0, 0]));
     assert!(
         red[0] > 200 && red[1] < 60 && red[2] < 60,

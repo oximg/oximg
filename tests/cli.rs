@@ -90,7 +90,9 @@ fn usage_errors_exit_2() {
         &["resize", "in.jpg", "0", "100", "out.jpg"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-f", "gif"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-q", "0"][..],
-        &["resize", "in.jpg", "100", "100", "out.jpg", "--preset", "bogus"][..],
+        &[
+            "resize", "in.jpg", "100", "100", "out.jpg", "--preset", "bogus",
+        ][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "--bogus"][..],
         &["probe"][..],
         &["frobnicate"][..],

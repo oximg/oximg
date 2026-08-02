@@ -606,9 +606,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     .map_err(|e| {
         use pipeline::ErrorKind;
         match e.kind() {
-            ErrorKind::SourceNotFound => {
-                (StatusCode::NOT_FOUND, "image not found".to_string())
-            }
+            ErrorKind::SourceNotFound => (StatusCode::NOT_FOUND, "image not found".to_string()),
             ErrorKind::SourceTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "source image exceeds the configured size limit".to_string(),

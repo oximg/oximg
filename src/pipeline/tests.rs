@@ -201,7 +201,18 @@ fn preheated_session_bytes_match_serial_oriented_avif() {
     let run = |fuse: Fuse| -> Vec<u8> {
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(&jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, &Params::default(), orientation, fuse, None).unwrap() {
+        match decode_resize(
+            &mut s,
+            dec,
+            320,
+            320,
+            &Params::default(),
+            orientation,
+            fuse,
+            None,
+        )
+        .unwrap()
+        {
             Decoded::PixelsSession {
                 dst_w,
                 dst_h,

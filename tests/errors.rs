@@ -29,8 +29,7 @@ fn garbage_bytes_are_undecodable() {
 fn probe_classifies_like_process() {
     let e = pipeline::probe(&[0u8; 4]).expect_err("must fail");
     assert_eq!(e.kind(), ErrorKind::Undecodable);
-    let e = pipeline::probe(b"definitely not an image, but long enough")
-        .expect_err("must fail");
+    let e = pipeline::probe(b"definitely not an image, but long enough").expect_err("must fail");
     assert_eq!(e.kind(), ErrorKind::Undecodable);
 }
 
