@@ -36,7 +36,9 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/img && cp tests/fixtures/photo.jpg tests/fixtures/rgb.png \
             tests/fixtures/photo.webp tests/fixtures/photo.avif tests/fixtures/alpha.avif /tmp/img/
-          docker run -d --rm --name ox -v /tmp/img:/images:ro -p 8081:8081 oximg:ci
+          # No --rm on ox: its exit code is inspected by the graceful-stop
+          # check at the end.
+          docker run -d --name ox -v /tmp/img:/images:ro -p 8081:8081 oximg:ci
           for i in $(seq 1 100); do curl -sf http://127.0.0.1:8081/health >/dev/null && break; sleep 0.3; done
 
           fetch() { # file expected-content-type
@@ -72,7 +74,22 @@ jobs:
           [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/0/100/photo.jpg)" = 400 ]
           echo "ok: error mapping"
 
-          docker stop ox ox2 >/dev/null
+          # Graceful shutdown through the container path: docker stop
+          # sends SIGTERM to PID 1 (exec-form CMD, unprivileged user) and
+          # the server must exit 0 well inside the 10s grace period — a
+          # SIGKILL fallback shows up as exit 137 and ~10s elapsed. This
+          # verifies signal delivery in the image, which cargo tests
+          # cannot.
+          start=$(date +%s)
+          docker stop ox >/dev/null
+          elapsed=$(( $(date +%s) - start ))
+          code=$(docker inspect ox --format '{{.State.ExitCode}}')
+          [ "$code" = 0 ] || { echo "FAIL graceful stop: exit code $code"; exit 1; }
+          [ "$elapsed" -lt 8 ] || { echo "FAIL graceful stop: took ${elapsed}s (SIGKILL fallback?)"; exit 1; }
+          echo "ok: graceful stop (exit 0 in ${elapsed}s)"
+          docker rm ox >/dev/null
+
+          docker stop ox2 >/dev/null
 
       - name: Log in to GHCR
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
