@@ -12,6 +12,29 @@ HTTP interface without notice.
 
 ### Added
 
+- **Typed library errors**: every public pipeline entry point returns
+  `pipeline::Error`; its `ErrorKind` (SourceNotFound / SourceTooLarge /
+  SourceUnreadable / Upstream / Undecodable / Internal) is the
+  semver-stable classification the server's HTTP status mapping is now
+  built on, replacing anyhow-downcast conventions. `{e}` prints the
+  client-safe top-level message, `{e:#}` the full context chain.
+- **Per-call `Params` overrides** for knobs that were process-global
+  env config: `webp_quality`, `png_effort`, `auto_rotate`, `icc`,
+  `flatten_bg`, `linear_light`, and (with the avif feature)
+  `avif_quality`. `None` (the default) keeps the `OXIMG_*` behavior
+  byte-for-byte; `Some` wins per call, so one process can run
+  different settings side by side.
+
+### Changed
+
+- **Breaking (library)**: public pipeline functions now return
+  `Result<_, pipeline::Error>` instead of `anyhow::Result`; the
+  `ServerFault`/`UpstreamFault` marker types left the public surface.
+  Errors still convert into `anyhow::Error` via `?`.
+- A source over `OXIMG_MAX_SRC_PIXELS` now answers **413** like the
+  byte cap (both classify as SourceTooLarge), not 422 — the request
+  was fine, the source is too large.
+
 - **Deployment guides** under `docs/`: Docker/docker-compose,
   Kubernetes (example manifest with probes, resource limits, security
   context, drain behavior), and Cloud Run/serverless containers

@@ -234,7 +234,18 @@ re-encoded bytes plus their format, `probe` reads just the header.
 Depend on it with `default-features = false` to drop the entire HTTP
 stack (axum, tokio, ureq, hmac, sha2); add `features = ["avif"]` for
 AVIF. `process_url` (remote HTTP sources) needs the `server` feature.
-See [`examples/`](examples/):
+
+Failures are typed: every entry point returns `pipeline::Error`, whose
+`kind()` (`ErrorKind`: SourceNotFound / SourceTooLarge /
+SourceUnreadable / Upstream / Undecodable / Internal) is the stable
+classification the server's own status mapping is built on — match on
+it instead of parsing messages, with a wildcard arm for kinds added
+later. `Params` also carries per-call overrides (`webp_quality`,
+`png_effort`, `auto_rotate`, `icc`, `flatten_bg`, `linear_light`,
+`avif_quality`) for the knobs that are otherwise process-global
+`OXIMG_*` environment variables: `None` keeps the env-configured
+behavior, `Some` wins per call — so one process can run different
+settings side by side. See [`examples/`](examples/):
 
 ```sh
 cargo run --release --example thumbnail -- photo.jpg 300 200 out.jpg
@@ -260,7 +271,8 @@ instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
 413), `OXIMG_MAX_SRC_PIXELS` (64,000,000; decoded-size cap enforced
 after each format's header parse, before any pixel allocation —
-compressed size does not bound decoded size), `QUALITY`
+compressed size does not bound decoded size; over-cap sources also
+answer 413), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
 (55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `OXIMG_AVIF_SPEED`
 (SVT preset, 8; setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes
