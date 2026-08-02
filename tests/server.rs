@@ -295,19 +295,25 @@ fn unreadable_local_source_is_server_error() {
 }
 
 /// The decoded-pixel cap rejects decompression bombs before any
-/// pixel-sized allocation, across formats.
+/// pixel-sized allocation, across formats — as 413 (the source is too
+/// large), the same class as the byte cap, not 422 blaming the bytes.
 #[test]
 fn src_pixel_cap_rejects_before_allocation() {
     // photo.jpg is 200x150 = 30000 px; tiny.jpg is 40x30 = 1200.
     let s = Server::start(&[("OXIMG_MAX_SRC_PIXELS", "10000".into())]);
     assert_eq!(s.status_of("/resize/100/100/tiny.jpg"), 200);
-    for name in ["photo.jpg", "rgb.png", "photo.webp", "photo.avif"] {
+    for name in ["photo.jpg", "rgb.png", "photo.webp"] {
         assert_eq!(
             s.status_of(&format!("/resize/100/100/{name}")),
-            422,
+            413,
             "{name} must be rejected by the pixel cap"
         );
     }
+    // AVIF only reaches its header parse (and thus the cap) with the
+    // feature compiled in; without it the source is rejected earlier
+    // as unsupported input.
+    let want = if cfg!(feature = "avif") { 413 } else { 422 };
+    assert_eq!(s.status_of("/resize/100/100/photo.avif"), want);
 }
 
 /// Set-but-invalid runtime knobs refuse to boot: a typo in a limit

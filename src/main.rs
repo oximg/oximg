@@ -576,7 +576,6 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         .source_base
         .as_ref()
         .map(|base| format!("{base}/{file}"));
-    let remote = source_url.is_some();
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit; // hold the CPU slot for the whole processing
         // Streaming decode: the source is never buffered whole on the heap
@@ -595,73 +594,55 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             "image processing failed".to_string(),
         )
     })?
-    .map_err(|e| match e.downcast_ref::<std::io::Error>() {
-        Some(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "image not found".to_string())
+    // The pipeline classifies its own failures (pipeline::ErrorKind);
+    // this match only assigns statuses. Faults on our side (unreadable
+    // source, upstream, internal) answer with generic bodies — the
+    // detail (full context chain, {e:#}) goes to stderr, where an
+    // operator can see it, instead of to the client. Undecodable client
+    // input returns its top-level message, which is safe and useful.
+    .map_err(|e| {
+        use pipeline::ErrorKind;
+        match e.kind() {
+            ErrorKind::SourceNotFound => {
+                (StatusCode::NOT_FOUND, "image not found".to_string())
+            }
+            ErrorKind::SourceTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "source image exceeds the configured size limit".to_string(),
+            ),
+            ErrorKind::SourceUnreadable => {
+                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "source could not be read".to_string(),
+                )
+            }
+            ErrorKind::Upstream => {
+                eprintln!("oximg: error status=502 file={file:?} err={e:#}");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream image fetch failed".to_string(),
+                )
+            }
+            ErrorKind::Internal => {
+                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal image-processing error".to_string(),
+                )
+            }
+            ErrorKind::Undecodable => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+            // ErrorKind is #[non_exhaustive] (the binary is a consumer
+            // of the library crate like any embedder): treat kinds this
+            // binary predates as internal faults — log, generic body.
+            _ => {
+                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal image-processing error".to_string(),
+                )
+            }
         }
-        Some(io) if io.kind() == std::io::ErrorKind::FileTooLarge => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "source image exceeds the configured size limit".to_string(),
-        ),
-        // A local source that exists but cannot be read — wrong
-        // permissions, or a directory where a file was expected — is a
-        // server/deployment fault, not bad client input.
-        Some(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
-            ) =>
-        {
-            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "source could not be read".to_string(),
-            )
-        }
-        // A remote body that dies mid-stream (reset, broken pipe,
-        // truncated, timed out) is the upstream's fault. The same
-        // kinds on a *local* source mean a truncated/short file — bad
-        // input — so this only fires in remote-source mode. (The
-        // streaming JPEG path may still translate a mid-body failure
-        // into its own decode error, surfacing as 422; buffered
-        // formats classify precisely.)
-        Some(io)
-            if remote
-                && matches!(
-                    io.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::TimedOut
-                ) =>
-        {
-            eprintln!("oximg: error status=502 file={file:?} err={e:#}");
-            (
-                StatusCode::BAD_GATEWAY,
-                "upstream image fetch failed".to_string(),
-            )
-        }
-        // Upstream and server faults answer with generic bodies — the
-        // detail (full context chain) goes to stderr, where an
-        // operator can see it, instead of to the client.
-        _ if e.downcast_ref::<pipeline::UpstreamFault>().is_some() => {
-            eprintln!("oximg: error status=502 file={file:?} err={e:#}");
-            (
-                StatusCode::BAD_GATEWAY,
-                "upstream image fetch failed".to_string(),
-            )
-        }
-        _ if e.downcast_ref::<pipeline::ServerFault>().is_some() => {
-            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal image-processing error".to_string(),
-            )
-        }
-        // Everything else is undecodable client input: the top-level
-        // message (not the chain) is safe and useful to return.
-        _ => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
     })?;
 
     let (bytes, format) = out;

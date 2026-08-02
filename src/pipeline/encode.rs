@@ -370,8 +370,8 @@ pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize)
     }
 }
 
-pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>> {
-    encode_with_icc(rgb, w, h, p, None)
+pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>, super::Error> {
+    encode_with_icc(rgb, w, h, p, None).map_err(|e| super::Error::classify(e, false))
 }
 
 /// JPEG encode with an optional ICC profile written ahead of the

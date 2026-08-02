@@ -12,6 +12,16 @@ pub fn decode_and_resize(
     max_w: u32,
     max_h: u32,
     parallel: usize,
+) -> Result<(Vec<u8>, usize, usize), super::Error> {
+    decode_and_resize_inner(jpeg, max_w, max_h, parallel)
+        .map_err(|e| super::Error::classify(e, false))
+}
+
+fn decode_and_resize_inner(
+    jpeg: &[u8],
+    max_w: u32,
+    max_h: u32,
+    parallel: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();

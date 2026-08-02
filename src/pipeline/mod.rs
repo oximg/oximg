@@ -213,7 +213,11 @@ impl ImageFormat {
 /// auto-rotation on (the default), `process` fits and emits the
 /// *displayed* frame, so for orientations 5-8 its output axes are
 /// swapped relative to these dimensions.
-pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
+pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize), Error> {
+    probe_inner(bytes).map_err(|e| Error::classify(e, false))
+}
+
+fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     let mut header = [0u8; 12];
     anyhow::ensure!(bytes.len() >= 12, "source too short");
     header.copy_from_slice(&bytes[..12]);
@@ -257,8 +261,8 @@ pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     }
 }
 
-pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
-    process_reader(std::io::Cursor::new(bytes), p)
+pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    process_reader(std::io::Cursor::new(bytes), p).map_err(|e| Error::classify(e, false))
 }
 
 /// Sniff the source format, then resize + re-encode in the target
@@ -303,9 +307,12 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
 /// concurrency this saves concurrency x file-size of resident memory;
 /// entropy decoding is a sequential read anyway, so the page cache
 /// serves it fine.
-pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
-    let file = std::fs::File::open(path).context("open source")?;
-    process_reader(file, p)
+pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    let inner = || -> Result<(Vec<u8>, ImageFormat)> {
+        let file = std::fs::File::open(path).context("open source")?;
+        process_reader(file, p)
+    };
+    inner().map_err(|e| Error::classify(e, false))
 }
 
 /// Remote-source HTTP client (the `server` feature). ureq and the rest
@@ -334,10 +341,10 @@ fn max_source_bytes() -> u64 {
 
 /// Marker attached (as anyhow context) to failures that are the
 /// server's fault — encoding, worker infrastructure — as opposed to
-/// undecodable client input. The HTTP layer maps these to 500 with a
-/// generic body instead of 422 with error text.
+/// undecodable client input. Consumed by [`Error::classify`] into
+/// [`ErrorKind::Internal`]; not part of the public surface.
 #[derive(Debug, Clone, Copy)]
-pub struct ServerFault;
+pub(crate) struct ServerFault;
 
 impl std::fmt::Display for ServerFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -346,14 +353,14 @@ impl std::fmt::Display for ServerFault {
 }
 
 /// Marker for remote-origin failures (transport errors, non-404 error
-/// statuses): the HTTP layer answers 502, not 422 — the client's
-/// request was fine, the upstream wasn't. Only produced on the
-/// remote-source path, so it lives behind the `server` feature.
-#[cfg(feature = "server")]
+/// statuses): the client's request was fine, the upstream wasn't.
+/// Consumed by [`Error::classify`] into [`ErrorKind::Upstream`]; not
+/// part of the public surface. (Produced on the remote-source path,
+/// but classification must see the type on every build, so it is not
+/// feature-gated.)
 #[derive(Debug, Clone, Copy)]
-pub struct UpstreamFault;
+pub(crate) struct UpstreamFault;
 
-#[cfg(feature = "server")]
 impl std::fmt::Display for UpstreamFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("upstream image fetch failed")
@@ -399,7 +406,12 @@ impl<R: std::io::Read> std::io::Read for CappedReader<R> {
 /// buffered whole, same as the file path. Requires the `server`
 /// feature (the HTTP client stack).
 #[cfg(feature = "server")]
-pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    process_url_inner(url, p).map_err(|e| Error::classify(e, true))
+}
+
+#[cfg(feature = "server")]
+fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     let resp = http_agent().get(url).call().map_err(|e| match e {
         // Preserve source 404s so the HTTP layer can pass them through.
         ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
@@ -741,15 +753,20 @@ pub(crate) const ICC_CAP: usize = 4 * 1024 * 1024;
 pub(crate) fn check_src_pixels(w: usize, h: usize) -> Result<()> {
     let cap = crate::config::config().max_src_pixels;
     let px = (w as u64).saturating_mul(h as u64);
-    anyhow::ensure!(
-        px <= cap,
-        "source is {w}x{h} ({px} pixels), over the OXIMG_MAX_SRC_PIXELS limit ({cap})"
-    );
+    if px > cap {
+        // FileTooLarge, like the byte cap, so both limits classify as
+        // ErrorKind::SourceTooLarge (HTTP 413).
+        anyhow::bail!(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("source is {w}x{h} ({px} pixels), over the OXIMG_MAX_SRC_PIXELS limit ({cap})"),
+        ));
+    }
     Ok(())
 }
 
 mod cmyk;
 mod encode;
+mod error;
 mod formats;
 mod fuse;
 mod jpeg;
@@ -759,6 +776,7 @@ mod tests;
 use cmyk::*;
 pub use encode::encode;
 use encode::*;
+pub use error::{Error, ErrorKind};
 use formats::*;
 use fuse::*;
 pub use jpeg::decode_and_resize;
