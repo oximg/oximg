@@ -12,6 +12,13 @@ HTTP interface without notice.
 
 ### Added
 
+- **Prebuilt release binaries**: tagged releases now attach
+  `oximg-<tag>-<target>.tar.gz` (+ `.sha256`) for Linux
+  x86_64/aarch64 (glibc, libstdc++ static) and macOS arm64, built on
+  native runners and smoke-tested (resize + probe) before upload.
+  Default features — server + CLI, no AVIF — matching crates.io and
+  Homebrew; Docker images remain the AVIF-included channel.
+
 - **One-shot CLI**: `oximg resize <in> <max_w> <max_h> <out>
   [-q N] [-f fmt] [--preset P]` and `oximg probe <file>` run the
   pipeline without the server; the output format follows `--format`,
