@@ -170,7 +170,7 @@ curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
 **Prebuilt binaries** ([GitHub Releases](https://github.com/oximg/oximg/releases),
-from the first tag after 0.5.1; Linux x86_64/aarch64 and macOS arm64;
+v0.6.0+; Linux x86_64/aarch64 and macOS arm64;
 JPEG/PNG/WebP, no AVIF) — suited to CI asset pipelines where a Docker
 pull or a source build is too slow. Assets are named
 `oximg-<tag>-<target>.tar.gz` with a `.sha256` alongside; each is
@@ -178,13 +178,13 @@ smoke-tested before upload. Linux builds link glibc >= 2.39
 (Ubuntu 24.04) with libstdc++ static — self-contained on any current
 CI runner.
 
-**Homebrew** (builds v0.5.1 from source; JPEG/PNG/WebP, no AVIF):
+**Homebrew** (builds v0.6.0 from source; JPEG/PNG/WebP, no AVIF):
 
 ```sh
 brew install oximg/tap/oximg
 ```
 
-**Cargo** (crates.io, v0.5.1; add `--features avif` if SVT-AV1 >= 4.1
+**Cargo** (crates.io, v0.6.0; add `--features avif` if SVT-AV1 >= 4.1
 and dav1d are installed and visible to pkg-config):
 
 ```sh

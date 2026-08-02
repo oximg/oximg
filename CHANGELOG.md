@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-02
+
+The library-vs-server strategy release: the binary grows a real CLI,
+deployments get graceful shutdown and per-platform guides, releases
+ship prebuilt binaries, and the library API turns embedder-grade —
+typed errors and per-call config. **Breaking for library users** (see
+Changed); the HTTP interface is unchanged except that over-pixel-cap
+sources now answer 413 and SIGTERM drains instead of killing in-flight
+requests.
+
 ### Added
 
 - **Typed library errors**: every public pipeline entry point returns
