@@ -154,30 +154,37 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     }
 }
 
+mod cli;
+
 fn main() -> anyhow::Result<()> {
-    // Minimal, dependency-free flag handling: the server takes all its
-    // real configuration from the environment, so the only CLI is
-    // --version/--help (the version is what a bug report should cite).
-    // The server takes all its real configuration from the
-    // environment, so the only CLI is --version/--help.
-    match std::env::args().nth(1).as_deref() {
-        None => {}
+    // Minimal, dependency-free subcommand dispatch. `serve` is the
+    // default — bare `oximg` keeps every existing deployment and the
+    // Docker CMD working; the server takes all its real configuration
+    // from the environment. `resize`/`probe` are the one-shot CLI over
+    // the same pipeline.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None | Some("serve") => {
+            if args.len() > 1 {
+                eprintln!(
+                    "oximg: serve takes no arguments (configuration is via \
+                     environment variables; try --help)"
+                );
+                std::process::exit(2);
+            }
+        }
+        Some("resize") => return cli::resize(&args[1..]),
+        Some("probe") => return cli::probe(&args[1..]),
         Some("-V" | "--version") => {
             println!("oximg {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         Some("-h" | "--help") => {
-            println!(
-                "oximg {}\n\n\
-                 A fast image resize/transcode server. All configuration is via\n\
-                 environment variables (PORT, IMAGES_DIR, OXIMG_*); see the README.\n\n\
-                 Usage: oximg [--version] [--help]",
-                env!("CARGO_PKG_VERSION")
-            );
+            cli::print_help();
             return Ok(());
         }
         Some(other) => {
-            eprintln!("oximg: unknown argument {other:?} (try --help)");
+            eprintln!("oximg: unknown command {other:?} (try --help)");
             std::process::exit(2);
         }
     }

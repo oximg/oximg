@@ -228,6 +228,7 @@ mod tests {
             #[cfg(feature = "avif")]
             include_str!("avif/decode.rs"),
             include_str!("main.rs"),
+            include_str!("cli.rs"),
         ];
         for src in sources {
             for m in src.match_indices("\"OXIMG_") {
