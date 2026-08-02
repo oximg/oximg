@@ -127,6 +127,37 @@ impl Server {
     }
 }
 
+impl Server {
+    /// Deliver a signal by name ("TERM", "INT") via /bin/kill — takes
+    /// &self so a test can signal while other threads hold requests
+    /// open against the server.
+    #[cfg(unix)]
+    fn signal(&self, sig: &str) {
+        let status = Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{sig} failed");
+    }
+
+    /// Wait for the process to exit on its own (no kill), panicking
+    /// past the deadline — a graceful shutdown that hangs must fail
+    /// the test, not stall the suite.
+    fn wait_exit(&mut self, timeout: std::time::Duration) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("server did not exit within {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -965,4 +996,105 @@ fn remote_source_mode_streams_from_http_origin() {
     assert!(body.starts_with(&[0xFF, 0xD8]));
     // origin 404 passes through
     assert_eq!(s.status_of("/resize/100/100/nope.jpg"), 404);
+}
+
+/// An idle server must exit 0 promptly on SIGTERM (what docker stop,
+/// Kubernetes, and Cloud Run send) and on SIGINT (terminal ctrl-C) —
+/// not ride out the orchestrator's SIGKILL as exit 137.
+#[cfg(unix)]
+#[test]
+fn idle_server_exits_cleanly_on_sigterm_and_sigint() {
+    for sig in ["TERM", "INT"] {
+        let mut s = Server::start(&[]);
+        s.signal(sig);
+        let status = s.wait_exit(std::time::Duration::from_secs(10));
+        assert!(status.success(), "SIG{sig}: exited {status}");
+    }
+}
+
+/// The full graceful-shutdown contract, made deterministic by an
+/// origin that stalls mid-body until the test releases it: after
+/// SIGTERM lands with a request in flight, (1) the listener closes —
+/// new connections are refused, (2) the in-flight response still
+/// completes as a valid 200, (3) the process then exits 0.
+#[cfg(unix)]
+#[test]
+fn graceful_shutdown_drains_inflight_and_refuses_new_connections() {
+    use std::io::Write;
+
+    let jpeg = std::fs::read(format!(
+        "{}/tests/fixtures/photo.jpg",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    let (inflight_tx, inflight_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // One-shot origin: send headers plus the first KB, then hold the
+    // body open until released — the request is pinned in flight for
+    // exactly as long as the test needs, with no sleeps to race.
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = std::io::Read::read(&mut stream, &mut buf);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            jpeg.len()
+        )
+        .unwrap();
+        stream.write_all(&jpeg[..1024]).unwrap();
+        stream.flush().unwrap();
+        inflight_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+        let _ = stream.write_all(&jpeg[1024..]);
+    });
+
+    let mut s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{origin_port}"),
+    )]);
+    let port = s.port;
+
+    std::thread::scope(|sc| {
+        let request = sc.spawn(|| s.get("/resize/100/100/photo.jpg"));
+        inflight_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("request never reached the origin");
+
+        s.signal("TERM");
+
+        // (1) The accept loop must stop while the request drains. Poll:
+        // signal delivery is asynchronous, but the listener has to be
+        // closed well before the deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let refused = std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                std::time::Duration::from_millis(250),
+            )
+            .is_err();
+            if refused {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener still accepting after SIGTERM"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        // (2) The pinned request survives the shutdown and completes.
+        release_tx.send(()).unwrap();
+        let (status, ct, body) = request.join().unwrap().expect("in-flight request failed");
+        assert_eq!(status, 200);
+        assert_eq!(ct, "image/jpeg");
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!((w, h), (100, 75));
+    });
+
+    // (3) With the last response delivered, the process exits cleanly.
+    let status = s.wait_exit(std::time::Duration::from_secs(10));
+    assert!(status.success(), "exited {status}");
 }

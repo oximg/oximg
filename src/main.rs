@@ -250,8 +250,39 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         "oximg listening on :{bound} (images: {}, workers: {workers})",
         images_dir.display()
     );
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    eprintln!("oximg: shutdown complete");
     Ok(())
+}
+
+/// Resolves when the process is asked to stop: SIGTERM (what `docker
+/// stop`, Kubernetes, and Cloud Run send) or SIGINT (terminal ctrl-C).
+/// axum then stops accepting connections, finishes in-flight requests,
+/// and `serve` returns for a clean exit 0. No drain timeout of our own:
+/// every orchestrator escalates to SIGKILL after its grace period
+/// (docker stop and Cloud Run 10s, Kubernetes
+/// terminationGracePeriodSeconds), which backstops a response that
+/// never finishes.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let name = tokio::select! {
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+    };
+    eprintln!("oximg: {name} received, draining in-flight requests");
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install ctrl-C handler");
+    eprintln!("oximg: ctrl-C received, draining in-flight requests");
 }
 
 /// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
