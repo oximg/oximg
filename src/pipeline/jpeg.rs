@@ -23,21 +23,29 @@ fn decode_and_resize_inner(
     max_h: u32,
     parallel: usize,
 ) -> Result<(Vec<u8>, usize, usize)> {
+    // No override surface on this helper: a default Params resolves
+    // every knob from the environment, like the server path.
+    let p = Params {
+        max_width: max_w,
+        max_height: max_h,
+        parallel,
+        ..Params::default()
+    };
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         // The ICC scan feeds the CMYK→RGB conversion only (this
         // helper returns raw pixels, so there is no pass-through);
         // OXIMG_ICC=0 downgrades CMYK sources to the naive composite
         // here exactly like the server path.
-        let want_icc = icc_passthrough();
-        let meta = if auto_rotate() || want_icc {
+        let want_icc = icc_passthrough(&p);
+        let meta = if auto_rotate(&p) || want_icc {
             let mut prefix = Vec::new();
             let mut r = jpeg;
             crate::meta::scan_jpeg_meta(&mut r, &mut prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
         };
-        let orientation = if auto_rotate() {
+        let orientation = if auto_rotate(&p) {
             meta.orientation
         } else {
             crate::meta::Orientation::UPRIGHT
@@ -48,7 +56,7 @@ fn decode_and_resize_inner(
             dec,
             max_w,
             max_h,
-            parallel,
+            &p,
             orientation,
             Fuse::Off,
             meta.icc.as_deref(),
@@ -138,7 +146,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     mut dec: Decompress<R>,
     max_w: u32,
     max_h: u32,
-    parallel: usize,
+    p: &Params,
     orientation: crate::meta::Orientation,
     fuse: Fuse,
     // The source's profile, dual-purpose by path: the fused jpegli
@@ -188,7 +196,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             .context("decode failed")?;
         started.finish().context("decode finish failed")?;
         cmyk_to_rgb_in_chunk8(s, dec_w, dec_h, icc);
-        resize_pixels_to(s, 3, dec_w, dec_h, dst_w, dst_h, parallel)?;
+        resize_pixels_to(s, 3, dec_w, dec_h, dst_w, dst_h, p)?;
         if timing {
             eprintln!(
                 "timing cmyk({dec_w}x{dec_h}->{dst_w}x{dst_h}) total={:.1}ms",
@@ -213,7 +221,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     let mut started = dec.rgb().context("decode start failed")?;
     let (dec_w, dec_h) = (started.width(), started.height());
     let row_bytes = dec_w * 3;
-    let linear = linear_light() && (dec_w, dec_h) != (dst_w, dst_h);
+    let linear = linear_light(p) && (dec_w, dec_h) != (dst_w, dst_h);
 
     if (dec_w, dec_h) == (dst_w, dst_h) {
         // Decoded size is already the target size: output directly; a
@@ -356,7 +364,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
         // through the back LUT as they emit. Serial and fused therefore
         // produce identical bytes on every architecture.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-        if parallel <= 1
+        if p.parallel <= 1
             && !crate::config::config().fir_backend
             && let Ok(mut resizer) =
                 crate::resize_kernel::StreamResize::<FuseKernel>::new(dec_w, dec_h, dst_w, dst_h, 3)
@@ -443,7 +451,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             dst_w,
             dst_h,
             PixelType::U16x3,
-            parallel,
+            p.parallel,
             &mut s.resizer,
         )?;
 
@@ -479,7 +487,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             dst_w,
             dst_h,
             PixelType::U8x3,
-            parallel,
+            p.parallel,
             &mut s.resizer,
         )?;
         if timing {
@@ -521,13 +529,13 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // is CMYK is unknown until the frame header parses, after
         // this scan. (OXIMG_ICC=0 therefore also downgrades CMYK
         // sources to the naive conversion.)
-        let want_icc = icc_passthrough();
-        let meta = if auto_rotate() || want_icc {
+        let want_icc = icc_passthrough(p);
+        let meta = if auto_rotate(p) || want_icc {
             crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
         };
-        let orientation = if auto_rotate() {
+        let orientation = if auto_rotate(p) {
             meta.orientation
         } else {
             crate::meta::Orientation::UPRIGHT
@@ -570,7 +578,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // these is what encodes the frame.
         #[cfg(feature = "avif")]
         let avif_params = || {
-            let quality = avif_quality();
+            let quality = avif_quality(p);
             crate::avif::AvifParams {
                 quality,
                 alpha_quality: avif_alpha_quality(quality),
@@ -633,7 +641,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             dec,
             p.max_width,
             p.max_height,
-            p.parallel,
+            p,
             orientation,
             fuse,
             icc_dec,

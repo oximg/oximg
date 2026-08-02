@@ -79,6 +79,15 @@ impl Encoder {
     }
 }
 
+/// PNG encode effort, mirroring `OXIMG_PNG_EFFORT`'s levels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PngEffort {
+    Fastest,
+    Fast,
+    Balanced,
+    High,
+}
+
 /// Resize + re-encode parameters for [`process`] and friends.
 ///
 /// Construct with `..Default::default()` and only set the fields you
@@ -86,6 +95,13 @@ impl Encoder {
 /// version adds a field. (The struct keeps public fields rather than
 /// `#[non_exhaustive]`, which would forbid struct-literal construction
 /// across the crate boundary entirely, `..Default` included.)
+///
+/// The `Option` fields at the bottom are per-call overrides for knobs
+/// that are otherwise process-global (`OXIMG_*` environment variables,
+/// resolved once at first use): `None` keeps the env-configured
+/// behavior byte-for-byte, `Some` takes precedence — so an embedder
+/// can run different settings per call, in one process, without
+/// touching the environment.
 #[derive(Clone, Debug)]
 pub struct Params {
     pub max_width: u32,
@@ -100,13 +116,33 @@ pub struct Params {
     /// Output format; None re-encodes in the sniffed source format
     /// (the original contract, byte-identical to before this field).
     pub output: Option<ImageFormat>,
+    /// WebP encode quality (`OXIMG_WEBP_QUALITY`, default 75).
+    pub webp_quality: Option<f32>,
+    /// PNG encode effort (`OXIMG_PNG_EFFORT`, default fast).
+    pub png_effort: Option<PngEffort>,
+    /// Apply EXIF/AVIF orientation (`OXIMG_AUTO_ROTATE`, default on).
+    pub auto_rotate: Option<bool>,
+    /// Carry the source ICC profile into the output (`OXIMG_ICC`,
+    /// default on). `false` also selects the naive CMYK conversion,
+    /// exactly like `OXIMG_ICC=0`.
+    pub icc: Option<bool>,
+    /// Background for alpha→JPEG flattening (`OXIMG_FLATTEN_BG`,
+    /// default white).
+    pub flatten_bg: Option<[u8; 3]>,
+    /// Resize in linear light (`OXIMG_RESIZE`, default on; `false` =
+    /// the srgb mode).
+    pub linear_light: Option<bool>,
+    /// AVIF encode quality (`OXIMG_AVIF_QUALITY`, default 55).
+    #[cfg(feature = "avif")]
+    pub avif_quality: Option<u8>,
 }
 
 impl Default for Params {
     /// Re-encode at the source's own size and format, jpegli q80,
-    /// single-threaded. The dimension defaults are `u32::MAX`, i.e. no
-    /// downscale bound — the pipeline never upscales, so this yields
-    /// the original dimensions until a caller sets a smaller box.
+    /// single-threaded, every override unset (env-configured behavior).
+    /// The dimension defaults are `u32::MAX`, i.e. no downscale bound —
+    /// the pipeline never upscales, so this yields the original
+    /// dimensions until a caller sets a smaller box.
     fn default() -> Self {
         Params {
             max_width: u32::MAX,
@@ -115,6 +151,14 @@ impl Default for Params {
             encoder: Encoder::Jpegli,
             parallel: 1,
             output: None,
+            webp_quality: None,
+            png_effort: None,
+            auto_rotate: None,
+            icc: None,
+            flatten_bg: None,
+            linear_light: None,
+            #[cfg(feature = "avif")]
+            avif_quality: None,
         }
     }
 }
@@ -707,24 +751,28 @@ fn overlap_gate() -> bool {
     }
 }
 
-fn linear_light() -> bool {
-    crate::config::config().linear_light
+/// Per-call override, else OXIMG_RESIZE (linear unless "srgb").
+fn linear_light(p: &Params) -> bool {
+    p.linear_light
+        .unwrap_or_else(|| crate::config::config().linear_light)
 }
 
-/// OXIMG_AUTO_ROTATE: apply EXIF orientation (default on; "0"
-/// disables, which also skips the pre-decode segment scan entirely).
-fn auto_rotate() -> bool {
-    crate::config::config().auto_rotate
+/// Per-call override, else OXIMG_AUTO_ROTATE: apply EXIF orientation
+/// (default on; off also skips the pre-decode segment scan entirely).
+fn auto_rotate(p: &Params) -> bool {
+    p.auto_rotate
+        .unwrap_or_else(|| crate::config::config().auto_rotate)
 }
 
-/// OXIMG_ICC: carry the source's ICC profile into the output (default
-/// on; "0" disables and skips profile extraction entirely). RGB pixels
-/// are never color-converted — the profile bytes are passed through.
-/// CMYK JPEG sources are the exception: their profile is *consumed*
-/// by the CMYK→sRGB conversion (never emitted), so "0" also selects
-/// the naive conversion there.
-fn icc_passthrough() -> bool {
-    crate::config::config().icc_passthrough
+/// Per-call override, else OXIMG_ICC: carry the source's ICC profile
+/// into the output (default on; off disables and skips profile
+/// extraction entirely). RGB pixels are never color-converted — the
+/// profile bytes are passed through. CMYK JPEG sources are the
+/// exception: their profile is *consumed* by the CMYK→sRGB conversion
+/// (never emitted), so off also selects the naive conversion there.
+fn icc_passthrough(p: &Params) -> bool {
+    p.icc
+        .unwrap_or_else(|| crate::config::config().icc_passthrough)
 }
 
 /// Targets that can carry an ICC profile — all of them when the avif

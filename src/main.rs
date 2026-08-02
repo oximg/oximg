@@ -571,6 +571,9 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         // light-load latency.
         parallel: app.resize_threads,
         output: *output,
+        // Override fields stay None: the server's knobs are the
+        // process-global OXIMG_* environment, validated at startup.
+        ..Default::default()
     };
     let source_url = app
         .source_base

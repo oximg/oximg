@@ -4,8 +4,15 @@
 
 use super::*;
 
-pub(super) fn png_compression() -> png::Compression {
-    crate::config::config().png_compression
+/// Per-call override, else OXIMG_PNG_EFFORT.
+pub(super) fn png_compression(p: &Params) -> png::Compression {
+    match p.png_effort {
+        Some(PngEffort::Fastest) => png::Compression::Fastest,
+        Some(PngEffort::Fast) => png::Compression::Fast,
+        Some(PngEffort::Balanced) => png::Compression::Balanced,
+        Some(PngEffort::High) => png::Compression::High,
+        None => crate::config::config().png_compression,
+    }
 }
 
 pub(super) fn encode_png(
@@ -14,6 +21,7 @@ pub(super) fn encode_png(
     h: usize,
     channels: usize,
     icc: Option<&[u8]>,
+    p: &Params,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(64 * 1024);
     // The no-profile arm constructs the encoder exactly as the pre-ICC
@@ -32,21 +40,23 @@ pub(super) fn encode_png(
         png::ColorType::Rgb
     });
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png_compression());
+    enc.set_compression(png_compression(p));
     let mut writer = enc.write_header().context("PNG header")?;
     writer.write_image_data(pixels).context("PNG encode")?;
     writer.finish().context("PNG finish")?;
     Ok(out)
 }
 
-/// AVIF quality (libavif semantics). Nominal quality numbers are not
-/// comparable across encoders; this default is chosen by operating
-/// point: at 55, the 10-bit SVT-AV1 output is smaller than what the
-/// common imgproxy/libvips default (q65, 8-bit aom) produces and still
+/// AVIF quality (libavif semantics): per-call override, else
+/// OXIMG_AVIF_QUALITY. Nominal quality numbers are not comparable
+/// across encoders; the default is chosen by operating point: at 55,
+/// the 10-bit SVT-AV1 output is smaller than what the common
+/// imgproxy/libvips default (q65, 8-bit aom) produces and still
 /// scores several SSIMULACRA2 points higher (see bench/quality).
 #[cfg(feature = "avif")]
-pub(super) fn avif_quality() -> u8 {
-    crate::config::config().avif_quality
+pub(super) fn avif_quality(p: &Params) -> u8 {
+    p.avif_quality
+        .unwrap_or_else(|| crate::config::config().avif_quality)
 }
 
 /// Alpha-item quality; defaults to the color quality.
@@ -66,8 +76,10 @@ pub(super) fn avif_speed() -> i8 {
     crate::config::config().avif_speed
 }
 
-pub(super) fn webp_quality() -> f32 {
-    crate::config::config().webp_quality
+/// Per-call override, else OXIMG_WEBP_QUALITY.
+pub(super) fn webp_quality(p: &Params) -> f32 {
+    p.webp_quality
+        .unwrap_or_else(|| crate::config::config().webp_quality)
 }
 
 pub(super) fn webp_effort() -> i32 {
@@ -80,8 +92,9 @@ pub(super) fn encode_webp(
     h: usize,
     channels: usize,
     icc: Option<&[u8]>,
+    p: &Params,
 ) -> Result<Vec<u8>> {
-    let out = encode_webp_bare(pixels, w, h, channels)?;
+    let out = encode_webp_bare(pixels, w, h, channels, p)?;
     match icc {
         Some(icc) => wrap_webp_icc(&out, icc),
         None => Ok(out),
@@ -98,12 +111,13 @@ pub(super) fn encode_webp_bare(
     w: usize,
     h: usize,
     channels: usize,
+    p: &Params,
 ) -> Result<Vec<u8>> {
     use libwebp_sys as wp;
     unsafe {
         let mut config: wp::WebPConfig = std::mem::zeroed();
         anyhow::ensure!(wp::WebPInitConfig(&mut config), "libwebp ABI mismatch");
-        config.quality = webp_quality();
+        config.quality = webp_quality(p);
         config.method = webp_effort().clamp(0, 6);
 
         let mut pic: wp::WebPPicture = std::mem::zeroed();
@@ -299,7 +313,7 @@ fn encode_output_inner(
     match target {
         ImageFormat::Jpeg => {
             if channels == 4 {
-                flatten_alpha_in_out8(s, dst_w, dst_h);
+                flatten_alpha_in_out8(s, dst_w, dst_h, p);
             }
             encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p, icc)
         }
@@ -309,6 +323,7 @@ fn encode_output_inner(
             dst_h,
             channels,
             icc,
+            p,
         ),
         ImageFormat::Webp => encode_webp(
             &s.out8[..dst_w * dst_h * channels],
@@ -316,12 +331,13 @@ fn encode_output_inner(
             dst_h,
             channels,
             icc,
+            p,
         ),
         // Fully opaque RGBA drops its alpha item inside encode_avif
         // (skipping the second SVT session entirely).
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
-            let quality = avif_quality();
+            let quality = avif_quality(p);
             let params = crate::avif::AvifParams {
                 quality,
                 alpha_quality: avif_alpha_quality(quality),
@@ -342,19 +358,20 @@ fn encode_output_inner(
     }
 }
 
-/// OXIMG_FLATTEN_BG: background for alpha -> JPEG flattening, as RRGGBB
-/// hex; default white.
-pub(super) fn flatten_bg() -> [u8; 3] {
-    crate::config::config().flatten_bg
+/// Per-call override, else OXIMG_FLATTEN_BG: background for alpha ->
+/// JPEG flattening; default white.
+pub(super) fn flatten_bg(p: &Params) -> [u8; 3] {
+    p.flatten_bg
+        .unwrap_or_else(|| crate::config::config().flatten_bg)
 }
 
 /// Composite the straight-alpha RGBA8 pixels in `out8` onto the
 /// flatten background in linear light, compacting to RGB8 in place
 /// (pixel i writes 3i..3i+3 after reading 4i..4i+4, so the forward
 /// pass never clobbers unread input).
-pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize) {
+pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize, p: &Params) {
     let (fwd, back) = (fwd_lut(), back_lut());
-    let bg = flatten_bg();
+    let bg = flatten_bg(p);
     let bg_lin = [
         fwd[bg[0] as usize] as u32,
         fwd[bg[1] as usize] as u32,

@@ -30,7 +30,7 @@ pub(super) fn process_png<R: std::io::Read>(
     // post-IDAT placement, but Chrome and Firefox also honor only
     // pre-IDAT eXIf, so serving those unrotated is browser parity, and
     // fail-safe besides.
-    let orientation = if auto_rotate() {
+    let orientation = if auto_rotate(p) {
         png_reader
             .info()
             .exif_metadata
@@ -42,7 +42,7 @@ pub(super) fn process_png<R: std::io::Read>(
     };
     // iCCP profile (the png crate has already inflated it), bytes
     // passed through untouched.
-    let icc: Option<Vec<u8>> = if icc_passthrough() && target_supports_icc(target) {
+    let icc: Option<Vec<u8>> = if icc_passthrough(p) && target_supports_icc(target) {
         png_reader
             .info()
             .icc_profile
@@ -65,7 +65,7 @@ pub(super) fn process_png<R: std::io::Read>(
             && bits == png::BitDepth::Eight
             && !hdr.interlaced
             && (src_w, src_h) != (dst_w, dst_h)
-            && linear_light()
+            && linear_light(p)
             // Oriented PNGs are rare; they take the general arm below
             // rather than teaching the row-streaming path to rotate.
             && orientation.is_upright()
@@ -203,8 +203,8 @@ pub(super) fn process_webp<R: std::io::Read>(
     // disagree, browsers accept both).
     let (icc, exif) = webp_metadata(
         &s.srcbuf,
-        icc_passthrough() && target_supports_icc(target),
-        auto_rotate(),
+        icc_passthrough(p) && target_supports_icc(target),
+        auto_rotate(p),
     );
     let orientation = exif
         .and_then(|d| crate::meta::Orientation::from_exif_payload(&d))
@@ -258,12 +258,12 @@ pub(super) fn process_avif<R: std::io::Read>(
     let t0 = std::time::Instant::now();
     // avif-parse exposes neither colr nor irot/imir; both come from
     // our own bounded container walk.
-    let icc = if icc_passthrough() && target_supports_icc(target) {
+    let icc = if icc_passthrough(p) && target_supports_icc(target) {
         crate::avif::extract_icc(&s.srcbuf)
     } else {
         None
     };
-    let orientation = if auto_rotate() {
+    let orientation = if auto_rotate(p) {
         crate::avif::extract_orientation(&s.srcbuf)
     } else {
         crate::meta::Orientation::UPRIGHT
@@ -403,7 +403,7 @@ pub(super) fn resize_pixels_oriented(
     } else {
         (fit_w, fit_h)
     };
-    resize_pixels_to(s, channels, src_w, src_h, dst_w, dst_h, p.parallel)?;
+    resize_pixels_to(s, channels, src_w, src_h, dst_w, dst_h, p)?;
     if orientation.is_upright() {
         return Ok((dst_w, dst_h));
     }
@@ -432,7 +432,7 @@ pub(super) fn resize_pixels_to(
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
-    parallel: usize,
+    p: &Params,
 ) -> Result<(usize, usize)> {
     let src_len = src_w * src_h * channels;
     if (src_w, src_h) == (dst_w, dst_h) {
@@ -442,7 +442,7 @@ pub(super) fn resize_pixels_to(
         return Ok((dst_w, dst_h));
     }
 
-    if linear_light() {
+    if linear_light(p) {
         let (fwd, back) = (fwd_lut(), back_lut());
         // Fully overwritten by the LUT/premultiply loops just below.
         scratch_u16(&mut s.src16, src_len);
@@ -478,7 +478,7 @@ pub(super) fn resize_pixels_to(
             } else {
                 PixelType::U16x3
             },
-            parallel,
+            p.parallel,
             &mut s.resizer,
         )?;
         scratch_u8(&mut s.out8, dst_len);
@@ -526,7 +526,7 @@ pub(super) fn resize_pixels_to(
             } else {
                 PixelType::U8x3
             },
-            parallel,
+            p.parallel,
             &mut s.resizer,
         )?;
         if channels == 4 {

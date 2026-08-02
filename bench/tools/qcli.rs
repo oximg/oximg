@@ -59,7 +59,7 @@ fn params(quality: f32, preset: &str) -> pipeline::Params {
         quality,
         encoder: pipeline::Encoder::from_preset(preset),
         parallel: 1,
-        output: None,
+        ..Default::default()
     }
 }
 
@@ -113,6 +113,7 @@ fn main() -> anyhow::Result<()> {
                 ),
                 parallel: 1,
                 output: Some(target),
+                ..Default::default()
             };
             let (bytes, got) = pipeline::process(&fs::read(input)?, &p)?;
             anyhow::ensure!(got == target, "pipeline returned {got:?}");

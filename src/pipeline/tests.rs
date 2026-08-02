@@ -37,7 +37,7 @@ fn run_jpeg_icc(jpeg: &[u8], fuse_quality: Option<f32>, icc: Option<&[u8]>) -> V
         quality: 80.0,
         encoder: Encoder::Jpegli,
         parallel: 1,
-        output: None,
+        ..Params::default()
     };
     let fuse = match fuse_quality {
         Some(quality) => Fuse::Jpegli { quality },
@@ -50,7 +50,7 @@ fn run_jpeg_icc(jpeg: &[u8], fuse_quality: Option<f32>, icc: Option<&[u8]>) -> V
         dec,
         320,
         320,
-        1,
+        &Params::default(),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         icc,
@@ -118,7 +118,7 @@ fn run_jpeg_pixels(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
         dec,
         320,
         320,
-        1,
+        &Params::default(),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         None,
@@ -167,7 +167,7 @@ fn run_jpeg_avif_icc(jpeg: &[u8], yuv_fuse: bool, icc: Option<&[u8]>) -> Vec<u8>
         dec,
         320,
         320,
-        1,
+        &Params::default(),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         None,
@@ -201,7 +201,7 @@ fn preheated_session_bytes_match_serial_oriented_avif() {
     let run = |fuse: Fuse| -> Vec<u8> {
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(&jpeg).unwrap();
-        match decode_resize(&mut s, dec, 320, 320, 1, orientation, fuse, None).unwrap() {
+        match decode_resize(&mut s, dec, 320, 320, &Params::default(), orientation, fuse, None).unwrap() {
             Decoded::PixelsSession {
                 dst_w,
                 dst_h,
@@ -291,7 +291,7 @@ fn fused_yuv_survives_truncated_sources() {
             dec,
             320,
             320,
-            1,
+            &Params::default(),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Yuv {
                 params: test_avif_params(),
@@ -386,7 +386,7 @@ fn fused_pixels_survive_truncated_sources() {
             dec,
             320,
             320,
-            1,
+            &Params::default(),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Pixels,
             None,
@@ -407,7 +407,7 @@ fn fused_path_survives_truncated_sources() {
         quality: 80.0,
         encoder: Encoder::Jpegli,
         parallel: 1,
-        output: None,
+        ..Params::default()
     };
     let mut s = Scratch::default();
     if let Ok(dec) = Decompress::new_mem(cut) {
@@ -416,7 +416,7 @@ fn fused_path_survives_truncated_sources() {
             dec,
             320,
             320,
-            1,
+            &Params::default(),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Jpegli { quality: p.quality },
             None,
@@ -600,7 +600,11 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
             d[c] = ((v as u32 * k + 127) / 255) as u8;
         }
     }
-    resize_pixels_to(&mut s, 3, dec_w, dec_h, w, h, parallel).unwrap();
+    let p = Params {
+        parallel,
+        ..Params::default()
+    };
+    resize_pixels_to(&mut s, 3, dec_w, dec_h, w, h, &p).unwrap();
     assert_eq!(
         got,
         &s.out8[..w * h * 3],
