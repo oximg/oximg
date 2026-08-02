@@ -245,8 +245,12 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
 
     let router = Router::new()
         .route("/health", get(async || "ok"))
-        .route("/resize/{w}/{h}/{file}", get(handle_resize))
-        .route("/{sig}/resize/{w}/{h}/{file}", get(handle_signed_resize))
+        // {*file} spans path separators, so sources organized in
+        // directories (IMAGES_DIR trees, S3-style prefixes behind
+        // OXIMG_SOURCE_BASE_URL) are addressable; validate_source_path
+        // guards what the wider capture lets in.
+        .route("/resize/{w}/{h}/{*file}", get(handle_resize))
+        .route("/{sig}/resize/{w}/{h}/{*file}", get(handle_signed_resize))
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
@@ -340,9 +344,11 @@ async fn handle_signed_resize(
     let Some(signing) = app.signing.as_ref() else {
         return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
     };
-    // Signed material is the raw file segment, so an explicit @fmt token
+    // Signed material is the raw file capture, so an explicit @fmt token
     // is covered by the signature: photo.jpg's signature does not
-    // authorize photo.jpg@avif and its heavier encode.
+    // authorize photo.jpg@avif and its heavier encode. The capture spans
+    // path separators; the canonical form clients must sign is the
+    // percent-DECODED multi-segment path.
     let path = format!("/resize/{w}/{h}/{file}");
     if !signing.verify(&sig, &path) {
         return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
@@ -361,18 +367,44 @@ async fn handle_resize(
     serve_resize(app, w, h, file, accept).await
 }
 
+/// The source path is client input spanning multiple segments (already
+/// percent-decoded by the extractor), and it flows into a filesystem
+/// join or an upstream URL — so validate component-wise: every
+/// `/`-separated component must be a plain name. Rejecting empty
+/// components refuses absolute paths, `//` (which an upstream would
+/// read as a protocol-relative authority), and trailing slashes;
+/// rejecting `.`/`..` components refuses traversal in both the
+/// filesystem and the URL sense (interior dots like `my..file.jpg` are
+/// fine — the old substring check was coarser). `\`, `?`, `#`, and
+/// control bytes have no place in a source name in any mode.
+fn validate_source_path(file: &str) -> Result<(), (StatusCode, String)> {
+    let bad_component = |c: &str| c.is_empty() || c == "." || c == "..";
+    if file.contains(['\\', '?', '#'])
+        || file.bytes().any(|b| b < 0x20 || b == 0x7f)
+        || file.split('/').any(bad_component)
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid source path".into()));
+    }
+    Ok(())
+}
+
 /// Split a trailing imgproxy-style `@{fmt}` output-format token off the
 /// filename. Only exact known tokens count — any other suffix is part
 /// of the filename (`photo@2x.jpg` keeps working; a file literally
 /// named `x.jpg@webp` becomes unreachable, a documented trade). "jxl"
 /// is reserved so the future encoder slots in with a clear error today.
+/// Only the last path segment is considered: a `@` in a directory name
+/// is never a token by design, not just because its "token" would
+/// contain `/`.
 fn split_format(file: &str) -> Result<(&str, Option<ImageFormat>), (StatusCode, String)> {
-    let Some((base, token)) = file.rsplit_once('@') else {
+    let last_start = file.rfind('/').map_or(0, |i| i + 1);
+    let Some((seg_base, token)) = file[last_start..].rsplit_once('@') else {
         return Ok((file, None));
     };
-    if base.is_empty() {
+    if seg_base.is_empty() {
         return Ok((file, None));
     }
+    let base = &file[..last_start + seg_base.len()];
     match ImageFormat::from_token(token) {
         Some(ImageFormat::Avif) if cfg!(not(feature = "avif")) => Err((
             StatusCode::BAD_REQUEST,
@@ -440,12 +472,7 @@ async fn serve_resize_inner(
     if w == 0 || h == 0 || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
     }
-    if file.contains(['/', '\\', '?', '#'])
-        || file.contains("..")
-        || file.bytes().any(|b| b < 0x20 || b == 0x7f)
-    {
-        return Err((StatusCode::BAD_REQUEST, "invalid filename".into()));
-    }
+    validate_source_path(&file)?;
     let (base, explicit) = split_format(&file)?;
     // Precedence: explicit @fmt > Accept negotiation > source format.
     let target = explicit.or_else(|| negotiate(&app.auto_format, &accept));
@@ -547,6 +574,69 @@ async fn singleflight(app: &App, key: FlightKey) -> FlightResult {
     ))
 }
 
+/// Re-encode the (extractor-decoded) source path for the upstream URL.
+/// Bytes outside RFC 3986 pchar are percent-encoded and `/` is kept as
+/// the separator — so the origin sees exactly the segments the client
+/// addressed. Crucially `%` itself is encoded: the upstream applies its
+/// own decode, and a raw pass-through would let a double-encoded
+/// `%252e%252e` arrive there as `..` (a traversal the component checks
+/// on the decoded form cannot see).
+fn encode_upstream_path(file: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(file.len());
+    for &b in file.as_bytes() {
+        let pchar = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'.'
+                    | b'_'
+                    | b'~'
+                    | b'!'
+                    | b'$'
+                    | b'&'
+                    | b'\''
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'+'
+                    | b','
+                    | b';'
+                    | b'='
+                    | b':'
+                    | b'@'
+                    | b'/'
+            );
+        if pchar {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
+}
+
+/// Defense in depth for the filesystem mode: component validation
+/// already makes the joined path lexically inescapable, so this only
+/// fires when a symlink inside IMAGES_DIR points outside it — refused
+/// as 404 (indistinguishable from absent, revealing nothing). A path
+/// that fails to resolve falls through to the pipeline, whose open()
+/// classifies it (404/500) with a proper context chain.
+fn verify_within_root(
+    root: &std::path::Path,
+    path: &std::path::Path,
+) -> Result<(), (StatusCode, String)> {
+    let (Ok(resolved), Ok(root)) = (path.canonicalize(), root.canonicalize()) else {
+        return Ok(());
+    };
+    if resolved.starts_with(&root) {
+        Ok(())
+    } else {
+        Err((StatusCode::NOT_FOUND, "image not found".into()))
+    }
+}
+
 async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let (w, h, file, output) = key;
     let path = app.images_dir.join(file);
@@ -578,15 +668,19 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let source_url = app
         .source_base
         .as_ref()
-        .map(|base| format!("{base}/{file}"));
+        .map(|base| format!("{base}/{}", encode_upstream_path(file)));
+    let images_root = Arc::clone(&app.images_dir);
     let out = tokio::task::spawn_blocking(move || {
         let _permit = permit; // hold the CPU slot for the whole processing
         // Streaming decode: the source is never buffered whole on the heap
         // (saves concurrency x file-size for large sources under load);
         // for remote sources decoding overlaps the download.
         match source_url {
-            Some(url) => pipeline::process_url(&url, &params),
-            None => pipeline::process_path(&path, &params),
+            Some(url) => Ok(pipeline::process_url(&url, &params)),
+            None => {
+                verify_within_root(&images_root, &path)?;
+                Ok(pipeline::process_path(&path, &params))
+            }
         }
     })
     .await
@@ -596,7 +690,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             StatusCode::INTERNAL_SERVER_ERROR,
             "image processing failed".to_string(),
         )
-    })?
+    })??
     // The pipeline classifies its own failures (pipeline::ErrorKind);
     // this match only assigns statuses. Faults on our side (unreadable
     // source, upstream, internal) answer with generic bodies — the
@@ -755,6 +849,88 @@ mod tests {
         #[cfg(not(feature = "avif"))]
         assert_eq!(
             split_format("photo.jpg@avif").unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The full accept/reject table for multi-segment source paths: what
+    /// nesting lets in, and every escape the wider capture must not.
+    #[test]
+    fn source_path_validation_table() {
+        let ok = |p: &str| validate_source_path(p).is_ok();
+        // plain and nested names pass
+        assert!(ok("photo.jpg"));
+        assert!(ok("albums/2026/photo.jpg"));
+        assert!(ok("attachment/public_image/uuid-1/uuid-2.png"));
+        // interior dots are legitimate names, not traversal (the old
+        // substring check rejected these)
+        assert!(ok("my..file.jpg"));
+        assert!(ok("dir.d/...jpg"));
+        // '@' in a directory name is fine (token handling is separate)
+        assert!(ok("ver@2/photo.jpg"));
+        // traversal components, in any position
+        assert!(!ok(".."));
+        assert!(!ok("../secret.jpg"));
+        assert!(!ok("a/../secret.jpg"));
+        assert!(!ok("a/b/.."));
+        assert!(!ok("./a.jpg"));
+        assert!(!ok("a/./b.jpg"));
+        // empty components: absolute paths, '//' (a protocol-relative
+        // authority once joined onto a base URL), trailing slash
+        assert!(!ok("/etc/passwd"));
+        assert!(!ok("a//b.jpg"));
+        assert!(!ok("a/b/"));
+        // rejected bytes anywhere
+        assert!(!ok("a\\b.jpg"));
+        assert!(!ok("a/b?.jpg"));
+        assert!(!ok("a/b#.jpg"));
+        assert!(!ok("a/b\x00.jpg"));
+        assert!(!ok("a/b\x7f.jpg"));
+    }
+
+    /// The upstream URL re-encode: typical names pass through
+    /// byte-identical, everything outside pchar is escaped, and '%' is
+    /// escaped so the origin's own decode cannot manufacture characters
+    /// the validation never saw (double-decode traversal).
+    #[test]
+    fn upstream_path_encoding() {
+        assert_eq!(encode_upstream_path("photo.jpg"), "photo.jpg");
+        assert_eq!(
+            encode_upstream_path("albums/2026/photo@2x.jpg"),
+            "albums/2026/photo@2x.jpg"
+        );
+        assert_eq!(encode_upstream_path("a b.jpg"), "a%20b.jpg");
+        assert_eq!(encode_upstream_path("a%2e%2e/x.jpg"), "a%252e%252e/x.jpg");
+        // non-ASCII goes out as encoded UTF-8 bytes
+        assert_eq!(encode_upstream_path("café.jpg"), "caf%C3%A9.jpg");
+    }
+
+    /// @fmt tokens live on the last segment only; directory names with
+    /// '@' never participate.
+    #[test]
+    fn split_format_on_nested_paths() {
+        assert_eq!(
+            split_format("a/b/photo.png@webp"),
+            Ok(("a/b/photo.png", Some(ImageFormat::Webp)))
+        );
+        assert_eq!(
+            split_format("ver@2/photo.jpg"),
+            Ok(("ver@2/photo.jpg", None))
+        );
+        assert_eq!(
+            split_format("ver@webp/photo.jpg"),
+            Ok(("ver@webp/photo.jpg", None))
+        );
+        // '@token' with an empty base in the last segment is a filename
+        assert_eq!(split_format("dir/@webp"), Ok(("dir/@webp", None)));
+        #[cfg(feature = "avif")]
+        assert_eq!(
+            split_format("a/b/photo.jpg@avif"),
+            Ok(("a/b/photo.jpg", Some(ImageFormat::Avif)))
+        );
+        #[cfg(not(feature = "avif"))]
+        assert_eq!(
+            split_format("a/b/photo.jpg@avif").unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
     }
