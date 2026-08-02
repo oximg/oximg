@@ -71,6 +71,20 @@ in linear light onto `OXIMG_FLATTEN_BG` (hex `RRGGBB`, default white).
 Encode settings are keyed by the *output* format, using the same knobs
 as same-format requests.
 
+Choose the preference order by your goal: the AVIF defaults target
+fidelity, not minimum bytes — at default quality settings AVIF output
+measures 10–28% *larger* than WebP on photographic sources, and costs
+the more expensive encode. If the deployment's goal is byte reduction,
+prefer `webp,avif` (or `webp` alone), or lower `OXIMG_AVIF_QUALITY`
+until AVIF earns its slot; put `avif` first only after comparing sizes
+on your own corpus at your own settings. Also note what negotiation
+does *not* cover: when it doesn't fire (client sends `Accept: */*` —
+link-preview scrapers, social-card fetchers, curl integrations), the
+source format is kept, and PNG output is always lossless RGB(A) — there
+is no palette quantization, so a large photographic PNG stays large.
+Deployments that care about those clients should prefer explicit
+`@{fmt}` URLs over relying on negotiation.
+
 **Orientation**: every source format auto-rotates — JPEG EXIF, PNG
 `eXIf`, WebP `EXIF` chunks, and AVIF `irot`/`imir` transforms. The
 target box applies to the displayed frame and the pixels come out
@@ -310,7 +324,9 @@ against encode time), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DEC
 libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
 per-stage timing lines to stderr), `OXIMG_LOG` (`error`: one stderr
 line per failed request, always on; `request` also logs successes,
-with a request id and wall time),
+with a request id and wall time; these two are the only accepted
+values — anything else, `info` included, refuses to boot like every
+other misconfigured knob),
 `OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
 second thread, cutting single-request latency ~20%; the default `auto`
 fuses while `2 x active requests <= visible CPUs` and falls back to
