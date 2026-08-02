@@ -12,6 +12,12 @@ HTTP interface without notice.
 
 ### Added
 
+- **Deployment guides** under `docs/`: Docker/docker-compose,
+  Kubernetes (example manifest with probes, resource limits, security
+  context, drain behavior), and Cloud Run/serverless containers
+  (remote-origin mode, concurrency sizing, shutdown grace), plus a
+  Deployment section in the README linking them.
+
 - **Prebuilt release binaries**: tagged releases now attach
   `oximg-<tag>-<target>.tar.gz` (+ `.sha256`) for Linux
   x86_64/aarch64 (glibc, libstdc++ static) and macOS arm64, built on

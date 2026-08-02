@@ -299,6 +299,25 @@ combined with `OXIMG_OVERLAP` this is the speed profile, ~-13%
 single-request latency and ~+9% saturated throughput over the
 default).
 
+## Deployment
+
+Per-platform guides live in [`docs/`](docs/):
+
+- [Docker / docker-compose](docs/deploy-docker.md) — tag pinning
+  (`latest` rebuilds on every main push), read-only mounts, remote
+  origins, graceful `docker stop`, building tuned images.
+- [Kubernetes](docs/deploy-kubernetes.md) — an example Deployment
+  with probes, resource limits (the worker count follows the cgroup
+  CPU quota), security context, and rolling-update drain behavior.
+- [Cloud Run & serverless containers](docs/deploy-cloud-run.md) —
+  the `PORT` contract, remote-origin mode (no local disk),
+  concurrency-vs-vCPU sizing, and CDN caching in front.
+
+The short version for every platform: pin an image version, put a
+CDN in front (responses carry a 1-year `Cache-Control`), give the
+process whole CPUs, and allow ≥10s of shutdown grace so in-flight
+encodes drain.
+
 ## Not yet implemented (out of PoC scope)
 
 - JXL output (the `@jxl` token is reserved and returns a clear error)
