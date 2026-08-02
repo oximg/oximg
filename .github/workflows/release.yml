@@ -92,3 +92,68 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "oximg ${GITHUB_REF_NAME#v}" --notes-file notes.md
+
+  # Prebuilt binaries for the CLI/CI-pipeline persona: built on native
+  # runners with the recipe main CI already proves on every push,
+  # smoke-tested as artifacts, then attached to the release with
+  # checksums. Default features (server + CLI, no AVIF) to match
+  # crates.io and Homebrew; the Docker images stay the AVIF-included
+  # channel. Linux binaries are glibc builds (Ubuntu 24.04, so glibc
+  # >= 2.39 — fine for the CI-runner audience); a musl build would
+  # need the C++ codec stack (jpegli) cross-compiled and is future
+  # work.
+  binaries:
+    needs: github-release
+    if: github.ref_type == 'tag'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+        env:
+          # Static libstdc++/libgcc so the only dynamic dependency left
+          # is glibc (jpegli is C++; everything else already links
+          # statically). No effect asked of macOS, which links the
+          # system libc++ like every macOS binary.
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-static-libstdc++ -C link-arg=-static-libgcc' || '' }}
+      - name: Smoke test the artifact
+        run: |
+          set -euo pipefail
+          bin=target/release/oximg
+          "$bin" --version
+          "$bin" resize tests/fixtures/photo.jpg 100 100 /tmp/smoke.webp
+          "$bin" probe /tmp/smoke.webp | grep -q image/webp
+          echo "ok: resize + probe round-trip"
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="oximg-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            strip -Sx target/release/oximg
+          else
+            strip target/release/oximg
+          fi
+          mkdir "$name"
+          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
