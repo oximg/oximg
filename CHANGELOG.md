@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Graceful shutdown**: SIGTERM (what `docker stop`, Kubernetes, and
+  Cloud Run send) and SIGINT now stop the accept loop, drain in-flight
+  requests, and exit 0 — previously the process died immediately,
+  dropping responses mid-encode during rolling updates. Verified at
+  three layers: signal-handling integration tests that pin a request
+  in flight across SIGTERM, a `docker stop` exit-code/latency check in
+  the image CI, and the existing suite (no interface changes).
+
 ## [0.5.1] - 2026-07-06
 
 CMYK/YCCK JPEG input, start to finish. No library-API or HTTP-interface

@@ -219,6 +219,14 @@ cargo run --release --example transcode -- photo.jpg 800 800 webp out.webp
 cargo run --release --example probe     -- photo.webp
 ```
 
+**Graceful shutdown**: on SIGTERM (what `docker stop`, Kubernetes,
+and Cloud Run send) or SIGINT the server stops accepting connections,
+finishes in-flight requests, and exits 0. There is no drain timeout
+of its own — the orchestrator's grace period (10s for `docker stop`
+and Cloud Run, `terminationGracePeriodSeconds` on Kubernetes)
+backstops a response that never finishes, so give it a few seconds
+more than your slowest expected encode.
+
 URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
 require imgproxy-style signed URLs —
 `/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`.
