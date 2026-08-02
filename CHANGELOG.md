@@ -12,6 +12,13 @@ HTTP interface without notice.
 
 ### Added
 
+- **One-shot CLI**: `oximg resize <in> <max_w> <max_h> <out>
+  [-q N] [-f fmt] [--preset P]` and `oximg probe <file>` run the
+  pipeline without the server; the output format follows `--format`,
+  else the output extension, else the source format. `oximg serve` is
+  the explicit spelling of the bare-invocation default, so existing
+  deployments and the Docker CMD are unchanged.
+
 - **Graceful shutdown**: SIGTERM (what `docker stop`, Kubernetes, and
   Cloud Run send) and SIGINT now stop the accept loop, drain in-flight
   requests, and exit 0 — previously the process died immediately,

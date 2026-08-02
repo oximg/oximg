@@ -193,9 +193,23 @@ reservation that points here.
 ```sh
 cargo build --release            # JPEG, PNG, WebP
 cargo build --release --features avif   # + AVIF (needs SVT-AV1 >= 4.1, dav1d)
-IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg
-./target/release/oximg --version   # all config is via env; the only flags
+IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg   # = oximg serve
 ```
+
+**One-shot CLI** (the same pipeline, no server):
+
+```sh
+oximg resize photo.jpg 1600 1600 out.webp     # fit within 1600x1600; format from the extension
+oximg resize photo.jpg 800 800 out.jpg -q 70  # JPEG quality 70 (--preset fast|small for mozjpeg)
+oximg probe photo.webp                        # format + stored dimensions, header-only
+```
+
+The output format is `-f/--format`, else the `<out>` extension
+(`jpg|jpeg|png|webp|avif`), else the source's own format — the same
+precedence idea as the server's `@{fmt}` URL grammar. Encode knobs
+that are env-configured on the server (`OXIMG_WEBP_QUALITY`,
+`OXIMG_PNG_EFFORT`, ...) apply to CLI encodes the same way. Usage
+errors exit 2; processing failures exit 1.
 
 The Docker build needs no system dependencies — it compiles a pinned
 post-4.1 SVT-AV1 revision that carries the aarch64 kernels for the
