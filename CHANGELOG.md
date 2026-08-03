@@ -10,6 +10,19 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **Quantized PNG output defaults to `balanced` effort** ([#5]
+  follow-up): with `OXIMG_PNG_QUANTIZE=1` and no explicit
+  `OXIMG_PNG_EFFORT`/`png_effort`, the encoder now runs at `balanced`
+  instead of `fast` — field data shows `balanced` nearly doubles the
+  quantized reduction (1.7x → 3.0x against lossless, and from ~2x
+  larger than imgproxy's quantized output to within 1.03–1.4x) while
+  `high` adds only ~1% more. The lossless path's `fast` default and
+  any explicitly set effort are unchanged, and alpha sources (which
+  skip quantization) keep their exact bytes regardless of the
+  quantize knob.
+
 ## [0.7.1] - 2026-08-02
 
 The production-readiness batch, closing every adoption blocker named
@@ -36,7 +49,10 @@ variant); note the MSRV bump under Changed.
   encodes opaque PNG output as an indexed palette (Wu quantization
   with Floyd–Steinberg dithering, via `quantette`;
   `OXIMG_PNG_QUANTIZE_COLORS`, default 256) — typically a ~3x byte
-  reduction on photographic PNGs, near-exact on flat graphics. Off by
+  reduction on photographic PNGs (erratum: as measured at
+  `OXIMG_PNG_EFFORT=balanced`; 0.7.1's `fast` default reaches about
+  half that — fixed by the effort-default change in the next release),
+  near-exact on flat graphics. Off by
   default: quality loss on a lossless format must be a deliberate
   operator choice. Sources with alpha always encode lossless RGBA
   (quantette has no alpha-aware quantizer; approximating one would

@@ -344,14 +344,20 @@ the portable fast_image_resize convolution instead of the platform
 kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
 x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
-`OXIMG_PNG_EFFORT` (`fast`; `fastest`/`balanced`/`high` trade PNG size
-against encode time), `OXIMG_PNG_QUANTIZE` (`0`; `1` palette-quantizes
+`OXIMG_PNG_EFFORT` (unset; `fastest`/`fast`/`balanced`/`high` trade
+PNG size against encode time — unset resolves to `fast` for lossless
+output and `balanced` for quantized output, where effort matters ~2x
+more; setting it explicitly pins one level for both paths),
+`OXIMG_PNG_QUANTIZE` (`0`; `1` palette-quantizes
 opaque PNG output — Wu quantization with Floyd–Steinberg dithering —
-typically a ~3x byte reduction on photographic PNGs and nearly
-indistinguishable on flat graphics; opt-in because quality loss on a
-lossless format must be a deliberate choice; sources with alpha always
-encode lossless RGBA), `OXIMG_PNG_QUANTIZE_COLORS` (`256`; palette
-size, 2-256), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
+typically a ~3x byte reduction on photographic PNGs at the quantized
+path's `balanced` effort default (about half that if effort is forced
+to `fast`), and nearly indistinguishable on flat graphics; opt-in
+because quality loss on a lossless format must be a deliberate choice;
+sources with alpha always encode lossless RGBA and ignore this knob
+entirely), `OXIMG_PNG_QUANTIZE_COLORS` (`256`; palette
+size, 2-256 — 64 colors trades visible-on-inspection banding for
+another ~15% on photographic sources), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
 libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
 per-stage timing lines to stderr), `OXIMG_LOG` (`error`: one stderr
 line per failed request, always on; `request` also logs successes,
