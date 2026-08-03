@@ -1914,3 +1914,72 @@ fn invalid_options_prefix_refuses_to_boot() {
     let s = Server::start(&[("OXIMG_OPTIONS_PREFIX", "/cdn-cgi/image".into())]);
     assert_eq!(s.status_of("/cdn-cgi/image/width=100/photo.jpg"), 200);
 }
+
+/// Issue #11 (phase 1): one retry on connection-level transients. An
+/// origin that drops the first connection cold — the "single network
+/// blip" that caused a production rollback — now yields a 200 instead
+/// of a 502, the retry is visible in metrics, and an origin that is
+/// actually down still fails as 502 after the one retry.
+#[test]
+fn transient_connection_failure_is_retried_once() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    static CONNS: AtomicUsize = AtomicUsize::new(0);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Drop the very first connection without reading or
+            // writing a byte: the client sees a reset/EOF at the
+            // response head — a connection-level transient.
+            if CONNS.fetch_add(1, Ordering::SeqCst) == 0 {
+                drop(stream);
+                continue;
+            }
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    let (status, ct, _) = s.get("/resize/100/100/photo.jpg").unwrap();
+    assert_eq!(status, 200, "the blip must be invisible to the client");
+    assert_eq!(ct, "image/jpeg");
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(metric(&body, "oximg_upstream_retries_total"), 1.0);
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"ok\"}"),
+        1.0
+    );
+    drop(s);
+
+    // A dead origin (nothing listening) is still a 502 — one retry,
+    // not an infinite hope.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let s = Server::start(&[(
+        "OXIMG_SOURCE_BASE_URL",
+        format!("http://127.0.0.1:{dead_port}"),
+    )]);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 502);
+}
