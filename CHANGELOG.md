@@ -12,6 +12,23 @@ HTTP interface without notice.
 
 ### Added
 
+- **`gs://` source mode** ([#11]): `OXIMG_SOURCE_BASE_URL=gs://bucket[/prefix]`
+  reads a private GCS bucket directly with GCP-attached credentials
+  (metadata server: GKE Workload Identity, Cloud Run, GCE), removing
+  the HTTP mode's world-readable-bucket prerequisite and the egress
+  through a public endpoint. Tokens are cached and refreshed a minute
+  before expiry; boot fails closed with an actionable message when no
+  credentials are reachable; 404 stays 404 while 401/403 map to 500
+  (a deployment fault, never the requester's); 429/5xx get one
+  SDK-style retry on top of the connection-transient retry. In-tree
+  on the same blocking ureq stack — streaming decode, size caps,
+  deadlines all apply unchanged; the only new direct dependency is
+  `serde_json`, which was already in the tree via axum.
+  `OXIMG_GCS_ENDPOINT` and `GCE_METADATA_HOST` provide emulator/PSC
+  seams. Unknown `OXIMG_SOURCE_BASE_URL` schemes (including the
+  planned `s3://`) are now fatal at boot instead of producing broken
+  fetch URLs at request time.
+
 - **HTTP source fetches retry connection-level transients once**
   ([#11]): reset/refused/DNS-blip failures at the request phase are
   retried after 100ms — a GET is idempotent and no body bytes have

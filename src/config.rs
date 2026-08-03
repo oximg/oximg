@@ -100,6 +100,7 @@ const KNOBS: &[&str] = &[
     "OXIMG_MAX_SRC_PIXELS",
     "OXIMG_UPSTREAM_CONNECT_TIMEOUT",
     "OXIMG_UPSTREAM_TIMEOUT",
+    "OXIMG_GCS_ENDPOINT",
     "OXIMG_OVERLAP",
 ];
 
@@ -255,6 +256,8 @@ mod tests {
             include_str!("pipeline/jpeg.rs"),
             include_str!("pipeline/fuse.rs"),
             include_str!("pipeline/formats.rs"),
+            #[cfg(feature = "server")]
+            include_str!("pipeline/gcs.rs"),
             include_str!("pipeline/encode.rs"),
             #[cfg(feature = "avif")]
             include_str!("avif/encode.rs"),

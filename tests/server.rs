@@ -1983,3 +1983,207 @@ fn transient_connection_failure_is_retried_once() {
     )]);
     assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 502);
 }
+
+/// A fake GCP metadata server: answers the service-account token
+/// route (asserting the Metadata-Flavor handshake) with a counted
+/// token, so tests can pin both the auth header downstream and how
+/// many times credentials were fetched.
+fn fake_metadata_server(expires_in: u64) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&count);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                // ureq (the http crate) emits lowercase header names.
+                if !req.contains("metadata-flavor: google")
+                    || !req.contains("/computemetadata/v1/instance/service-accounts/default/token")
+                {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let body = format!(
+                    "{{\"access_token\":\"test-token-{n}\",\"expires_in\":{expires_in},\"token_type\":\"Bearer\"}}"
+                );
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            });
+        }
+    });
+    (port, count)
+}
+
+/// Issue #11 (phase 2a): the gs:// source mode reads a private bucket
+/// with metadata-server credentials. The fake origin asserts the
+/// Bearer header and the exact object path (bucket + configured
+/// prefix + nested request path); 404/403 map to honest statuses; a
+/// transient 503 is retried like the SDKs would.
+#[test]
+fn gcs_source_mode_authenticates_and_maps_statuses() {
+    use std::io::Write;
+
+    let (md_port, md_count) = fake_metadata_server(3600);
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gcs_port = listener.local_addr().unwrap().port();
+    static FLAKY_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let respond = |stream: &mut std::net::TcpStream, code: &str| {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {code}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                };
+                // Every request must carry the metadata-server token
+                // (lowercase: the http crate's wire format).
+                if !req
+                    .to_lowercase()
+                    .contains("authorization: bearer test-token-")
+                {
+                    return respond(&mut stream, "401 Unauthorized");
+                }
+                match path.as_str() {
+                    "/test-bucket/originals/albums/2026/photo.jpg" => {
+                        let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    "/test-bucket/originals/forbidden.jpg" => respond(&mut stream, "403 Forbidden"),
+                    "/test-bucket/originals/flaky.jpg" => {
+                        if FLAKY_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            respond(&mut stream, "503 Service Unavailable");
+                        } else {
+                            let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                data.len()
+                            );
+                            let _ = stream.write_all(&data);
+                        }
+                    }
+                    _ => respond(&mut stream, "404 Not Found"),
+                }
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        ("OXIMG_SOURCE_BASE_URL", "gs://test-bucket/originals".into()),
+        ("GCE_METADATA_HOST", format!("127.0.0.1:{md_port}")),
+        ("OXIMG_GCS_ENDPOINT", format!("http://127.0.0.1:{gcs_port}")),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+
+    // Happy path: nested key under the configured prefix, authenticated.
+    let (status, ct, body) = s.get("/resize/100/100/albums/2026/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+
+    // Status mapping: absent object 404; permission problem is a
+    // deployment fault (500), never blamed on the requester.
+    assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
+    assert_eq!(s.status_of("/resize/100/100/forbidden.jpg"), 500);
+
+    // A transient 503 is retried once, SDK-style: the client sees 200.
+    assert_eq!(s.get("/resize/100/100/flaky.jpg").unwrap().0, 200);
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert!(metric(&body, "oximg_upstream_retries_total") >= 1.0);
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"not_found\"}"),
+        1.0
+    );
+
+    // The boot probe plus all requests shared one cached token: the
+    // metadata server was hit exactly once.
+    assert_eq!(
+        md_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "token must be fetched once and cached"
+    );
+}
+
+/// gs:// without reachable credentials refuses to boot (fail closed,
+/// with the actionable message), and malformed source URLs are fatal
+/// rather than falling back to a mode with different security
+/// assumptions.
+#[test]
+fn gcs_boot_is_fail_closed() {
+    // A dead metadata host: allocate a port and close it.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    for envs in [
+        vec![
+            ("OXIMG_SOURCE_BASE_URL", "gs://bucket".to_string()),
+            ("GCE_METADATA_HOST", format!("127.0.0.1:{dead_port}")),
+        ],
+        vec![("OXIMG_SOURCE_BASE_URL", "gs://".to_string())],
+        vec![("OXIMG_SOURCE_BASE_URL", "s3://bucket".to_string())],
+        vec![("OXIMG_SOURCE_BASE_URL", "ftp://host".to_string())],
+        vec![("OXIMG_SOURCE_BASE_URL", "bucket-host/path".to_string())],
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in &envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let mut status = None;
+        for _ in 0..400 {
+            if let Ok(Some(s)) = child.try_wait() {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let Some(status) = status else {
+            let _ = child.kill();
+            panic!("server booted despite {envs:?}");
+        };
+        assert!(!status.success(), "{envs:?} must exit non-zero");
+        // The claim is "fail closed with an actionable message", so
+        // pin the message, not just the exit code.
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        assert!(
+            stderr.contains("oximg: fatal:"),
+            "{envs:?}: no fatal diagnostic on stderr: {stderr:?}"
+        );
+    }
+}
