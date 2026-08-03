@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-03
+
+Serverless field findings (#10): pin the CPU budget on platforms that
+show more vCPUs than they allocate, and honest documentation of where
+request coalescing does and does not apply.
+
 ### Added
 
 - **`OXIMG_WORKERS`** ([#10]): pins the CPU permit count explicitly
