@@ -44,12 +44,16 @@ Recommended shape:
   the autoscaler reacts.
 - Default request-based CPU allocation is fine: oximg does no
   background work, so it needs no CPU between requests.
-- **Cloud Run can show more vCPUs than it allocates** (`cpu: "1"`
-  presents 2), and the semaphore follows what the container observes,
-  not what the platform bills — so the concurrency budget you reason
-  about from your Cloud Run config can be off by 2x. Pin it with
-  `OXIMG_WORKERS=1` and confirm via the `oximg_cpu_workers` gauge
-  (`OXIMG_METRICS=1`).
+- **Leave `OXIMG_WORKERS` unset here.** Cloud Run's `cpu` is a *time
+  quota, not a core count*: a `cpu: "1"` container is scheduled across
+  the machine's cores with a one-vCPU budget, and typically observes 2
+  CPUs. That is not over-claiming — two operations in flight is how
+  the paid quota gets used. Field measurement (issue #10): pinning
+  `OXIMG_WORKERS=1` to "match the billed number" cost 17-36%
+  throughput across load shapes and worsened mean CPU-permit queue
+  wait 23x (375ms vs 16ms). The observed-parallelism default is the
+  right answer on this platform; `oximg_cpu_workers`
+  (`OXIMG_METRICS=1`) shows what took effect.
 - **Sizing is observable, not guesswork**: watch the
   `oximg_request_duration_seconds{phase="queue"}` histogram. Rising
   queue wait under flat processing time means requests are stacking

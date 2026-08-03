@@ -10,6 +10,16 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Reversed the `OXIMG_WORKERS` guidance for Cloud Run ([#10]
+  follow-up measurement): the platform's `cpu` setting is a time
+  quota, not a core count, so the observed-parallelism default was
+  right all along — pinning to the billed number measured 17-36%
+  slower with 23x worse queue wait. The knob stays (there are shapes
+  that genuinely want it); the docs no longer suggest using it to
+  "correct" the observed-vs-billed mismatch.
+
 ## [0.7.3] - 2026-08-03
 
 Serverless field findings (#10): pin the CPU budget on platforms that
@@ -20,10 +30,12 @@ request coalescing does and does not apply.
 
 - **`OXIMG_WORKERS`** ([#10]): pins the CPU permit count explicitly
   (1-512; unset keeps following the parallelism the container
-  observes). For platforms that present more vCPUs than they allocate
-  — Cloud Run `cpu=1` shows 2 — where the default sized the semaphore
-  to a budget the operator is not paying for. Verify with the
-  `oximg_cpu_workers` gauge.
+  observes). (Erratum: this entry originally suggested pinning on
+  platforms that show more vCPUs than they bill, e.g. Cloud Run
+  `cpu=1` showing 2 — follow-up measurement proved the opposite:
+  Cloud Run's `cpu` is a time quota, the observed default is correct
+  there, and pinning cost 17-36% throughput. See the next release's
+  Changed entry.) Verify with the `oximg_cpu_workers` gauge.
 
 ### Changed
 

@@ -203,11 +203,15 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     // CPU permits: OXIMG_WORKERS pins the count explicitly; unset
-    // follows what the container observes. The distinction matters on
-    // platforms that present more vCPUs than they allocate (Cloud Run
-    // cpu=1 shows 2), where the semaphore would otherwise be sized to
-    // a budget the operator is not actually paying for (issue #10).
-    // Verify with the oximg_cpu_workers gauge when metrics are on.
+    // follows what the container observes — which is the right answer
+    // nearly everywhere, including quota-scheduled platforms (Cloud
+    // Run cpu=1 observes 2 CPUs because cpu is a time budget, not a
+    // core count; pinning to the billed number measured 17-36% slower,
+    // issue #10). The knob exists for the shapes that genuinely want a
+    // different count: noisy-neighbor hosts, tail-latency-over-
+    // throughput deployments, or platforms where observed parallelism
+    // is unrelated to what is available. Verify with the
+    // oximg_cpu_workers gauge when metrics are on.
     let workers = match std::env::var("OXIMG_WORKERS") {
         Err(_) => std::thread::available_parallelism()?.get(),
         Ok(v) if v.trim().is_empty() => std::thread::available_parallelism()?.get(),

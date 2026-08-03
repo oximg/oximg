@@ -309,10 +309,14 @@ Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
 download), `OXIMG_WORKERS` (unset = the parallelism the container
-observes; 1-512 pins the CPU permit count explicitly — for platforms
-that present more vCPUs than they allocate, like Cloud Run `cpu=1`
-showing 2, where the default would size the semaphore to a budget you
-are not paying for; verify with the `oximg_cpu_workers` gauge),
+observes, which is the right default almost everywhere — including
+platforms like Cloud Run whose `cpu` setting is a time quota, not a
+core count, where "pinning to the billed number" measured 17-36%
+slower (issue #10); 1-512 pins the CPU permit count explicitly for
+the shapes that genuinely want it — noisy-neighbor hosts, trading
+throughput for tail latency, or platforms where observed parallelism
+is unrelated to what is actually available; verify with the
+`oximg_cpu_workers` gauge),
 `OXIMG_OPTIONS_PREFIX` (unset; mounts a second route
 speaking the Cloudflare Images option grammar at the given prefix —
 `OXIMG_OPTIONS_PREFIX=/image` serves
