@@ -531,6 +531,17 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
         }
         Err(e) => return Err(map_fetch_err(e)),
     };
+    process_response(resp, p)
+}
+
+/// The shared tail of every remote fetch (plain HTTP and object-store
+/// schemes alike): size caps, the no-redirect rule, and the streaming
+/// hand-off into the decoder.
+#[cfg(feature = "server")]
+fn process_response(
+    resp: ureq::http::Response<ureq::Body>,
+    p: &Params,
+) -> Result<(Vec<u8>, ImageFormat)> {
     // Content-Length lets us refuse before decoding a byte; the capped
     // reader below backstops chunked (or lying) origins. Streaming
     // decoders may translate the mid-read error into their own decode
