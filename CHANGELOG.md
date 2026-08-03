@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-03
+
+A test-hardening release whose first fuzz run paid for itself:
+malformed JPEGs panicked (HTTP 500 for client-fault input, and a dead
+process under `panic = "abort"`) and now classify as undecodable.
+
 ### Fixed
 
 - **Malformed JPEGs no longer panic** (found by the new fuzz harness):
