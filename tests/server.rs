@@ -327,6 +327,7 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_OVERLAP", "yes"),
         ("OXIMG_PNG_QUANTIZE", "yes"),
         ("OXIMG_UPSTREAM_TIMEOUT", "0"),
+        ("OXIMG_METRICS", "yes"),
         ("OXIMG_UPSTREAM_CONNECT_TIMEOUT", "fast"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
@@ -1527,4 +1528,159 @@ fn stalled_origin_times_out_as_504_and_releases_the_permit() {
             "{path}: follow-up request stalled — permit not released?"
         );
     }
+}
+
+/// Extract a metric value by its exact exposition-line prefix.
+fn metric(body: &str, prefix: &str) -> f64 {
+    body.lines()
+        .find(|l| l.starts_with(prefix) && l.as_bytes().get(prefix.len()) == Some(&b' '))
+        .unwrap_or_else(|| panic!("no metric line starts with {prefix:?}"))
+        .rsplit(' ')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap_or_else(|_| panic!("unparseable value for {prefix:?}"))
+}
+
+/// Issue #4: the metrics surface. Off by default (the route does not
+/// exist); with OXIMG_METRICS=1 the counters move with traffic —
+/// status class and resolved format, both duration phases, permits,
+/// and singleflight roles.
+#[test]
+fn metrics_endpoint_counts_what_happens() {
+    let off = Server::start(&[]);
+    assert_eq!(off.status_of("/metrics"), 404, "off by default");
+    drop(off);
+
+    let s = Server::start(&[("OXIMG_METRICS", "1".into())]);
+    assert_eq!(s.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+    assert_eq!(s.get("/resize/100/100/photo.jpg@webp").unwrap().0, 200);
+    assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
+    assert_eq!(s.status_of("/resize/0/0/photo.jpg"), 400);
+
+    let (status, ct, body) = s.get("/metrics").unwrap();
+    assert_eq!(status, 200);
+    assert!(ct.starts_with("text/plain"), "{ct}");
+    let body = String::from_utf8(body).unwrap();
+
+    // Status class x resolved format. The bare-URL 200 and the 404 both
+    // resolved "no explicit/negotiated target" -> format="source"; the
+    // 400 failed before resolution -> format="none".
+    let m = |p: &str| metric(&body, p);
+    assert_eq!(
+        m("oximg_requests_total{class=\"2xx\",format=\"source\"}"),
+        1.0
+    );
+    assert_eq!(
+        m("oximg_requests_total{class=\"2xx\",format=\"webp\"}"),
+        1.0
+    );
+    assert_eq!(
+        m("oximg_requests_total{class=\"4xx\",format=\"source\"}"),
+        1.0
+    );
+    assert_eq!(
+        m("oximg_requests_total{class=\"4xx\",format=\"none\"}"),
+        1.0
+    );
+
+    // Both duration phases observed once per request that reached the
+    // pipeline (two 200s and the 404; the 400 never got there).
+    assert_eq!(
+        m("oximg_request_duration_seconds_count{phase=\"queue\"}"),
+        3.0
+    );
+    assert_eq!(
+        m("oximg_request_duration_seconds_count{phase=\"process\"}"),
+        3.0
+    );
+    // Histogram buckets are cumulative: the +Inf bucket equals count.
+    assert_eq!(
+        m("oximg_request_duration_seconds_bucket{phase=\"queue\",le=\"+Inf\"}"),
+        3.0
+    );
+
+    // Three distinct URLs, no concurrency: three leaders, no followers.
+    assert_eq!(m("oximg_coalesced_requests_total{role=\"leader\"}"), 3.0);
+    assert_eq!(m("oximg_coalesced_requests_total{role=\"follower\"}"), 0.0);
+
+    // Local mode: the upstream family stays untouched.
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"ok\"}"), 0.0);
+
+    // Nothing is processing at scrape time.
+    assert_eq!(m("oximg_cpu_permits_in_use"), 0.0);
+    assert!(m("oximg_cpu_workers") >= 1.0);
+    assert_eq!(m("oximg_inflight_keys"), 0.0);
+}
+
+/// The upstream outcome family, exercised against a real origin: ok,
+/// not_found, and timeout each count exactly once — the split that
+/// lets an operator tell "origin is slow" from "origin is broken".
+#[test]
+fn metrics_split_upstream_outcomes() {
+    use std::io::Write;
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .trim_start_matches('/');
+                if path.starts_with("stall") {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
+                match std::fs::read(format!("{fixtures}/{path}")) {
+                    Ok(data) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    Err(_) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    assert_eq!(s.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+    assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
+    assert_eq!(s.status_of("/resize/100/100/stall.jpg"), 504);
+
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    let m = |p: &str| metric(&body, p);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"ok\"}"), 1.0);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"not_found\"}"), 1.0);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"timeout\"}"), 1.0);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"error\"}"), 0.0);
+    // The 504 shows up in the status classes too.
+    assert_eq!(
+        m("oximg_requests_total{class=\"5xx\",format=\"source\"}"),
+        1.0
+    );
 }
