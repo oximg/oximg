@@ -37,7 +37,9 @@ while resizing in linear light at measurably higher output quality
   SIMD resize kernels (AVX2 on x86-64, NEON on aarch64, both verified
   against an f64 reference), JPEG decode fused with resize+encode on a
   second thread under low load, request coalescing for concurrent
-  identical URLs, and CPU concurrency pinned to the core count. Peak
+  identical URLs (per-process — a horizontally scaled deployment gets
+  its dedup from the CDN in front, not from here), and CPU concurrency
+  pinned to the core count. Peak
   memory stays at a fraction of imgproxy's under identical load
   ([BENCH.md](BENCH.md)).
 - **Tunable profiles**: the default maximizes quality per byte
@@ -306,7 +308,12 @@ upstream.
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
-download), `OXIMG_OPTIONS_PREFIX` (unset; mounts a second route
+download), `OXIMG_WORKERS` (unset = the parallelism the container
+observes; 1-512 pins the CPU permit count explicitly — for platforms
+that present more vCPUs than they allocate, like Cloud Run `cpu=1`
+showing 2, where the default would size the semaphore to a budget you
+are not paying for; verify with the `oximg_cpu_workers` gauge),
+`OXIMG_OPTIONS_PREFIX` (unset; mounts a second route
 speaking the Cloudflare Images option grammar at the given prefix —
 `OXIMG_OPTIONS_PREFIX=/image` serves
 `/image/width=750,quality=80/albums/2026/photo.png` — so URLs built

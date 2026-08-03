@@ -202,7 +202,25 @@ fn main() -> anyhow::Result<()> {
         eprintln!("oximg: fatal: {e}");
         std::process::exit(2);
     }
-    let workers = std::thread::available_parallelism()?.get();
+    // CPU permits: OXIMG_WORKERS pins the count explicitly; unset
+    // follows what the container observes. The distinction matters on
+    // platforms that present more vCPUs than they allocate (Cloud Run
+    // cpu=1 shows 2), where the semaphore would otherwise be sized to
+    // a budget the operator is not actually paying for (issue #10).
+    // Verify with the oximg_cpu_workers gauge when metrics are on.
+    let workers = match std::env::var("OXIMG_WORKERS") {
+        Err(_) => std::thread::available_parallelism()?.get(),
+        Ok(v) if v.trim().is_empty() => std::thread::available_parallelism()?.get(),
+        Ok(v) => v
+            .trim()
+            .parse()
+            .ok()
+            .filter(|n| (1..=512).contains(n))
+            .unwrap_or_else(|| {
+                eprintln!("oximg: fatal: OXIMG_WORKERS={v:?} must be 1-512");
+                std::process::exit(2);
+            }),
+    };
     // Cap the blocking pool at CPU slots + a little IO headroom: this
     // bounds the number of thread-local scratch copies (tokio's default of
     // 512 threads would multiply RSS).
