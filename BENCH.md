@@ -50,7 +50,14 @@ diverse, 12.5 ms CPU/req.
 Note: oximg and imagor coalesce concurrent identical requests, so their
 same-URL columns reflect duplicate-traffic handling rather than pipeline
 throughput (see the diverse tables above for the latter); it also keeps
-their same-URL peak RSS low. Peak RSS under 16-way diverse load: oximg
+their same-URL peak RSS low. Coalescing is **per-process**: a single
+instance realises these numbers, while a horizontally scaled deployment
+(Cloud Run, Lambda, an autoscaled Deployment behind a round-robin
+Service) sees the benefit fall toward zero as instances multiply —
+identical requests land on different processes and never meet
+(measured in the field: 681 leaders, 0 followers across 6 Cloud Run
+instances). No oximg-side setting changes this; a CDN in front does
+the deduplication that matters there. Peak RSS under 16-way diverse load: oximg
 172 MB, imagor 167-177 MB.
 
 ## macOS (Apple M2 Max, 12 cores), native installs

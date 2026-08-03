@@ -10,6 +10,26 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`OXIMG_WORKERS`** ([#10]): pins the CPU permit count explicitly
+  (1-512; unset keeps following the parallelism the container
+  observes). For platforms that present more vCPUs than they allocate
+  — Cloud Run `cpu=1` shows 2 — where the default sized the semaphore
+  to a budget the operator is not paying for. Verify with the
+  `oximg_cpu_workers` gauge.
+
+### Changed
+
+- Documented that request coalescing is per-process ([#10], measured
+  in the field: 681 leaders, 0 followers across 6 Cloud Run
+  instances): README, BENCH.md, and the Cloud Run / Kubernetes guides
+  now state which deployment shapes realise it, that a fronting CDN
+  does the deduplication that matters on scaled-out shapes, and that
+  ingress-nginx's `upstream-hash-by` can restore it on Kubernetes.
+
+[#10]: https://github.com/oximg/oximg/issues/10
+
 ## [0.7.2] - 2026-08-02
 
 The migration-grammar release: URLs built for Cloudflare Images now

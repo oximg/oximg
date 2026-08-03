@@ -44,6 +44,31 @@ Recommended shape:
   the autoscaler reacts.
 - Default request-based CPU allocation is fine: oximg does no
   background work, so it needs no CPU between requests.
+- **Cloud Run can show more vCPUs than it allocates** (`cpu: "1"`
+  presents 2), and the semaphore follows what the container observes,
+  not what the platform bills — so the concurrency budget you reason
+  about from your Cloud Run config can be off by 2x. Pin it with
+  `OXIMG_WORKERS=1` and confirm via the `oximg_cpu_workers` gauge
+  (`OXIMG_METRICS=1`).
+- **Sizing is observable, not guesswork**: watch the
+  `oximg_request_duration_seconds{phase="queue"}` histogram. Rising
+  queue wait under flat processing time means requests are stacking
+  behind the CPU permits — lower `--concurrency` or raise CPU before
+  p99 does it for you.
+
+## Request coalescing does not span instances
+
+Coalescing merges identical concurrent requests **within one
+process**. On Cloud Run every instance has its own in-flight map, so
+as the autoscaler fans out, identical requests land on different
+instances and the benefit falls toward zero (measured: 681 leaders, 0
+followers across 6 instances under duplicate-heavy load). Cloud Run
+cannot route by URL (session affinity keys on client IP), so no
+configuration restores it. This is fine: if a CDN fronts the service
+— which the 1-year `Cache-Control` assumes — the CDN already collapses
+duplicate misses, and coalescing is not the feature you are buying.
+Size for pipeline throughput (the diverse-URL numbers in
+[BENCH.md](../BENCH.md)), not for dedup.
 
 ## Shutdown and cold starts
 

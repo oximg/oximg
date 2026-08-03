@@ -91,9 +91,14 @@ object storage.
   photos and your pods are small. Measure with your own corpus —
   peak RSS under load is reported in [BENCH.md](../BENCH.md).
 - **Horizontal scaling**: the process is stateless, so an HPA on CPU
-  works out of the box. Request coalescing is per-pod; a CDN or
-  caching layer in front (honoring the 1-year `Cache-Control`)
-  matters far more than pod-local dedup at scale.
+  works out of the box. Request coalescing is per-pod: behind a plain
+  round-robin Service its benefit falls toward zero as replicas
+  multiply, and a CDN or caching layer in front (honoring the 1-year
+  `Cache-Control`) matters far more than pod-local dedup at scale. If
+  you do want coalescing across a scaled Deployment, consistent-hash
+  the URL at the ingress so identical requests reach the same pod —
+  ingress-nginx: `nginx.ingress.kubernetes.io/upstream-hash-by:
+  "$request_uri"`.
 
 ## Rolling updates
 
