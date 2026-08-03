@@ -308,7 +308,16 @@ upstream.
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
-download), `OXIMG_WORKERS` (unset = the parallelism the container
+download. Connection-level transients — reset, refused, DNS blips —
+are retried once before any body bytes are consumed, so a single
+network blip is a slightly slower response instead of a broken image;
+`oximg_upstream_retries_total` counts them. **Exposure prerequisite**:
+this mode sends no credentials, so the origin must be anonymously
+readable — for an object-store bucket that means public objects, and
+anyone who can guess a path can fetch the original at full resolution,
+bypassing every resize/signing/CDN control in front. Weigh that before
+pointing this at a bucket that was private under an SDK-based
+fetcher), `OXIMG_WORKERS` (unset = the parallelism the container
 observes, which is the right default almost everywhere — including
 platforms like Cloud Run whose `cpu` setting is a time quota, not a
 core count, where "pinning to the billed number" measured 17-36%

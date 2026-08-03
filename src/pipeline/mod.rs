@@ -403,6 +403,32 @@ fn max_source_bytes() -> u64 {
     crate::config::config().max_source_bytes
 }
 
+/// Lifetime count of upstream fetch retries. A plain counter the
+/// server's /metrics page reads — the library keeps no other metrics
+/// state, and a retry that goes unobserved hides exactly the flakiness
+/// an operator needs to see (issue #11: the pre-retry version of that
+/// flakiness was a production rollback).
+#[cfg(feature = "server")]
+static UPSTREAM_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "server")]
+pub fn upstream_retry_count() -> u64 {
+    UPSTREAM_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Connection-level failures worth one retry: the socket broke, the
+/// connector produced nothing, or DNS blinked. Timeouts are excluded
+/// (the deadline budget is already spent, and doubling the permit
+/// hold is worse than failing), and status-code errors are the
+/// origin's answer, not a transient.
+#[cfg(feature = "server")]
+fn transient_fetch_error(e: &ureq::Error) -> bool {
+    matches!(
+        e,
+        ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound
+    )
+}
+
 /// Marker attached (as anyhow context) to failures that are the
 /// server's fault — encoding, worker infrastructure — as opposed to
 /// undecodable client input. Consumed by [`Error::classify`] into
@@ -476,7 +502,7 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Erro
 
 #[cfg(feature = "server")]
 fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
-    let resp = http_agent().get(url).call().map_err(|e| match e {
+    let map_fetch_err = |e: ureq::Error| match e {
         // Preserve source 404s so the HTTP layer can pass them through.
         ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -487,7 +513,24 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
         other => anyhow::Error::new(other)
             .context("fetch source")
             .context(UpstreamFault),
-    })?;
+    };
+    // One retry on connection-level transients: a GET is idempotent
+    // and no response bytes have been consumed yet, so retrying here
+    // is safe — and it is the difference between "a network blip" and
+    // "a broken image at the CDN" (issue #11, a production rollback).
+    // Failures after this point (mid-body, during streaming decode)
+    // are NOT retried: the decoder has already consumed part of the
+    // stream, and restarting would mean re-decoding from scratch while
+    // holding a CPU permit.
+    let resp = match http_agent().get(url).call() {
+        Ok(r) => r,
+        Err(e) if transient_fetch_error(&e) => {
+            UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            http_agent().get(url).call().map_err(map_fetch_err)?
+        }
+        Err(e) => return Err(map_fetch_err(e)),
+    };
     // Content-Length lets us refuse before decoding a byte; the capped
     // reader below backstops chunked (or lying) origins. Streaming
     // decoders may translate the mid-read error into their own decode

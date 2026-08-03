@@ -191,6 +191,17 @@ impl Metrics {
 
         let _ = writeln!(
             out,
+            "# HELP oximg_upstream_retries_total Connection-level fetch failures retried (one retry per fetch)."
+        );
+        let _ = writeln!(out, "# TYPE oximg_upstream_retries_total counter");
+        let _ = writeln!(
+            out,
+            "oximg_upstream_retries_total {}",
+            oximg::pipeline::upstream_retry_count()
+        );
+
+        let _ = writeln!(
+            out,
             "# HELP oximg_request_duration_seconds Time split into CPU-permit queue wait and processing."
         );
         let _ = writeln!(out, "# TYPE oximg_request_duration_seconds histogram");
