@@ -138,5 +138,8 @@ jobs:
         run: |
           sudo cp -r svt-install/* /usr/local/
           sudo ldconfig
+      # The threshold is a collapse detector, not a target: current
+      # line coverage sits ~86%, and 80 leaves room for normal churn
+      # while making a silent slide into the 70s a red build.
       - name: Coverage summary
-        run: cargo llvm-cov --release --features avif --summary-only
+        run: cargo llvm-cov --release --features avif --summary-only --fail-under-lines 80
