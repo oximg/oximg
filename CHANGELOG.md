@@ -10,6 +10,28 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Cloudflare Images-style URL options** ([#9]): set
+  `OXIMG_OPTIONS_PREFIX` (e.g. `/image`, `/cdn-cgi/image`) to mount a
+  second route speaking the option-list grammar —
+  `/image/width=750,quality=80/albums/2026/photo.png` — so URLs built
+  for Cloudflare Images survive a migration without a rewrite layer.
+  Options: `width`/`height` (one suffices; the zero-axis fit semantics
+  from #2), `quality` (1-100), `format`
+  (`jpeg|png|webp|avif|auto`; `auto` and absent both run the standard
+  Accept negotiation). Unknown or duplicate options answer 400 naming
+  the key — a deliberate divergence from Cloudflare's silent ignore,
+  since a dropped option changes the output. The filename is taken
+  literally on this route (no `@{fmt}` token), signing covers the
+  decoded path with the existing scheme, and coalescing keys on the
+  parsed options, so option order never duplicates work.
+- **Per-request quality** ([#3]): the `quality=` option steers the
+  encoder of whatever format the output resolves to (JPEG, WebP, and
+  AVIF knobs; PNG output is lossless and ignores it), overriding the
+  process-wide `QUALITY`/`OXIMG_*_QUALITY` defaults for that request
+  only. Distinct qualities never coalesce.
+
 ### Changed
 
 - **Quantized PNG output defaults to `balanced` effort** ([#5]
@@ -91,6 +113,8 @@ variant); note the MSRV bump under Changed.
 [#4]: https://github.com/oximg/oximg/issues/4
 
 [#2]: https://github.com/oximg/oximg/issues/2
+[#3]: https://github.com/oximg/oximg/issues/3
+[#9]: https://github.com/oximg/oximg/issues/9
 [#5]: https://github.com/oximg/oximg/issues/5
 
 ## [0.7.0] - 2026-08-02
