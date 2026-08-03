@@ -69,9 +69,11 @@ jobs:
           head -c12 /tmp/rt.avif | grep -q ftypavif
           echo "ok: served AVIF round-trips through the decoder"
 
-          # Error mapping stays intact.
+          # Error mapping stays intact (0/0 is the no-box error; a
+          # single zero axis is the width-/height-only grammar).
           [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/100/100/missing.jpg)" = 404 ]
-          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/0/100/photo.jpg)" = 400 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/0/0/photo.jpg)" = 400 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/100/0/photo.jpg)" = 200 ]
           echo "ok: error mapping"
 
           # Graceful shutdown through the container path: docker stop
