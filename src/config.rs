@@ -285,6 +285,7 @@ mod tests {
                     "OXIMG_AUTO_FORMAT",
                     "OXIMG_PAR",
                     "OXIMG_METRICS",
+                    "OXIMG_OPTIONS_PREFIX",
                 ];
                 assert!(
                     KNOBS.contains(&name) || startup.contains(&name),

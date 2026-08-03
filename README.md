@@ -306,7 +306,23 @@ upstream.
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
-download), `OXIMG_METRICS` (`0`; `1` serves a Prometheus text page at
+download), `OXIMG_OPTIONS_PREFIX` (unset; mounts a second route
+speaking the Cloudflare Images option grammar at the given prefix —
+`OXIMG_OPTIONS_PREFIX=/image` serves
+`/image/width=750,quality=80/albums/2026/photo.png` — so URLs built
+for Cloudflare Images survive a migration without a rewrite layer.
+Options: `width`/`height` (1-8192; one suffices, the other axis
+follows the aspect ratio), `quality` (1-100, applied to whichever
+format the output resolves to; PNG output is lossless and ignores
+it), `format` (`jpeg|png|webp|avif`, or `auto` = the same
+Accept negotiation as a bare positional URL, which also runs when
+`format` is absent). Unknown or duplicate options answer 400 naming
+the key — Cloudflare silently ignores unknown options, but a dropped
+`fit=cover` changes the output, so this divergence is deliberate. The
+filename is taken literally on this route (no `@{fmt}` token), and
+with signing enabled the same HMAC scheme covers
+`/{signature}{prefix}/{options}/{file}` over the decoded path),
+`OXIMG_METRICS` (`0`; `1` serves a Prometheus text page at
 `/metrics`: requests by status class and resolved output format,
 upstream fetch outcomes with timeouts distinct from faults, latency
 histograms split into CPU-permit queue wait vs processing — rising

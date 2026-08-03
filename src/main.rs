@@ -28,8 +28,10 @@ use oximg::pipeline::ImageFormat;
 // boundary: None never coalesces with Some(X) even when X is the actual
 // source format — the source format is untrusted before sniffing, so
 // merging them pre-sniff would mislabel Content-Types; cost is capped
-// at one extra flight per hot (w, h, file).
-type FlightKey = (u32, u32, String, Option<ImageFormat>);
+// at one extra flight per hot (w, h, file). The quality slot is the
+// per-request override (None = the process-wide QUALITY default) —
+// different qualities are different bytes and must never coalesce.
+type FlightKey = (u32, u32, String, Option<ImageFormat>, Option<u8>);
 type FlightResult = Result<(Bytes, &'static str), (StatusCode, String)>;
 type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>>;
 
@@ -58,6 +60,9 @@ struct App {
     // negotiation off (and no Vary header, exactly the pre-feature
     // response shape).
     auto_format: Arc<[ImageFormat]>,
+    // OXIMG_OPTIONS_PREFIX: where the Cloudflare-style option route is
+    // mounted (e.g. "/image", "/cdn-cgi/image"); None = not mounted.
+    options_prefix: Option<Arc<str>>,
 }
 
 /// imgproxy-style URL signing: base64url(HMAC-SHA256(key, salt || path)),
@@ -159,6 +164,7 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 mod cli;
 mod metrics;
+mod options;
 
 fn main() -> anyhow::Result<()> {
     // Minimal, dependency-free subcommand dispatch. `serve` is the
@@ -233,6 +239,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
             })
             .map(Arc::new),
         auto_format: auto_format_from_env().into(),
+        options_prefix: options_prefix_from_env().map(Arc::from),
     };
     if app.signing.is_some() {
         eprintln!("oximg: URL signing enabled");
@@ -256,6 +263,18 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         // guards what the wider capture lets in.
         .route("/resize/{w}/{h}/{*file}", get(handle_resize))
         .route("/{sig}/resize/{w}/{h}/{*file}", get(handle_signed_resize));
+    if let Some(prefix) = app.options_prefix.as_deref() {
+        eprintln!("oximg: options route enabled at {prefix}/{{options}}/{{file}}");
+        router = router
+            .route(
+                &format!("{prefix}/{{options}}/{{*file}}"),
+                get(handle_options),
+            )
+            .route(
+                &format!("/{{sig}}{prefix}/{{options}}/{{*file}}"),
+                get(handle_signed_options),
+            );
+    }
     // Off by default; the route sits outside the URL-signing scheme,
     // so expose it to the scrape network only. The counters themselves
     // are always maintained — a handful of relaxed atomics per request.
@@ -322,6 +341,38 @@ fn shutdown_signal() -> impl std::future::Future<Output = ()> {
             .expect("install ctrl-C handler");
         eprintln!("oximg: ctrl-C received, draining in-flight requests");
     }
+}
+
+/// OXIMG_OPTIONS_PREFIX: mount point for the Cloudflare Images-style
+/// option route (issue #9). Unset = route absent, behavior unchanged.
+/// Set-but-invalid is fatal, like every other startup setting: a
+/// prefix that cannot mount must not silently serve positional-only.
+fn options_prefix_from_env() -> Option<String> {
+    let raw = std::env::var("OXIMG_OPTIONS_PREFIX").ok()?;
+    let v = raw.trim().trim_end_matches('/').to_string();
+    let fatal = |why: &str| -> ! {
+        eprintln!("oximg: fatal: OXIMG_OPTIONS_PREFIX={raw:?} {why}");
+        std::process::exit(2);
+    };
+    if v.is_empty() {
+        return None;
+    }
+    if !v.starts_with('/') {
+        fatal("must start with '/'");
+    }
+    if v.split('/').skip(1).any(|seg| {
+        seg.is_empty() || seg.contains(['{', '}', '\\', '?', '#']) || seg == "." || seg == ".."
+    }) {
+        fatal("must be plain path segments");
+    }
+    // The fixed routes win over a colliding prefix in confusing ways —
+    // refuse outright.
+    for reserved in ["/health", "/metrics", "/resize"] {
+        if v == reserved || v.starts_with(&format!("{reserved}/")) {
+            fatal("collides with a built-in route");
+        }
+    }
+    Some(v)
 }
 
 /// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
@@ -396,6 +447,70 @@ async fn handle_resize(
         return Err((StatusCode::FORBIDDEN, "signature required".into()));
     }
     serve_resize(app, w, h, file, accept).await
+}
+
+/// The options route (OXIMG_OPTIONS_PREFIX): Cloudflare Images-style
+/// `{prefix}/width=750,quality=80/{file}`. The option list owns the
+/// grammar — the filename is taken literally (no @fmt token), and the
+/// parse happens before anything else so errors name the offending
+/// key.
+async fn handle_options(
+    State(app): State<App>,
+    Path((options, file)): Path<(String, String)>,
+    accept: AcceptHeader,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if app.signing.is_some() {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::FORBIDDEN, "signature required".into()));
+    }
+    serve_options(app, options, file, accept).await
+}
+
+async fn handle_signed_options(
+    State(app): State<App>,
+    Path((sig, options, file)): Path<(String, String, String)>,
+    accept: AcceptHeader,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Some(signing) = app.signing.as_ref() else {
+        metrics::METRICS.record_request(404, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
+    };
+    // Same scheme as the positional route, not a second one: the
+    // signed material is the decoded path, raw option order included
+    // (normalization is a cache-key concern, not a signing one).
+    let prefix = app.options_prefix.as_deref().unwrap_or_default();
+    let path = format!("{prefix}/{options}/{file}");
+    if !signing.verify(&sig, &path) {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
+    }
+    serve_options(app, options, file, accept).await
+}
+
+async fn serve_options(
+    app: App,
+    options: String,
+    file: String,
+    accept: AcceptHeader,
+) -> Result<Response, (StatusCode, String)> {
+    let parsed = match options::parse(&options) {
+        Ok(p) => p,
+        Err(msg) => {
+            metrics::METRICS.record_request(400, metrics::FormatLabel::Unresolved);
+            return Err((StatusCode::BAD_REQUEST, msg));
+        }
+    };
+    let prefix = app.options_prefix.as_deref().unwrap_or_default();
+    let path = format!("{prefix}/{options}/{file}");
+    let task = ResizeTask {
+        w: parsed.width,
+        h: parsed.height,
+        file,
+        quality: parsed.quality,
+        spec: FormatSpec::Explicit(parsed.format),
+        path,
+    };
+    serve_logged(app, task, accept).await
 }
 
 /// The source path is client input spanning multiple segments (already
@@ -475,9 +590,30 @@ fn negotiate(auto: &[ImageFormat], accept: &AcceptHeader) -> Option<ImageFormat>
         .find(|f| accept.contains(f.content_type()))
 }
 
-/// Logging wrapper: one structured stderr line per failure (always)
-/// or per request (OXIMG_LOG=request), with a process-unique id so
-/// concurrent requests interleave legibly.
+/// How a route names its output format: the positional route carries
+/// an optional `@fmt` suffix on the filename, the options route
+/// pre-parses `format=` (where None means "negotiate, else source" —
+/// same as a bare positional URL).
+enum FormatSpec {
+    FromSuffix,
+    Explicit(Option<ImageFormat>),
+}
+
+/// One resize request after route-specific parsing — what the shared
+/// serving path needs, whichever grammar produced it.
+struct ResizeTask {
+    w: u32,
+    h: u32,
+    file: String,
+    quality: Option<u8>,
+    spec: FormatSpec,
+    /// Display path for logs; on the signed routes this is also the
+    /// string the signature was verified against.
+    path: String,
+}
+
+/// The positional route: /resize/{w}/{h}/{file}. Thin adapter over the
+/// shared serving path.
 async fn serve_resize(
     app: App,
     w: u32,
@@ -485,13 +621,34 @@ async fn serve_resize(
     file: String,
     accept: AcceptHeader,
 ) -> Result<Response, (StatusCode, String)> {
+    let path = format!("/resize/{w}/{h}/{file}");
+    let task = ResizeTask {
+        w,
+        h,
+        file,
+        quality: None,
+        spec: FormatSpec::FromSuffix,
+        path,
+    };
+    serve_logged(app, task, accept).await
+}
+
+/// Logging wrapper shared by every serving route: one structured
+/// stderr line per failure (always) or per request (OXIMG_LOG=request),
+/// with a process-unique id so concurrent requests interleave legibly;
+/// also the single place requests are counted into metrics.
+async fn serve_logged(
+    app: App,
+    task: ResizeTask,
+    accept: AcceptHeader,
+) -> Result<Response, (StatusCode, String)> {
     static REQ_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let req = REQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let log_requests = app.log_requests;
     let t0 = std::time::Instant::now();
-    let path = format!("/resize/{w}/{h}/{file}");
+    let path = task.path.clone();
     let mut fmt = metrics::FormatLabel::Unresolved;
-    let result = serve_resize_inner(app, w, h, file, accept, &mut fmt).await;
+    let result = serve_resize_inner(app, task, accept, &mut fmt).await;
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     match &result {
         Err((status, msg)) => {
@@ -510,36 +667,54 @@ async fn serve_resize(
 
 async fn serve_resize_inner(
     app: App,
-    w: u32,
-    h: u32,
-    file: String,
+    task: ResizeTask,
     accept: AcceptHeader,
     fmt: &mut metrics::FormatLabel,
 ) -> Result<Response, (StatusCode, String)> {
+    let ResizeTask {
+        w,
+        h,
+        file,
+        quality,
+        spec,
+        path: _,
+    } = task;
     // 0 on one axis means "unconstrained": /resize/750/0/... is
     // width-only (height follows the aspect ratio), the reverse is
     // height-only. This replaces the sentinel-height workaround
     // (h=8192), which silently narrowed sources taller than the
     // sentinel's aspect ratio — corrupting srcset width descriptors.
     // Both axes zero stays an error: "no constraint at all" is not a
-    // resize request.
+    // resize request. (The options route's parser enforces its own
+    // grammar first; this check is the single source of truth either
+    // way.)
     if (w == 0 && h == 0) || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
     }
     validate_source_path(&file)?;
-    let (base, explicit) = split_format(&file)?;
-    // Precedence: explicit @fmt > Accept negotiation > source format.
+    // The @fmt suffix belongs to the positional route's grammar only:
+    // on the options route `format=` owns the choice and the filename
+    // is taken literally (a Cloudflare-style URL never carries tokens).
+    let (file, explicit) = match spec {
+        FormatSpec::FromSuffix => {
+            let (base, explicit) = split_format(&file)?;
+            // base is always a prefix of file, so truncating in place
+            // moves the already-owned String into the key — no
+            // allocation on the bare-URL path (which strips nothing).
+            let base_len = base.len();
+            let mut file = file;
+            file.truncate(base_len);
+            (file, explicit)
+        }
+        FormatSpec::Explicit(explicit) => (file, explicit),
+    };
+    // Precedence: explicit @fmt / format= > Accept negotiation >
+    // source format.
     let target = explicit.or_else(|| negotiate(&app.auto_format, &accept));
     *fmt = metrics::FormatLabel::Resolved(target);
     let vary_accept = !app.auto_format.is_empty();
 
-    // base is always a prefix of file, so truncating in place moves the
-    // already-owned String into the key — no allocation on the bare-URL
-    // path (which strips nothing).
-    let base_len = base.len();
-    let mut file = file;
-    file.truncate(base_len);
-    let (out, content_type) = singleflight(&app, (w, h, file, target)).await?;
+    let (out, content_type) = singleflight(&app, (w, h, file, target, quality)).await?;
     let headers = [
         (header::CONTENT_TYPE, content_type),
         (header::CACHE_CONTROL, "public, max-age=31536000"),
@@ -700,7 +875,7 @@ fn verify_within_root(
 }
 
 async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
-    let (w, h, file, output) = key;
+    let (w, h, file, output, quality) = key;
     let path = app.images_dir.join(file);
 
     // CPU concurrency cap = core count; queueing happens here instead of
@@ -722,7 +897,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     // stays bounded by the source's own dimensions (the pipeline never
     // enlarges) and by the decode-time pixel caps.
     let unbounded = |d: u32| if d == 0 { u32::MAX } else { d };
-    let params = pipeline::Params {
+    let mut params = pipeline::Params {
         max_width: unbounded(*w),
         max_height: unbounded(*h),
         quality: app.quality,
@@ -734,9 +909,23 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         parallel: app.resize_threads,
         output: *output,
         // Override fields stay None: the server's knobs are the
-        // process-global OXIMG_* environment, validated at startup.
+        // process-global OXIMG_* environment, validated at startup —
+        // except a per-request quality below.
         ..Default::default()
     };
+    // Per-request quality (the options route's quality=N) steers the
+    // encoder of whatever format the output resolves to — the format
+    // may be unknown until the source is sniffed, so set every
+    // format's knob; the one that runs picks it up. PNG output is
+    // lossless and has no quality knob to steer (documented).
+    if let Some(q) = quality {
+        params.quality = f32::from(*q);
+        params.webp_quality = Some(f32::from(*q));
+        #[cfg(feature = "avif")]
+        {
+            params.avif_quality = Some(*q);
+        }
+    }
     let source_url = app
         .source_base
         .as_ref()
