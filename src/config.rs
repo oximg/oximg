@@ -154,6 +154,7 @@ pub(crate) fn validate() -> Result<(), String> {
     one_of("OXIMG_RESIZE_BACKEND", &["fir", "kernel"])?;
     one_of("OXIMG_PNG_EFFORT", &["fastest", "fast", "balanced", "high"])?;
     one_of("OXIMG_LOG", &["error", "request"])?;
+    one_of("OXIMG_METRICS", &["0", "1"])?;
     num("OXIMG_DCT_MARGIN", 1.0f64, 8.0)?;
     num("OXIMG_WEBP_QUALITY", 0.0f32, 100.0)?;
     num("OXIMG_WEBP_EFFORT", 0i64, 6)?;
@@ -279,6 +280,7 @@ mod tests {
                     "OXIMG_SOURCE_BASE_URL",
                     "OXIMG_AUTO_FORMAT",
                     "OXIMG_PAR",
+                    "OXIMG_METRICS",
                 ];
                 assert!(
                     KNOBS.contains(&name) || startup.contains(&name),

@@ -306,7 +306,16 @@ upstream.
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
 `OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
 instead of the local filesystem; streaming decode overlaps the
-download), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
+download), `OXIMG_METRICS` (`0`; `1` serves a Prometheus text page at
+`/metrics`: requests by status class and resolved output format,
+upstream fetch outcomes with timeouts distinct from faults, latency
+histograms split into CPU-permit queue wait vs processing — rising
+queue wait under flat processing means "needs more CPU", both rising
+means "sources got bigger" — plus permit and coalescing gauges. The
+route sits outside the URL-signing scheme, so expose it to your
+scrape network only. Failure-rate attribution still needs a
+platform-side memory/restart alert to catch an OOM loop — metrics
+from a process that keeps dying cannot tell that story alone), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
 413), `OXIMG_MAX_SRC_PIXELS` (64,000,000; decoded-size cap enforced
 after each format's header parse, before any pixel allocation —
 compressed size does not bound decoded size; over-cap sources also

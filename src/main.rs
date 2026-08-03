@@ -44,6 +44,9 @@ struct App {
     // SSRF surface).
     source_base: Option<Arc<str>>,
     cpu_slots: Arc<Semaphore>,
+    /// Total CPU permits (= core count); the /metrics permits-in-use
+    /// gauge is workers minus available permits at scrape time.
+    workers: usize,
     quality: f32,
     encoder: pipeline::Encoder,
     resize_threads: usize,
@@ -155,6 +158,7 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
 }
 
 mod cli;
+mod metrics;
 
 fn main() -> anyhow::Result<()> {
     // Minimal, dependency-free subcommand dispatch. `serve` is the
@@ -214,6 +218,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
             .ok()
             .map(|s| Arc::from(s.trim_end_matches('/'))),
         cpu_slots: Arc::new(Semaphore::new(workers)),
+        workers,
         quality: env_or("QUALITY", 80.0),
         encoder: pipeline::Encoder::from_preset(
             std::env::var("PRESET").as_deref().unwrap_or("jpegli"),
@@ -243,15 +248,22 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         );
     }
 
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/health", get(async || "ok"))
         // {*file} spans path separators, so sources organized in
         // directories (IMAGES_DIR trees, S3-style prefixes behind
         // OXIMG_SOURCE_BASE_URL) are addressable; validate_source_path
         // guards what the wider capture lets in.
         .route("/resize/{w}/{h}/{*file}", get(handle_resize))
-        .route("/{sig}/resize/{w}/{h}/{*file}", get(handle_signed_resize))
-        .with_state(app);
+        .route("/{sig}/resize/{w}/{h}/{*file}", get(handle_signed_resize));
+    // Off by default; the route sits outside the URL-signing scheme,
+    // so expose it to the scrape network only. The counters themselves
+    // are always maintained — a handful of relaxed atomics per request.
+    if std::env::var("OXIMG_METRICS").as_deref() == Ok("1") {
+        eprintln!("oximg: /metrics enabled");
+        router = router.route("/metrics", get(handle_metrics));
+    }
+    let router = router.with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     // Install the signal handlers BEFORE announcing readiness: the
@@ -358,6 +370,7 @@ async fn handle_signed_resize(
     accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let Some(signing) = app.signing.as_ref() else {
+        metrics::METRICS.record_request(404, metrics::FormatLabel::Unresolved);
         return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
     };
     // Signed material is the raw file capture, so an explicit @fmt token
@@ -367,6 +380,7 @@ async fn handle_signed_resize(
     // percent-DECODED multi-segment path.
     let path = format!("/resize/{w}/{h}/{file}");
     if !signing.verify(&sig, &path) {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
         return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
     }
     serve_resize(app, w, h, file, accept).await
@@ -378,6 +392,7 @@ async fn handle_resize(
     accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if app.signing.is_some() {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
         return Err((StatusCode::FORBIDDEN, "signature required".into()));
     }
     serve_resize(app, w, h, file, accept).await
@@ -402,6 +417,17 @@ fn validate_source_path(file: &str) -> Result<(), (StatusCode, String)> {
         return Err((StatusCode::BAD_REQUEST, "invalid source path".into()));
     }
     Ok(())
+}
+
+/// Scrape endpoint (OXIMG_METRICS=1). Counters live in the static
+/// registry; the gauges read live server state at scrape time.
+async fn handle_metrics(State(app): State<App>) -> impl IntoResponse {
+    let inflight = match app.inflight.lock() {
+        Ok(g) => g.len(),
+        Err(poisoned) => poisoned.into_inner().len(),
+    };
+    let body = metrics::METRICS.render(app.workers, app.cpu_slots.available_permits(), inflight);
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
 
 /// Split a trailing imgproxy-style `@{fmt}` output-format token off the
@@ -464,16 +490,20 @@ async fn serve_resize(
     let log_requests = app.log_requests;
     let t0 = std::time::Instant::now();
     let path = format!("/resize/{w}/{h}/{file}");
-    let result = serve_resize_inner(app, w, h, file, accept).await;
+    let mut fmt = metrics::FormatLabel::Unresolved;
+    let result = serve_resize_inner(app, w, h, file, accept, &mut fmt).await;
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     match &result {
         Err((status, msg)) => {
+            metrics::METRICS.record_request(status.as_u16(), fmt);
             eprintln!("oximg: req={req} status={status} ms={ms:.1} path={path:?} err={msg:?}");
         }
-        Ok(_) if log_requests => {
-            eprintln!("oximg: req={req} status=200 ms={ms:.1} path={path:?}");
+        Ok(_) => {
+            metrics::METRICS.record_request(200, fmt);
+            if log_requests {
+                eprintln!("oximg: req={req} status=200 ms={ms:.1} path={path:?}");
+            }
         }
-        Ok(_) => {}
     }
     result
 }
@@ -484,6 +514,7 @@ async fn serve_resize_inner(
     h: u32,
     file: String,
     accept: AcceptHeader,
+    fmt: &mut metrics::FormatLabel,
 ) -> Result<Response, (StatusCode, String)> {
     // 0 on one axis means "unconstrained": /resize/750/0/... is
     // width-only (height follows the aspect ratio), the reverse is
@@ -499,6 +530,7 @@ async fn serve_resize_inner(
     let (base, explicit) = split_format(&file)?;
     // Precedence: explicit @fmt > Accept negotiation > source format.
     let target = explicit.or_else(|| negotiate(&app.auto_format, &accept));
+    *fmt = metrics::FormatLabel::Resolved(target);
     let vary_accept = !app.auto_format.is_empty();
 
     // base is always a prefix of file, so truncating in place moves the
@@ -570,6 +602,7 @@ async fn singleflight(app: &App, key: FlightKey) -> FlightResult {
         };
         match leader_tx {
             Ok(tx) => {
+                metrics::METRICS.record_leader();
                 let guard = FlightGuard {
                     map: Arc::clone(&app.inflight),
                     key: key.clone(),
@@ -581,14 +614,20 @@ async fn singleflight(app: &App, key: FlightKey) -> FlightResult {
                 tx.send_replace(Some(result.clone()));
                 return result;
             }
-            Err(mut rx) => loop {
-                if let Some(result) = rx.borrow_and_update().as_ref() {
-                    return result.clone();
+            Err(mut rx) => {
+                // Counted on entry: a follower whose leader dies re-runs
+                // the outer loop and may count again — leader-death is
+                // the rare path, and the hit-rate reading is unaffected.
+                metrics::METRICS.record_follower();
+                loop {
+                    if let Some(result) = rx.borrow_and_update().as_ref() {
+                        return result.clone();
+                    }
+                    if rx.changed().await.is_err() {
+                        break; // leader died before publishing; retry for leadership
+                    }
                 }
-                if rx.changed().await.is_err() {
-                    break; // leader died before publishing; retry for leadership
-                }
-            },
+            }
         }
     }
     Err((
@@ -665,13 +704,18 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let path = app.images_dir.join(file);
 
     // CPU concurrency cap = core count; queueing happens here instead of
-    // flooding the blocking pool.
+    // flooding the blocking pool. The wait is the queue-phase
+    // observation: rising queue wait under flat processing time is the
+    // "needs more CPU" signature, and nothing outside the process can
+    // measure it.
+    let t_queue = std::time::Instant::now();
     let permit = app
         .cpu_slots
         .clone()
         .acquire_owned()
         .await
         .expect("semaphore closed");
+    metrics::METRICS.observe_queue(t_queue.elapsed().as_secs_f64());
 
     // URL 0 = unconstrained axis; the library spelling for that is
     // u32::MAX (Params::default's "no downscale bound"). The output
@@ -698,6 +742,8 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         .as_ref()
         .map(|base| format!("{base}/{}", encode_upstream_path(file)));
     let images_root = Arc::clone(&app.images_dir);
+    let remote = app.source_base.is_some();
+    let t_process = std::time::Instant::now();
     // The explicit return type pins `?`'s error to (StatusCode, String)
     // — a dependency's blanket From impls otherwise make the inference
     // ambiguous here.
@@ -722,7 +768,8 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             StatusCode::INTERNAL_SERVER_ERROR,
             "image processing failed".to_string(),
         )
-    })??
+    })?
+    .inspect(|_| metrics::METRICS.observe_process(t_process.elapsed().as_secs_f64()))?
     // The pipeline classifies its own failures (pipeline::ErrorKind);
     // this match only assigns statuses. Faults on our side (unreadable
     // source, upstream, internal) answer with generic bodies — the
@@ -731,6 +778,18 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     // input returns its top-level message, which is safe and useful.
     .map_err(|e| {
         use pipeline::ErrorKind;
+        // Fetch-outcome accounting (remote mode): kinds that indict the
+        // origin count as their own outcomes; anything else means the
+        // fetch itself delivered bytes (decode/encode failures are not
+        // the origin's problem).
+        if remote {
+            metrics::METRICS.record_upstream(match e.kind() {
+                ErrorKind::SourceNotFound => "not_found",
+                ErrorKind::UpstreamTimeout => "timeout",
+                ErrorKind::Upstream => "error",
+                _ => "ok",
+            });
+        }
         match e.kind() {
             ErrorKind::SourceNotFound => (StatusCode::NOT_FOUND, "image not found".to_string()),
             ErrorKind::SourceTooLarge => (
@@ -779,6 +838,9 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         }
     })?;
 
+    if remote {
+        metrics::METRICS.record_upstream("ok");
+    }
     let (bytes, format) = out;
     Ok((Bytes::from(bytes), format.content_type()))
 }
