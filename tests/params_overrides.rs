@@ -354,3 +354,37 @@ fn png_quantize_is_near_exact_on_flat_low_color_images() {
         .unwrap();
     assert!(max_delta <= 4, "max channel delta {max_delta} > 4");
 }
+
+/// The effort/quantize interaction (issue #5 field data): with
+/// quantization active and no explicit effort, the encoder runs at
+/// `balanced` — byte-identical to asking for it — because `fast`
+/// leaves half the reduction on the table (1.7x vs 3.0x). An explicit
+/// effort still wins, and the lossless path's `fast` default is
+/// untouched (pinned by png_effort_override_steers_the_encoder).
+#[test]
+fn png_quantize_defaults_effort_to_balanced() {
+    let src = fixture("photo.jpg");
+    let at = |q: Option<bool>, e: Option<PngEffort>| {
+        run(
+            &src,
+            &Params {
+                png_quantize: q,
+                png_effort: e,
+                ..base(ImageFormat::Png)
+            },
+        )
+    };
+    let default_effort = at(Some(true), None);
+    assert_eq!(
+        default_effort,
+        at(Some(true), Some(PngEffort::Balanced)),
+        "quantized default effort is balanced"
+    );
+    let explicit_fast = at(Some(true), Some(PngEffort::Fast));
+    assert!(
+        default_effort.len() < explicit_fast.len(),
+        "balanced default ({}) must undercut explicit fast ({})",
+        default_effort.len(),
+        explicit_fast.len()
+    );
+}
