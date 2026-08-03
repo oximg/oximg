@@ -326,6 +326,8 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_WEBP_QUALITY", "150"),
         ("OXIMG_OVERLAP", "yes"),
         ("OXIMG_PNG_QUANTIZE", "yes"),
+        ("OXIMG_UPSTREAM_TIMEOUT", "0"),
+        ("OXIMG_UPSTREAM_CONNECT_TIMEOUT", "fast"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
         ("QUALITY", "eighty"),
@@ -1430,4 +1432,99 @@ fn png_quantize_knob_shrinks_png_responses() {
     let a = plain.get("/resize/100/100/rgba.png").unwrap().2;
     let b = quant.get("/resize/100/100/rgba.png").unwrap().2;
     assert_eq!(a, b, "alpha PNG must stay lossless under the knob");
+}
+
+/// Issue #4: a stalled origin is bounded by OXIMG_UPSTREAM_TIMEOUT and
+/// answers 504 (distinct from other upstream failures' 502) — and,
+/// the part that matters for capacity, the CPU permit comes back: a
+/// normal request right after the timeout is served promptly instead
+/// of queueing behind a zombie fetch.
+#[test]
+fn stalled_origin_times_out_as_504_and_releases_the_permit() {
+    use std::io::Write;
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .trim_start_matches('/');
+                if path.starts_with("stall") {
+                    // Accept, read the request, answer nothing: the
+                    // classic hung origin. Hold the socket open well
+                    // past the server's deadline.
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
+                if path.starts_with("drip") {
+                    // Headers promptly, then a body that stalls
+                    // mid-stream: the timeout must cover body reads,
+                    // not just the response head.
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(b"\x89PNG\r\n\x1a\n");
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    return;
+                }
+                match std::fs::read(format!("{fixtures}/{path}")) {
+                    Ok(data) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    Err(_) => {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                }
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+    ]);
+
+    for path in ["stall.jpg", "drip.jpg"] {
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            s.status_of(&format!("/resize/100/100/{path}")),
+            504,
+            "{path}: a deadline-exceeding origin is a gateway timeout"
+        );
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "{path}: answered in {elapsed:?}, the deadline did not bound the fetch"
+        );
+        // The permit is back: a healthy request completes promptly.
+        let t0 = std::time::Instant::now();
+        let (status, _, _) = s.get("/resize/100/100/photo.jpg").unwrap();
+        assert_eq!(status, 200);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "{path}: follow-up request stalled — permit not released?"
+        );
+    }
 }
