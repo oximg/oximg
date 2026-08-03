@@ -214,3 +214,143 @@ fn avif_quality_override_steers_the_encoder() {
     );
     assert_eq!(at(Some(55)), at(None), "documented default");
 }
+
+/// PNG quantization overrides: `Some(true)` produces a strictly
+/// smaller indexed encode, the palette-size knob steers it further,
+/// `Some(false)`/`Some(256)` match the env-fallback defaults
+/// byte-for-byte, and the quantized output still decodes at the same
+/// dimensions.
+#[test]
+fn png_quantize_override_steers_the_encoder() {
+    let src = fixture("photo.jpg");
+    let at = |q: Option<bool>, colors: Option<u16>| {
+        run(
+            &src,
+            &Params {
+                png_quantize: q,
+                png_quantize_colors: colors,
+                ..base(ImageFormat::Png)
+            },
+        )
+    };
+    let lossless = at(None, None);
+    let quant = at(Some(true), None);
+    assert!(
+        quant.len() < lossless.len(),
+        "quantized ({}) must undercut lossless ({})",
+        quant.len(),
+        lossless.len()
+    );
+    let q16 = at(Some(true), Some(16));
+    assert!(
+        q16.len() < quant.len(),
+        "16 colors ({}) must undercut 256 ({})",
+        q16.len(),
+        quant.len()
+    );
+    assert_eq!(dims_of(&quant), dims_of(&lossless));
+    // Some(documented default) == None, the override-precedence pin.
+    assert_eq!(at(Some(false), None), lossless);
+    assert_eq!(at(Some(true), Some(256)), quant);
+}
+
+/// The opaque-only scope is a contract: an alpha source ignores the
+/// quantize knob entirely and encodes the same lossless RGBA bytes.
+#[test]
+fn png_quantize_leaves_alpha_sources_lossless() {
+    // A PNG with a real alpha gradient (not fully opaque).
+    let (w, h) = (64usize, 48usize);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            rgba.extend([x as u8 * 3, y as u8 * 5, 128, (x * 4).min(255) as u8]);
+        }
+    }
+    let mut src = Vec::new();
+    let mut enc = png::Encoder::new(&mut src, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer.write_image_data(&rgba).unwrap();
+    writer.finish().unwrap();
+
+    let at = |q: Option<bool>| {
+        run(
+            &src,
+            &Params {
+                png_quantize: q,
+                ..base(ImageFormat::Png)
+            },
+        )
+    };
+    assert_eq!(
+        at(Some(true)),
+        at(None),
+        "alpha sources must be untouched by the quantize knob"
+    );
+}
+
+/// Quantization must not cost the ICC profile: the indexed encode
+/// carries the source profile through like the lossless one does.
+#[test]
+fn png_quantize_preserves_icc_profile() {
+    let px = corner_base(64, 48, 8);
+    let profile = common::fake_icc(400);
+    let src = png_with_icc(&px, 64, 48, &profile);
+    let out = run(
+        &src,
+        &Params {
+            png_quantize: Some(true),
+            ..base(ImageFormat::Png)
+        },
+    );
+    assert_eq!(png_icc(&out).as_deref(), Some(&profile[..]));
+}
+
+/// A low-color flat image survives quantization essentially exactly:
+/// four well-separated colors at 256 palette slots decode back within
+/// a small tolerance (Wu's histogram bins merge nothing here, and
+/// dithering has no error to diffuse).
+#[test]
+fn png_quantize_is_near_exact_on_flat_low_color_images() {
+    let (w, h) = (64usize, 64usize);
+    let palette = [[0u8, 0, 0], [255, 0, 0], [0, 255, 0], [64, 128, 255]];
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            rgb.extend(palette[(x / 32) + 2 * (y / 32)]);
+        }
+    }
+    let mut src = Vec::new();
+    let mut enc = png::Encoder::new(&mut src, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer.write_image_data(&rgb).unwrap();
+    writer.finish().unwrap();
+
+    let out = run(
+        &src,
+        &Params {
+            png_quantize: Some(true),
+            ..base(ImageFormat::Png)
+        },
+    );
+    // Decode with the png crate directly (EXPAND resolves the palette;
+    // pipeline::decode_and_resize is the JPEG-path helper, not for PNG).
+    let mut dec = png::Decoder::new(std::io::Cursor::new(&out));
+    dec.set_transformations(png::Transformations::EXPAND);
+    let mut reader = dec.read_info().unwrap();
+    let mut decoded = vec![0u8; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut decoded).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgb, "EXPAND resolves PLTE");
+    decoded.truncate(info.buffer_size());
+    assert_eq!((info.width, info.height), (64, 64));
+    let max_delta = decoded
+        .iter()
+        .zip(&rgb)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap();
+    assert!(max_delta <= 4, "max channel delta {max_delta} > 4");
+}

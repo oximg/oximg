@@ -325,6 +325,9 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_AUTO_ROTATE", "false"),
         ("OXIMG_WEBP_QUALITY", "150"),
         ("OXIMG_OVERLAP", "yes"),
+        ("OXIMG_PNG_QUANTIZE", "yes"),
+        ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
+        ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
         ("QUALITY", "eighty"),
     ] {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
@@ -1388,4 +1391,43 @@ fn width_only_serves_taller_than_the_old_sentinel() {
     let (_, _, body) = s.get("/resize/10/8192/tall.png").unwrap();
     let (_, w, _) = oximg::pipeline::probe(&body).unwrap();
     assert!(w < 10, "the sentinel workaround narrows tall sources ({w})");
+}
+
+/// OXIMG_PNG_QUANTIZE steers the server end to end: PNG-in/PNG-out
+/// shrinks, an explicit @png token from another source format is
+/// governed by the same knob (encode settings are keyed by the output
+/// format), and the colors knob steers further.
+#[test]
+fn png_quantize_knob_shrinks_png_responses() {
+    let plain = Server::start(&[]);
+    let quant = Server::start(&[("OXIMG_PNG_QUANTIZE", "1".into())]);
+    let quant16 = Server::start(&[
+        ("OXIMG_PNG_QUANTIZE", "1".into()),
+        ("OXIMG_PNG_QUANTIZE_COLORS", "16".into()),
+    ]);
+    for url in ["/resize/100/100/rgb.png", "/resize/100/100/photo.jpg@png"] {
+        let lossless = plain.get(url).unwrap().2;
+        let quantized = quant.get(url).unwrap().2;
+        let q16 = quant16.get(url).unwrap().2;
+        assert!(
+            quantized.len() < lossless.len(),
+            "{url}: quantized ({}) must undercut lossless ({})",
+            quantized.len(),
+            lossless.len()
+        );
+        assert!(
+            q16.len() < quantized.len(),
+            "{url}: 16 colors ({}) must undercut 256 ({})",
+            q16.len(),
+            quantized.len()
+        );
+        // Every variant still probes as a PNG at the same dimensions.
+        let (fmt, w, h) = oximg::pipeline::probe(&q16).unwrap();
+        assert_eq!(fmt, oximg::pipeline::ImageFormat::Png, "{url}");
+        assert_eq!((w, h), (100, 75), "{url}");
+    }
+    // Alpha sources are untouched by the knob: identical lossless bytes.
+    let a = plain.get("/resize/100/100/rgba.png").unwrap().2;
+    let b = quant.get("/resize/100/100/rgba.png").unwrap().2;
+    assert_eq!(a, b, "alpha PNG must stay lossless under the knob");
 }
