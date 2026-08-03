@@ -10,6 +10,14 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-02
+
+The migration-grammar release: URLs built for Cloudflare Images now
+work as-is (#9), which also delivers per-request quality (#3) — the
+last two items keeping evaluated deployments behind a URL-rewrite
+layer. Plus the quantized-PNG effort default fix from the #5 field
+measurements. No library API changes.
+
 ### Added
 
 - **Cloudflare Images-style URL options** ([#9]): set

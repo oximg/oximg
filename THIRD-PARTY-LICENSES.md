@@ -236,7 +236,7 @@ Used by:
 ## Apache License 2.0
 
 Used by:
-- [oximg 0.7.1](https://github.com/oximg/oximg)
+- [oximg 0.7.2](https://github.com/oximg/oximg)
 - [cmov 0.5.4](https://github.com/RustCrypto/utils)
 - [ctutils 0.4.2](https://github.com/RustCrypto/utils)
 - [zeroize 1.9.0](https://github.com/RustCrypto/utils)
