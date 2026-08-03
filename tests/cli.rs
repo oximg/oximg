@@ -69,6 +69,44 @@ fn resize_quality_flag_changes_output_size() {
     );
 }
 
+/// 0 leaves an axis unconstrained (issue #2): width-only follows the
+/// aspect ratio, and `0 0` is the pure re-encode at the source's own
+/// size (never-enlarge means dimensions pass through).
+#[test]
+fn zero_axis_resizes_width_only_and_zero_zero_transcodes() {
+    let out = tmp("wonly.jpg");
+    let output = bin()
+        .args(["resize", &fixture("photo.jpg"), "100", "0"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_, w, h) = oximg::pipeline::probe(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!((w, h), (100, 75), "width-only follows the aspect ratio");
+    std::fs::remove_file(&out).ok();
+
+    // photo.jpg is 200x150; 0 0 re-encodes at the stored size.
+    let out = tmp("transcode.webp");
+    let output = bin()
+        .args(["resize", &fixture("photo.jpg"), "0", "0"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (fmt, w, h) = oximg::pipeline::probe(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+    assert_eq!((w, h), (200, 150), "0 0 keeps the source dimensions");
+    std::fs::remove_file(&out).ok();
+}
+
 #[test]
 fn probe_prints_format_and_dimensions_without_decoding() {
     let output = bin()
@@ -87,7 +125,8 @@ fn probe_prints_format_and_dimensions_without_decoding() {
 fn usage_errors_exit_2() {
     for args in [
         &["resize"][..],
-        &["resize", "in.jpg", "0", "100", "out.jpg"][..],
+        &["resize", "in.jpg", "-1", "100", "out.jpg"][..],
+        &["resize", "in.jpg", "wide", "100", "out.jpg"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-f", "gif"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-q", "0"][..],
         &[

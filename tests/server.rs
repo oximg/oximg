@@ -196,7 +196,7 @@ fn serves_avif_with_matching_content_type() {
 #[test]
 fn error_mapping() {
     let s = Server::start(&[]);
-    assert_eq!(s.status_of("/resize/0/100/photo.jpg"), 400);
+    assert_eq!(s.status_of("/resize/0/0/photo.jpg"), 400);
     assert_eq!(s.status_of("/resize/9000/9000/photo.jpg"), 400);
     assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
     assert_eq!(s.status_of("/resize/100/100/..%2Fsecret"), 400);
@@ -1327,4 +1327,65 @@ fn base_url_mode_forwards_nested_paths_verbatim() {
         ],
         "origin saw exactly the addressed segments, nothing else"
     );
+}
+
+/// Issue #2: 0 on one axis means unconstrained. Width-only and
+/// height-only requests produce the aspect-following dimension, an
+/// output taller than the old 8192 sentinel is possible (the silent
+/// narrowing the sentinel caused is gone), and both-zero stays 400.
+#[test]
+fn zero_axis_is_unconstrained() {
+    // photo.jpg is 200x150.
+    let s = Server::start(&[]);
+    let (status, _, body) = s.get("/resize/100/0/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75), "width-only follows the aspect ratio");
+
+    let (status, _, body) = s.get("/resize/0/75/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75), "height-only follows the aspect ratio");
+
+    assert_eq!(s.status_of("/resize/0/0/photo.jpg"), 400, "no box at all");
+    assert_eq!(
+        s.status_of("/resize/9000/0/photo.jpg"),
+        400,
+        "cap still applies"
+    );
+}
+
+/// The regression that motivated #2: a tall source under a width-only
+/// request must come out at the requested width, even when the height
+/// lands beyond the old 8192 sentinel — the case where the workaround
+/// silently produced a narrower image and corrupted srcset descriptors.
+#[test]
+fn width_only_serves_taller_than_the_old_sentinel() {
+    let dir = std::env::temp_dir().join(format!("oximg-tall-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, 20, 18000);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer
+        .write_image_data(&vec![64u8; 20 * 18000 * 3])
+        .unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("tall.png"), &out).unwrap();
+
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+    let (status, _, body) = s.get("/resize/10/0/tall.png").unwrap();
+    assert_eq!(status, 200);
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(
+        (w, h),
+        (10, 9000),
+        "requested width delivered; height exceeds the old sentinel"
+    );
+    // The best pre-#2 emulation of the same request, for contrast: the
+    // sentinel constrains this source and the width comes out wrong.
+    let (_, _, body) = s.get("/resize/10/8192/tall.png").unwrap();
+    let (_, w, _) = oximg::pipeline::probe(&body).unwrap();
+    assert!(w < 10, "the sentinel workaround narrows tall sources ({w})");
 }
