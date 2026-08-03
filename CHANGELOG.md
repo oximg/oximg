@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-03
+
+The private-sources release (#11), written after a production cutover
+rolled back on a single network blip: HTTP source fetches now retry
+connection-level transients, and `gs://` reads private GCS buckets
+directly with GCP-attached credentials — no world-readable bucket, no
+public-endpoint egress. Plus the reversed `OXIMG_WORKERS` guidance
+from the #10 follow-up measurement.
+
 ### Added
 
 - **`gs://` source mode** ([#11]): `OXIMG_SOURCE_BASE_URL=gs://bucket[/prefix]`
