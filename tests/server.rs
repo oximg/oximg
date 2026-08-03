@@ -328,6 +328,9 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_PNG_QUANTIZE", "yes"),
         ("OXIMG_UPSTREAM_TIMEOUT", "0"),
         ("OXIMG_METRICS", "yes"),
+        ("OXIMG_WORKERS", "0"),
+        ("OXIMG_WORKERS", "600"),
+        ("OXIMG_WORKERS", "two"),
         ("OXIMG_UPSTREAM_CONNECT_TIMEOUT", "fast"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
@@ -1611,6 +1614,18 @@ fn metrics_endpoint_counts_what_happens() {
     assert_eq!(m("oximg_cpu_permits_in_use"), 0.0);
     assert!(m("oximg_cpu_workers") >= 1.0);
     assert_eq!(m("oximg_inflight_keys"), 0.0);
+}
+
+/// OXIMG_WORKERS pins the CPU permit count — the knob for platforms
+/// that present more vCPUs than they allocate (issue #10: Cloud Run
+/// cpu=1 shows 2 CPUs) — and the gauge confirms what took effect.
+#[test]
+fn workers_override_sizes_the_semaphore() {
+    let s = Server::start(&[("OXIMG_WORKERS", "1".into()), ("OXIMG_METRICS", "1".into())]);
+    // Still serves normally at one permit.
+    assert_eq!(s.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(metric(&body, "oximg_cpu_workers"), 1.0);
 }
 
 /// The upstream outcome family, exercised against a real origin: ok,
