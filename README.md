@@ -18,16 +18,24 @@ while resizing in linear light at measurably higher output quality
 
 - **HTTP resize service**: `GET /resize/{w}/{h}/{file}` fits the source
   within `w x h` (never enlarges) and re-encodes it in its own format.
-  `0` leaves an axis unconstrained: `/resize/750/0/…` is width-only
-  (height follows the aspect ratio — what `srcset` `w` descriptors and
-  Next.js loaders emit), `/resize/0/1024/…` height-only. Prefer that
-  over a large sentinel height, which silently narrows sources taller
-  than the sentinel's aspect ratio.
-  `{file}` may span directories (`/resize/300/200/albums/2026/photo.jpg`),
-  so S3-style prefixes and nested trees are addressable as-is. Sources
-  come from a local directory or any HTTP(S) origin
-  (`OXIMG_SOURCE_BASE_URL`), where decoding overlaps the download.
-  Optional imgproxy-style HMAC URL signing.
+  `0` leaves an axis unconstrained (`/resize/750/0/…` is width-only —
+  what `srcset` `w` descriptors and Next.js loaders emit), and
+  `{file}` may span directories, so S3-style prefixes and nested trees
+  are addressable as-is. Optional imgproxy-style HMAC URL signing.
+- **Cloudflare Images URL compatibility**: mount a second route
+  (`OXIMG_OPTIONS_PREFIX`) speaking the option-list grammar —
+  `/image/width=750,quality=80/path/to/photo.png` — so URLs built for
+  Cloudflare Images survive a migration without a rewrite layer,
+  per-request quality included.
+- **Sources**: a local directory, any HTTP(S) origin, or a **private
+  GCS bucket** (`gs://` with GCP-attached credentials — no public
+  bucket, no public-endpoint egress). Streaming decode overlaps the
+  download; transient fetch failures are retried, so a network blip is
+  a slower response, not a broken image.
+- **Production operability**: graceful SIGTERM drain, upstream fetch
+  deadlines (slow-origin 504s distinct from broken-origin 502s), and
+  an opt-in Prometheus `/metrics` page whose queue-wait/processing
+  split tells "needs more CPU" apart from "sources got bigger".
 - **Quality-first processing**: resizing happens in linear light on
   16-bit samples with Lanczos3, JPEG sources are decoded supersampled
   (DCT shrink-on-load kept ≥ 1.7x the target), and alpha is
@@ -185,10 +193,11 @@ at +6.7 SSIMULACRA2.
 - [bench/quality/QUALITY.md](bench/quality/QUALITY.md) — output quality
   (SSIMULACRA2) at matched settings vs imgproxy and sharp.
 
-## Usage
+## Install
 
 **Docker** (recommended — multi-arch linux/amd64 + linux/arm64, AVIF
-included; both registries rebuild on every `main` push):
+included; both registries rebuild on every `main` push, so pin a
+version tag in production):
 
 ```sh
 docker run -p 8081:8081 -v $PWD/images:/images:ro ghcr.io/oximg/oximg:latest
@@ -197,42 +206,105 @@ curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
 **Prebuilt binaries** ([GitHub Releases](https://github.com/oximg/oximg/releases),
-v0.6.0+; Linux x86_64/aarch64 and macOS arm64;
-JPEG/PNG/WebP, no AVIF) — suited to CI asset pipelines where a Docker
-pull or a source build is too slow. Assets are named
-`oximg-<tag>-<target>.tar.gz` with a `.sha256` alongside; each is
-smoke-tested before upload. Linux builds link glibc >= 2.39
-(Ubuntu 24.04) with libstdc++ static — self-contained on any current
-CI runner.
+v0.6.0+; Linux x86_64/aarch64 and macOS arm64; JPEG/PNG/WebP, no
+AVIF) — suited to CI asset pipelines where a Docker pull or a source
+build is too slow. Assets are `oximg-<tag>-<target>.tar.gz` with a
+`.sha256` alongside; each is smoke-tested before upload. Linux builds
+link glibc >= 2.39 with libstdc++ static.
 
-**Homebrew** (builds v0.7.4 from source; JPEG/PNG/WebP, no AVIF):
+**Homebrew** (builds the latest release from source; JPEG/PNG/WebP):
 
 ```sh
 brew install oximg/tap/oximg
 ```
 
-**Cargo** (crates.io, v0.7.4; add `--features avif` if SVT-AV1 >= 4.1
-and dav1d are installed and visible to pkg-config):
+**Cargo** (crates.io; add `--features avif` if SVT-AV1 >= 4.1 and
+dav1d are installed and visible to pkg-config):
 
 ```sh
 cargo install oximg
 ```
 
-Note the release channels lag `main`: crates.io and the brew formula
-ship the last tagged release, while the Docker images rebuild on every
-`main` push. The npm package
+**From source** (the Docker build needs no system dependencies — it
+compiles a pinned SVT-AV1 itself):
+
+```sh
+cargo build --release                    # JPEG, PNG, WebP
+cargo build --release --features avif    # + AVIF (needs SVT-AV1 >= 4.1, dav1d)
+IMAGES_DIR=./images PORT=8081 ./target/release/oximg   # = oximg serve
+```
+
+Release channels lag `main`: crates.io and the brew formula ship the
+last tagged release, while the Docker images rebuild on every `main`
+push. The npm package
 [`@oximg/oximg`](https://www.npmjs.com/package/@oximg/oximg) is a name
 reservation that points here.
 
-**From source**:
+## Serving
 
-```sh
-cargo build --release            # JPEG, PNG, WebP
-cargo build --release --features avif   # + AVIF (needs SVT-AV1 >= 4.1, dav1d)
-IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg   # = oximg serve
+**URL grammars.** The positional route is
+`/resize/{w}/{h}/{file}[@fmt]`; `0` leaves an axis unconstrained, and
+`{file}` may span directories. Setting `OXIMG_OPTIONS_PREFIX` mounts a
+second route speaking the Cloudflare Images option grammar at that
+prefix:
+
+```
+/image/width=750,quality=80/albums/2026/photo.png
 ```
 
-**One-shot CLI** (the same pipeline, no server):
+with `width`/`height` (1-8192; one suffices, the other axis follows
+the aspect ratio), `quality` (1-100, applied to whichever format the
+output resolves to; PNG output is lossless and ignores it), and
+`format` (`jpeg|png|webp|avif`, or `auto` = the same Accept
+negotiation as a bare positional URL, which also runs when `format`
+is absent). Unknown or duplicate options answer 400 naming the key —
+Cloudflare silently ignores unknown options, but a silently dropped
+`fit=cover` changes the output, so the divergence is deliberate. The
+filename is taken literally on this route (no `@fmt` token).
+
+**Sources.** With `OXIMG_SOURCE_BASE_URL` unset, sources come from
+`IMAGES_DIR`. Set it and the scheme selects the transport:
+
+- `https://host/prefix` — anonymous HTTP. **Exposure prerequisite**:
+  no credentials are sent, so the origin must be anonymously readable;
+  for an object-store bucket that means public objects, and anyone who
+  can guess a path can fetch the original at full resolution,
+  bypassing every resize/signing/CDN control in front.
+- `gs://bucket[/prefix]` — a **private GCS bucket**, read directly
+  with GCP-attached credentials (GKE Workload Identity, Cloud Run, and
+  GCE metadata credentials; tokens cached and refreshed; boot fails
+  closed with a clear message when no credentials are reachable).
+  `service_account` JSON keys are not supported — on GCP use Workload
+  Identity, off GCP use the HTTP mode. `s3://` is planned (issue #11).
+
+Streaming decode overlaps the download in every mode.
+Connection-level transients (reset, refused, DNS blips) are retried
+once before any body bytes are consumed, and the `gs://` mode also
+retries 429/5xx SDK-style; `oximg_upstream_retries_total` counts both.
+
+**Source paths** are validated component-wise — `.`/`..` components,
+empty components, `\`, `?`, `#`, and control bytes answer 400. Local
+sources also pass a symlink-containment check (a path resolving
+outside `IMAGES_DIR` answers 404), and remote paths are re-encoded
+segment-wise so a percent in a name is never double-decoded upstream.
+
+**URL signing** (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
+require imgproxy-style signed URLs —
+`/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`,
+and the same scheme over `{prefix}/{options}/{file}` on the options
+route. The signed `path` is the percent-decoded form, so one signature
+covers every URL encoding of the same source.
+
+**Graceful shutdown**: on SIGTERM (what `docker stop`, Kubernetes, and
+Cloud Run send) or SIGINT the server stops accepting connections,
+finishes in-flight requests, and exits 0. There is no drain timeout of
+its own — the orchestrator's grace period backstops a response that
+never finishes, so allow a few seconds more than your slowest expected
+encode.
+
+## CLI
+
+One-shot commands over the same pipeline, no server:
 
 ```sh
 oximg resize photo.jpg 1600 1600 out.webp     # fit within 1600x1600; format from the extension
@@ -242,39 +314,34 @@ oximg resize photo.jpg 0 0 out.webp           # 0 0 = re-encode at the source's 
 oximg probe photo.webp                        # format + stored dimensions, header-only
 ```
 
-The output format is `-f/--format`, else the `<out>` extension
-(`jpg|jpeg|png|webp|avif`), else the source's own format — the same
-precedence idea as the server's `@{fmt}` URL grammar. Encode knobs
-that are env-configured on the server (`OXIMG_WEBP_QUALITY`,
-`OXIMG_PNG_EFFORT`, ...) apply to CLI encodes the same way. Usage
-errors exit 2; processing failures exit 1.
+The output format is `-f/--format`, else the `<out>` extension, else
+the source's own format — the same precedence idea as the server's
+`@fmt` grammar. The `OXIMG_*` encode knobs below apply to CLI encodes
+the same way. Usage errors exit 2; processing failures exit 1.
 
-The Docker build needs no system dependencies — it compiles a pinned
-post-4.1 SVT-AV1 revision that carries the aarch64 kernels for the
-still-image path:
+## Library
 
-```sh
-docker build -t oximg .
-```
-
-**As a library**: the `oximg::pipeline` module is usable without the
-HTTP server — `process`/`process_path` take a `Params` and return the
-re-encoded bytes plus their format, `probe` reads just the header.
-Depend on it with `default-features = false` to drop the entire HTTP
-stack (axum, tokio, ureq, hmac, sha2); add `features = ["avif"]` for
-AVIF. `process_url` (remote HTTP sources) needs the `server` feature.
+The `oximg::pipeline` module is usable without the HTTP server —
+`process`/`process_path` take a `Params` and return the re-encoded
+bytes plus their format, `probe` reads just the header. Depend on it
+with `default-features = false` to drop the entire HTTP stack (axum,
+tokio, ureq, hmac, sha2, serde_json); add `features = ["avif"]` for
+AVIF. `process_url` and `process_gcs` (remote sources) need the
+`server` feature.
 
 Failures are typed: every entry point returns `pipeline::Error`, whose
 `kind()` (`ErrorKind`: SourceNotFound / SourceTooLarge /
-SourceUnreadable / Upstream / Undecodable / Internal) is the stable
-classification the server's own status mapping is built on — match on
-it instead of parsing messages, with a wildcard arm for kinds added
-later. `Params` also carries per-call overrides (`webp_quality`,
-`png_effort`, `auto_rotate`, `icc`, `flatten_bg`, `linear_light`,
-`avif_quality`) for the knobs that are otherwise process-global
-`OXIMG_*` environment variables: `None` keeps the env-configured
-behavior, `Some` wins per call — so one process can run different
-settings side by side. See [`examples/`](examples/):
+SourceUnreadable / Upstream / UpstreamTimeout / Undecodable /
+Internal) is the stable classification the server's own status mapping
+is built on — match on it instead of parsing messages, with a wildcard
+arm for kinds added later. `Params` also carries per-call overrides
+(`webp_quality`, `png_effort`, `png_quantize`, `auto_rotate`, `icc`,
+`flatten_bg`, `linear_light`, `avif_quality`, …) for the knobs that
+are otherwise process-global environment variables: `None` keeps the
+env-configured behavior, `Some` wins per call — so one process can run
+different settings side by side. Rustdoc examples on `probe`,
+`process`, and `Params` are compiled and run in CI; see also
+[`examples/`](examples/):
 
 ```sh
 cargo run --release --example thumbnail -- photo.jpg 300 200 out.jpg
@@ -282,147 +349,68 @@ cargo run --release --example transcode -- photo.jpg 800 800 webp out.webp
 cargo run --release --example probe     -- photo.webp
 ```
 
-**Graceful shutdown**: on SIGTERM (what `docker stop`, Kubernetes,
-and Cloud Run send) or SIGINT the server stops accepting connections,
-finishes in-flight requests, and exits 0. There is no drain timeout
-of its own — the orchestrator's grace period (10s for `docker stop`
-and Cloud Run, `terminationGracePeriodSeconds` on Kubernetes)
-backstops a response that never finishes, so give it a few seconds
-more than your slowest expected encode.
+## Configuration
 
-URL signing (optional): set `OXIMG_KEY` and `OXIMG_SALT` (hex) to
-require imgproxy-style signed URLs —
-`/{base64url(HMAC-SHA256(key, salt || path))}/resize/{w}/{h}/{file}`.
-The signed `path` is the percent-decoded form (nested `{file}` included,
-with any `@{fmt}` token), so one signature covers every URL encoding of
-the same source.
+Everything is environment variables, read once at startup. The shared
+rule is **fail-closed**: any variable that is set but unparseable or
+out of range refuses to boot with a message naming it — a typo'd limit
+never silently falls back to a default.
 
-**Source paths**: `{file}` is validated component-wise — `.` or `..`
-components, empty components (leading/trailing/double slashes), `\`,
-`?`, `#`, and control bytes answer 400. Local sources additionally
-resolve through a symlink-containment check: a path that escapes
-`IMAGES_DIR` answers 404. Remote sources are re-encoded segment-wise
-before the origin fetch, so a percent in a name is never double-decoded
-upstream.
+### Server
 
-Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
-`OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` instead of
-the local filesystem; the scheme selects the transport. `https://` is
-the anonymous HTTP mode; **`gs://bucket[/prefix]` reads a private GCS
-bucket directly** with GCP-attached credentials — GKE Workload
-Identity, Cloud Run, and GCE metadata credentials all work, tokens are
-cached and refreshed, and boot fails closed with a clear message if no
-credentials are reachable. No public bucket, no egress through a
-public endpoint, and SDK-style retries on 429/5xx. (`service_account`
-JSON keys are not supported — on GCP use Workload Identity; off GCP
-use the HTTP mode. `s3://` is planned, see issue #11.) Streaming
-decode overlaps the download in every mode. Connection-level transients — reset, refused, DNS blips —
-are retried once before any body bytes are consumed, so a single
-network blip is a slightly slower response instead of a broken image;
-`oximg_upstream_retries_total` counts them. **Exposure prerequisite**:
-this mode sends no credentials, so the origin must be anonymously
-readable — for an object-store bucket that means public objects, and
-anyone who can guess a path can fetch the original at full resolution,
-bypassing every resize/signing/CDN control in front. Weigh that before
-pointing this at a bucket that was private under an SDK-based
-fetcher), `OXIMG_GCS_ENDPOINT` (`https://storage.googleapis.com`; override for
-Private Service Connect endpoints or emulators — `GCE_METADATA_HOST`
-is honored the same way for the token source),
-`OXIMG_WORKERS` (unset = the parallelism the container
-observes, which is the right default almost everywhere — including
-platforms like Cloud Run whose `cpu` setting is a time quota, not a
-core count, where "pinning to the billed number" measured 17-36%
-slower (issue #10); 1-512 pins the CPU permit count explicitly for
-the shapes that genuinely want it — noisy-neighbor hosts, trading
-throughput for tail latency, or platforms where observed parallelism
-is unrelated to what is actually available; verify with the
-`oximg_cpu_workers` gauge),
-`OXIMG_OPTIONS_PREFIX` (unset; mounts a second route
-speaking the Cloudflare Images option grammar at the given prefix —
-`OXIMG_OPTIONS_PREFIX=/image` serves
-`/image/width=750,quality=80/albums/2026/photo.png` — so URLs built
-for Cloudflare Images survive a migration without a rewrite layer.
-Options: `width`/`height` (1-8192; one suffices, the other axis
-follows the aspect ratio), `quality` (1-100, applied to whichever
-format the output resolves to; PNG output is lossless and ignores
-it), `format` (`jpeg|png|webp|avif`, or `auto` = the same
-Accept negotiation as a bare positional URL, which also runs when
-`format` is absent). Unknown or duplicate options answer 400 naming
-the key — Cloudflare silently ignores unknown options, but a dropped
-`fit=cover` changes the output, so this divergence is deliberate. The
-filename is taken literally on this route (no `@{fmt}` token), and
-with signing enabled the same HMAC scheme covers
-`/{signature}{prefix}/{options}/{file}` over the decoded path),
-`OXIMG_METRICS` (`0`; `1` serves a Prometheus text page at
-`/metrics`: requests by status class and resolved output format,
-upstream fetch outcomes with timeouts distinct from faults, latency
-histograms split into CPU-permit queue wait vs processing — rising
-queue wait under flat processing means "needs more CPU", both rising
-means "sources got bigger" — plus permit and coalescing gauges. The
-route sits outside the URL-signing scheme, so expose it to your
-scrape network only. Failure-rate attribution still needs a
-platform-side memory/restart alert to catch an OOM loop — metrics
-from a process that keeps dying cannot tell that story alone), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
-413), `OXIMG_MAX_SRC_PIXELS` (64,000,000; decoded-size cap enforced
-after each format's header parse, before any pixel allocation —
-compressed size does not bound decoded size; over-cap sources also
-answer 413), `OXIMG_UPSTREAM_TIMEOUT` (30; seconds for the whole
-origin fetch — this bounds how long a stalled upstream can hold one
-of the core-count CPU permits, so it is the knob that keeps a slow
-origin from silently eating throughput; timeouts answer 504, distinct
-from other upstream failures' 502), `OXIMG_UPSTREAM_CONNECT_TIMEOUT`
-(5; seconds to establish the origin connection), `QUALITY`
-(JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
-(55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `OXIMG_AVIF_SPEED`
-(SVT preset, 8; setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes
-for ~28% less encode CPU — measured +19% JPEG→AVIF req/s on a real
-c7i.large, ahead of imgproxy by +16%; see [BENCH.md](BENCH.md) and
-[bench/quality/QUALITY.md](bench/quality/QUALITY.md)), `PRESET` (`jpegli` default; `fast` = mozjpeg baseline profile,
-`small` = mozjpeg trellis+progressive), `OXIMG_AUTO_FORMAT` (unset;
-comma-separated `Accept`-negotiation preference list, e.g. `avif,webp`),
-`OXIMG_FLATTEN_BG` (`ffffff`; background for alpha → JPEG flattening),
-`OXIMG_AUTO_ROTATE` (`1`; `0` serves the stored orientation),
-`OXIMG_ICC` (`1`; `0` strips source ICC profiles from outputs and
-converts CMYK sources naively instead of through their profile; the
-shared JPEG header scan is skipped only when both knobs are off),
-`OXIMG_RESIZE=srgb` (resize in
-sRGB space instead of linear light), `OXIMG_RESIZE_BACKEND=fir` (use
-the portable fast_image_resize convolution instead of the platform
-kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
-x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
-`OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
-`OXIMG_PNG_EFFORT` (unset; `fastest`/`fast`/`balanced`/`high` trade
-PNG size against encode time — unset resolves to `fast` for lossless
-output and `balanced` for quantized output, where effort matters ~2x
-more; setting it explicitly pins one level for both paths),
-`OXIMG_PNG_QUANTIZE` (`0`; `1` palette-quantizes
-opaque PNG output — Wu quantization with Floyd–Steinberg dithering —
-typically a ~3x byte reduction on photographic PNGs at the quantized
-path's `balanced` effort default (about half that if effort is forced
-to `fast`), and nearly indistinguishable on flat graphics; opt-in
-because quality loss on a lossless format must be a deliberate choice;
-sources with alpha always encode lossless RGBA and ignore this knob
-entirely), `OXIMG_PNG_QUANTIZE_COLORS` (`256`; palette
-size, 2-256 — 64 colors trades visible-on-inspection banding for
-another ~15% on photographic sources), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
-libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
-per-stage timing lines to stderr), `OXIMG_LOG` (`error`: one stderr
-line per failed request, always on; `request` also logs successes,
-with a request id and wall time; these two are the only accepted
-values — anything else, `info` included, refuses to boot like every
-other misconfigured knob),
-`OXIMG_OVERLAP` (JPEG requests fuse decode with resize+encode on a
-second thread, cutting single-request latency ~20%; the default `auto`
-fuses while `2 x active requests <= visible CPUs` and falls back to
-one core per request under contention. Serial and fused stream through
-the same SIMD kernel, so a URL's bytes are identical either way; `1`
-forces fusing, `0` disables it), `OXIMG_JPEG_PROGRESSIVE` (`0`
-selects baseline jpegli: a few percent larger JPEG output — still at
-or below libjpeg-turbo size for the same input, at higher quality —
-in exchange for moving jpegli's entropy pass off the latency tail:
-combined with `OXIMG_OVERLAP` this is the speed profile, ~-13%
-single-request latency and ~+9% saturated throughput over the
-default).
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | `8081` | Listen port (`0` = OS-assigned, printed on stderr) |
+| `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
+| `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
+| `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |
+| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes; verify with the `oximg_cpu_workers` gauge |
+| `OXIMG_LOG` | `error` | `error` = one stderr line per failure; `request` also logs successes. The only accepted values |
+| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), queue-wait vs processing histograms, permit/coalescing gauges. Outside the signing scheme — expose it to your scrape network only |
+
+### Sources
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OXIMG_SOURCE_BASE_URL` | unset | `https://…` or `gs://bucket[/prefix]` (see [Serving](#serving)) |
+| `OXIMG_GCS_ENDPOINT` | `https://storage.googleapis.com` | Override for Private Service Connect or emulators; `GCE_METADATA_HOST` is honored the same way for the token source |
+| `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch — bounds how long a stalled upstream can hold a CPU permit; timeouts answer 504, distinct from other upstream failures' 502 |
+| `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
+| `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
+| `OXIMG_MAX_SRC_PIXELS` | 64,000,000 | Decoded-size cap, enforced after each format's header parse and before any pixel allocation (compressed size does not bound decoded size); over-cap sources answer 413 |
+
+### Encoding
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `QUALITY` | `80` | JPEG quality |
+| `PRESET` | `jpegli` | `fast` = mozjpeg baseline, `small` = mozjpeg trellis+progressive |
+| `OXIMG_JPEG_PROGRESSIVE` | `1` | `0` = baseline jpegli: a few percent larger output for lower latency; with `OXIMG_OVERLAP` this is the speed profile (~-13% single-request latency, ~+9% saturated throughput) |
+| `OXIMG_WEBP_QUALITY` | `75` | WebP quality |
+| `OXIMG_WEBP_EFFORT` | `2` | libwebp `method` |
+| `OXIMG_AVIF_QUALITY` | `55` | AVIF quality (libavif semantics; chosen by operating point, see [bench/quality/QUALITY.md](bench/quality/QUALITY.md)) |
+| `OXIMG_AVIF_ALPHA_QUALITY` | color quality | Alpha-plane quality |
+| `OXIMG_AVIF_SPEED` | `8` | SVT preset; `9` trades ~-0.6 SSIMULACRA2 at unchanged bytes for ~28% less encode CPU |
+| `OXIMG_PNG_EFFORT` | path-dependent | `fastest`/`fast`/`balanced`/`high`. Unset resolves to `fast` for lossless output and `balanced` for quantized output, where effort matters ~2x more; setting it pins one level for both |
+| `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG output (Wu + Floyd–Steinberg): typically ~3x smaller photographic PNGs at the quantized `balanced` default (about half that if effort is forced `fast`), near-exact on flat graphics. Opt-in because quality loss on a lossless format must be deliberate; alpha sources always encode lossless RGBA and ignore this knob |
+| `OXIMG_PNG_QUANTIZE_COLORS` | `256` | Palette size, 2-256; 64 trades visible-on-inspection banding for another ~15% |
+| `OXIMG_AUTO_FORMAT` | unset | Comma-separated `Accept`-negotiation preference list (e.g. `avif,webp`); see the ordering guidance under [Supported formats](#supported-formats) |
+| `OXIMG_FLATTEN_BG` | `ffffff` | Background for alpha → JPEG flattening |
+
+### Pixel pipeline
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OXIMG_AUTO_ROTATE` | `1` | `0` serves the stored orientation |
+| `OXIMG_ICC` | `1` | `0` strips source ICC profiles and converts CMYK naively instead of through their profile |
+| `OXIMG_RESIZE` | `linear` | `srgb` resizes in sRGB space instead of linear light |
+| `OXIMG_RESIZE_BACKEND` | `kernel` | `fir` selects the portable fast_image_resize convolution instead of the platform SIMD kernel |
+| `OXIMG_OVERLAP` | `auto` | JPEG decode fused with resize+encode on a second thread (~-20% single-request latency); `auto` fuses while `2 x active requests <= visible CPUs`. Bytes are identical either way |
+| `OXIMG_PAR` | `1` | Resize threads per request |
+| `OXIMG_DCT_MARGIN` | `1.7` | JPEG shrink-on-load headroom over the target size |
+| `OXIMG_WEBP_DECODE_THREADS` | `1` | `0` disables libwebp's two-thread decode pipelining |
+| `OXIMG_AVIF_DECODE_THREADS` | arch-dependent | dav1d workers: 2 on x86-64 (SMT absorbs the second thread), 1 on aarch64 |
+| `OXIMG_TIMING` | unset | Print per-stage timing lines to stderr |
 
 ## Deployment
 
@@ -433,36 +421,40 @@ Per-platform guides live in [`docs/`](docs/):
   origins, graceful `docker stop`, building tuned images.
 - [Kubernetes](docs/deploy-kubernetes.md) — an example Deployment
   with probes, resource limits (the worker count follows the cgroup
-  CPU quota), security context, and rolling-update drain behavior.
+  CPU quota), security context, rolling-update drain behavior, and
+  restoring cross-pod request coalescing via ingress URI hashing.
 - [Cloud Run & serverless containers](docs/deploy-cloud-run.md) —
-  the `PORT` contract, remote-origin mode (no local disk),
-  concurrency-vs-vCPU sizing, and CDN caching in front.
+  the `PORT` contract, remote-origin mode, `gs://` with the service
+  identity, concurrency-vs-vCPU sizing, and why per-process request
+  coalescing yields nothing on scaled-out shapes.
 
-The short version for every platform: pin an image version, put a
-CDN in front (responses carry a 1-year `Cache-Control`), give the
-process whole CPUs, and allow ≥10s of shutdown grace so in-flight
-encodes drain.
+The short version for every platform: pin an image version, put a CDN
+in front (responses carry a 1-year `Cache-Control`), give the process
+whole CPUs, and allow ≥10s of shutdown grace so in-flight encodes
+drain.
 
 ## Not yet implemented (out of PoC scope)
 
+- Private S3 / S3-compatible sources (`gs://` landed in 0.7.4; `s3://`
+  is tracked in [#11](https://github.com/oximg/oximg/issues/11) and
+  fails at boot with a pointer rather than misbehaving)
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output (animated AVIF and WebP *sources* render their
   first frame, like other image proxies)
-- Private S3 sources (public/presigned HTTP origins work), caching
-- Production-grade load testing
+- Response caching
 
 ## Roadmap
 
 Rough order, subject to change (experimental PoC):
 
-- **JXL output** once a maintained encoder binding stabilizes (the
-  `@jxl` token is already reserved).
-- **Response caching** (keyed on the resolved URL + format) and
-  private-origin support (presigned S3 already works via HTTP).
-- **0.5.0 library-API cleanup**: `Params` gains `Default` +
-  `#[non_exhaustive]`, the server-only dependencies move behind a
-  feature so library users do not compile the HTTP stack, and the
-  raw codec bindings stop being part of the public surface.
+- **`s3://` sources** — S3 and S3-compatible endpoints (R2, MinIO,
+  B2) with static credentials first, the AWS credential chain after
+  ([#11](https://github.com/oximg/oximg/issues/11)).
+- **Per-image output format selection** — choose quantized-PNG vs
+  WebP per image rather than per deployment
+  ([#6](https://github.com/oximg/oximg/issues/6)).
+- **JXL output** once a maintained encoder binding stabilizes.
+- **Response caching** (keyed on the resolved URL + format).
 
 ## Status
 
