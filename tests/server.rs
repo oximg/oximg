@@ -2159,7 +2159,7 @@ fn gcs_boot_is_fail_closed() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
         cmd.env("PORT", "0")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         for (k, v) in &envs {
             cmd.env(k, v);
         }
@@ -2177,5 +2177,13 @@ fn gcs_boot_is_fail_closed() {
             panic!("server booted despite {envs:?}");
         };
         assert!(!status.success(), "{envs:?} must exit non-zero");
+        // The claim is "fail closed with an actionable message", so
+        // pin the message, not just the exit code.
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        assert!(
+            stderr.contains("oximg: fatal:"),
+            "{envs:?}: no fatal diagnostic on stderr: {stderr:?}"
+        );
     }
 }

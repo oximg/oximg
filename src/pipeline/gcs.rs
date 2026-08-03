@@ -65,7 +65,11 @@ fn fetch_token() -> Result<CachedToken> {
     let token = v["access_token"]
         .as_str()
         .context("metadata token response lacks access_token")?;
-    let expires_in = v["expires_in"].as_u64().unwrap_or(300);
+    // Clamp to a day: a metadata endpoint (possibly a misconfigured
+    // GCE_METADATA_HOST) returning a pathological expires_in must not
+    // panic Instant + Duration on overflow — and no real token lives
+    // longer anyway.
+    let expires_in = v["expires_in"].as_u64().unwrap_or(300).min(24 * 3600);
     Ok(CachedToken {
         bearer: format!("Bearer {token}"),
         // Refresh a minute early so a token never expires mid-fetch;
