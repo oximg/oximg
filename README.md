@@ -310,7 +310,12 @@ download), `OXIMG_MAX_SOURCE_BYTES` (64MiB; over-limit remote sources answer
 413), `OXIMG_MAX_SRC_PIXELS` (64,000,000; decoded-size cap enforced
 after each format's header parse, before any pixel allocation —
 compressed size does not bound decoded size; over-cap sources also
-answer 413), `QUALITY`
+answer 413), `OXIMG_UPSTREAM_TIMEOUT` (30; seconds for the whole
+origin fetch — this bounds how long a stalled upstream can hold one
+of the core-count CPU permits, so it is the knob that keeps a slow
+origin from silently eating throughput; timeouts answer 504, distinct
+from other upstream failures' 502), `OXIMG_UPSTREAM_CONNECT_TIMEOUT`
+(5; seconds to establish the origin connection), `QUALITY`
 (JPEG quality, 80), `OXIMG_WEBP_QUALITY` (75), `OXIMG_AVIF_QUALITY`
 (55), `OXIMG_AVIF_ALPHA_QUALITY` (same as color), `OXIMG_AVIF_SPEED`
 (SVT preset, 8; setting 9 trades ~-0.6 SSIMULACRA2 at unchanged bytes

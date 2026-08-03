@@ -35,6 +35,12 @@ pub enum ErrorKind {
     /// refused redirect, or a body that died mid-stream. Only produced
     /// by `process_url`. (HTTP: 502.)
     Upstream,
+    /// A remote origin exceeded the fetch deadline
+    /// (`OXIMG_UPSTREAM_TIMEOUT` / `OXIMG_UPSTREAM_CONNECT_TIMEOUT`).
+    /// Distinct from [`ErrorKind::Upstream`] so "the origin is slow"
+    /// separates from "the origin is broken" in statuses and metrics.
+    /// Only produced by `process_url`. (HTTP: 504.)
+    UpstreamTimeout,
     /// The bytes are not a decodable image, or the request asks for a
     /// capability this build lacks (e.g. AVIF output without the
     /// `avif` feature). The client's fault; the top-level message is
@@ -63,7 +69,9 @@ impl Error {
     /// failures indict the origin; the same failures on a local source
     /// mean a truncated file — bad input.
     pub(crate) fn classify(inner: anyhow::Error, remote: bool) -> Error {
-        let kind = if let Some(io) = inner.downcast_ref::<std::io::Error>() {
+        let kind = if remote && chain_has_timeout(&inner) {
+            ErrorKind::UpstreamTimeout
+        } else if let Some(io) = inner.downcast_ref::<std::io::Error>() {
             match io.kind() {
                 IoKind::NotFound => ErrorKind::SourceNotFound,
                 IoKind::FileTooLarge => ErrorKind::SourceTooLarge,
@@ -72,7 +80,6 @@ impl Error {
                 | IoKind::ConnectionAborted
                 | IoKind::BrokenPipe
                 | IoKind::UnexpectedEof
-                | IoKind::TimedOut
                     if remote =>
                 {
                     ErrorKind::Upstream
@@ -88,6 +95,41 @@ impl Error {
         };
         Error { kind, inner }
     }
+}
+
+/// Walk the full source chain for timeout evidence. Timeouts surface
+/// in three shapes depending on where the deadline fires: an
+/// `io::Error` with kind `TimedOut` (socket-level, possibly re-wrapped
+/// by a streaming decoder that preserves sources), a `ureq::Error::
+/// Timeout` at the root (the `.call()` phase), or a ureq timeout boxed
+/// inside `io::Error::other` (mid-body, ureq's reader adapter).
+/// `chain()` descends through arbitrary `source()` links, so all three
+/// are reachable from here.
+fn chain_has_timeout(inner: &anyhow::Error) -> bool {
+    inner.chain().any(|c| {
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            if io.kind() == IoKind::TimedOut {
+                return true;
+            }
+            #[cfg(feature = "server")]
+            if let Some(r) = io.get_ref()
+                && matches!(
+                    r.downcast_ref::<ureq::Error>(),
+                    Some(ureq::Error::Timeout(_))
+                )
+            {
+                return true;
+            }
+        }
+        #[cfg(feature = "server")]
+        if matches!(
+            c.downcast_ref::<ureq::Error>(),
+            Some(ureq::Error::Timeout(_))
+        ) {
+            return true;
+        }
+        false
+    })
 }
 
 impl std::fmt::Display for Error {
@@ -136,8 +178,15 @@ mod tests {
             (io(IoKind::UnexpectedEof), true, ErrorKind::Upstream),
             (io(IoKind::UnexpectedEof), false, ErrorKind::Undecodable),
             (io(IoKind::ConnectionReset), true, ErrorKind::Upstream),
-            (io(IoKind::TimedOut), true, ErrorKind::Upstream),
+            // timeouts get their own kind — but only against an origin
+            (io(IoKind::TimedOut), true, ErrorKind::UpstreamTimeout),
             (io(IoKind::TimedOut), false, ErrorKind::Undecodable),
+            // ...and are found however deep the chain buries them
+            (
+                io(IoKind::TimedOut).context("decode png"),
+                true,
+                ErrorKind::UpstreamTimeout,
+            ),
             // markers attached as context
             (
                 anyhow::anyhow!("origin 500").context(super::super::UpstreamFault),

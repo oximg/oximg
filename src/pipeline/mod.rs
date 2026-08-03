@@ -374,8 +374,17 @@ pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, Imag
 fn http_agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
+        let cfg = crate::config::config();
         ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            // The whole-fetch deadline is the bound on how long a
+            // stalled origin can hold a CPU permit (the body is read
+            // through the decoder while the permit is held); the
+            // connect timeout separates "origin unreachable" from
+            // "origin slow" without waiting out the full budget.
+            .timeout_global(Some(std::time::Duration::from_secs(cfg.upstream_timeout)))
+            .timeout_connect(Some(std::time::Duration::from_secs(
+                cfg.upstream_connect_timeout,
+            )))
             // No redirects: the operator points OXIMG_SOURCE_BASE_URL
             // at the right place, and an origin that can be induced to
             // redirect (e.g. object-store website endpoints honoring

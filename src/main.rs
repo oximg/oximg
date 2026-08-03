@@ -751,6 +751,13 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
                     "upstream image fetch failed".to_string(),
                 )
             }
+            ErrorKind::UpstreamTimeout => {
+                eprintln!("oximg: error status=504 file={file:?} err={e:#}");
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream image fetch timed out".to_string(),
+                )
+            }
             ErrorKind::Internal => {
                 eprintln!("oximg: error status=500 file={file:?} err={e:#}");
                 (

@@ -58,6 +58,14 @@ pub(crate) struct Config {
     /// on the remote-source path, which is behind the `server` feature.
     #[cfg_attr(not(feature = "server"), allow(dead_code))]
     pub max_source_bytes: u64,
+    /// OXIMG_UPSTREAM_CONNECT_TIMEOUT: seconds to establish the origin
+    /// connection (remote-source path).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub upstream_connect_timeout: u64,
+    /// OXIMG_UPSTREAM_TIMEOUT: seconds for the whole origin fetch —
+    /// the bound on how long a stalled upstream can hold a CPU permit.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    pub upstream_timeout: u64,
     /// OXIMG_MAX_SRC_PIXELS: decoded-size cap (w*h), enforced after
     /// each format's header parse and before any pixel-sized
     /// allocation — compressed-size caps do not bound decoded size.
@@ -87,6 +95,8 @@ const KNOBS: &[&str] = &[
     "OXIMG_AVIF_DECODE_THREADS",
     "OXIMG_MAX_SOURCE_BYTES",
     "OXIMG_MAX_SRC_PIXELS",
+    "OXIMG_UPSTREAM_CONNECT_TIMEOUT",
+    "OXIMG_UPSTREAM_TIMEOUT",
     "OXIMG_OVERLAP",
 ];
 
@@ -153,6 +163,8 @@ pub(crate) fn validate() -> Result<(), String> {
     num("OXIMG_AVIF_DECODE_THREADS", 1i64, 64)?;
     num("OXIMG_MAX_SOURCE_BYTES", 1u64, u64::MAX)?;
     num("OXIMG_MAX_SRC_PIXELS", 1u64, u64::MAX)?;
+    num("OXIMG_UPSTREAM_CONNECT_TIMEOUT", 1u64, 3600)?;
+    num("OXIMG_UPSTREAM_TIMEOUT", 1u64, 3600)?;
     if let Some(v) = set("OXIMG_FLATTEN_BG") {
         let t = v.trim().trim_start_matches('#');
         if t.len() != 6 || !t.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -213,6 +225,8 @@ pub(crate) fn config() -> &'static Config {
             .unwrap_or(if cfg!(target_arch = "x86_64") { 2 } else { 1 }),
         max_source_bytes: parsed("OXIMG_MAX_SOURCE_BYTES").unwrap_or(64 * 1024 * 1024),
         max_src_pixels: parsed("OXIMG_MAX_SRC_PIXELS").unwrap_or(64_000_000),
+        upstream_connect_timeout: parsed("OXIMG_UPSTREAM_CONNECT_TIMEOUT").unwrap_or(5),
+        upstream_timeout: parsed("OXIMG_UPSTREAM_TIMEOUT").unwrap_or(30),
     })
 }
 
