@@ -3,7 +3,7 @@ name = "oximg"
 version = "0.7.0"
 edition = "2024"
 # Bounded by pic-scale (1.89); verified by the CI msrv job.
-rust-version = "1.89"
+rust-version = "1.90"
 description = "High-performance image compression: library, CLI, and self-hostable server (PoC)."
 license = "Apache-2.0"
 readme = "README.md"
@@ -28,6 +28,7 @@ libwebp-sys = { version = "0.14", features = ["neon"] }
 hmac = { version = "0.13.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 moxcms = "0.8"
+quantette = { version = "0.6", default-features = false }
 
 [profile.release]
 lto = true

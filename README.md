@@ -57,7 +57,7 @@ combines with any encode column:
 | Format | Decode | Encode |
 |---|---|---|
 | JPEG | baseline & progressive, grayscale; streaming, DCT shrink-on-load | jpegli progressive (default), mozjpeg profiles via `PRESET` |
-| PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A) |
+| PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A); opt-in palette quantization (`OXIMG_PNG_QUANTIZE`) |
 | WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
 
@@ -85,10 +85,14 @@ until AVIF earns its slot; put `avif` first only after comparing sizes
 on your own corpus at your own settings. Also note what negotiation
 does *not* cover: when it doesn't fire (client sends `Accept: */*` —
 link-preview scrapers, social-card fetchers, curl integrations), the
-source format is kept, and PNG output is always lossless RGB(A) — there
-is no palette quantization, so a large photographic PNG stays large.
-Deployments that care about those clients should prefer explicit
-`@{fmt}` URLs over relying on negotiation.
+source format is kept, and PNG output defaults to lossless RGB(A) — a
+large photographic PNG stays large unless `OXIMG_PNG_QUANTIZE=1` is
+set. Deployments that care about those clients should enable
+quantization or prefer explicit `@{fmt}` URLs over relying on
+negotiation. On flat graphics (charts, screenshots, text-heavy
+panels), a quantized PNG is often both smaller *and* truer to the
+source than any WebP quality setting — worth remembering when tuning
+`OXIMG_AUTO_FORMAT` for mixed content.
 
 **Orientation**: every source format auto-rotates — JPEG EXIF, PNG
 `eXIf`, WebP `EXIF` chunks, and AVIF `irot`/`imir` transforms. The
@@ -327,7 +331,13 @@ kernel), `OXIMG_AVIF_DECODE_THREADS` (dav1d workers; defaults to 2 on
 x86-64 where SMT absorbs the second thread and 1 on SMT-less aarch64),
 `OXIMG_DCT_MARGIN` (1.7), `OXIMG_PAR` (resize threads, 1),
 `OXIMG_PNG_EFFORT` (`fast`; `fastest`/`balanced`/`high` trade PNG size
-against encode time), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
+against encode time), `OXIMG_PNG_QUANTIZE` (`0`; `1` palette-quantizes
+opaque PNG output — Wu quantization with Floyd–Steinberg dithering —
+typically a ~3x byte reduction on photographic PNGs and nearly
+indistinguishable on flat graphics; opt-in because quality loss on a
+lossless format must be a deliberate choice; sources with alpha always
+encode lossless RGBA), `OXIMG_PNG_QUANTIZE_COLORS` (`256`; palette
+size, 2-256), `OXIMG_WEBP_EFFORT` (libwebp `method`, 2), `OXIMG_WEBP_DECODE_THREADS` (`1`; `0` disables
 libwebp's two-thread decode pipelining), `OXIMG_TIMING` (set to print
 per-stage timing lines to stderr), `OXIMG_LOG` (`error`: one stderr
 line per failed request, always on; `request` also logs successes,

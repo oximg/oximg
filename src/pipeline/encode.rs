@@ -15,6 +15,19 @@ pub(super) fn png_compression(p: &Params) -> png::Compression {
     }
 }
 
+/// Per-call override, else OXIMG_PNG_QUANTIZE(_COLORS): Some(palette
+/// size) when quantization applies. Off by default — silent quality
+/// loss on a lossless format must be a deliberate choice.
+pub(super) fn png_quantize(p: &Params) -> Option<u16> {
+    let cfg = crate::config::config();
+    let on = p.png_quantize.unwrap_or(cfg.png_quantize);
+    let colors = p
+        .png_quantize_colors
+        .unwrap_or(cfg.png_quantize_colors)
+        .clamp(2, 256);
+    on.then_some(colors)
+}
+
 pub(super) fn encode_png(
     pixels: &[u8],
     w: usize,
@@ -23,6 +36,14 @@ pub(super) fn encode_png(
     icc: Option<&[u8]>,
     p: &Params,
 ) -> Result<Vec<u8>> {
+    // Opaque output only: quantette has no alpha-aware quantizer, and
+    // approximating one (per-palette-cell alpha) would produce fringes
+    // exactly where alpha matters. Alpha sources stay lossless RGBA.
+    let quantized = if channels == 3 {
+        png_quantize(p).map(|colors| quantize_rgb(pixels, w, h, colors))
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(64 * 1024);
     // The no-profile arm constructs the encoder exactly as the pre-ICC
     // code did, keeping profile-less output byte-identical.
@@ -34,17 +55,52 @@ pub(super) fn encode_png(
         }
         None => png::Encoder::new(&mut out, w as u32, h as u32),
     };
-    enc.set_color(if channels == 4 {
-        png::ColorType::Rgba
-    } else {
-        png::ColorType::Rgb
-    });
     enc.set_depth(png::BitDepth::Eight);
     enc.set_compression(png_compression(p));
-    let mut writer = enc.write_header().context("PNG header")?;
-    writer.write_image_data(pixels).context("PNG encode")?;
-    writer.finish().context("PNG finish")?;
+    match &quantized {
+        Some((palette, indices)) => {
+            enc.set_color(png::ColorType::Indexed);
+            enc.set_palette(palette.as_slice());
+            let mut writer = enc.write_header().context("PNG header")?;
+            writer.write_image_data(indices).context("PNG encode")?;
+            writer.finish().context("PNG finish")?;
+        }
+        None => {
+            enc.set_color(if channels == 4 {
+                png::ColorType::Rgba
+            } else {
+                png::ColorType::Rgb
+            });
+            let mut writer = enc.write_header().context("PNG header")?;
+            writer.write_image_data(pixels).context("PNG encode")?;
+            writer.finish().context("PNG finish")?;
+        }
+    }
     Ok(out)
+}
+
+/// Wu color quantization (quantette) with Floyd-Steinberg dithering,
+/// single-threaded — request concurrency is the CPU semaphore's job.
+/// Returns (PLTE bytes, per-pixel indices).
+fn quantize_rgb(pixels: &[u8], w: usize, h: usize, colors: u16) -> (Vec<u8>, Vec<u8>) {
+    use quantette::deps::palette::Srgb;
+    let px: Vec<Srgb<u8>> = pixels
+        .chunks_exact(3)
+        .map(|c| Srgb::new(c[0], c[1], c[2]))
+        .collect();
+    let image =
+        quantette::ImageBuf::new(w as u32, h as u32, px).expect("pixel count matches dimensions");
+    let indexed = quantette::Pipeline::new()
+        .palette_size(quantette::PaletteSize::try_from(colors).expect("colors clamped to 2-256"))
+        .ditherer(quantette::dither::FloydSteinberg::new())
+        .input_image(image.as_ref())
+        .output_srgb8_indexed_image();
+    let (palette, indices) = indexed.into_parts();
+    let plte: Vec<u8> = palette
+        .into_iter()
+        .flat_map(|c| [c.red, c.green, c.blue])
+        .collect();
+    (plte, indices)
 }
 
 /// AVIF quality (libavif semantics): per-call override, else

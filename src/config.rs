@@ -28,6 +28,12 @@ pub(crate) struct Config {
     pub flatten_bg: [u8; 3],
     /// OXIMG_PNG_EFFORT: fastest / fast (default) / balanced / high.
     pub png_compression: png::Compression,
+    /// OXIMG_PNG_QUANTIZE ("1" enables palette quantization for opaque
+    /// PNG output; off by default — silent quality loss on a lossless
+    /// format must be a deliberate operator choice).
+    pub png_quantize: bool,
+    /// OXIMG_PNG_QUANTIZE_COLORS: palette size, 2-256.
+    pub png_quantize_colors: u16,
     /// OXIMG_WEBP_QUALITY.
     pub webp_quality: f32,
     /// OXIMG_WEBP_EFFORT (libwebp `method`, clamped 0-6 at use).
@@ -70,6 +76,8 @@ const KNOBS: &[&str] = &[
     "OXIMG_JPEG_PROGRESSIVE",
     "OXIMG_FLATTEN_BG",
     "OXIMG_PNG_EFFORT",
+    "OXIMG_PNG_QUANTIZE",
+    "OXIMG_PNG_QUANTIZE_COLORS",
     "OXIMG_WEBP_QUALITY",
     "OXIMG_WEBP_EFFORT",
     "OXIMG_WEBP_DECODE_THREADS",
@@ -126,9 +134,11 @@ pub(crate) fn validate() -> Result<(), String> {
         "OXIMG_ICC",
         "OXIMG_JPEG_PROGRESSIVE",
         "OXIMG_WEBP_DECODE_THREADS",
+        "OXIMG_PNG_QUANTIZE",
     ] {
         one_of(b, &["0", "1"])?;
     }
+    num("OXIMG_PNG_QUANTIZE_COLORS", 2i64, 256)?;
     one_of("OXIMG_OVERLAP", &["0", "1", "auto"])?;
     one_of("OXIMG_RESIZE", &["srgb", "linear"])?;
     one_of("OXIMG_RESIZE_BACKEND", &["fir", "kernel"])?;
@@ -185,6 +195,10 @@ pub(crate) fn config() -> &'static Config {
             Ok("high") => png::Compression::High,
             _ => png::Compression::Fast,
         },
+        png_quantize: std::env::var("OXIMG_PNG_QUANTIZE").as_deref() == Ok("1"),
+        png_quantize_colors: parsed::<u16>("OXIMG_PNG_QUANTIZE_COLORS")
+            .filter(|c| (2..=256).contains(c))
+            .unwrap_or(256),
         webp_quality: parsed("OXIMG_WEBP_QUALITY").unwrap_or(75.0),
         webp_effort: parsed("OXIMG_WEBP_EFFORT").unwrap_or(2),
         webp_decode_threads: std::env::var("OXIMG_WEBP_DECODE_THREADS").as_deref() != Ok("0"),

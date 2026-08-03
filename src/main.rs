@@ -682,7 +682,11 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         .as_ref()
         .map(|base| format!("{base}/{}", encode_upstream_path(file)));
     let images_root = Arc::clone(&app.images_dir);
-    let out = tokio::task::spawn_blocking(move || {
+    // The explicit return type pins `?`'s error to (StatusCode, String)
+    // — a dependency's blanket From impls otherwise make the inference
+    // ambiguous here.
+    type Processed = Result<(Vec<u8>, ImageFormat), pipeline::Error>;
+    let out = tokio::task::spawn_blocking(move || -> Result<Processed, (StatusCode, String)> {
         let _permit = permit; // hold the CPU slot for the whole processing
         // Streaming decode: the source is never buffered whole on the heap
         // (saves concurrency x file-size for large sources under load);

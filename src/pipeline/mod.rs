@@ -120,6 +120,13 @@ pub struct Params {
     pub webp_quality: Option<f32>,
     /// PNG encode effort (`OXIMG_PNG_EFFORT`, default fast).
     pub png_effort: Option<PngEffort>,
+    /// Palette-quantize opaque PNG output (`OXIMG_PNG_QUANTIZE`,
+    /// default off). Sources with an alpha channel always encode
+    /// lossless RGBA regardless of this setting.
+    pub png_quantize: Option<bool>,
+    /// Quantized palette size, 2-256 (`OXIMG_PNG_QUANTIZE_COLORS`,
+    /// default 256). Values outside the range are clamped.
+    pub png_quantize_colors: Option<u16>,
     /// Apply EXIF/AVIF orientation (`OXIMG_AUTO_ROTATE`, default on).
     pub auto_rotate: Option<bool>,
     /// Carry the source ICC profile into the output (`OXIMG_ICC`,
@@ -153,6 +160,8 @@ impl Default for Params {
             output: None,
             webp_quality: None,
             png_effort: None,
+            png_quantize: None,
+            png_quantize_colors: None,
             auto_rotate: None,
             icc: None,
             flatten_bg: None,
