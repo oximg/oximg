@@ -18,6 +18,11 @@ while resizing in linear light at measurably higher output quality
 
 - **HTTP resize service**: `GET /resize/{w}/{h}/{file}` fits the source
   within `w x h` (never enlarges) and re-encodes it in its own format.
+  `0` leaves an axis unconstrained: `/resize/750/0/…` is width-only
+  (height follows the aspect ratio — what `srcset` `w` descriptors and
+  Next.js loaders emit), `/resize/0/1024/…` height-only. Prefer that
+  over a large sentinel height, which silently narrows sources taller
+  than the sentinel's aspect ratio.
   `{file}` may span directories (`/resize/300/200/albums/2026/photo.jpg`),
   so S3-style prefixes and nested trees are addressable as-is. Sources
   come from a local directory or any HTTP(S) origin
@@ -226,6 +231,8 @@ IMAGES_DIR=./images PORT=8081 QUALITY=80 ./target/release/oximg   # = oximg serv
 ```sh
 oximg resize photo.jpg 1600 1600 out.webp     # fit within 1600x1600; format from the extension
 oximg resize photo.jpg 800 800 out.jpg -q 70  # JPEG quality 70 (--preset fast|small for mozjpeg)
+oximg resize photo.jpg 750 0 out.jpg          # width-only: height follows the aspect ratio
+oximg resize photo.jpg 0 0 out.webp           # 0 0 = re-encode at the source's own size
 oximg probe photo.webp                        # format + stored dimensions, header-only
 ```
 

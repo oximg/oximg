@@ -10,6 +10,22 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Width-only / height-only resize** ([#2]): `0` on one axis of
+  `/resize/{w}/{h}/{file}` leaves it unconstrained —
+  `/resize/750/0/photo.jpg` delivers the requested width with the
+  height following the aspect ratio, for any source shape. This
+  replaces the sentinel-height workaround (`h=8192`), which silently
+  narrowed sources taller than the sentinel's aspect ratio and
+  corrupted `srcset` width descriptors. Both axes `0` remains 400.
+  The CLI accepts the same spelling (`oximg resize in.jpg 750 0 out`),
+  where `0 0` additionally means "re-encode at the source's own size".
+  No library change: `Params` has always spelled unconstrained as
+  `u32::MAX`.
+
+[#2]: https://github.com/oximg/oximg/issues/2
+
 ## [0.7.0] - 2026-08-02
 
 Nested source paths: the adoption blocker for directory-organized
