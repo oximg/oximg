@@ -39,8 +39,12 @@ jobs:
           # weekly scheduled run digs for 15 minutes per target.
           secs=90
           [ "${{ github.event_name }}" = "schedule" ] && secs=900
+          # --target is explicit because the prebuilt cargo-fuzz binary
+          # is musl-linked and defaults to the triple it was compiled
+          # for — ASAN is incompatible with statically linked libc.
           for target in probe options_parse; do
-            cargo fuzz run "$target" -- -max_total_time="$secs" -rss_limit_mb=4096
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu \
+              -- -max_total_time="$secs" -rss_limit_mb=4096
           done
       - name: Upload crash artifacts
         if: failure()
