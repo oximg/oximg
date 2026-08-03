@@ -102,6 +102,30 @@ pub enum PngEffort {
 /// behavior byte-for-byte, `Some` takes precedence — so an embedder
 /// can run different settings per call, in one process, without
 /// touching the environment.
+///
+/// # Examples
+///
+/// Contradictory settings coexist in one process — the point of
+/// per-call overrides:
+///
+/// ```
+/// use oximg::pipeline::{ImageFormat, Params};
+///
+/// let thumbnail = Params {
+///     max_width: 100,
+///     max_height: 100,
+///     output: Some(ImageFormat::Webp),
+///     webp_quality: Some(40.0),
+///     ..Params::default()
+/// };
+/// let content = Params {
+///     max_width: 1600,
+///     max_height: 1600,
+///     webp_quality: Some(85.0),
+///     ..Params::default()
+/// };
+/// assert_ne!(thumbnail.webp_quality, content.webp_quality);
+/// ```
 #[derive(Clone, Debug)]
 pub struct Params {
     pub max_width: u32,
@@ -268,6 +292,21 @@ impl ImageFormat {
 /// auto-rotation on (the default), `process` fits and emits the
 /// *displayed* frame, so for orientations 5-8 its output axes are
 /// swapped relative to these dimensions.
+///
+/// # Examples
+///
+/// ```
+/// use oximg::pipeline::{self, ImageFormat};
+///
+/// let bytes = std::fs::read(concat!(
+///     env!("CARGO_MANIFEST_DIR"),
+///     "/tests/fixtures/photo.jpg"
+/// ))?;
+/// let (format, w, h) = pipeline::probe(&bytes)?;
+/// assert_eq!(format, ImageFormat::Jpeg);
+/// assert_eq!((w, h), (200, 150));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn probe(bytes: &[u8]) -> Result<(ImageFormat, usize, usize), Error> {
     probe_inner(bytes).map_err(|e| Error::classify(e, false))
 }
@@ -316,6 +355,32 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     }
 }
 
+/// Resize + re-encode a source held in memory: sniff the format by
+/// magic bytes, fit within the [`Params`] box (never enlarging), and
+/// encode in `p.output` (defaulting to the source's own format).
+///
+/// # Examples
+///
+/// ```
+/// use oximg::pipeline::{self, ImageFormat, Params};
+///
+/// let src = std::fs::read(concat!(
+///     env!("CARGO_MANIFEST_DIR"),
+///     "/tests/fixtures/photo.jpg"
+/// ))?;
+/// // Fit a 200x150 JPEG within 64x64 and transcode to WebP.
+/// let p = Params {
+///     max_width: 64,
+///     max_height: 64,
+///     output: Some(ImageFormat::Webp),
+///     ..Params::default()
+/// };
+/// let (bytes, format) = pipeline::process(&src, &p)?;
+/// assert_eq!(format, ImageFormat::Webp);
+/// let (_, w, h) = pipeline::probe(&bytes)?;
+/// assert_eq!((w, h), (64, 48), "aspect preserved inside the box");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
     process_reader(std::io::Cursor::new(bytes), p).map_err(|e| Error::classify(e, false))
 }
