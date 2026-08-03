@@ -10,7 +10,26 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **HTTP source fetches retry connection-level transients once**
+  ([#11]): reset/refused/DNS-blip failures at the request phase are
+  retried after 100ms — a GET is idempotent and no body bytes have
+  been consumed yet — so a single network blip becomes a slightly
+  slower response instead of a broken image at the CDN (the failure
+  mode behind a production rollback). Timeouts and origin status
+  codes are never retried, and neither are mid-body failures (the
+  streaming decoder has already consumed part of the stream).
+  `oximg_upstream_retries_total` makes the flakiness visible.
+
 ### Changed
+
+- The README now states the HTTP source mode's exposure prerequisite
+  ([#11]): the origin must be anonymously readable, which for an
+  object-store bucket means public objects — a posture change easy to
+  miss when migrating from an SDK-based fetcher.
+
+[#11]: https://github.com/oximg/oximg/issues/11
 
 - Reversed the `OXIMG_WORKERS` guidance for Cloud Run ([#10]
   follow-up measurement): the platform's `cpu` setting is a time
