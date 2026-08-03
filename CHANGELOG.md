@@ -10,6 +10,27 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Malformed JPEGs no longer panic** (found by the new fuzz harness):
+  mozjpeg reports fatal libjpeg errors — bogus Huffman tables, corrupt
+  scan data — by unwinding out of its C error handler, so such input
+  arrived as a panic rather than an `Err`. Both `probe` and the resize
+  path now unwind-guard the whole JPEG operation and classify it as
+  `Undecodable` (HTTP 422), keeping the libjpeg reason in the error
+  chain. Previously this surfaced as HTTP 500 for input that is the
+  client's fault, and would have aborted a `panic = "abort"` build.
+
+### Added
+
+- **Fuzz harness** for the hand-written parser layer (`cargo fuzz`
+  targets for `probe` and the options-route grammar), running 90s per
+  target on every push and 15 minutes weekly. The JPEG panic above was
+  its first finding.
+- Coverage floor in CI (`--fail-under-lines 80`; currently ~86%) and
+  rustdoc examples on `probe`/`process`/`Params`, so the library's
+  entry documentation is compiled and run.
+
 ## [0.7.4] - 2026-08-03
 
 The private-sources release (#11), written after a production cutover

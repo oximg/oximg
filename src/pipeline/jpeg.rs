@@ -13,8 +13,14 @@ pub fn decode_and_resize(
     max_h: u32,
     parallel: usize,
 ) -> Result<(Vec<u8>, usize, usize), super::Error> {
-    decode_and_resize_inner(jpeg, max_w, max_h, parallel)
-        .map_err(|e| super::Error::classify(e, false))
+    // Unwind-guarded end to end: libjpeg reports fatal errors by
+    // unwinding out of mozjpeg's C error handler, at the header parse
+    // or any later stage (see panic_guard).
+    crate::panic_guard::catch_unwind_as_error("JPEG decode", || {
+        decode_and_resize_inner(jpeg, max_w, max_h, parallel)
+    })
+    .and_then(|inner| inner)
+    .map_err(|e| super::Error::classify(e, false))
 }
 
 fn decode_and_resize_inner(

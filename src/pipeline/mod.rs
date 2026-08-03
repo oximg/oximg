@@ -318,8 +318,17 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
     match format {
         ImageFormat::Jpeg => {
-            let dec = Decompress::new_mem(bytes).context("parse JPEG")?;
-            let (w, h) = dec.size();
+            // mozjpeg reports fatal libjpeg errors by unwinding out of
+            // its C error handler, so a malformed header is a panic,
+            // not an Err — caught here so it classifies as undecodable
+            // input (422) instead of taking the request, or under
+            // panic=abort the process, down. Found by fuzzing: a
+            // 4-component Adobe-marked JPEG whose SOF0 disagrees with
+            // its component table panics inside jpeg_read_header.
+            let (w, h) = crate::panic_guard::catch_unwind_as_error("JPEG header parse", || {
+                Decompress::new_mem(bytes).map(|dec| dec.size())
+            })?
+            .context("parse JPEG")?;
             Ok((format, w, h))
         }
         ImageFormat::Png => {
@@ -410,7 +419,14 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         let out = match format {
-            ImageFormat::Jpeg => jpeg::process_jpeg(s, reader, target, p)?,
+            // The whole JPEG decode is unwind-guarded, not just the
+            // header parse: libjpeg signals fatal errors (bogus
+            // Huffman tables, corrupt scan data) by unwinding out of
+            // mozjpeg's C error handler at whichever stage hits them,
+            // and every one of them is undecodable client input.
+            ImageFormat::Jpeg => crate::panic_guard::catch_unwind_as_error("JPEG decode", || {
+                jpeg::process_jpeg(s, reader, target, p)
+            })??,
             ImageFormat::Png => process_png(s, reader, target, p)?,
             ImageFormat::Webp => process_webp(s, reader, target, p)?,
             #[cfg(feature = "avif")]

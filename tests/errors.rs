@@ -60,3 +60,27 @@ fn avif_without_feature_is_undecodable() {
     let e = pipeline::process_path(fixture.as_ref(), &p).expect_err("must fail");
     assert_eq!(e.kind(), ErrorKind::Undecodable);
 }
+
+/// Regression, found by fuzzing `probe`: mozjpeg reports fatal libjpeg
+/// errors by unwinding out of its C error handler, so a malformed
+/// header arrived as a panic rather than an Err — a 500 (or, under
+/// panic=abort, a dead process) for what is undecodable client input.
+/// Both entry points must classify it as Undecodable and keep the
+/// libjpeg reason in the chain.
+#[test]
+fn bogus_jpeg_header_is_undecodable_not_a_panic() {
+    let fixture = format!(
+        "{}/tests/fixtures/bogus_huffman.jpg",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let bytes = std::fs::read(&fixture).expect("read fixture");
+
+    let e = pipeline::probe(&bytes).expect_err("must fail");
+    assert_eq!(e.kind(), ErrorKind::Undecodable);
+    let chain = format!("{e:#}");
+    assert!(chain.contains("Bogus Huffman"), "{chain}");
+
+    // The resize path takes the same guard.
+    let e = pipeline::process(&bytes, &Params::default()).expect_err("must fail");
+    assert_eq!(e.kind(), ErrorKind::Undecodable);
+}

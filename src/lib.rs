@@ -1,3 +1,4 @@
+mod panic_guard;
 pub mod pipeline;
 
 pub(crate) mod config;

@@ -9,57 +9,16 @@ pub(super) const EAGAIN: std::os::raw::c_int = 11;
 #[cfg(not(target_os = "linux"))]
 pub(super) const EAGAIN: std::os::raw::c_int = 35;
 
-thread_local! {
-    /// Set while the deliberately unwind-caught avif-parse call runs, so
-    /// the filtering panic hook stays silent for it: without this, every
-    /// attacker-supplied malformed AVIF would print a crash-shaped trace
-    /// (and, under RUST_BACKTRACE, serialize on the global backtrace
-    /// lock) even though the request fails cleanly.
-    static SUPPRESS_PANIC_LOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Install (once) a panic hook that skips logging for panics this
-/// module catches on purpose and delegates to the previous hook for
-/// everything else.
-pub(super) fn install_quiet_panic_hook() {
-    static HOOK: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    HOOK.get_or_init(|| {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if !SUPPRESS_PANIC_LOG.with(|s| s.get()) {
-                prev(info);
-            }
-        }));
-    });
-}
-
 /// avif-parse can panic on truncated/malformed containers (internal
 /// parser-state assertions, observed in 2.1.0); malformed input must
-/// surface as a parse error, not a crash, so the call is unwind-caught.
-/// The crate is pure Rust and the input is a shared slice, so no state
-/// can be left torn.
+/// surface as a parse error, not a crash, so the call is unwind-caught
+/// by the shared guard. The crate is pure Rust and the input is a
+/// shared slice, so no state can be left torn.
 pub(super) fn read_avif_container(data: &[u8]) -> Result<avif_parse::AvifData> {
-    install_quiet_panic_hook();
-    struct Unsuppress;
-    impl Drop for Unsuppress {
-        fn drop(&mut self) {
-            SUPPRESS_PANIC_LOG.with(|s| s.set(false));
-        }
-    }
-    SUPPRESS_PANIC_LOG.with(|s| s.set(true));
-    let _guard = Unsuppress;
-    match std::panic::catch_unwind(|| avif_parse::read_avif(&mut std::io::Cursor::new(data))) {
-        Ok(parsed) => parsed.context("parse AVIF container"),
-        // Keep the assertion text: it identifies which upstream bug fired.
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("non-string panic payload");
-            Err(anyhow::anyhow!("AVIF container parse panicked: {msg}"))
-        }
-    }
+    crate::panic_guard::catch_unwind_as_error("AVIF container parse", || {
+        avif_parse::read_avif(&mut std::io::Cursor::new(data))
+    })?
+    .context("parse AVIF container")
 }
 
 // ---------------------------------------------------------------------
