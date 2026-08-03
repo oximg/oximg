@@ -1,0 +1,51 @@
+# Smoke-fuzz the hand-written parser layer on every main push (short),
+# with a deeper weekly run. Crashing inputs upload as artifacts so a
+# red run is immediately reproducible with `cargo fuzz run <target>
+# <artifact>`.
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake nasm pkg-config
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Fuzz
+        run: |
+          # 90s per target keeps the push feedback loop tight; the
+          # weekly scheduled run digs for 15 minutes per target.
+          secs=90
+          [ "${{ github.event_name }}" = "schedule" ] && secs=900
+          for target in probe options_parse; do
+            cargo fuzz run "$target" -- -max_total_time="$secs" -rss_limit_mb=4096
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

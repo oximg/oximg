@@ -1,0 +1,30 @@
+# Fuzz targets for the hand-written parser layer (cargo-fuzz; needs
+# nightly). The upstream C codecs carry their own fuzzers — these
+# cover what this repo wrote itself: the format sniff + header
+# parsers behind `probe`, and the options-route grammar.
+[package]
+name = "oximg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Library core only: probe and ImageFormat need no HTTP stack, and a
+# lean build keeps fuzz iteration fast.
+oximg = { path = "..", default-features = false }
+
+[[bin]]
+name = "probe"
+path = "fuzz_targets/probe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "options_parse"
+path = "fuzz_targets/options_parse.rs"
+test = false
+doc = false
