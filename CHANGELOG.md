@@ -23,8 +23,26 @@ HTTP interface without notice.
   where `0 0` additionally means "re-encode at the source's own size".
   No library change: `Params` has always spelled unconstrained as
   `u32::MAX`.
+- **Opt-in PNG palette quantization** ([#5]): `OXIMG_PNG_QUANTIZE=1`
+  encodes opaque PNG output as an indexed palette (Wu quantization
+  with Floyd–Steinberg dithering, via `quantette`;
+  `OXIMG_PNG_QUANTIZE_COLORS`, default 256) — typically a ~3x byte
+  reduction on photographic PNGs, near-exact on flat graphics. Off by
+  default: quality loss on a lossless format must be a deliberate
+  operator choice. Sources with alpha always encode lossless RGBA
+  (quantette has no alpha-aware quantizer; approximating one would
+  fringe exactly where alpha matters). The `@png` explicit token is
+  governed by the same knob — encode settings are keyed by the output
+  format. `Params` gains matching `png_quantize` /
+  `png_quantize_colors` per-call overrides. ICC profiles pass through
+  the indexed encode unchanged.
+
+### Changed
+
+- MSRV 1.89 → 1.90 (required by `quantette`).
 
 [#2]: https://github.com/oximg/oximg/issues/2
+[#5]: https://github.com/oximg/oximg/issues/5
 
 ## [0.7.0] - 2026-08-02
 
