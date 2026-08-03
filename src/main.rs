@@ -254,6 +254,12 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         .with_state(app);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    // Install the signal handlers BEFORE announcing readiness: the
+    // listening line is the "safe to manage this process" signal, and
+    // a SIGTERM racing in after it must drain, never hit the default
+    // disposition. (shutdown_signal() registers the OS handlers
+    // synchronously; only the wait is deferred to the future.)
+    let shutdown = shutdown_signal();
     // Report the *bound* port: PORT=0 asks the OS for a free one (the
     // test harness relies on this line to discover it).
     let bound = listener.local_addr()?.port();
@@ -262,7 +268,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         images_dir.display()
     );
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown)
         .await?;
     eprintln!("oximg: shutdown complete");
     Ok(())
@@ -276,24 +282,34 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
 /// (docker stop and Cloud Run 10s, Kubernetes
 /// terminationGracePeriodSeconds), which backstops a response that
 /// never finishes.
+/// Not an `async fn` on purpose: `signal()` registers the OS handlers
+/// at the call, so callers can install them eagerly (before the
+/// listening line invites an orchestrator to send signals) — an async
+/// fn would defer installation to the first poll, leaving a window
+/// where SIGTERM kills via the default disposition instead of
+/// draining (observed as a CI-only test failure).
 #[cfg(unix)]
-async fn shutdown_signal() {
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
     let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    let name = tokio::select! {
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-    };
-    eprintln!("oximg: {name} received, draining in-flight requests");
+    async move {
+        let name = tokio::select! {
+            _ = term.recv() => "SIGTERM",
+            _ = int.recv() => "SIGINT",
+        };
+        eprintln!("oximg: {name} received, draining in-flight requests");
+    }
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("install ctrl-C handler");
-    eprintln!("oximg: ctrl-C received, draining in-flight requests");
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
+    async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl-C handler");
+        eprintln!("oximg: ctrl-C received, draining in-flight requests");
+    }
 }
 
 /// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
