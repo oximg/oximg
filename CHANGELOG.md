@@ -37,9 +37,33 @@ HTTP interface without notice.
   `png_quantize_colors` per-call overrides. ICC profiles pass through
   the indexed encode unchanged.
 
+- **Upstream fetch deadlines** ([#4]): `OXIMG_UPSTREAM_TIMEOUT` (30s,
+  whole fetch — the bound on how long a stalled origin can hold one of
+  the core-count CPU permits) and `OXIMG_UPSTREAM_CONNECT_TIMEOUT`
+  (5s) replace the hardcoded 30s global timeout. Timeouts answer
+  **504** via the new `ErrorKind::UpstreamTimeout` (non-breaking: the
+  enum is `#[non_exhaustive]`), distinct from other upstream failures'
+  502.
+- **Metrics surface** ([#4]): `OXIMG_METRICS=1` serves a Prometheus
+  text page at `/metrics` — requests by status class and resolved
+  output format, upstream fetch outcomes (`ok`/`not_found`/`timeout`/
+  `error`), latency histograms split into CPU-permit queue wait vs
+  processing, permit and in-flight gauges, and singleflight
+  leader/follower counters. In-tree exposition, no new dependencies;
+  off by default, and the route sits outside the URL-signing scheme —
+  expose it to the scrape network only.
+
+### Fixed
+
+- Signal handlers are installed before the "listening on" line: a
+  SIGTERM racing in right after readiness was announced could hit the
+  default disposition and kill the process instead of draining.
+
 ### Changed
 
 - MSRV 1.89 → 1.90 (required by `quantette`).
+
+[#4]: https://github.com/oximg/oximg/issues/4
 
 [#2]: https://github.com/oximg/oximg/issues/2
 [#5]: https://github.com/oximg/oximg/issues/5
