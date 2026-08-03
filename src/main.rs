@@ -35,16 +35,26 @@ type FlightKey = (u32, u32, String, Option<ImageFormat>, Option<u8>);
 type FlightResult = Result<(Bytes, &'static str), (StatusCode, String)>;
 type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>>;
 
+/// Where sources come from when OXIMG_SOURCE_BASE_URL is set. The
+/// scheme selects the transport: http(s):// is the anonymous HTTP
+/// mode, gs:// reads a private GCS bucket with GCP-attached
+/// credentials (issue #11). The base is operator-configured, so user
+/// input never chooses the host (no SSRF surface).
+#[derive(Clone)]
+enum SourceMode {
+    Http(Arc<str>),
+    Gcs {
+        bucket: Arc<str>,
+        prefix: Option<Arc<str>>,
+    },
+}
+
 #[derive(Clone)]
 struct App {
     /// OXIMG_LOG=request also logs successes; failures always log.
     log_requests: bool,
     images_dir: Arc<PathBuf>,
-    // When set (OXIMG_SOURCE_BASE_URL), sources are fetched from
-    // `<base>/<file>` over HTTP instead of the local filesystem. The base
-    // is operator-configured, so user input never chooses the host (no
-    // SSRF surface).
-    source_base: Option<Arc<str>>,
+    source: Option<SourceMode>,
     cpu_slots: Arc<Semaphore>,
     /// Total CPU permits (= core count); the /metrics permits-in-use
     /// gauge is workers minus available permits at scrape time.
@@ -242,9 +252,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
 
     let app = App {
         images_dir: Arc::new(images_dir.clone()),
-        source_base: std::env::var("OXIMG_SOURCE_BASE_URL")
-            .ok()
-            .map(|s| Arc::from(s.trim_end_matches('/'))),
+        source: source_mode_from_env(),
         cpu_slots: Arc::new(Semaphore::new(workers)),
         workers,
         quality: env_or("QUALITY", 80.0),
@@ -265,6 +273,19 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
     };
     if app.signing.is_some() {
         eprintln!("oximg: URL signing enabled");
+    }
+    if let Some(SourceMode::Gcs { bucket, prefix }) = &app.source {
+        // Fail closed at boot: a gs:// mode without reachable
+        // credentials must refuse to start, not 502 on the first
+        // cache miss. One local metadata-server round trip.
+        if let Err(e) = pipeline::gcs_startup() {
+            eprintln!("oximg: fatal: {e}");
+            std::process::exit(2);
+        }
+        match prefix {
+            Some(p) => eprintln!("oximg: gcs source enabled (bucket {bucket:?}, prefix {p:?})"),
+            None => eprintln!("oximg: gcs source enabled (bucket {bucket:?})"),
+        }
     }
     if !app.auto_format.is_empty() {
         eprintln!(
@@ -395,6 +416,48 @@ fn options_prefix_from_env() -> Option<String> {
         }
     }
     Some(v)
+}
+
+/// OXIMG_SOURCE_BASE_URL: scheme-dispatched source location.
+/// http(s):// keeps the anonymous HTTP mode byte-for-byte; gs://
+/// selects the GCS mode (bucket + optional key prefix). Anything else
+/// is fatal — a typo'd scheme must not silently fall back to a mode
+/// that needs a public bucket (issue #11's exposure trap in reverse).
+fn source_mode_from_env() -> Option<SourceMode> {
+    let raw = std::env::var("OXIMG_SOURCE_BASE_URL").ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let fatal = |why: &str| -> ! {
+        eprintln!("oximg: fatal: OXIMG_SOURCE_BASE_URL={raw:?} {why}");
+        std::process::exit(2);
+    };
+    if let Some(rest) = v.strip_prefix("gs://") {
+        let rest = rest.trim_matches('/');
+        let (bucket, prefix) = match rest.split_once('/') {
+            Some((b, p)) => (b, Some(p.trim_matches('/'))),
+            None => (rest, None),
+        };
+        if bucket.is_empty()
+            || !bucket.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+            })
+        {
+            fatal("has an invalid bucket name");
+        }
+        return Some(SourceMode::Gcs {
+            bucket: Arc::from(bucket),
+            prefix: prefix.filter(|p| !p.is_empty()).map(Arc::from),
+        });
+    }
+    if v.starts_with("s3://") {
+        fatal("s3:// is not supported yet (see issue #11; use an HTTPS endpoint meanwhile)");
+    }
+    if v.starts_with("http://") || v.starts_with("https://") {
+        return Some(SourceMode::Http(Arc::from(v.trim_end_matches('/'))));
+    }
+    fatal("must be http(s):// or gs://");
 }
 
 /// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
@@ -948,12 +1011,28 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             params.avif_quality = Some(*q);
         }
     }
-    let source_url = app
-        .source_base
-        .as_ref()
-        .map(|base| format!("{base}/{}", encode_upstream_path(file)));
+    // Resolve the fetch target outside the blocking task: the URL for
+    // the HTTP mode, the encoded (prefixed) key for the GCS mode.
+    enum Fetch {
+        Url(String),
+        Gcs { bucket: String, key: String },
+        Local,
+    }
+    let fetch = match &app.source {
+        Some(SourceMode::Http(base)) => {
+            Fetch::Url(format!("{base}/{}", encode_upstream_path(file)))
+        }
+        Some(SourceMode::Gcs { bucket, prefix }) => Fetch::Gcs {
+            bucket: bucket.to_string(),
+            key: match prefix {
+                Some(p) => encode_upstream_path(&format!("{p}/{file}")),
+                None => encode_upstream_path(file),
+            },
+        },
+        None => Fetch::Local,
+    };
     let images_root = Arc::clone(&app.images_dir);
-    let remote = app.source_base.is_some();
+    let remote = app.source.is_some();
     let t_process = std::time::Instant::now();
     // The explicit return type pins `?`'s error to (StatusCode, String)
     // — a dependency's blanket From impls otherwise make the inference
@@ -964,9 +1043,10 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         // Streaming decode: the source is never buffered whole on the heap
         // (saves concurrency x file-size for large sources under load);
         // for remote sources decoding overlaps the download.
-        match source_url {
-            Some(url) => Ok(pipeline::process_url(&url, &params)),
-            None => {
+        match fetch {
+            Fetch::Url(url) => Ok(pipeline::process_url(&url, &params)),
+            Fetch::Gcs { bucket, key } => Ok(pipeline::process_gcs(&bucket, &key, &params)),
+            Fetch::Local => {
                 verify_within_root(&images_root, &path)?;
                 Ok(pipeline::process_path(&path, &params))
             }

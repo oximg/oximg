@@ -306,9 +306,17 @@ before the origin fetch, so a percent in a name is never double-decoded
 upstream.
 
 Environment variables: `PORT` (8081), `IMAGES_DIR` (./images),
-`OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` over HTTP
-instead of the local filesystem; streaming decode overlaps the
-download. Connection-level transients — reset, refused, DNS blips —
+`OXIMG_SOURCE_BASE_URL` (fetch sources from `<base>/<file>` instead of
+the local filesystem; the scheme selects the transport. `https://` is
+the anonymous HTTP mode; **`gs://bucket[/prefix]` reads a private GCS
+bucket directly** with GCP-attached credentials — GKE Workload
+Identity, Cloud Run, and GCE metadata credentials all work, tokens are
+cached and refreshed, and boot fails closed with a clear message if no
+credentials are reachable. No public bucket, no egress through a
+public endpoint, and SDK-style retries on 429/5xx. (`service_account`
+JSON keys are not supported — on GCP use Workload Identity; off GCP
+use the HTTP mode. `s3://` is planned, see issue #11.) Streaming
+decode overlaps the download in every mode. Connection-level transients — reset, refused, DNS blips —
 are retried once before any body bytes are consumed, so a single
 network blip is a slightly slower response instead of a broken image;
 `oximg_upstream_retries_total` counts them. **Exposure prerequisite**:
@@ -317,7 +325,10 @@ readable — for an object-store bucket that means public objects, and
 anyone who can guess a path can fetch the original at full resolution,
 bypassing every resize/signing/CDN control in front. Weigh that before
 pointing this at a bucket that was private under an SDK-based
-fetcher), `OXIMG_WORKERS` (unset = the parallelism the container
+fetcher), `OXIMG_GCS_ENDPOINT` (`https://storage.googleapis.com`; override for
+Private Service Connect endpoints or emulators — `GCE_METADATA_HOST`
+is honored the same way for the token source),
+`OXIMG_WORKERS` (unset = the parallelism the container
 observes, which is the right default almost everywhere — including
 platforms like Cloud Run whose `cpu` setting is a time quota, not a
 core count, where "pinning to the billed number" measured 17-36%

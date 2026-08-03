@@ -827,6 +827,7 @@ dependencies = [
  "pic-scale",
  "png",
  "quantette",
+ "serde_json",
  "sha2",
  "tokio",
  "ureq",

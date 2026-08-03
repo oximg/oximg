@@ -23,6 +23,9 @@ anyhow = "1"
 mimalloc = { version = "0.1.52", optional = true }
 jpegli = "0.1.0"
 ureq = { version = "3.3.0", optional = true }
+# Already in the tree via axum's default `json` feature; declared here so
+# the gs:// source path can parse token responses without hand-rolling JSON.
+serde_json = { version = "1", optional = true }
 png = "0.18.1"
 libwebp-sys = { version = "0.14", features = ["neon"] }
 hmac = { version = "0.13.0", optional = true }
@@ -45,7 +48,7 @@ pic-scale = "0.7"
 # `pipeline` API build with `--no-default-features` to drop the whole
 # HTTP stack (axum, tokio, ureq, hmac, sha2).
 default = ["server"]
-server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:hmac", "dep:sha2"]
+server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:hmac", "dep:sha2", "dep:serde_json"]
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
 # Re-exposes the internal SIMD resize kernels for the resize_bench
 # examples; not part of the public API.

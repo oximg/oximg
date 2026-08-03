@@ -500,6 +500,27 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Erro
     process_url_inner(url, p).map_err(|e| Error::classify(e, true))
 }
 
+/// GCS-source variant (`gs://` mode): fetch `key` from `bucket` with
+/// GCP-attached credentials and stream it into the decoder, same
+/// contract as [`process_url`]. `key` must already be percent-encoded
+/// segment-wise. Requires the `server` feature.
+#[cfg(feature = "server")]
+pub fn process_gcs(bucket: &str, key: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    let inner = || -> Result<(Vec<u8>, ImageFormat)> {
+        let resp = gcs::fetch(bucket, key)?;
+        process_response(resp, p)
+    };
+    inner().map_err(|e| Error::classify(e, true))
+}
+
+/// Startup credential probe for the `gs://` mode — the server calls
+/// this at boot so a missing metadata server refuses to start instead
+/// of failing on the first cache miss.
+#[cfg(feature = "server")]
+pub fn gcs_startup() -> Result<(), String> {
+    gcs::startup()
+}
+
 #[cfg(feature = "server")]
 fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     let map_fetch_err = |e: ureq::Error| match e {
@@ -891,6 +912,8 @@ mod encode;
 mod error;
 mod formats;
 mod fuse;
+#[cfg(feature = "server")]
+mod gcs;
 mod jpeg;
 #[cfg(test)]
 mod tests;
