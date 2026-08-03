@@ -26,8 +26,11 @@ pub(crate) struct Config {
     pub jpegli_progressive: bool,
     /// OXIMG_FLATTEN_BG: alpha→JPEG flatten background, RRGGBB hex.
     pub flatten_bg: [u8; 3],
-    /// OXIMG_PNG_EFFORT: fastest / fast (default) / balanced / high.
-    pub png_compression: png::Compression,
+    /// OXIMG_PNG_EFFORT: fastest / fast / balanced / high. `None` =
+    /// unset, so the effective default can depend on the path: `fast`
+    /// for lossless output, `balanced` when quantization is active
+    /// (see `pipeline::encode::png_compression`).
+    pub png_compression: Option<png::Compression>,
     /// OXIMG_PNG_QUANTIZE ("1" enables palette quantization for opaque
     /// PNG output; off by default — silent quality loss on a lossless
     /// format must be a deliberate operator choice).
@@ -200,13 +203,14 @@ pub(crate) fn config() -> &'static Config {
             })
             .unwrap_or([255, 255, 255]),
         png_compression: match std::env::var("OXIMG_PNG_EFFORT").as_deref() {
-            Ok("fastest") => png::Compression::Fastest,
+            Ok("fastest") => Some(png::Compression::Fastest),
+            Ok("fast") => Some(png::Compression::Fast),
             // Balanced spends ~15ms/request more than Fast to shave
             // ~14% of the file; Fast still undercuts libvips' default
             // output size.
-            Ok("balanced") => png::Compression::Balanced,
-            Ok("high") => png::Compression::High,
-            _ => png::Compression::Fast,
+            Ok("balanced") => Some(png::Compression::Balanced),
+            Ok("high") => Some(png::Compression::High),
+            _ => None,
         },
         png_quantize: std::env::var("OXIMG_PNG_QUANTIZE").as_deref() == Ok("1"),
         png_quantize_colors: parsed::<u16>("OXIMG_PNG_QUANTIZE_COLORS")

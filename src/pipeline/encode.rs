@@ -4,14 +4,29 @@
 
 use super::*;
 
-/// Per-call override, else OXIMG_PNG_EFFORT.
-pub(super) fn png_compression(p: &Params) -> png::Compression {
+/// Per-call override, else OXIMG_PNG_EFFORT, else a path-dependent
+/// default: `fast` for lossless output, `balanced` when this encode
+/// actually quantizes. Field data (issue #5): on quantized output,
+/// `balanced` nearly doubles the byte reduction over `fast` (1.7x ->
+/// 3.0x against lossless) while `high` adds only ~1% more — and the
+/// extra CPU is confined to a path the operator explicitly opted
+/// into. The lossless default stays `fast`, where effort buys much
+/// less; `quantizing` is per-encode, not per-knob, so alpha sources
+/// (which skip quantization) keep their bytes regardless of the
+/// quantize setting.
+pub(super) fn png_compression(p: &Params, quantizing: bool) -> png::Compression {
     match p.png_effort {
         Some(PngEffort::Fastest) => png::Compression::Fastest,
         Some(PngEffort::Fast) => png::Compression::Fast,
         Some(PngEffort::Balanced) => png::Compression::Balanced,
         Some(PngEffort::High) => png::Compression::High,
-        None => crate::config::config().png_compression,
+        None => crate::config::config().png_compression.unwrap_or({
+            if quantizing {
+                png::Compression::Balanced
+            } else {
+                png::Compression::Fast
+            }
+        }),
     }
 }
 
@@ -56,7 +71,7 @@ pub(super) fn encode_png(
         None => png::Encoder::new(&mut out, w as u32, h as u32),
     };
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png_compression(p));
+    enc.set_compression(png_compression(p, quantized.is_some()));
     match &quantized {
         Some((palette, indices)) => {
             enc.set_color(png::ColorType::Indexed);

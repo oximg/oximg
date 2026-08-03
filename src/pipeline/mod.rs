@@ -118,7 +118,9 @@ pub struct Params {
     pub output: Option<ImageFormat>,
     /// WebP encode quality (`OXIMG_WEBP_QUALITY`, default 75).
     pub webp_quality: Option<f32>,
-    /// PNG encode effort (`OXIMG_PNG_EFFORT`, default fast).
+    /// PNG encode effort (`OXIMG_PNG_EFFORT`). Unset, the default
+    /// depends on the path: fast for lossless output, balanced when
+    /// quantization is active (where effort buys ~2x the reduction).
     pub png_effort: Option<PngEffort>,
     /// Palette-quantize opaque PNG output (`OXIMG_PNG_QUANTIZE`,
     /// default off). Sources with an alpha channel always encode
