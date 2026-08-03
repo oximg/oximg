@@ -1684,3 +1684,218 @@ fn metrics_split_upstream_outcomes() {
         1.0
     );
 }
+
+/// Issue #9: the Cloudflare Images option grammar. Not mounted unless
+/// OXIMG_OPTIONS_PREFIX is set; mounted, the option list drives
+/// dimensions, quality, and format, the filename is literal (no @fmt
+/// token on this route), and rejections name the offending key.
+#[test]
+fn options_route_speaks_the_cloudflare_grammar() {
+    let off = Server::start(&[]);
+    assert_eq!(
+        off.status_of("/image/width=100/photo.jpg"),
+        404,
+        "not mounted by default"
+    );
+    drop(off);
+
+    let s = Server::start(&[("OXIMG_OPTIONS_PREFIX", "/image".into())]);
+
+    // width-only follows the aspect ratio (photo.jpg is 200x150).
+    let (status, ct, body) = s.get("/image/width=100/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+
+    // format= transcodes; nested paths work as on the positional route.
+    let dir = nested_images_dir("options");
+    drop(s);
+    let s = Server::start(&[
+        ("OXIMG_OPTIONS_PREFIX", "/image".into()),
+        ("IMAGES_DIR", dir.to_str().unwrap().to_string()),
+    ]);
+    let (status, ct, body) = s
+        .get("/image/width=100,format=webp/albums/2026/photo.jpg")
+        .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/webp");
+    let (fmt, w, _) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+    assert_eq!(w, 100);
+
+    // quality= steers the encoder per request...
+    let q20 = s
+        .get("/image/width=100,quality=20/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    let q95 = s
+        .get("/image/width=100,quality=95/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    assert!(
+        q20.len() < q95.len(),
+        "q20 ({}) must be smaller than q95 ({})",
+        q20.len(),
+        q95.len()
+    );
+    // ...for webp output too (the option applies to whatever format
+    // the output resolves to).
+    let wq20 = s
+        .get("/image/width=100,quality=20,format=webp/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    let wq95 = s
+        .get("/image/width=100,quality=95,format=webp/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    assert!(wq20.len() < wq95.len());
+
+    // Option order does not change the bytes (parsed values key the
+    // coalescing, not the raw string).
+    let a = s
+        .get("/image/width=100,quality=80/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    let b = s
+        .get("/image/quality=80,width=100/albums/2026/photo.jpg")
+        .unwrap()
+        .2;
+    assert_eq!(a, b);
+
+    // The grammar rejections, end to end.
+    for url in [
+        "/image/width=100,fit=cover/albums/2026/photo.jpg", // unknown key
+        "/image/width=100,width=50/albums/2026/photo.jpg",  // duplicate
+        "/image/quality=80/albums/2026/photo.jpg",          // no dimension
+        "/image/width=9000/albums/2026/photo.jpg",          // over cap
+        "/image/width=100,quality=0/albums/2026/photo.jpg", // range
+        "/image/width=100,format=gif/albums/2026/photo.jpg",
+    ] {
+        assert_eq!(s.status_of(url), 400, "{url}");
+    }
+    // Traversal guards apply on this route too.
+    assert_eq!(
+        s.status_of("/image/width=100/%2e%2e/secret.jpg"),
+        400,
+        "traversal refused"
+    );
+
+    // No @fmt token grammar here: the filename is literal, so the
+    // suffixed name simply does not exist.
+    assert_eq!(
+        s.status_of("/image/width=100/albums/2026/photo.jpg@webp"),
+        404,
+        "options route takes the filename literally"
+    );
+}
+
+/// format=auto (and an absent format) run the same Accept negotiation
+/// as a bare positional URL, Vary rules included.
+#[test]
+fn options_route_negotiates_like_the_positional_route() {
+    let s = Server::start(&[
+        ("OXIMG_OPTIONS_PREFIX", "/image".into()),
+        ("OXIMG_AUTO_FORMAT", "webp".into()),
+    ]);
+    for url in [
+        "/image/width=100,format=auto/photo.jpg",
+        "/image/width=100/photo.jpg",
+    ] {
+        let (status, ct, vary, _) = s.get_accept(url, Some("image/webp,*/*")).unwrap();
+        assert_eq!(status, 200, "{url}");
+        assert_eq!(ct, "image/webp", "{url}");
+        assert_eq!(vary.as_deref(), Some("Accept"), "{url}");
+    }
+    // An explicit format= wins over negotiation.
+    let (_, ct, _, _) = s
+        .get_accept(
+            "/image/width=100,format=jpeg/photo.jpg",
+            Some("image/webp,*/*"),
+        )
+        .unwrap();
+    assert_eq!(ct, "image/jpeg");
+}
+
+/// Signing covers the options route with the same scheme: the decoded
+/// path (prefix, raw option order, nested file) is the signed
+/// material, an unsigned request is refused while signing is on, and
+/// a signature never authorizes different options.
+#[test]
+fn signed_urls_cover_the_options_route() {
+    let key = "deadbeef".repeat(8);
+    let salt = "cafebabe".repeat(8);
+    let s = Server::start(&[
+        ("OXIMG_OPTIONS_PREFIX", "/image".into()),
+        ("OXIMG_KEY", key),
+        ("OXIMG_SALT", salt),
+    ]);
+    assert_eq!(
+        s.status_of("/image/width=100,quality=80/photo.jpg"),
+        403,
+        "unsigned options URL refused while signing is enabled"
+    );
+    // Precomputed with python hmac over
+    // "/image/width=100,quality=80/photo.jpg" (same key/salt/scheme as
+    // signing_gate).
+    let sig = "3L75Z6c-9s0175zccq1KSndX9lTfEkuk0VciL8PXwPA";
+    let (status, ct, _) = s
+        .get(&format!("/{sig}/image/width=100,quality=80/photo.jpg"))
+        .unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    // The signature covers the raw option string: different options
+    // (here: a different quality) do not verify...
+    assert_eq!(
+        s.status_of(&format!("/{sig}/image/width=100,quality=20/photo.jpg")),
+        403
+    );
+    // ...and neither does the same option set spelled in another order.
+    assert_eq!(
+        s.status_of(&format!("/{sig}/image/quality=80,width=100/photo.jpg")),
+        403,
+        "signed material is the raw path, order included"
+    );
+    let sig_plain = "w-W-i0ZiV_9i2RiBO4La4E0I_2dR4m7nmSg3Crqgfjk";
+    assert_eq!(
+        s.status_of(&format!("/{sig_plain}/image/width=100/photo.jpg")),
+        200
+    );
+}
+
+/// A misconfigured options prefix refuses to boot, fail-closed like
+/// every other startup setting.
+#[test]
+fn invalid_options_prefix_refuses_to_boot() {
+    for bad in [
+        "image",
+        "/resize",
+        "/resize/x",
+        "/health",
+        "/a//b",
+        "/a/../b",
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .env("OXIMG_OPTIONS_PREFIX", bad)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let mut status = None;
+        for _ in 0..200 {
+            if let Ok(Some(s)) = child.try_wait() {
+                status = Some(s);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let Some(status) = status else {
+            let _ = child.kill();
+            panic!("server booted despite OXIMG_OPTIONS_PREFIX={bad}");
+        };
+        assert!(!status.success(), "{bad} must exit non-zero");
+    }
+    // A multi-segment prefix is legitimate (the Cloudflare default).
+    let s = Server::start(&[("OXIMG_OPTIONS_PREFIX", "/cdn-cgi/image".into())]);
+    assert_eq!(s.status_of("/cdn-cgi/image/width=100/photo.jpg"), 200);
+}
