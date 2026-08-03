@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-08-02
+
+The production-readiness batch, closing every adoption blocker named
+by the field evaluation in #1: width-only resize (#2), opt-in PNG
+palette quantization (#5), upstream fetch deadlines and a metrics
+surface (#4), plus a signal-handler race fix. Library API only grows
+(new `Params` override fields, a new `#[non_exhaustive]` `ErrorKind`
+variant); note the MSRV bump under Changed.
+
 ### Added
 
 - **Width-only / height-only resize** ([#2]): `0` on one axis of

@@ -12,7 +12,7 @@ suitable for trying oximg out, not for production. Tagged releases
 publish immutable version tags; pin one (or a digest):
 
 ```sh
-docker pull ghcr.io/oximg/oximg:0.7.0          # version tag
+docker pull ghcr.io/oximg/oximg:0.7.1          # version tag
 docker pull ghcr.io/oximg/oximg@sha256:...      # or stronger: a digest
 ```
 
@@ -22,7 +22,7 @@ docker pull ghcr.io/oximg/oximg@sha256:...      # or stronger: a digest
 docker run -d --name oximg \
   -p 8081:8081 \
   -v /srv/images:/images:ro \
-  ghcr.io/oximg/oximg:0.7.0
+  ghcr.io/oximg/oximg:0.7.1
 curl "localhost:8081/resize/500/500/photo.jpg" -o out.jpg
 ```
 
@@ -40,7 +40,7 @@ directories, so an existing bucket or CDN layout
 ```sh
 docker run -d --name oximg -p 8081:8081 \
   -e OXIMG_SOURCE_BASE_URL=https://static.example.com/originals \
-  ghcr.io/oximg/oximg:0.7.0
+  ghcr.io/oximg/oximg:0.7.1
 ```
 
 The fetcher sends no credentials, so the origin must be reachable
@@ -52,7 +52,7 @@ that embeds its own auth).
 ```yaml
 services:
   oximg:
-    image: ghcr.io/oximg/oximg:0.7.0
+    image: ghcr.io/oximg/oximg:0.7.1
     ports:
       - "8081:8081"
     volumes:
