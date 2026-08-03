@@ -469,7 +469,14 @@ async fn serve_resize_inner(
     file: String,
     accept: AcceptHeader,
 ) -> Result<Response, (StatusCode, String)> {
-    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+    // 0 on one axis means "unconstrained": /resize/750/0/... is
+    // width-only (height follows the aspect ratio), the reverse is
+    // height-only. This replaces the sentinel-height workaround
+    // (h=8192), which silently narrowed sources taller than the
+    // sentinel's aspect ratio — corrupting srcset width descriptors.
+    // Both axes zero stays an error: "no constraint at all" is not a
+    // resize request.
+    if (w == 0 && h == 0) || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
     }
     validate_source_path(&file)?;
@@ -650,9 +657,14 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         .await
         .expect("semaphore closed");
 
+    // URL 0 = unconstrained axis; the library spelling for that is
+    // u32::MAX (Params::default's "no downscale bound"). The output
+    // stays bounded by the source's own dimensions (the pipeline never
+    // enlarges) and by the decode-time pixel caps.
+    let unbounded = |d: u32| if d == 0 { u32::MAX } else { d };
     let params = pipeline::Params {
-        max_width: *w,
-        max_height: *h,
+        max_width: unbounded(*w),
+        max_height: unbounded(*h),
         quality: app.quality,
         encoder: app.encoder,
         // The resize stage may briefly fan out into row bands without

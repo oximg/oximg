@@ -21,7 +21,9 @@ pub fn print_help() {
              OXIMG_*); see the README.\n  \
            oximg resize <in> <max_w> <max_h> <out> [options]\n          \
              Fit one image within <max_w> x <max_h> (never enlarges) and\n          \
-             re-encode it. Output format: --format, else the <out> file\n          \
+             re-encode it. 0 leaves an axis unconstrained: `750 0` is\n          \
+             width-only, `0 0` re-encodes at the source's own size.\n          \
+             Output format: --format, else the <out> file\n          \
              extension, else the source's own format.\n          \
              -q, --quality N    JPEG quality, 1-100 (default 80)\n          \
              -f, --format FMT   jpg | png | webp | avif\n          \
@@ -99,11 +101,16 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     let [input, max_w, max_h, output] = positional[..] else {
         usage_error("usage: oximg resize <in> <max_w> <max_h> <out> [-q N] [-f fmt] [--preset P]");
     };
+    // 0 = unconstrained axis, spelled u32::MAX in Params (the library's
+    // "no downscale bound"). Unlike the server, 0 0 is allowed here:
+    // "re-encode at the source's own size" is a useful one-shot
+    // transcode, and the CLI has no reason to refuse it.
     let dim = |v: &str, name: &str| -> u32 {
-        v.parse()
-            .ok()
-            .filter(|d| *d > 0)
-            .unwrap_or_else(|| usage_error(&format!("invalid {name} {v:?}")))
+        match v.parse() {
+            Ok(0) => u32::MAX,
+            Ok(d) => d,
+            Err(_) => usage_error(&format!("invalid {name} {v:?}")),
+        }
     };
     let params = Params {
         max_width: dim(max_w, "max_w"),
