@@ -58,7 +58,6 @@ from the #10 follow-up measurement.
   seams. Unknown `OXIMG_SOURCE_BASE_URL` schemes (including the
   planned `s3://`) are now fatal at boot instead of producing broken
   fetch URLs at request time.
-
 - **HTTP source fetches retry connection-level transients once**
   ([#11]): reset/refused/DNS-blip failures at the request phase are
   retried after 100ms — a GET is idempotent and no body bytes have
@@ -75,9 +74,6 @@ from the #10 follow-up measurement.
   ([#11]): the origin must be anonymously readable, which for an
   object-store bucket means public objects — a posture change easy to
   miss when migrating from an SDK-based fetcher.
-
-[#11]: https://github.com/oximg/oximg/issues/11
-
 - Reversed the `OXIMG_WORKERS` guidance for Cloud Run ([#10]
   follow-up measurement): the platform's `cpu` setting is a time
   quota, not a core count, so the observed-parallelism default was
@@ -85,6 +81,8 @@ from the #10 follow-up measurement.
   slower with 23x worse queue wait. The knob stays (there are shapes
   that genuinely want it); the docs no longer suggest using it to
   "correct" the observed-vs-billed mismatch.
+
+[#11]: https://github.com/oximg/oximg/issues/11
 
 ## [0.7.3] - 2026-08-03
 
