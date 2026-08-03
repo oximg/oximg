@@ -38,7 +38,8 @@ jobs:
             tests/fixtures/photo.webp tests/fixtures/photo.avif tests/fixtures/alpha.avif /tmp/img/
           # No --rm on ox: its exit code is inspected by the graceful-stop
           # check at the end.
-          docker run -d --name ox -v /tmp/img:/images:ro -p 8081:8081 oximg:ci
+          docker run -d --name ox -v /tmp/img:/images:ro -p 8081:8081 \
+            -e OXIMG_OPTIONS_PREFIX=/image oximg:ci
           for i in $(seq 1 100); do curl -sf http://127.0.0.1:8081/health >/dev/null && break; sleep 0.3; done
 
           fetch() { # file expected-content-type
@@ -75,6 +76,13 @@ jobs:
           [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/0/0/photo.jpg)" = 400 ]
           [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/resize/100/0/photo.jpg)" = 200 ]
           echo "ok: error mapping"
+
+          # Options route (OXIMG_OPTIONS_PREFIX): the Cloudflare Images
+          # grammar works in the image, and unknown options are named
+          # 400s rather than silently ignored.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8081/image/width=100,quality=80/photo.jpg')" = 200 ]
+          [ "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8081/image/width=100,fit=cover/photo.jpg')" = 400 ]
+          echo "ok: options route"
 
           # Graceful shutdown through the container path: docker stop
           # sends SIGTERM to PID 1 (exec-form CMD, unprivileged user) and
