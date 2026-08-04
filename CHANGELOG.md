@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-08-03
+
+Error classes follow fault: a source key no store can serve is a
+client error, so unservable crawler traffic no longer reads as an
+origin outage (#13, found on a production CDN cutover).
+
 ### Fixed
 
 - **Impossible source keys are client errors, not upstream failures**
