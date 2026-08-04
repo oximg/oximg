@@ -304,18 +304,29 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         // directories (IMAGES_DIR trees, S3-style prefixes behind
         // OXIMG_SOURCE_BASE_URL) are addressable; validate_source_path
         // guards what the wider capture lets in.
-        .route("/resize/{w}/{h}/{*file}", get(handle_resize))
-        .route("/{sig}/resize/{w}/{h}/{*file}", get(handle_signed_resize));
+        // `.options(...)` on the same routes so a CORS preflight gets
+        // the 2xx it requires; without it axum's method router answers
+        // 405, which no CDN-attached CORS header can rescue (the status
+        // itself fails the preflight — issue #15). Genuinely
+        // unsupported methods still get 405.
+        .route(
+            "/resize/{w}/{h}/{*file}",
+            get(handle_resize).options(handle_preflight),
+        )
+        .route(
+            "/{sig}/resize/{w}/{h}/{*file}",
+            get(handle_signed_resize).options(handle_preflight),
+        );
     if let Some(prefix) = app.options_prefix.as_deref() {
         eprintln!("oximg: options route enabled at {prefix}/{{options}}/{{file}}");
         router = router
             .route(
                 &format!("{prefix}/{{options}}/{{*file}}"),
-                get(handle_options),
+                get(handle_options).options(handle_preflight),
             )
             .route(
                 &format!("/{{sig}}{prefix}/{{options}}/{{*file}}"),
-                get(handle_signed_options),
+                get(handle_signed_options).options(handle_preflight),
             );
     }
     // Off by default; the route sits outside the URL-signing scheme,
@@ -617,6 +628,24 @@ fn validate_source_path(file: &str) -> Result<(), (StatusCode, String)> {
         return Err((StatusCode::BAD_REQUEST, "invalid source path".into()));
     }
     Ok(())
+}
+
+/// CORS preflight on an image route. A preflight is the browser
+/// asking permission to send a later GET, not an attempt to invoke
+/// OPTIONS as a method, and it requires a 2xx — so 204 with `Allow` is
+/// the answer to the question actually being asked (issue #15).
+///
+/// Deliberately not signature-checked, even on the signed routes: the
+/// preflight reads nothing, processes nothing, and answers identically
+/// for every path, so it leaks nothing either. Refusing it would only
+/// stop the browser from ever sending the signed GET that *is*
+/// checked. The CORS response headers themselves are not emitted here
+/// — a fronting CDN or proxy owns that policy today.
+async fn handle_preflight() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::ALLOW, "GET, HEAD, OPTIONS")],
+    )
 }
 
 /// Scrape endpoint (OXIMG_METRICS=1). Counters live in the static

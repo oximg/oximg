@@ -318,6 +318,15 @@ and the same scheme over `{prefix}/{options}/{file}` on the options
 route. The signed `path` is the percent-decoded form, so one signature
 covers every URL encoding of the same source.
 
+**CORS preflight**: `OPTIONS` on an image route answers **204** with
+`Allow: GET, HEAD, OPTIONS`, because a browser preflight requires a
+2xx — a 405 fails it no matter what CORS headers a CDN attaches, since
+the status itself is the blocker. Preflights are not signature-checked
+(they perform no work and answer identically for every path; the GET
+that follows still is). oximg does not emit the CORS response headers
+themselves — `Access-Control-Allow-Origin` and friends come from
+whatever fronts it. Other methods still answer 405.
+
 **Graceful shutdown**: on SIGTERM (what `docker stop`, Kubernetes, and
 Cloud Run send) or SIGINT the server stops accepting connections,
 finishes in-flight requests, and exits 0. There is no drain timeout of
