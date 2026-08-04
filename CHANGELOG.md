@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-08-03
+
+Tall images work in WebP: the format's 16383 px ceiling is now part of
+the fit rather than a 500 (#14, the second half of the "error classes
+follow fault" pass that 0.7.6 started).
+
 ### Fixed
 
 - **Tall WebP output is scaled to fit instead of failing** ([#14]):
