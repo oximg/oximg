@@ -656,3 +656,51 @@ fn dct_scale_picks_smallest_sufficient() {
     // already at target size -> no scaling
     assert_eq!(dct_scale_num(500, 334, 500, 334, 1.0), 8);
 }
+
+/// Issue #14: the output format's dimension ceiling is one more
+/// constraint on the same fit box. WebP caps a side at 16383, so a
+/// tall source must come back scaled to fit — the largest WebP that
+/// keeps the source's shape — instead of failing at the encoder.
+#[test]
+fn webp_output_is_clamped_to_the_format_ceiling() {
+    let webp = |max_w: u32, max_h: u32| {
+        let p = Params {
+            max_width: max_w,
+            max_height: max_h,
+            output: Some(ImageFormat::Webp),
+            ..Params::default()
+        };
+        let c = clamp_to_format(&p, ImageFormat::Webp);
+        (c.max_width, c.max_height)
+    };
+    // The reporter's case: width=1920 on a 2000x19708 source. The box
+    // tightens, and fit_dims then lands on the imgproxy answer.
+    assert_eq!(webp(1920, u32::MAX), (1920, 16383));
+    assert_eq!(fit_dims(2000, 19708, 1920, 16383), (1663, 16383));
+    // An unconstrained request on a tall source: both axes capped.
+    assert_eq!(webp(u32::MAX, u32::MAX), (16383, 16383));
+    assert_eq!(fit_dims(2000, 19708, 16383, 16383), (1663, 16383));
+    // Boxes already inside the ceiling are untouched, and sources
+    // inside it never move.
+    assert_eq!(webp(800, 600), (800, 600));
+    assert_eq!(fit_dims(300, 200, 16383, 16383), (300, 200));
+    // Exactly at the limit stays at the limit (the cap is inclusive).
+    assert_eq!(fit_dims(2000, 16383, 16383, 16383), (2000, 16383));
+
+    // Only WebP has a ceiling worth enforcing: the same tall request
+    // in another format keeps its full box.
+    for target in [ImageFormat::Jpeg, ImageFormat::Png] {
+        let p = Params {
+            max_width: 1920,
+            max_height: u32::MAX,
+            output: Some(target),
+            ..Params::default()
+        };
+        let c = clamp_to_format(&p, target);
+        assert_eq!(
+            (c.max_width, c.max_height),
+            (1920, u32::MAX),
+            "{target:?} must not be clamped"
+        );
+    }
+}

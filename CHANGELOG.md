@@ -10,6 +10,25 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tall WebP output is scaled to fit instead of failing** ([#14]):
+  WebP caps a side at 16383 px, and a resize landing past it answered
+  **500 `internal image-processing error`** — nothing internal had
+  gone wrong, and the shape (tall single-column infographics, long
+  product pages) is ordinary CMS content. The output format's ceiling
+  is now folded into the same fit box before any decode work, so a
+  2000x19708 source asked for `width=1920` as WebP returns
+  1663x16383 with the aspect ratio preserved (matching what imgproxy
+  does with the same request) rather than 500ing. Other formats are
+  untouched — their limits sit past the decoded-pixel caps.
+- libwebp's `VP8_ENC_ERROR_BAD_DIMENSION` now classifies as
+  `SourceRejected` (**400**) rather than an internal fault: it is a
+  statement about the request. Allocation failures and encoder bugs
+  keep their 500, so the two are distinguishable on a pager.
+
+[#14]: https://github.com/oximg/oximg/issues/14
+
 ## [0.7.6] - 2026-08-03
 
 Error classes follow fault: a source key no store can serve is a

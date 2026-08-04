@@ -2333,3 +2333,63 @@ fn http_origin_client_errors_are_not_upstream_failures() {
         1.0
     );
 }
+
+/// Issue #14 end to end: a source taller than WebP can express comes
+/// back as the largest WebP that keeps its shape, instead of a 500
+/// from the encoder. The same source in a format without that ceiling
+/// keeps its full height, so the clamp is the format's constraint and
+/// not a new global cap.
+#[test]
+fn tall_sources_encode_to_webp_by_fitting_the_format_ceiling() {
+    let dir = std::env::temp_dir().join(format!("oximg-tallwebp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 20x16500: past WebP's 16383 ceiling by 117 px, but only 330k
+    // pixels, so generating and encoding it stays cheap.
+    let (w, h) = (20u32, 16500u32);
+    let mut png = Vec::new();
+    let mut enc = png::Encoder::new(&mut png, w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    let mut rows = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            rows.extend([(x * 12) as u8, (y % 251) as u8, 128]);
+        }
+    }
+    writer.write_image_data(&rows).unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("tall.png"), &png).unwrap();
+
+    let s = Server::start(&[("IMAGES_DIR", dir.to_str().unwrap().to_string())]);
+
+    // Width-only at the source's own width (the reporter's shape: the
+    // height is unconstrained and overflows the ceiling on its own).
+    let (status, ct, body) = s.get("/resize/20/0/tall.png@webp").unwrap();
+    assert_eq!(status, 200, "the format ceiling must not fail the request");
+    assert_eq!(ct, "image/webp");
+    let (fmt, ow, oh) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+    assert_eq!(oh, 16383, "the long side sits exactly on the limit");
+    // 20 * 16383/16500 = 19.86, which rounds back to 20: the scale is
+    // proportional, and the narrow axis keeps its nearest pixel.
+    assert_eq!(ow, 20);
+
+    // The options route reaches the same code path.
+    let opts = Server::start(&[
+        ("IMAGES_DIR", dir.to_str().unwrap().to_string()),
+        ("OXIMG_OPTIONS_PREFIX", "/image".into()),
+    ]);
+    let (status, ct, body) = opts.get("/image/width=20,format=webp/tall.png").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/webp");
+    let (_, _, oh) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(oh, 16383);
+
+    // PNG has no such ceiling: the full height survives.
+    let (status, ct, body) = s.get("/resize/20/0/tall.png").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/png");
+    let (_, ow, oh) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((ow, oh), (20, 16500), "PNG keeps the source dimensions");
+}
