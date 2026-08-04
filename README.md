@@ -68,7 +68,7 @@ combines with any encode column:
 |---|---|---|
 | JPEG | baseline & progressive, grayscale; streaming, DCT shrink-on-load | jpegli progressive (default), mozjpeg profiles via `PRESET` |
 | PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A); opt-in palette quantization (`OXIMG_PNG_QUANTIZE`) |
-| WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha |
+| WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha; output is scaled to fit WebP's 16383 px limit |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
 
 **Cross-format output**: append an imgproxy-style `@{fmt}` token to the
@@ -281,6 +281,16 @@ Streaming decode overlaps the download in every mode.
 Connection-level transients (reset, refused, DNS blips) are retried
 once before any body bytes are consumed, and the `gs://` mode also
 retries 429/5xx SDK-style; `oximg_upstream_retries_total` counts both.
+
+**Format ceilings are part of the fit**: WebP cannot express a side
+past 16383 px, so a request whose output would exceed that is scaled
+down until it fits, aspect ratio preserved — a 2000x19708 source asked
+for `width=1920` as WebP comes back 1663x16383. Tall single-column
+images (infographics, long product pages) hit this routinely, and the
+alternative is failing a request the format simply cannot serve at the
+asked-for size. The returned image reports its own dimensions; other
+output formats have no ceiling worth enforcing here (their limits sit
+past `OXIMG_MAX_SRC_PIXELS`).
 
 **Error classes follow fault, not convenience**: a source key that no
 store can serve — past an object store's key-length limit, or refused

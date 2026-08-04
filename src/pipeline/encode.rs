@@ -211,6 +211,19 @@ pub(super) fn encode_webp_bare(
         wp::WebPPictureFree(&mut pic);
         if ok == 0 {
             wp::WebPMemoryWriterClear(&mut writer);
+            // Split the request's fault from ours: BAD_DIMENSION means
+            // the asked-for output exceeds what the format can express
+            // (16383 px a side) — the fit box is capped upstream so
+            // this should be unreachable, but if it fires it is still
+            // a statement about the request, not about the service.
+            // Everything else (allocation failures, partition
+            // overflows, encoder bugs) is ours to own as a 500.
+            if pic.error_code == wp::WebPEncodingError::VP8_ENC_ERROR_BAD_DIMENSION {
+                return Err(anyhow::anyhow!(
+                    "output dimensions exceed the WebP limit of 16383 px a side"
+                )
+                .context(super::SourceRejected));
+            }
             anyhow::bail!("webp encode failed (error {:?})", pic.error_code);
         }
         let out = std::slice::from_raw_parts(writer.mem, writer.size).to_vec();

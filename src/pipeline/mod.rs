@@ -198,6 +198,42 @@ impl Default for Params {
     }
 }
 
+/// The largest dimension the format's own container can express.
+/// WebP's is a hard 14-bit field in the VP8 bitstream; the others
+/// have no limit worth enforcing here (JPEG 65535 and PNG/AVIF 2^31
+/// are past the decoded-pixel caps).
+fn format_max_dimension(format: ImageFormat) -> Option<u32> {
+    match format {
+        ImageFormat::Webp => Some(16383),
+        _ => None,
+    }
+}
+
+/// Tighten a request's fit box to what the output format can hold.
+/// Capping the box (rather than the fitted output) keeps `fit_dims`'
+/// proportional scaling intact: a 2000x19708 source asked for
+/// width=1920 as WebP comes out 1663x16383, the largest WebP that
+/// still has the source's shape. Sources already inside the ceiling
+/// are untouched — the box only ever shrinks, and never enlarges.
+fn clamp_to_format(p: &Params, target: ImageFormat) -> Params {
+    let Some(cap) = format_max_dimension(target) else {
+        return p.clone();
+    };
+    if p.max_width <= cap && p.max_height <= cap {
+        return p.clone();
+    }
+    // Not counted anywhere: the box is `u32::MAX` on an unconstrained
+    // axis, so "the box was tightened" fires on almost every WebP
+    // request while "the output was actually reduced" is only knowable
+    // where the source dimensions are (four fit_dims call sites down).
+    // The returned dimensions describe themselves; the README says so.
+    Params {
+        max_width: p.max_width.min(cap),
+        max_height: p.max_height.min(cap),
+        ..p.clone()
+    }
+}
+
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).
 fn fit_dims(src_w: usize, src_h: usize, max_w: u32, max_h: u32) -> (usize, usize) {
     let scale = f64::min(
@@ -406,6 +442,13 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
     let target = p.output.unwrap_or(format);
+    // The output format's own dimension ceiling is one more constraint
+    // on the same fit box, so fold it in before any decode work: the
+    // resize then lands inside it in one pass, with the aspect ratio
+    // preserved. Without this, a tall source encoded to WebP failed at
+    // the encoder (issue #14) — a 500 for a request the format simply
+    // cannot express at the asked-for size.
+    let p = &clamp_to_format(p, target);
     // Fail before decode work; the HTTP layer rejects earlier still,
     // this covers library callers.
     #[cfg(not(feature = "avif"))]
