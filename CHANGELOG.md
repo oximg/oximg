@@ -10,6 +10,32 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Impossible source keys are client errors, not upstream failures**
+  ([#13]): a key past the object store's length limit, or refused by
+  the origin as a malformed request (400/414), answered **502** — the
+  same class as a real outage. Found after a production CDN cutover,
+  where crawlers fetching whole `srcset` attributes as single ~1300-
+  byte URLs moved the origin 5xx rate from 0.012% to 0.4% and looked
+  exactly like a migration regression. Now:
+  - `gs://` refuses over-length object names **locally** (GCS's
+    documented 1024-byte limit), answering 404 without a round trip —
+    from the requester's side an impossible name is indistinguishable
+    from an absent one.
+  - A 400/414 from the store or the HTTP origin maps to the new
+    `ErrorKind::SourceRejected` → **400** (non-breaking: the enum is
+    `#[non_exhaustive]`). Connect failures, resets and 5xx keep their
+    502; slow origins keep their 504.
+  - `oximg_upstream_fetch_total` gains `outcome="rejected"`, kept out
+    of `error` so that series answers "is the upstream actually
+    unwell".
+
+  CDNs retry and fail over on 5xx but pass 4xx to their error cache,
+  so the misfiling turned unservable crawler traffic into origin load.
+
+[#13]: https://github.com/oximg/oximg/issues/13
+
 ## [0.7.5] - 2026-08-03
 
 A test-hardening release whose first fuzz run paid for itself:

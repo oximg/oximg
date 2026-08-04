@@ -2187,3 +2187,149 @@ fn gcs_boot_is_fail_closed() {
         );
     }
 }
+
+/// Issue #13: a source key no store can serve is the requester's
+/// fault, not the upstream's. Over-length keys answer 404 *without a
+/// round trip*, an origin's 400/414 answers 400, and neither counts
+/// in the upstream `error` series that an operator watches for
+/// origin health.
+#[test]
+fn impossible_source_keys_are_client_errors_not_502() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (md_port, _md_count) = fake_metadata_server(3600);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gcs_port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                // The store's own verdict on a malformed request.
+                let code = if path.contains("bad-request") {
+                    "400 Bad Request"
+                } else if path.contains("too-long") {
+                    "414 URI Too Long"
+                } else {
+                    "500 Internal Server Error"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        ("OXIMG_SOURCE_BASE_URL", "gs://test-bucket".into()),
+        ("GCE_METADATA_HOST", format!("127.0.0.1:{md_port}")),
+        ("OXIMG_GCS_ENDPOINT", format!("http://127.0.0.1:{gcs_port}")),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    hits.store(0, Ordering::SeqCst);
+
+    // GCS caps object names at 1024 bytes: 1024 is legal (the origin
+    // answers, here with a 500 -> 502), 1025 cannot exist.
+    let legal = "x".repeat(1020);
+    assert_eq!(
+        s.status_of(&format!("/resize/100/100/{legal}.png")),
+        502,
+        "a legal-length key still reaches the origin"
+    );
+    let before = hits.load(Ordering::SeqCst);
+    assert!(before > 0, "the legal key must have been fetched");
+
+    for len in [1025usize, 1400] {
+        let over = "y".repeat(len);
+        assert_eq!(
+            s.status_of(&format!("/resize/100/100/{over}.png")),
+            404,
+            "{len}-byte key is impossible, not an upstream failure"
+        );
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "over-length keys must never leave the process"
+    );
+
+    // The store's own client errors are 400s, not 502s.
+    assert_eq!(s.status_of("/resize/100/100/bad-request.png"), 400);
+    assert_eq!(s.status_of("/resize/100/100/too-long.png"), 400);
+
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    let m = |p: &str| metric(&body, p);
+    // Impossible keys are counted apart from upstream ill-health: the
+    // two 400s are "rejected", the over-length pair "not_found", and
+    // only the genuine 500 lands in "error".
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"rejected\"}"), 2.0);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"not_found\"}"), 2.0);
+    assert_eq!(m("oximg_upstream_fetch_total{outcome=\"error\"}"), 1.0);
+}
+
+/// The HTTP source mode shares the verdict: an origin answering
+/// 400/414 (the shape an over-long URL produces there) is a client
+/// error, not an upstream failure.
+#[test]
+fn http_origin_client_errors_are_not_upstream_failures() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req.split_whitespace().nth(1).unwrap_or("/");
+                let code = if path.contains("too-long") {
+                    "414 URI Too Long"
+                } else if path.contains("bad-request") {
+                    "400 Bad Request"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {code}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    assert_eq!(s.status_of("/resize/100/100/too-long.png"), 400);
+    assert_eq!(s.status_of("/resize/100/100/bad-request.png"), 400);
+    assert_eq!(
+        s.status_of("/resize/100/100/other.png"),
+        502,
+        "a genuine origin fault stays 502"
+    );
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"rejected\"}"),
+        2.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"error\"}"),
+        1.0
+    );
+}
