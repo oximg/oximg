@@ -32,7 +32,13 @@ pub(super) fn process_png<R: std::io::Read>(
             _ => 3,
         };
         let (sw, sh) = (hdr.width as usize, hdr.height as usize);
-        let (ow, oh) = fit_dims(sw, sh, p.max_width, p.max_height);
+        // The eXIf orientation is parsed below this block, so which way
+        // the fit runs is not known yet — and an axis-swapping
+        // orientation with an asymmetric box can make the real output
+        // several times larger than the unoriented fit. Take the larger
+        // of the two candidates: over-counting the output side is the
+        // safe direction for a limit.
+        let (ow, oh) = larger_fit(sw, sh, p);
         check_decoded_bytes(
             DecodeCost::full_frame(sw, sh, channels, p)
                 .with_output(ow, oh, channels)
@@ -174,6 +180,21 @@ pub(super) fn process_png<R: std::io::Read>(
     out
 }
 
+/// The larger of the two fits a source could take once its orientation
+/// is known: axis-swapping orientations fit the *displayed* frame, and
+/// with an asymmetric box that can be several times the unoriented
+/// result. Used where the estimate runs before the orientation is
+/// parsed — over-counting the output side keeps a limit safe.
+fn larger_fit(w: usize, h: usize, p: &Params) -> (usize, usize) {
+    let a = fit_dims(w, h, p.max_width, p.max_height);
+    let b = fit_dims(h, w, p.max_width, p.max_height);
+    if a.0 * a.1 >= b.0 * b.1 {
+        a
+    } else {
+        (b.1, b.0)
+    }
+}
+
 /// Expand grayscale(+alpha) pixels in `chunk8[..len]` to RGB(A) in place.
 pub(super) fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
     let out_ch = in_ch + 2;
@@ -285,6 +306,22 @@ pub(super) fn process_avif<R: std::io::Read>(
     } else {
         crate::meta::Orientation::UPRIGHT
     };
+    {
+        // Before the decode allocates: dav1d has no shrink-on-load, so
+        // the whole frame materializes. Dimensions come from the
+        // container probe; four channels covers the alpha auxiliary
+        // item, and 10/12-bit sources stage two bytes per sample, which
+        // the linear-light term already accounts for.
+        let (pw, ph) = crate::avif::probe_avif(&s.srcbuf)?;
+        check_src_pixels(pw, ph)?;
+        let (ow, oh) = larger_fit(pw, ph, p);
+        check_decoded_bytes(
+            DecodeCost::full_frame(pw, ph, 4, p)
+                .with_output(ow, oh, 4)
+                .with_compressed(s.srcbuf.len()),
+            "AVIF",
+        )?;
+    }
     let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
@@ -340,7 +377,7 @@ pub(super) fn webp_decode_into_chunk8(
         // Conservative for WebP: libwebp's decode scaler may shrink
         // this below the source (decided a few lines down), so the
         // full frame is an upper bound, not the exact figure.
-        let (ow, oh) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        let (ow, oh) = larger_fit(src_w, src_h, p);
         check_decoded_bytes(
             DecodeCost::full_frame(src_w, src_h, channels as u64, p)
                 .with_output(ow, oh, channels as u64)

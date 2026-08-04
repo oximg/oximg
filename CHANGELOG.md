@@ -31,8 +31,11 @@ HTTP interface without notice.
     the output side, which is why they are cheap. Field-validated at
     1.2-1.8x above measured peaks on four real sources; encode-side
     buffers remain excluded, and it rounds up.
-  - Over-cap sources answer **413** naming the figure, on the same
-    terms as the existing caps. `OXIMG_MAX_SRC_PIXELS` is unchanged
+  - Over-cap sources answer **413** on the same terms as the existing
+    caps. The body stays generic across all three (it would otherwise
+    expose the configured limits to clients); the stderr line now names
+    which limit was hit and the figure — previously no 413 logged
+    anything, so an operator could not tell the three caps apart. `OXIMG_MAX_SRC_PIXELS` is unchanged
     and still useful as a cheap dimension guard.
   - **Unset by default**, and the estimate is computed and exposed
     regardless as the `oximg_decoded_bytes_estimate` histogram — so a

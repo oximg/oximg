@@ -1113,20 +1113,6 @@ impl DecodeCost {
         }
     }
 
-    /// `full_frame` for call sites without a `Params` in scope (the
-    /// AVIF picture converter): assumes linear light, which is the
-    /// default and the more expensive branch.
-    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
-    pub fn full_frame_linear(w: usize, h: usize, channels: u64) -> Self {
-        let px = (w as u64).saturating_mul(h as u64);
-        let staged = px.saturating_mul(channels);
-        DecodeCost {
-            staged_bytes: staged,
-            resize_input_bytes: staged * 2,
-            ..Default::default()
-        }
-    }
-
     /// A streaming path: no full frame is ever resident, only the
     /// output-side buffers (added by `with_output`).
     pub fn streaming() -> Self {

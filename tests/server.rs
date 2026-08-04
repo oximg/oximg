@@ -2471,6 +2471,76 @@ fn options_answers_204_so_preflight_can_succeed() {
     assert_eq!(signed.status_of("/resize/100/100/photo.jpg"), 403);
 }
 
+/// The 413 body is generic across the three source caps, so the log
+/// line is the only place an operator learns *which* limit they are
+/// against and by how much. Previously no 413 logged anything.
+#[test]
+fn oversize_413_names_the_limit_on_stderr() {
+    let dir = std::env::temp_dir().join(format!("oximg-413log-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A 1000x1000 RGB PNG: 3 MB staged plus 6 MB as the linear-light
+    // resize input, comfortably over the 1 MiB floor cap. (A JPEG would
+    // not do — it streams, which is exactly why it is cheap.)
+    let mut png_bytes = Vec::new();
+    let mut enc = png::Encoder::new(&mut png_bytes, 1000, 1000);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer
+        .write_image_data(&vec![77u8; 1000 * 1000 * 3])
+        .unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("big.png"), &png_bytes).unwrap();
+
+    // Spawn by hand: the shared helper drains stderr into a sink.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oximg"))
+        .env("PORT", "0")
+        .env("IMAGES_DIR", dir.to_str().unwrap())
+        .env("OXIMG_MAX_DECODED_BYTES", (1024 * 1024).to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn oximg");
+    use std::io::BufRead;
+    let stderr = child.stderr.take().unwrap();
+    let mut lines = std::io::BufReader::new(stderr).lines();
+    let port: u16 = lines
+        .find_map(|l| {
+            let l = l.ok()?;
+            l.strip_prefix("oximg listening on :")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("listening line");
+
+    let url = format!("http://127.0.0.1:{port}/resize/500/500/big.png");
+    let status = match ureq::get(&url).call() {
+        Ok(r) => r.status().as_u16(),
+        Err(ureq::Error::StatusCode(s)) => s,
+        Err(e) => panic!("transport error: {e}"),
+    };
+    assert_eq!(status, 413);
+
+    let logged = lines
+        .find_map(|l| {
+            let l = l.ok()?;
+            l.contains("status=413").then_some(l)
+        })
+        .expect("a 413 must log its cause");
+    assert!(
+        logged.contains("OXIMG_MAX_DECODED_BYTES"),
+        "the log must name which limit: {logged}"
+    );
+    assert!(
+        logged.contains("bytes"),
+        "and the figure behind it: {logged}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Issue #17: the decoded-bytes cap is expressed in the unit an
 /// operator has a limit in, and — the part that made pixel caps
 /// unusable — it separates sources that pixel counts cannot. The
