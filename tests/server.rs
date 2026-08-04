@@ -2738,3 +2738,173 @@ fn jpeg_estimate_follows_the_shrink_on_load_scale() {
         "a streaming JPEG's estimate is output-sized, not source-sized"
     );
 }
+
+/// Every source path that estimates decoded bytes must be reachable by
+/// the cap, not just the JPEG and PNG ones the other tests cover. The
+/// buffered formats (WebP, AVIF, PNG) all materialize a whole frame, so
+/// a cap below that frame must refuse them.
+#[test]
+fn decoded_bytes_cap_reaches_every_source_path() {
+    let dir = std::env::temp_dir().join(format!("oximg-allpaths-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // One 900x900 RGB source, re-encoded into each buffered format
+    // through the pipeline itself. Staged it is 2.4 MB, plus 4.9 MB as
+    // the linear-light u16 input — so a 4 MiB cap is below the frame
+    // and a 64 MiB one is well above it.
+    let (w, h) = (900usize, 900usize);
+    let mut png = Vec::new();
+    let mut enc = png::Encoder::new(&mut png, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    let mut rows = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            rows.extend([(x % 233) as u8, (y % 197) as u8, 90]);
+        }
+    }
+    writer.write_image_data(&rows).unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("big.png"), &png).unwrap();
+
+    let transcode = |target| {
+        oximg::pipeline::process(
+            &png,
+            &oximg::pipeline::Params {
+                output: Some(target),
+                ..Default::default()
+            },
+        )
+        .expect("transcode fixture")
+        .0
+    };
+    std::fs::write(
+        dir.join("big.webp"),
+        transcode(oximg::pipeline::ImageFormat::Webp),
+    )
+    .unwrap();
+    #[cfg(feature = "avif")]
+    std::fs::write(
+        dir.join("big.avif"),
+        transcode(oximg::pipeline::ImageFormat::Avif),
+    )
+    .unwrap();
+
+    let images = dir.to_str().unwrap().to_string();
+    let tight = Server::start(&[
+        ("IMAGES_DIR", images.clone()),
+        ("OXIMG_MAX_DECODED_BYTES", (4 * 1024 * 1024).to_string()),
+    ]);
+    let generous = Server::start(&[
+        ("IMAGES_DIR", images),
+        ("OXIMG_MAX_DECODED_BYTES", (64 * 1024 * 1024).to_string()),
+    ]);
+
+    // Only mutated under the avif feature.
+    #[cfg_attr(not(feature = "avif"), allow(unused_mut))]
+    let mut sources = vec!["big.png", "big.webp"];
+    #[cfg(feature = "avif")]
+    sources.push("big.avif");
+    for file in sources {
+        assert_eq!(
+            generous.get(&format!("/resize/100/100/{file}")).unwrap().0,
+            200,
+            "{file} fits a generous cap"
+        );
+        assert_eq!(
+            tight.status_of(&format!("/resize/100/100/{file}")),
+            413,
+            "{file}: a buffered format must be bounded by the frame it materializes"
+        );
+    }
+
+    // The streaming JPEG path is the contrast: the same pixels cost
+    // only the output side, so the tight cap serves it. This is the
+    // distinction a source-pixel cap cannot express, across formats.
+    // PRESET=fast is mozjpeg's baseline profile — the default (jpegli)
+    // writes progressive, whose coefficient arrays are themselves over
+    // this cap, as jpeg_estimate_follows_the_shrink_on_load_scale pins.
+    let baseline = oximg::pipeline::process(
+        &png,
+        &oximg::pipeline::Params {
+            output: Some(oximg::pipeline::ImageFormat::Jpeg),
+            encoder: oximg::pipeline::Encoder::MozFast,
+            ..Default::default()
+        },
+    )
+    .expect("transcode fixture")
+    .0;
+    std::fs::write(dir.join("big.jpg"), &baseline).unwrap();
+    assert_eq!(
+        tight.get("/resize/100/100/big.jpg").unwrap().0,
+        200,
+        "a streaming source of identical pixels fits the same cap"
+    );
+}
+
+/// The conservative both-orientations fit, end to end. The check runs
+/// before a PNG's `eXIf` chunk is parsed, so it cannot know which way
+/// the fit will go — and therefore assumes the larger candidate for
+/// *every* source. That is deliberate: an axis-swapping source under an
+/// asymmetric box really does produce the larger frame, and
+/// under-counting it is the failure mode this cap exists to prevent.
+#[test]
+fn oriented_sources_are_capped_on_the_larger_fit() {
+    let dir = std::env::temp_dir().join(format!("oximg-orientcap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 1200x300 stored; orientation 6 presents it as 300x1200, so a
+    // width-only box of 1000 fits the displayed frame to 300x1200 —
+    // 360k pixels of output against the unoriented fit's 250k.
+    let (w, h) = (1200usize, 300usize);
+    let px = vec![120u8; w * h * 3];
+    std::fs::write(
+        dir.join("upright.png"),
+        common::png_with_orientation(&px, w, h, 1),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("rotated.png"),
+        common::png_with_orientation(&px, w, h, 6),
+    )
+    .unwrap();
+    let images = dir.to_str().unwrap().to_string();
+
+    // The rotated source really does produce the swapped, larger frame.
+    let loose = Server::start(&[("IMAGES_DIR", images.clone())]);
+    let (_, _, body) = loose.get("/resize/1000/0/rotated.png").unwrap();
+    let (_, ow, oh) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((ow, oh), (300, 1200), "orientation 6 swaps the axes");
+    let (_, _, body) = loose.get("/resize/1000/0/upright.png").unwrap();
+    let (_, ow, oh) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((ow, oh), (1000, 250));
+
+    // A cap between the unoriented estimate (3.24 MB source-side plus
+    // 2.25 MB of 1000x250 output) and the conservative one (the same
+    // source side plus 3.24 MB of 1200x300) refuses *both*: the
+    // estimate cannot yet know which way the fit goes, so it assumes
+    // the larger for either. Refusing the upright source is the price
+    // of never under-counting the rotated one.
+    let capped = Server::start(&[
+        ("IMAGES_DIR", images.clone()),
+        ("OXIMG_MAX_DECODED_BYTES", (6 * 1024 * 1024).to_string()),
+    ]);
+    for file in ["rotated.png", "upright.png"] {
+        assert_eq!(
+            capped.status_of(&format!("/resize/1000/0/{file}")),
+            413,
+            "{file} is estimated on the larger candidate fit"
+        );
+    }
+    // Above the conservative figure, both serve.
+    let generous = Server::start(&[
+        ("IMAGES_DIR", images),
+        ("OXIMG_MAX_DECODED_BYTES", (16 * 1024 * 1024).to_string()),
+    ]);
+    for file in ["rotated.png", "upright.png"] {
+        assert_eq!(
+            generous.get(&format!("/resize/1000/0/{file}")).unwrap().0,
+            200,
+            "{file} serves above the conservative estimate"
+        );
+    }
+}
