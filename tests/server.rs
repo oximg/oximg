@@ -2470,3 +2470,104 @@ fn options_answers_204_so_preflight_can_succeed() {
     }
     assert_eq!(signed.status_of("/resize/100/100/photo.jpg"), 403);
 }
+
+/// Issue #17: the decoded-bytes cap is expressed in the unit an
+/// operator has a limit in, and — the part that made pixel caps
+/// unusable — it separates sources that pixel counts cannot. The
+/// estimate is always computed and exposed, so a cap can be read off a
+/// corpus before being enforced.
+#[test]
+fn decoded_bytes_cap_bounds_what_pixels_cannot() {
+    let dir = std::env::temp_dir().join(format!("oximg-decbytes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A wide-but-shallow PNG: 4000x800 = 3.2 MP, ~9.6 MB decoded at
+    // RGB8. Cheap to generate, and its estimate is far above the
+    // 1 MiB floor so a cap can straddle it.
+    let (w, h) = (4000u32, 800u32);
+    let mut png_bytes = Vec::new();
+    let mut enc = png::Encoder::new(&mut png_bytes, w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer
+        .write_image_data(&vec![96u8; (w * h * 3) as usize])
+        .unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("wide.png"), &png_bytes).unwrap();
+    // The cheap baseline-JPEG comparison lives in the same directory.
+    std::fs::copy(
+        format!("{}/tests/fixtures/photo.jpg", env!("CARGO_MANIFEST_DIR")),
+        dir.join("photo.jpg"),
+    )
+    .unwrap();
+    let images = dir.to_str().unwrap().to_string();
+
+    // Unset: the estimate is computed and exposed, nothing is refused.
+    let s = Server::start(&[
+        ("IMAGES_DIR", images.clone()),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    assert_eq!(s.get("/resize/100/100/wide.png").unwrap().0, 200);
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(&body, "oximg_decoded_bytes_estimate_count"),
+        1.0,
+        "the estimate is recorded even with no cap set"
+    );
+    // 4000*800*3 = 9.6 MB, so the 16 MiB bucket holds it and the 8 MiB
+    // one does not — the histogram is what an operator reads a cap off.
+    assert_eq!(
+        metric(
+            &body,
+            "oximg_decoded_bytes_estimate_bucket{le=\"16777216\"}"
+        ),
+        1.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_decoded_bytes_estimate_bucket{le=\"8388608\"}"),
+        0.0
+    );
+    assert!(metric(&body, "oximg_decoded_bytes_estimate_sum") > 9_000_000.0);
+    drop(s);
+
+    // A cap above the estimate serves; below it answers 413 (the same
+    // class as the other source caps).
+    let generous = Server::start(&[
+        ("IMAGES_DIR", images.clone()),
+        ("OXIMG_MAX_DECODED_BYTES", (32 * 1024 * 1024).to_string()),
+    ]);
+    assert_eq!(generous.get("/resize/100/100/wide.png").unwrap().0, 200);
+    drop(generous);
+
+    let tight = Server::start(&[
+        ("IMAGES_DIR", images.clone()),
+        ("OXIMG_MAX_DECODED_BYTES", (4 * 1024 * 1024).to_string()),
+    ]);
+    assert_eq!(tight.status_of("/resize/100/100/wide.png"), 413);
+    // The cheap baseline-JPEG path is *not* caught by the same cap:
+    // shrink-on-load decodes near the output, which is the whole point
+    // — a pixel cap could not express this distinction.
+    assert_eq!(tight.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+
+    // A set-but-absurd cap refuses to boot rather than 413ing
+    // everything.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+    cmd.env("PORT", "0")
+        .env("OXIMG_MAX_DECODED_BYTES", "1024")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some(st)) = child.try_wait() {
+            status = Some(st);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        panic!("server booted with a 1 KiB decoded-bytes cap");
+    };
+    assert!(!status.success());
+}

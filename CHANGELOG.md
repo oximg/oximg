@@ -10,6 +10,35 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`OXIMG_MAX_DECODED_BYTES`** ([#17]): a cap on what a single decode
+  is estimated to allocate, in the unit a container limit is actually
+  in. Source pixels cannot be mapped to memory in this pipeline —
+  field measurement found **16x variance at equal pixel counts**, and
+  a cap tuned to admit a 96 MP PNG happily admitted a 1385 MiB
+  progressive CMYK source while rejecting a 238 MP baseline JPEG that
+  cost 86 MiB. The reason is architectural, not a defect: baseline
+  JPEG decodes through DCT shrink-on-load so its cost tracks the
+  *output*, while progressive JPEG buffers whole-image coefficients
+  and PNG/AVIF decode full frames, so theirs track the *source*.
+  - The estimate is per-format and computed at the existing check
+    point: decoded pixels *after* the shrink-on-load factor that will
+    actually be applied, times bytes per staged pixel (4 for CMYK),
+    plus progressive JPEG's coefficient arrays — the term
+    `OXIMG_MAX_SRC_PIXELS` explicitly could not see. It rounds up and
+    excludes resize scratch and encode buffers, and says so.
+  - Over-cap sources answer **413** naming the figure, on the same
+    terms as the existing caps. `OXIMG_MAX_SRC_PIXELS` is unchanged
+    and still useful as a cheap dimension guard.
+  - **Unset by default**, and the estimate is computed and exposed
+    regardless as the `oximg_decoded_bytes_estimate` histogram — so a
+    cap can be read off a real corpus instead of guessed, which is the
+    failure the issue actually reported (set three times, wrong three
+    times).
+
+[#17]: https://github.com/oximg/oximg/issues/17
+
 ## [0.7.8] - 2026-08-04
 
 Cross-origin callers can preflight: `OPTIONS` answers 204 instead of
