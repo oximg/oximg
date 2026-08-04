@@ -707,69 +707,82 @@ fn webp_output_is_clamped_to_the_format_ceiling() {
 
 /// Issue #17's core claim in arithmetic: at equal pixel counts the
 /// decode cost varies by more than an order of magnitude, so a pixel
-/// cap cannot bound memory while a byte estimate can. The numbers
-/// below mirror the four sources measured in the field.
+/// cap cannot bound memory while a byte estimate can. The shapes and
+/// the measured peaks come from the field validation on the issue.
 #[test]
 fn decode_cost_separates_what_pixel_counts_cannot() {
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let p = &Params::default();
 
-    // Baseline JPEG, 3980x59828 (238 MP), asked for a small output:
-    // DCT shrink-on-load decodes near the target, so the estimate
-    // tracks the output rather than the source.
-    let num = dct_scale_num(3980, 59828, 200, 3000, 1.7);
-    let (dec_w, dec_h) = (
-        (3980 * num as usize).div_ceil(8),
-        (59828 * num as usize).div_ceil(8),
-    );
-    let baseline = DecodeCost::scaled(dec_w, dec_h, 3);
+    // Baseline JPEG, 3980x59828 (238 MP) at width=1920, whose WebP
+    // output clamps to 16383 tall: streaming, so only the output side
+    // is resident. Measured peak 92 MiB.
+    let baseline = DecodeCost::streaming().with_output(1090, 16383, 3);
+    let ratio = mib(baseline.bytes()) / 92.0;
     assert!(
-        mib(baseline.bytes()) < 100.0,
-        "baseline JPEG stays cheap: {:.0} MiB",
+        (1.0..3.0).contains(&ratio),
+        "baseline JPEG: {:.0} MiB vs 92 measured ({ratio:.2}x)",
         mib(baseline.bytes())
     );
 
-    // RGB PNG, 15834x6084 (96 MP): no shrink-on-load, full frame.
-    let png = DecodeCost::full_frame(15834, 6084, 3);
+    // RGB PNG, 2250x26115 (58.8 MP) at width=1920 (output clamped to
+    // 16383 tall): full frame, plus the linear-light u16 copy, plus the
+    // output side. Measured peak 592 MiB — the case the first attempt
+    // under-estimated 3.5x, which is the dangerous direction.
+    let png = DecodeCost::full_frame(2250, 26115, 3, p)
+        .with_output(1411, 16383, 3)
+        .with_compressed(12 << 20);
+    let ratio = mib(png.bytes()) / 592.0;
     assert!(
-        (270.0..300.0).contains(&mib(png.bytes())),
-        "PNG is full-frame: {:.0} MiB",
+        (1.0..2.0).contains(&ratio),
+        "PNG: {:.0} MiB vs 592 measured ({ratio:.2}x)",
         mib(png.bytes())
     );
 
-    // The comparison the issue is about: 2.5x fewer pixels, but more
-    // estimated bytes than the 238 MP baseline JPEG. A pixel cap
-    // admitting the PNG admits everything cheaper; one bounding the
-    // PNG rejects the cheap 238 MP source.
-    assert!(png.bytes() > baseline.bytes());
-    assert!(png.decoded_pixels < 238_000_000);
-
-    // Progressive CMYK, 150 MP: four-channel staging *plus* libjpeg's
-    // whole-image coefficient arrays, which no output size reduces —
-    // exactly what MAX_SRC_PIXELS could not see.
-    let (cw, ch) = (12247, 12247); // ~150 MP
-    let prog = DecodeCost::scaled(cw / 2, ch / 2, 4).with_progressive_coefficients(cw, ch, 4);
-    let flat = DecodeCost::scaled(cw / 2, ch / 2, 4);
+    // Progressive CMYK 4:4:4, ~150 MP at width=1920: four-channel
+    // staging at the shrink-on-load size, plus coefficient arrays no
+    // output size reduces. Measured peak 1231 MiB.
+    let num = dct_scale_num(12247, 12247, 1920, 1920, 1.7) as usize;
+    let (dw, dh) = ((12247 * num).div_ceil(8), (12247 * num).div_ceil(8));
+    let prog = DecodeCost::full_frame(dw, dh, 4, p)
+        .with_output(1920, 1920, 4)
+        .with_progressive_coefficients(12247, 12247, 4);
+    let ratio = mib(prog.bytes()) / 1231.0;
     assert!(
-        prog.bytes() > flat.bytes() * 3,
-        "coefficients dominate: {:.0} vs {:.0} MiB",
-        mib(prog.bytes()),
-        mib(flat.bytes())
+        (1.0..2.5).contains(&ratio),
+        "progressive CMYK: {:.0} MiB vs 1231 measured ({ratio:.2}x)",
+        mib(prog.bytes())
     );
-    // And the progressive term is output-independent: halving the
-    // decode target leaves it untouched.
-    let smaller = DecodeCost::scaled(cw / 4, ch / 4, 4).with_progressive_coefficients(cw, ch, 4);
-    assert_eq!(prog.whole_source_bytes, smaller.whole_source_bytes);
+
+    // Every estimate must sit *above* its measured peak: under-
+    // estimating is what gets a container OOM-killed while the cap
+    // reports itself satisfied.
+    for (name, est, peak) in [
+        ("baseline", baseline.bytes(), 92.0),
+        ("png", png.bytes(), 592.0),
+        ("progressive", prog.bytes(), 1231.0),
+    ] {
+        assert!(mib(est) >= peak, "{name} under-estimates its peak");
+    }
+
+    // The progressive term is output-independent: a smaller output
+    // barely helps, which is why pixel- and output-based reasoning
+    // both fail on those sources.
+    let smaller = DecodeCost::full_frame(dw / 2, dh / 2, 4, p)
+        .with_output(480, 480, 4)
+        .with_progressive_coefficients(12247, 12247, 4);
     assert!(
         smaller.bytes() > prog.bytes() / 2,
-        "a smaller output barely helps a progressive source"
+        "progressive cost does not scale with the output"
     );
 
-    // Per-pixel spread across the shapes, the ratio the issue reports.
-    let per_mp = |c: &DecodeCost, src_px: u64| c.bytes() as f64 / src_px as f64;
-    let cheap = per_mp(&baseline, 238_000_000);
-    let dear = per_mp(&prog, 150_000_000);
+    // And the spread the issue is about: cost per *source* pixel across
+    // these shapes spans an order of magnitude.
+    let per_px = |c: &DecodeCost, src_px: f64| c.bytes() as f64 / src_px;
+    let cheap = per_px(&baseline, 238e6);
+    let dear = per_px(&prog, 150e6);
     assert!(
         dear / cheap > 10.0,
-        "cost per source pixel spans an order of magnitude: {cheap:.3} vs {dear:.3}"
+        "spread across shapes: {cheap:.3} vs {dear:.3} B per source pixel"
     );
 }

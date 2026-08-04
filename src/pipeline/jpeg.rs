@@ -181,25 +181,39 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
 
-    // The decoded-bytes estimate has to come *after* the scale is set:
-    // shrink-on-load is exactly what makes baseline JPEG cheap, and an
-    // estimate from the header dimensions would miss it by the scale
-    // factor squared (issue #17). Progressive sources add libjpeg's
-    // whole-image coefficient arrays, which no output size reduces.
+    // The decoded-bytes estimate. Two things field validation caught
+    // here (issue #17 follow-up), both worth naming:
+    //
+    // 1. The scaled dimensions must be computed from the factor just
+    //    passed to `dec.scale()`. `Decompress::width()/height()` return
+    //    libjpeg's `image_width`/`image_height` — the *source* — and
+    //    `output_width` is only populated at jpeg_calc_output_dimensions
+    //    or start_decompress. Reading the accessors here estimated the
+    //    full source and made the cheapest path in the corpus produce
+    //    the largest figure: the very failure this cap exists to fix.
+    //    `dct_scale_num`'s own arithmetic (num/8, rounded up) needs no
+    //    libjpeg call.
+    // 2. The dominant term for a streaming JPEG is the *output* side,
+    //    not the source: nothing full-frame is resident. The buffered
+    //    arms (CMYK/YCCK) do materialize a frame, and progressive
+    //    sources add coefficient arrays no output size reduces.
     {
-        let (dec_w, dec_h) = (dec.width(), dec.height());
+        let num = dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()) as usize;
+        let (dec_w, dec_h) = ((src_w * num).div_ceil(8), (src_h * num).div_ceil(8));
         let comps = dec.components().len().max(1) as u64;
-        // CMYK/YCCK stages four channels below; every other colorspace
-        // is asked for RGB.
-        let staged = if matches!(
+        let buffered = matches!(
             dec.color_space(),
             ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
-        ) {
-            4
+        );
+        let channels = if buffered { 4 } else { 3 };
+        let mut cost = if buffered {
+            // Staged whole (4-channel CMYK) and fed to the full-frame
+            // resize, like the buffered formats.
+            DecodeCost::full_frame(dec_w, dec_h, channels, p)
         } else {
-            3
+            DecodeCost::streaming()
         };
-        let mut cost = DecodeCost::scaled(dec_w, dec_h, staged);
+        cost = cost.with_output(dst_w, dst_h, channels);
         if s.jpeg_progressive {
             cost = cost.with_progressive_coefficients(src_w, src_h, comps);
         }

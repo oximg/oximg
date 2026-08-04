@@ -22,12 +22,15 @@ HTTP interface without notice.
   JPEG decodes through DCT shrink-on-load so its cost tracks the
   *output*, while progressive JPEG buffers whole-image coefficients
   and PNG/AVIF decode full frames, so theirs track the *source*.
-  - The estimate is per-format and computed at the existing check
-    point: decoded pixels *after* the shrink-on-load factor that will
-    actually be applied, times bytes per staged pixel (4 for CMYK),
-    plus progressive JPEG's coefficient arrays — the term
-    `OXIMG_MAX_SRC_PIXELS` explicitly could not see. It rounds up and
-    excludes resize scratch and encode buffers, and says so.
+  - The estimate models the buffers held at once: the decoder's frame
+    (at the shrink-on-load size that will actually be applied), the
+    linear-light resize input, the output-side buffers, progressive
+    JPEG's coefficient arrays — the term `OXIMG_MAX_SRC_PIXELS`
+    explicitly could not see — and the compressed source where a
+    format needs it whole. Streaming paths (baseline JPEG) pay only
+    the output side, which is why they are cheap. Field-validated at
+    1.2-1.8x above measured peaks on four real sources; encode-side
+    buffers remain excluded, and it rounds up.
   - Over-cap sources answer **413** naming the figure, on the same
     terms as the existing caps. `OXIMG_MAX_SRC_PIXELS` is unchanged
     and still useful as a cheap dimension guard.

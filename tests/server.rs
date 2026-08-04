@@ -2514,27 +2514,32 @@ fn decoded_bytes_cap_bounds_what_pixels_cannot() {
         1.0,
         "the estimate is recorded even with no cap set"
     );
-    // 4000*800*3 = 9.6 MB, so the 16 MiB bucket holds it and the 8 MiB
-    // one does not — the histogram is what an operator reads a cap off.
+    // 3.2 MP RGB: 9.6 MB staged plus 19.2 MB as the linear-light u16
+    // resize input, so ~28 MB — the 32 MiB bucket holds it and the
+    // 16 MiB one does not. This histogram is what an operator reads a
+    // cap off, so its placement is the contract.
+    assert_eq!(
+        metric(
+            &body,
+            "oximg_decoded_bytes_estimate_bucket{le=\"33554432\"}"
+        ),
+        1.0
+    );
     assert_eq!(
         metric(
             &body,
             "oximg_decoded_bytes_estimate_bucket{le=\"16777216\"}"
         ),
-        1.0
-    );
-    assert_eq!(
-        metric(&body, "oximg_decoded_bytes_estimate_bucket{le=\"8388608\"}"),
         0.0
     );
-    assert!(metric(&body, "oximg_decoded_bytes_estimate_sum") > 9_000_000.0);
+    assert!(metric(&body, "oximg_decoded_bytes_estimate_sum") > 25_000_000.0);
     drop(s);
 
     // A cap above the estimate serves; below it answers 413 (the same
     // class as the other source caps).
     let generous = Server::start(&[
         ("IMAGES_DIR", images.clone()),
-        ("OXIMG_MAX_DECODED_BYTES", (32 * 1024 * 1024).to_string()),
+        ("OXIMG_MAX_DECODED_BYTES", (64 * 1024 * 1024).to_string()),
     ]);
     assert_eq!(generous.get("/resize/100/100/wide.png").unwrap().0, 200);
     drop(generous);
@@ -2570,4 +2575,96 @@ fn decoded_bytes_cap_bounds_what_pixels_cannot() {
         panic!("server booted with a 1 KiB decoded-bytes cap");
     };
     assert!(!status.success());
+}
+
+/// Regression for the wiring, not the model (issue #17 field
+/// validation): a streaming JPEG's estimate must come from the
+/// post-shrink-on-load dimensions. The first attempt read
+/// `Decompress::width()`, which is libjpeg's `image_width` — the
+/// source — so an 8 MP source asked for a 100 px output estimated the
+/// whole frame and the cheapest path produced the largest figure.
+///
+/// The cap here sits far below the source-side cost and far above the
+/// output-side one, so only correct wiring passes.
+#[test]
+fn jpeg_estimate_follows_the_shrink_on_load_scale() {
+    let dir = std::env::temp_dir().join(format!("oximg-jpegest-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Build an 8 MP JPEG through the pipeline itself.
+    let (w, h) = (4000usize, 2000usize);
+    let mut png = Vec::new();
+    let mut enc = png::Encoder::new(&mut png, w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    let mut rows = Vec::with_capacity(w * h * 3);
+    for y in 0..h {
+        for x in 0..w {
+            rows.extend([(x % 251) as u8, (y % 241) as u8, 140]);
+        }
+    }
+    writer.write_image_data(&rows).unwrap();
+    writer.finish().unwrap();
+    let encode = |encoder| {
+        oximg::pipeline::process(
+            &png,
+            &oximg::pipeline::Params {
+                output: Some(oximg::pipeline::ImageFormat::Jpeg),
+                encoder,
+                ..Default::default()
+            },
+        )
+        .expect("encode fixture")
+        .0
+    };
+    // PRESET=fast is mozjpeg's baseline profile; the default (jpegli)
+    // writes progressive, which is the other half of this test.
+    std::fs::write(
+        dir.join("baseline.jpg"),
+        encode(oximg::pipeline::Encoder::MozFast),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("progressive.jpg"),
+        encode(oximg::pipeline::Encoder::Jpegli),
+    )
+    .unwrap();
+
+    // 8 MP staged as RGB is 24 MB, and with the linear-light copy 72 MB;
+    // the 100x50 output side is well under a mebibyte. A 8 MiB cap
+    // therefore fails loudly if the estimate ever regresses to source
+    // dimensions.
+    let s = Server::start(&[
+        ("IMAGES_DIR", dir.to_str().unwrap().to_string()),
+        ("OXIMG_MAX_DECODED_BYTES", (8 * 1024 * 1024).to_string()),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    let (status, _, body) = s
+        .get("/resize/100/0/baseline.jpg")
+        .expect("a shrink-on-load JPEG must fit a small cap");
+    assert_eq!(status, 200);
+    let (_, ow, _) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(ow, 100);
+
+    // Same pixels, same request, progressive encoding: libjpeg will
+    // buffer whole-image coefficients (8 MP x 3 comps x 2 B = 48 MB),
+    // which no output size reduces — so it exceeds the same cap. This
+    // is the distinction a pixel cap cannot express, in one pair.
+    assert_eq!(
+        s.status_of("/resize/100/0/progressive.jpg"),
+        413,
+        "progressive coefficients must be counted"
+    );
+
+    // The recorded estimate must be small — the smallest bucket holds
+    // it — rather than source-sized.
+    let metrics = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(
+            &metrics,
+            "oximg_decoded_bytes_estimate_bucket{le=\"1048576\"}"
+        ),
+        1.0,
+        "a streaming JPEG's estimate is output-sized, not source-sized"
+    );
 }

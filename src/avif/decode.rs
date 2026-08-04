@@ -303,7 +303,10 @@ pub(super) fn picture_to_rgb(
     // dav1d has no shrink-on-load: the full frame materializes, and a
     // 10/12-bit source stages two bytes per sample. Four channels
     // covers the alpha auxiliary item when present.
-    crate::pipeline::check_decoded_bytes(crate::pipeline::DecodeCost::full_frame(w, h, 4), "AVIF")?;
+    crate::pipeline::check_decoded_bytes(
+        crate::pipeline::DecodeCost::full_frame_linear(w, h, 4).with_output(w, h, 4),
+        "AVIF",
+    )?;
     let bpc = pic.p.bpc as u32;
     ensure!(matches!(bpc, 8 | 10 | 12), "unsupported bit depth {bpc}");
     let seq = unsafe { &*pic.seq_hdr };

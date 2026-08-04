@@ -31,8 +31,12 @@ pub(super) fn process_png<R: std::io::Read>(
             png::ColorType::Indexed => 4,
             _ => 3,
         };
+        let (sw, sh) = (hdr.width as usize, hdr.height as usize);
+        let (ow, oh) = fit_dims(sw, sh, p.max_width, p.max_height);
         check_decoded_bytes(
-            DecodeCost::full_frame(hdr.width as usize, hdr.height as usize, channels),
+            DecodeCost::full_frame(sw, sh, channels, p)
+                .with_output(ow, oh, channels)
+                .with_compressed(s.srcbuf.len()),
             "PNG",
         )?;
     }
@@ -336,8 +340,11 @@ pub(super) fn webp_decode_into_chunk8(
         // Conservative for WebP: libwebp's decode scaler may shrink
         // this below the source (decided a few lines down), so the
         // full frame is an upper bound, not the exact figure.
+        let (ow, oh) = fit_dims(src_w, src_h, p.max_width, p.max_height);
         check_decoded_bytes(
-            DecodeCost::full_frame(src_w, src_h, channels as u64),
+            DecodeCost::full_frame(src_w, src_h, channels as u64, p)
+                .with_output(ow, oh, channels as u64)
+                .with_compressed(s.srcbuf.len()),
             "WebP",
         )?;
 

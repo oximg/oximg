@@ -1060,53 +1060,104 @@ pub(crate) const ICC_CAP: usize = 4 * 1024 * 1024;
 /// - CMYK/YCCK stages four channels instead of three.
 /// - PNG and AVIF have no shrink-on-load: full frame, always.
 ///
-/// This is deliberately an estimate of the *decode* stage's dominant
-/// allocations, not a memory accounting: resize scratch and encode
-/// buffers are not counted, and it rounds toward over-estimating. It
-/// exists to be checkable before the allocation happens and tunable
-/// from a container limit — neither of which a pixel count can do.
-#[derive(Clone, Copy, Debug)]
+/// The model follows the buffers the code actually holds at once:
+/// the decoder's output frame, the linear-light resize input (the same
+/// frame as u16), the output-side `dst16`+`out8`, progressive JPEG's
+/// coefficient arrays, and the compressed source where a format needs
+/// it whole. Field validation (issue #17 follow-up) put it 1.2-1.8x
+/// above measured peaks across four real sources — deliberately on the
+/// conservative side, because under-estimating is the direction that
+/// gets a container OOM-killed while the cap reports itself satisfied.
+/// Encode-side buffers are still excluded, which is why it rounds up
+/// elsewhere.
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DecodeCost {
-    /// Pixels the decoder will actually materialize (after any
-    /// shrink-on-load that will be applied).
-    pub decoded_pixels: u64,
-    /// Bytes per materialized pixel (channels, times sample size).
-    pub bytes_per_pixel: u64,
-    /// Extra whole-source buffering the codec needs regardless of the
-    /// output size — progressive JPEG's coefficient arrays.
+    /// The decoder's own output buffer: pixels it materializes (after
+    /// any shrink-on-load) times bytes per staged pixel. Zero for the
+    /// streaming JPEG path, which only ever holds row bands.
+    pub staged_bytes: u64,
+    /// The linear-light resize input for full-frame paths: the same
+    /// frame again as u16 (`src16`). Zero when the path streams or
+    /// when linear light is off.
+    pub resize_input_bytes: u64,
+    /// Output-side buffers every path allocates: `dst16` (u16) plus
+    /// `out8`, i.e. 3x the output frame per channel.
+    pub output_bytes: u64,
+    /// Whole-source buffering no output size reduces — progressive
+    /// JPEG's coefficient arrays.
     pub whole_source_bytes: u64,
+    /// The compressed source, held whole by the buffered formats
+    /// (`srcbuf`); the JPEG path streams and never does.
+    pub compressed_bytes: u64,
 }
 
 impl DecodeCost {
     pub fn bytes(&self) -> u64 {
-        self.decoded_pixels
-            .saturating_mul(self.bytes_per_pixel)
+        self.staged_bytes
+            .saturating_add(self.resize_input_bytes)
+            .saturating_add(self.output_bytes)
             .saturating_add(self.whole_source_bytes)
+            .saturating_add(self.compressed_bytes)
     }
 
-    /// Full-frame decode: every pixel materialized at `channels` bytes.
-    pub fn full_frame(w: usize, h: usize, channels: u64) -> Self {
+    /// A path that materializes the whole `w x h` frame at `channels`
+    /// bytes per pixel and feeds the full-frame resize: `chunk8` plus,
+    /// under linear light (the default), the same frame as u16.
+    pub fn full_frame(w: usize, h: usize, channels: u64, p: &Params) -> Self {
+        let px = (w as u64).saturating_mul(h as u64);
+        let staged = px.saturating_mul(channels);
         DecodeCost {
-            decoded_pixels: (w as u64).saturating_mul(h as u64),
-            bytes_per_pixel: channels,
-            whole_source_bytes: 0,
+            staged_bytes: staged,
+            resize_input_bytes: if linear_light(p) { staged * 2 } else { 0 },
+            ..Default::default()
         }
     }
 
-    /// A decode that materializes only `dec_w x dec_h` (shrink-on-load
-    /// applied), optionally plus whole-source coefficient buffering.
-    pub fn scaled(dec_w: usize, dec_h: usize, channels: u64) -> Self {
-        DecodeCost::full_frame(dec_w, dec_h, channels)
+    /// `full_frame` for call sites without a `Params` in scope (the
+    /// AVIF picture converter): assumes linear light, which is the
+    /// default and the more expensive branch.
+    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
+    pub fn full_frame_linear(w: usize, h: usize, channels: u64) -> Self {
+        let px = (w as u64).saturating_mul(h as u64);
+        let staged = px.saturating_mul(channels);
+        DecodeCost {
+            staged_bytes: staged,
+            resize_input_bytes: staged * 2,
+            ..Default::default()
+        }
+    }
+
+    /// A streaming path: no full frame is ever resident, only the
+    /// output-side buffers (added by `with_output`).
+    pub fn streaming() -> Self {
+        DecodeCost::default()
+    }
+
+    /// `dst16` + `out8` for the resize target. Every path pays this,
+    /// and on the streaming paths it is the dominant term — measured
+    /// 5.1 B per output pixel against the 9 modeled here (issue #17
+    /// follow-up), i.e. conservative.
+    pub fn with_output(mut self, out_w: usize, out_h: usize, channels: u64) -> Self {
+        let px = (out_w as u64).saturating_mul(out_h as u64);
+        self.output_bytes = px.saturating_mul(channels).saturating_mul(3);
+        self
     }
 
     /// Progressive JPEG's whole-image coefficient arrays: full source
     /// resolution, one `JCOEF` (2 bytes) per sample per component.
-    /// `MAX_SRC_PIXELS` explicitly could not see these.
+    /// `MAX_SRC_PIXELS` explicitly could not see these, and field
+    /// measurement confirmed they dominate such sources.
     pub fn with_progressive_coefficients(mut self, src_w: usize, src_h: usize, comps: u64) -> Self {
         self.whole_source_bytes = (src_w as u64)
             .saturating_mul(src_h as u64)
             .saturating_mul(comps)
             .saturating_mul(2);
+        self
+    }
+
+    /// The compressed source held whole by the buffered formats.
+    pub fn with_compressed(mut self, bytes: usize) -> Self {
+        self.compressed_bytes = bytes as u64;
         self
     }
 }
@@ -1128,19 +1179,14 @@ pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &str) -> Result<()> {
         anyhow::bail!(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
             format!(
-                "{what} decode needs about {bytes} bytes \
-                 ({} decoded pixels x {} B/px{}), over the \
+                "{what} decode needs about {bytes} bytes (staged {}, resize input {}, \
+                 output {}, whole-source {}, compressed {}), over the \
                  OXIMG_MAX_DECODED_BYTES limit ({cap})",
-                cost.decoded_pixels,
-                cost.bytes_per_pixel,
-                if cost.whole_source_bytes > 0 {
-                    format!(
-                        " plus {} B of whole-source buffering",
-                        cost.whole_source_bytes
-                    )
-                } else {
-                    String::new()
-                }
+                cost.staged_bytes,
+                cost.resize_input_bytes,
+                cost.output_bytes,
+                cost.whole_source_bytes,
+                cost.compressed_bytes,
             ),
         ));
     }
