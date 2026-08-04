@@ -29,7 +29,7 @@ spec:
       containers:
         - name: oximg
           # latest rebuilds on every main push; pin a version tag or digest.
-          image: ghcr.io/oximg/oximg:0.8.0
+          image: ghcr.io/oximg/oximg:0.8.1
           ports:
             - containerPort: 8081
           env:

@@ -10,6 +10,12 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-04
+
+The other half of the decoded-bytes work: an expensive request can now
+be *named* without being refused, which is what makes a cap settable
+from a real corpus (#19).
+
 ### Added
 
 - **`OXIMG_LOG_DECODED_BYTES_ABOVE`** ([#19]): report any decode whose
