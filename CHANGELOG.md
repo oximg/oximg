@@ -10,6 +10,11 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-08-04
+
+Cross-origin callers can preflight: `OPTIONS` answers 204 instead of
+405 (#15), which no CDN-attached CORS header could work around.
+
 ### Fixed
 
 - **`OPTIONS` answers 204 instead of 405** ([#15]), so a browser CORS
