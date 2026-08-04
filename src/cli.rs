@@ -124,6 +124,11 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     };
     let (bytes, format) = pipeline::process_path(std::path::Path::new(input), &params)
         .with_context(|| format!("process {input}"))?;
+    // Same reporting threshold as the server: useful for sizing a cap
+    // against a corpus offline, one file at a time.
+    if let Some(report) = pipeline::decode_report_above_threshold() {
+        eprintln!("oximg: decoded-bytes file={input:?} {report}");
+    }
     std::fs::write(output, &bytes).with_context(|| format!("write {output}"))?;
     // Summary on stderr: stdout stays clean for scripting.
     let (_, w, h) = pipeline::probe(&bytes)?;

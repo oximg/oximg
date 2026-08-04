@@ -1153,9 +1153,52 @@ impl DecodeCost {
 /// on purpose: an operator who cannot see the figure can only guess a
 /// cap and learn from user reports (issue #17 — set three times, wrong
 /// three times).
-pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &str) -> Result<()> {
+impl DecodeCost {
+    /// The per-term breakdown, in the one place it is formatted. The
+    /// terms are the point, not the total: they tell an operator
+    /// whether a request is bounded by the source side (buy memory) or
+    /// the output side (cap the requested width).
+    fn report(&self, what: &str) -> String {
+        format!(
+            "{what} decode needs about {} bytes (staged {}, resize input {}, \
+             output {}, whole-source {}, compressed {})",
+            self.bytes(),
+            self.staged_bytes,
+            self.resize_input_bytes,
+            self.output_bytes,
+            self.whole_source_bytes,
+            self.compressed_bytes,
+        )
+    }
+}
+
+thread_local! {
+    /// The last decode's cost on this thread, so the caller — which is
+    /// the only place that knows *which source* this was — can report
+    /// it. Set on every request; formatted only if someone asks.
+    static LAST_COST: std::cell::Cell<Option<(DecodeCost, &'static str)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The last decode's per-term report, if its estimate exceeded
+/// `OXIMG_LOG_DECODED_BYTES_ABOVE`. `None` when the knob is unset, when
+/// the estimate is under it, or when no decode has run on this thread.
+///
+/// This exists because the cap can only ever name what it *rejects*
+/// (issue #19): the histogram counts an expensive request without
+/// identifying it, and a cap high enough to be safe names nothing at
+/// all. Reporting without refusing is how a deployment learns its own
+/// corpus before choosing a limit.
+pub fn decode_report_above_threshold() -> Option<String> {
+    let threshold = crate::config::config().log_decoded_bytes_above?;
+    let (cost, what) = LAST_COST.get()?;
+    (cost.bytes() > threshold).then(|| cost.report(what))
+}
+
+pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &'static str) -> Result<()> {
     let bytes = cost.bytes();
     record_decoded_bytes(bytes);
+    LAST_COST.set(Some((cost, what)));
     let Some(cap) = crate::config::config().max_decoded_bytes else {
         return Ok(());
     };
@@ -1165,14 +1208,8 @@ pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &str) -> Result<()> {
         anyhow::bail!(std::io::Error::new(
             std::io::ErrorKind::FileTooLarge,
             format!(
-                "{what} decode needs about {bytes} bytes (staged {}, resize input {}, \
-                 output {}, whole-source {}, compressed {}), over the \
-                 OXIMG_MAX_DECODED_BYTES limit ({cap})",
-                cost.staged_bytes,
-                cost.resize_input_bytes,
-                cost.output_bytes,
-                cost.whole_source_bytes,
-                cost.compressed_bytes,
+                "{}, over the OXIMG_MAX_DECODED_BYTES limit ({cap})",
+                cost.report(what)
             ),
         ));
     }

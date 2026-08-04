@@ -1067,20 +1067,25 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     // — a dependency's blanket From impls otherwise make the inference
     // ambiguous here.
     type Processed = Result<(Vec<u8>, ImageFormat), pipeline::Error>;
-    let out = tokio::task::spawn_blocking(move || -> Result<Processed, (StatusCode, String)> {
-        let _permit = permit; // hold the CPU slot for the whole processing
-        // Streaming decode: the source is never buffered whole on the heap
-        // (saves concurrency x file-size for large sources under load);
-        // for remote sources decoding overlaps the download.
-        match fetch {
-            Fetch::Url(url) => Ok(pipeline::process_url(&url, &params)),
-            Fetch::Gcs { bucket, key } => Ok(pipeline::process_gcs(&bucket, &key, &params)),
-            Fetch::Local => {
-                verify_within_root(&images_root, &path)?;
-                Ok(pipeline::process_path(&path, &params))
-            }
-        }
-    })
+    let out = tokio::task::spawn_blocking(
+        move || -> Result<(Processed, Option<String>), (StatusCode, String)> {
+            let _permit = permit; // hold the CPU slot for the whole processing
+            // Streaming decode: the source is never buffered whole on the heap
+            // (saves concurrency x file-size for large sources under load);
+            // for remote sources decoding overlaps the download.
+            let processed = match fetch {
+                Fetch::Url(url) => pipeline::process_url(&url, &params),
+                Fetch::Gcs { bucket, key } => pipeline::process_gcs(&bucket, &key, &params),
+                Fetch::Local => {
+                    verify_within_root(&images_root, &path)?;
+                    pipeline::process_path(&path, &params)
+                }
+            };
+            // Read the estimate report on the thread that decoded, so the
+            // caller — which knows *which* source this was — can name it.
+            Ok((processed, pipeline::decode_report_above_threshold()))
+        },
+    )
     .await
     .map_err(|e| {
         eprintln!("oximg: error status=500 file={file:?} panic={e}");
@@ -1089,7 +1094,22 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             "image processing failed".to_string(),
         )
     })?
-    .inspect(|_| metrics::METRICS.observe_process(t_process.elapsed().as_secs_f64()))?
+    .map(|(processed, report)| {
+        metrics::METRICS.observe_process(t_process.elapsed().as_secs_f64());
+        // Report-without-refusing (issue #19): the cap can only ever
+        // name what it *rejects*, so a deployment learning its corpus
+        // needs expensive requests named while they are still served.
+        // Only on success — a rejection already names itself, with the
+        // limit clause attached. The filename lives here, not in the
+        // pipeline, which is why the report travels back out of the
+        // blocking task rather than being logged where it is computed.
+        if processed.is_ok()
+            && let Some(report) = report
+        {
+            eprintln!("oximg: decoded-bytes file={file:?} {report}");
+        }
+        processed
+    })?
     // The pipeline classifies its own failures (pipeline::ErrorKind);
     // this match only assigns statuses. Faults on our side (unreadable
     // source, upstream, internal) answer with generic bodies — the
