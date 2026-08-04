@@ -10,6 +10,24 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`OPTIONS` answers 204 instead of 405** ([#15]), so a browser CORS
+  preflight can succeed. A preflight is the browser asking permission
+  to send a later `GET`, not an attempt to invoke `OPTIONS`; answering
+  "method not allowed" was true about the method and the wrong answer
+  to the question. It also could not be worked around at the edge —
+  a CDN-attached `Access-Control-Allow-Origin` arrived on a 405, and
+  the status alone fails the preflight. All four image routes answer,
+  including the signed ones (a preflight performs no work and answers
+  identically for every path, so requiring a signature would only stop
+  the browser from ever sending the signed `GET`, which is still
+  checked). Genuinely unsupported methods keep their 405, and oximg
+  still leaves the CORS response headers themselves to whatever fronts
+  it.
+
+[#15]: https://github.com/oximg/oximg/issues/15
+
 ## [0.7.7] - 2026-08-03
 
 Tall images work in WebP: the format's 16383 px ceiling is now part of

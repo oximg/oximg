@@ -89,6 +89,40 @@ impl Server {
         Ok((status, ct, body))
     }
 
+    /// Send an arbitrary method, returning (status, Allow header).
+    /// ureq errors on non-2xx, so both arms are unwrapped by hand.
+    fn method_of(&self, method: &str, path: &str) -> (u16, Option<String>) {
+        let url = format!("http://127.0.0.1:{}{}", self.port, path);
+        let req = match method {
+            "OPTIONS" => ureq::options(&url),
+            "POST" => return (self.post_status(&url), None),
+            other => panic!("unsupported test method {other}"),
+        };
+        match req
+            .header("Origin", "https://example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .call()
+        {
+            Ok(resp) => {
+                let allow = resp
+                    .headers()
+                    .get("allow")
+                    .map(|v| v.to_str().unwrap_or("").to_string());
+                (resp.status().as_u16(), allow)
+            }
+            Err(ureq::Error::StatusCode(s)) => (s, None),
+            Err(e) => panic!("transport error: {e}"),
+        }
+    }
+
+    fn post_status(&self, url: &str) -> u16 {
+        match ureq::post(url).send_empty() {
+            Ok(r) => r.status().as_u16(),
+            Err(ureq::Error::StatusCode(s)) => s,
+            Err(e) => panic!("transport error: {e}"),
+        }
+    }
+
     /// Status even for error responses (ureq errors on non-2xx by default).
     fn status_of(&self, path: &str) -> u16 {
         match self.get(path) {
@@ -2392,4 +2426,47 @@ fn tall_sources_encode_to_webp_by_fitting_the_format_ceiling() {
     assert_eq!(ct, "image/png");
     let (_, ow, oh) = oximg::pipeline::probe(&body).unwrap();
     assert_eq!((ow, oh), (20, 16500), "PNG keeps the source dimensions");
+}
+
+/// Issue #15: a CORS preflight needs a 2xx, and a 405 cannot be
+/// rescued by CORS headers attached at the edge — the status itself
+/// fails it. OPTIONS on every image route answers 204 with `Allow`,
+/// including on the signed routes (a preflight performs no work and
+/// answers identically for every path, so requiring a signature would
+/// only stop the browser from ever sending the signed GET). Other
+/// methods keep their 405.
+#[test]
+fn options_answers_204_so_preflight_can_succeed() {
+    let s = Server::start(&[("OXIMG_OPTIONS_PREFIX", "/image".into())]);
+    for path in [
+        "/resize/100/100/photo.jpg",
+        "/image/width=100/photo.jpg",
+        // A nested path and an @fmt token take the same route shapes.
+        "/resize/100/100/photo.jpg@webp",
+    ] {
+        let (status, allow) = s.method_of("OPTIONS", path);
+        assert_eq!(status, 204, "{path}");
+        assert_eq!(allow.as_deref(), Some("GET, HEAD, OPTIONS"), "{path}");
+    }
+    // Genuinely unsupported methods still say so.
+    assert_eq!(s.method_of("POST", "/resize/100/100/photo.jpg").0, 405);
+    // GET is untouched.
+    assert_eq!(s.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+    drop(s);
+
+    // With signing on, the preflight still succeeds while the
+    // unsigned GET it precedes is still refused.
+    let signed = Server::start(&[
+        ("OXIMG_OPTIONS_PREFIX", "/image".into()),
+        ("OXIMG_KEY", "deadbeef".repeat(8)),
+        ("OXIMG_SALT", "cafebabe".repeat(8)),
+    ]);
+    for path in [
+        "/resize/100/100/photo.jpg",
+        "/AAAA/resize/100/100/photo.jpg",
+        "/AAAA/image/width=100/photo.jpg",
+    ] {
+        assert_eq!(signed.method_of("OPTIONS", path).0, 204, "{path}");
+    }
+    assert_eq!(signed.status_of("/resize/100/100/photo.jpg"), 403);
 }
