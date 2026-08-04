@@ -704,3 +704,121 @@ fn webp_output_is_clamped_to_the_format_ceiling() {
         );
     }
 }
+
+/// Issue #17's core claim in arithmetic: at equal pixel counts the
+/// decode cost varies by more than an order of magnitude, so a pixel
+/// cap cannot bound memory while a byte estimate can. The shapes and
+/// the measured peaks come from the field validation on the issue.
+#[test]
+fn decode_cost_separates_what_pixel_counts_cannot() {
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let p = &Params::default();
+
+    // Baseline JPEG, 3980x59828 (238 MP) at width=1920, whose WebP
+    // output clamps to 16383 tall: streaming, so only the output side
+    // is resident. Measured peak 92 MiB.
+    let baseline = DecodeCost::streaming().with_output(1090, 16383, 3);
+    let ratio = mib(baseline.bytes()) / 92.0;
+    assert!(
+        (1.0..3.0).contains(&ratio),
+        "baseline JPEG: {:.0} MiB vs 92 measured ({ratio:.2}x)",
+        mib(baseline.bytes())
+    );
+
+    // RGB PNG, 2250x26115 (58.8 MP) at width=1920 (output clamped to
+    // 16383 tall): full frame, plus the linear-light u16 copy, plus the
+    // output side. Measured peak 592 MiB — the case the first attempt
+    // under-estimated 3.5x, which is the dangerous direction.
+    let png = DecodeCost::full_frame(2250, 26115, 3, p)
+        .with_output(1411, 16383, 3)
+        .with_compressed(12 << 20);
+    let ratio = mib(png.bytes()) / 592.0;
+    assert!(
+        (1.0..2.0).contains(&ratio),
+        "PNG: {:.0} MiB vs 592 measured ({ratio:.2}x)",
+        mib(png.bytes())
+    );
+
+    // Progressive CMYK 4:4:4, ~150 MP at width=1920: four-channel
+    // staging at the shrink-on-load size, plus coefficient arrays no
+    // output size reduces. Measured peak 1231 MiB.
+    let num = dct_scale_num(12247, 12247, 1920, 1920, 1.7) as usize;
+    let (dw, dh) = ((12247 * num).div_ceil(8), (12247 * num).div_ceil(8));
+    let prog = DecodeCost::full_frame(dw, dh, 4, p)
+        .with_output(1920, 1920, 4)
+        .with_progressive_coefficients(12247, 12247, 4);
+    let ratio = mib(prog.bytes()) / 1231.0;
+    assert!(
+        (1.0..2.5).contains(&ratio),
+        "progressive CMYK: {:.0} MiB vs 1231 measured ({ratio:.2}x)",
+        mib(prog.bytes())
+    );
+
+    // Every estimate must sit *above* its measured peak: under-
+    // estimating is what gets a container OOM-killed while the cap
+    // reports itself satisfied.
+    for (name, est, peak) in [
+        ("baseline", baseline.bytes(), 92.0),
+        ("png", png.bytes(), 592.0),
+        ("progressive", prog.bytes(), 1231.0),
+    ] {
+        assert!(mib(est) >= peak, "{name} under-estimates its peak");
+    }
+
+    // The progressive term is output-independent: a smaller output
+    // barely helps, which is why pixel- and output-based reasoning
+    // both fail on those sources.
+    let smaller = DecodeCost::full_frame(dw / 2, dh / 2, 4, p)
+        .with_output(480, 480, 4)
+        .with_progressive_coefficients(12247, 12247, 4);
+    assert!(
+        smaller.bytes() > prog.bytes() / 2,
+        "progressive cost does not scale with the output"
+    );
+
+    // And the spread the issue is about: cost per *source* pixel across
+    // these shapes spans an order of magnitude.
+    let per_px = |c: &DecodeCost, src_px: f64| c.bytes() as f64 / src_px;
+    let cheap = per_px(&baseline, 238e6);
+    let dear = per_px(&prog, 150e6);
+    assert!(
+        dear / cheap > 10.0,
+        "spread across shapes: {cheap:.3} vs {dear:.3} B per source pixel"
+    );
+}
+
+/// `larger_fit` is what keeps the output-side estimate conservative
+/// before a source's orientation is known (issue #17 review): it must
+/// return whichever of the two candidate fits covers more pixels, with
+/// the axes back in stored order.
+#[test]
+fn larger_fit_covers_the_swapped_orientation() {
+    let box_ = |w: u32, h: u32| Params {
+        max_width: w,
+        max_height: h,
+        ..Params::default()
+    };
+    // The review's shape: 4000x1000 under a width-only box. Upright it
+    // fits to 1920x480; presented as 1000x4000 by orientation 6 it fits
+    // to 1000x4000 — four times the pixels, and what must be counted.
+    assert_eq!(
+        super::formats::larger_fit(4000, 1000, &box_(1920, u32::MAX)),
+        (4000, 1000)
+    );
+    // The mirror case: the unoriented fit is already the larger one.
+    assert_eq!(
+        super::formats::larger_fit(1000, 4000, &box_(1920, u32::MAX)),
+        (1000, 4000)
+    );
+    // A symmetric box makes both candidates equal, so the stored
+    // orientation is returned unchanged.
+    assert_eq!(
+        super::formats::larger_fit(4000, 1000, &box_(500, 500)),
+        (500, 125)
+    );
+    // Sources inside the box are never enlarged either way.
+    assert_eq!(
+        super::formats::larger_fit(300, 200, &box_(1920, u32::MAX)),
+        (300, 200)
+    );
+}

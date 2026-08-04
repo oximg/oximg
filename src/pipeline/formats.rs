@@ -22,6 +22,29 @@ pub(super) fn process_png<R: std::io::Read>(
     {
         let hdr = png_reader.info();
         check_src_pixels(hdr.width as usize, hdr.height as usize)?;
+        // PNG has no shrink-on-load: the whole frame materializes,
+        // normalized to RGB8 or RGBA8 (EXPAND|STRIP_16 upstream).
+        let channels = match hdr.color_type {
+            png::ColorType::Rgba | png::ColorType::GrayscaleAlpha => 4,
+            // Palette sources can carry tRNS, which EXPAND resolves to
+            // RGBA; assume the wider staging rather than under-count.
+            png::ColorType::Indexed => 4,
+            _ => 3,
+        };
+        let (sw, sh) = (hdr.width as usize, hdr.height as usize);
+        // The eXIf orientation is parsed below this block, so which way
+        // the fit runs is not known yet — and an axis-swapping
+        // orientation with an asymmetric box can make the real output
+        // several times larger than the unoriented fit. Take the larger
+        // of the two candidates: over-counting the output side is the
+        // safe direction for a limit.
+        let (ow, oh) = larger_fit(sw, sh, p);
+        check_decoded_bytes(
+            DecodeCost::full_frame(sw, sh, channels, p)
+                .with_output(ow, oh, channels)
+                .with_compressed(s.srcbuf.len()),
+            "PNG",
+        )?;
     }
     // eXIf orientation (raw TIFF per the PNG spec; a stray JPEG-style
     // prefix is tolerated like browsers do). Only chunks ahead of the
@@ -157,6 +180,21 @@ pub(super) fn process_png<R: std::io::Read>(
     out
 }
 
+/// The larger of the two fits a source could take once its orientation
+/// is known: axis-swapping orientations fit the *displayed* frame, and
+/// with an asymmetric box that can be several times the unoriented
+/// result. Used where the estimate runs before the orientation is
+/// parsed — over-counting the output side keeps a limit safe.
+pub(super) fn larger_fit(w: usize, h: usize, p: &Params) -> (usize, usize) {
+    let a = fit_dims(w, h, p.max_width, p.max_height);
+    let b = fit_dims(h, w, p.max_width, p.max_height);
+    if a.0 * a.1 >= b.0 * b.1 {
+        a
+    } else {
+        (b.1, b.0)
+    }
+}
+
 /// Expand grayscale(+alpha) pixels in `chunk8[..len]` to RGB(A) in place.
 pub(super) fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
     let out_ch = in_ch + 2;
@@ -268,6 +306,22 @@ pub(super) fn process_avif<R: std::io::Read>(
     } else {
         crate::meta::Orientation::UPRIGHT
     };
+    {
+        // Before the decode allocates: dav1d has no shrink-on-load, so
+        // the whole frame materializes. Dimensions come from the
+        // container probe; four channels covers the alpha auxiliary
+        // item, and 10/12-bit sources stage two bytes per sample, which
+        // the linear-light term already accounts for.
+        let (pw, ph) = crate::avif::probe_avif(&s.srcbuf)?;
+        check_src_pixels(pw, ph)?;
+        let (ow, oh) = larger_fit(pw, ph, p);
+        check_decoded_bytes(
+            DecodeCost::full_frame(pw, ph, 4, p)
+                .with_output(ow, oh, 4)
+                .with_compressed(s.srcbuf.len()),
+            "AVIF",
+        )?;
+    }
     let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
@@ -320,6 +374,16 @@ pub(super) fn webp_decode_into_chunk8(
         let (src_w, src_h) = (config.input.width as usize, config.input.height as usize);
         check_src_pixels(src_w, src_h)?;
         let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
+        // Conservative for WebP: libwebp's decode scaler may shrink
+        // this below the source (decided a few lines down), so the
+        // full frame is an upper bound, not the exact figure.
+        let (ow, oh) = larger_fit(src_w, src_h, p);
+        check_decoded_bytes(
+            DecodeCost::full_frame(src_w, src_h, channels as u64, p)
+                .with_output(ow, oh, channels as u64)
+                .with_compressed(s.srcbuf.len()),
+            "WebP",
+        )?;
 
         // The stored-space resize target: fit the *displayed* frame,
         // swap back for axis-swapping orientations. Deciding the decode

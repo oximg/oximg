@@ -44,7 +44,7 @@ fn decode_and_resize_inner(
         // OXIMG_ICC=0 downgrades CMYK sources to the naive composite
         // here exactly like the server path.
         let want_icc = icc_passthrough(&p);
-        let meta = if auto_rotate(&p) || want_icc {
+        let meta = if auto_rotate(&p) || want_icc || decoded_bytes_cap_set() {
             let mut prefix = Vec::new();
             let mut r = jpeg;
             crate::meta::scan_jpeg_meta(&mut r, &mut prefix, want_icc)
@@ -56,6 +56,7 @@ fn decode_and_resize_inner(
         } else {
             crate::meta::Orientation::UPRIGHT
         };
+        s.jpeg_progressive = meta.progressive;
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
         match decode_resize(
             s,
@@ -179,6 +180,45 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     };
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
+
+    // The decoded-bytes estimate. Two things field validation caught
+    // here (issue #17 follow-up), both worth naming:
+    //
+    // 1. The scaled dimensions must be computed from the factor just
+    //    passed to `dec.scale()`. `Decompress::width()/height()` return
+    //    libjpeg's `image_width`/`image_height` — the *source* — and
+    //    `output_width` is only populated at jpeg_calc_output_dimensions
+    //    or start_decompress. Reading the accessors here estimated the
+    //    full source and made the cheapest path in the corpus produce
+    //    the largest figure: the very failure this cap exists to fix.
+    //    `dct_scale_num`'s own arithmetic (num/8, rounded up) needs no
+    //    libjpeg call.
+    // 2. The dominant term for a streaming JPEG is the *output* side,
+    //    not the source: nothing full-frame is resident. The buffered
+    //    arms (CMYK/YCCK) do materialize a frame, and progressive
+    //    sources add coefficient arrays no output size reduces.
+    {
+        let num = dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()) as usize;
+        let (dec_w, dec_h) = ((src_w * num).div_ceil(8), (src_h * num).div_ceil(8));
+        let comps = dec.components().len().max(1) as u64;
+        let buffered = matches!(
+            dec.color_space(),
+            ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+        );
+        let channels = if buffered { 4 } else { 3 };
+        let mut cost = if buffered {
+            // Staged whole (4-channel CMYK) and fed to the full-frame
+            // resize, like the buffered formats.
+            DecodeCost::full_frame(dec_w, dec_h, channels, p)
+        } else {
+            DecodeCost::streaming()
+        };
+        cost = cost.with_output(dst_w, dst_h, channels);
+        if s.jpeg_progressive {
+            cost = cost.with_progressive_coefficients(src_w, src_h, comps);
+        }
+        check_decoded_bytes(cost, "JPEG")?;
+    }
 
     // CMYK and YCCK sources (print-workflow JPEGs) take a buffered
     // serial path: libjpeg itself normalizes YCCK back to CMYK when
@@ -536,7 +576,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // this scan. (OXIMG_ICC=0 therefore also downgrades CMYK
         // sources to the naive conversion.)
         let want_icc = icc_passthrough(p);
-        let meta = if auto_rotate(p) || want_icc {
+        let meta = if auto_rotate(p) || want_icc || decoded_bytes_cap_set() {
             crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
@@ -546,6 +586,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         } else {
             crate::meta::Orientation::UPRIGHT
         };
+        s.jpeg_progressive = meta.progressive;
         let icc = meta.icc;
         let reader = std::io::Read::chain(&scan_prefix[..], reader);
         let dec = Decompress::new_reader(reader).context("parse JPEG")?;

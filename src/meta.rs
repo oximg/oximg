@@ -138,12 +138,19 @@ const SCAN_CAP: usize = 1024 * 1024;
 pub(crate) struct JpegMeta {
     pub(crate) orientation: Orientation,
     pub(crate) icc: Option<Vec<u8>>,
+    /// SOF2 seen: libjpeg will buffer whole-image coefficients for this
+    /// source, which dominates its memory cost and is invisible to any
+    /// pixel- or byte-count cap (issue #17). mozjpeg's `Decompress`
+    /// keeps `cinfo` private, so the marker walk this scanner already
+    /// does is where the flag comes from.
+    pub(crate) progressive: bool,
 }
 
 impl JpegMeta {
     pub(crate) const NONE: JpegMeta = JpegMeta {
         orientation: Orientation::UPRIGHT,
         icc: None,
+        progressive: false,
     };
 }
 
@@ -289,6 +296,11 @@ pub(crate) fn scan_jpeg_meta<R: std::io::BufRead>(
             }
             if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
                 continue;
+            }
+            // SOF2 is the progressive start-of-frame; the marker still
+            // carries a length, so fall through and skip its body.
+            if marker == 0xC2 {
+                meta.progressive = true;
             }
             let Some(l) = take(prefix, 2) else {
                 break 'walk;

@@ -1124,10 +1124,20 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
                 StatusCode::BAD_REQUEST,
                 "source key rejected by the origin".to_string(),
             ),
-            ErrorKind::SourceTooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "source image exceeds the configured size limit".to_string(),
-            ),
+            ErrorKind::SourceTooLarge => {
+                // The body stays generic across all three source caps —
+                // it would otherwise hand a client the configured limit
+                // values — so the chain, which names *which* limit and
+                // the figure, has to reach the log. Without this an
+                // operator sees one sentence and cannot tell
+                // MAX_SOURCE_BYTES from MAX_SRC_PIXELS from
+                // MAX_DECODED_BYTES (issue #17 follow-up).
+                eprintln!("oximg: error status=413 file={file:?} err={e:#}");
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "source image exceeds the configured size limit".to_string(),
+                )
+            }
             ErrorKind::SourceUnreadable => {
                 eprintln!("oximg: error status=500 file={file:?} err={e:#}");
                 (
