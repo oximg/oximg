@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-04
+
+A memory limit an operator can actually set: `OXIMG_MAX_DECODED_BYTES`
+caps what a decode will allocate, in bytes, because source pixels
+cannot be mapped to memory in this pipeline (#17 — 16x variance at
+equal pixel counts). Field-validated against seven real sources at
+1.1-1.8x above measured peaks, never under. Minor rather than patch
+for the new knob and the new `ErrorKind` variants this cycle.
+
 ### Added
 
 - **`OXIMG_MAX_DECODED_BYTES`** ([#17]): a cap on what a single decode
