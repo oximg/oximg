@@ -203,6 +203,31 @@ impl Metrics {
             oximg::pipeline::upstream_retry_count()
         );
 
+        // The decoded-bytes estimate as a histogram: an operator can
+        // read a cap off their own corpus instead of guessing one from
+        // pixels, which do not map to memory in this pipeline (#17).
+        let _ = writeln!(
+            out,
+            "# HELP oximg_decoded_bytes_estimate Estimated decode-stage allocation per request, in bytes."
+        );
+        let _ = writeln!(out, "# TYPE oximg_decoded_bytes_estimate histogram");
+        let (counts, sum) = oximg::pipeline::decoded_bytes_histogram();
+        let mut cum = 0u64;
+        for (i, b) in oximg::pipeline::DECODED_BYTES_BOUNDS.iter().enumerate() {
+            cum += counts[i];
+            let _ = writeln!(
+                out,
+                "oximg_decoded_bytes_estimate_bucket{{le=\"{b}\"}} {cum}"
+            );
+        }
+        cum += counts[oximg::pipeline::DECODED_BYTES_BOUNDS.len()];
+        let _ = writeln!(
+            out,
+            "oximg_decoded_bytes_estimate_bucket{{le=\"+Inf\"}} {cum}"
+        );
+        let _ = writeln!(out, "oximg_decoded_bytes_estimate_sum {sum}");
+        let _ = writeln!(out, "oximg_decoded_bytes_estimate_count {cum}");
+
         let _ = writeln!(
             out,
             "# HELP oximg_request_duration_seconds Time split into CPU-permit queue wait and processing."

@@ -747,6 +747,12 @@ thread_local! {
 
 #[derive(Default)]
 struct Scratch {
+    /// Set by the JPEG paths from the header scan before decode_resize
+    /// runs: whether libjpeg will buffer whole-image coefficients for
+    /// this source. Carried here rather than as a ninth parameter, and
+    /// reset per request by its setters (both JPEG entry points assign
+    /// it unconditionally).
+    jpeg_progressive: bool,
     chunk8: Vec<u8>,
     src16: Vec<u16>,
     dst16: Vec<u16>,
@@ -1037,6 +1043,161 @@ pub(crate) const ICC_CAP: usize = 4 * 1024 * 1024;
 /// *before* any pixel-sized allocation: compressed-size caps do not
 /// bound decoded size — a ~2MB flat-color 50000x50000 PNG would
 /// otherwise force a 7.5GB allocation.
+/// What a decode is about to allocate, in bytes — the unit an operator
+/// actually has a limit in.
+///
+/// Source pixels cannot be mapped to memory in this pipeline, because
+/// the cost per pixel varies by more than an order of magnitude with
+/// the source encoding (issue #17 measured 16x at *equal* pixel
+/// counts, and the cheapest source in that corpus was the one a pixel
+/// cap rejected first):
+///
+/// - Baseline JPEG decodes through DCT shrink-on-load, so its cost
+///   tracks the **output** size — the cheapest path by far.
+/// - Progressive JPEG forces libjpeg to buffer whole-image
+///   coefficients at full source resolution, so its cost tracks the
+///   **source** and barely moves with the requested output.
+/// - CMYK/YCCK stages four channels instead of three.
+/// - PNG and AVIF have no shrink-on-load: full frame, always.
+///
+/// This is deliberately an estimate of the *decode* stage's dominant
+/// allocations, not a memory accounting: resize scratch and encode
+/// buffers are not counted, and it rounds toward over-estimating. It
+/// exists to be checkable before the allocation happens and tunable
+/// from a container limit — neither of which a pixel count can do.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DecodeCost {
+    /// Pixels the decoder will actually materialize (after any
+    /// shrink-on-load that will be applied).
+    pub decoded_pixels: u64,
+    /// Bytes per materialized pixel (channels, times sample size).
+    pub bytes_per_pixel: u64,
+    /// Extra whole-source buffering the codec needs regardless of the
+    /// output size — progressive JPEG's coefficient arrays.
+    pub whole_source_bytes: u64,
+}
+
+impl DecodeCost {
+    pub fn bytes(&self) -> u64 {
+        self.decoded_pixels
+            .saturating_mul(self.bytes_per_pixel)
+            .saturating_add(self.whole_source_bytes)
+    }
+
+    /// Full-frame decode: every pixel materialized at `channels` bytes.
+    pub fn full_frame(w: usize, h: usize, channels: u64) -> Self {
+        DecodeCost {
+            decoded_pixels: (w as u64).saturating_mul(h as u64),
+            bytes_per_pixel: channels,
+            whole_source_bytes: 0,
+        }
+    }
+
+    /// A decode that materializes only `dec_w x dec_h` (shrink-on-load
+    /// applied), optionally plus whole-source coefficient buffering.
+    pub fn scaled(dec_w: usize, dec_h: usize, channels: u64) -> Self {
+        DecodeCost::full_frame(dec_w, dec_h, channels)
+    }
+
+    /// Progressive JPEG's whole-image coefficient arrays: full source
+    /// resolution, one `JCOEF` (2 bytes) per sample per component.
+    /// `MAX_SRC_PIXELS` explicitly could not see these.
+    pub fn with_progressive_coefficients(mut self, src_w: usize, src_h: usize, comps: u64) -> Self {
+        self.whole_source_bytes = (src_w as u64)
+            .saturating_mul(src_h as u64)
+            .saturating_mul(comps)
+            .saturating_mul(2);
+        self
+    }
+}
+
+/// Histogram-able record of every decode's estimated cost, plus the
+/// enforcement of `OXIMG_MAX_DECODED_BYTES`. Observability comes first
+/// on purpose: an operator who cannot see the figure can only guess a
+/// cap and learn from user reports (issue #17 — set three times, wrong
+/// three times).
+pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &str) -> Result<()> {
+    let bytes = cost.bytes();
+    record_decoded_bytes(bytes);
+    let Some(cap) = crate::config::config().max_decoded_bytes else {
+        return Ok(());
+    };
+    if bytes > cap {
+        // FileTooLarge like the other caps, so this classifies as
+        // ErrorKind::SourceTooLarge (HTTP 413) on the same terms.
+        anyhow::bail!(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "{what} decode needs about {bytes} bytes \
+                 ({} decoded pixels x {} B/px{}), over the \
+                 OXIMG_MAX_DECODED_BYTES limit ({cap})",
+                cost.decoded_pixels,
+                cost.bytes_per_pixel,
+                if cost.whole_source_bytes > 0 {
+                    format!(
+                        " plus {} B of whole-source buffering",
+                        cost.whole_source_bytes
+                    )
+                } else {
+                    String::new()
+                }
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an `OXIMG_MAX_DECODED_BYTES` cap is configured. The JPEG
+/// header scan is normally skipped when neither rotation nor ICC needs
+/// it; it also carries the progressive flag, and omitting that flag
+/// under-estimates by the whole coefficient term — the dangerous
+/// direction for a limit — so the scan runs whenever the cap is on.
+pub(crate) fn decoded_bytes_cap_set() -> bool {
+    crate::config::config().max_decoded_bytes.is_some()
+}
+
+/// Bucketed lifetime counts of the decoded-bytes estimate, exposed as
+/// a histogram on the server's /metrics page so a cap can be derived
+/// from a real corpus instead of guessed. Bounds are powers of two
+/// from 1 MiB to 4 GiB.
+pub const DECODED_BYTES_BOUNDS: [u64; 13] = [
+    1 << 20,
+    1 << 21,
+    1 << 22,
+    1 << 23,
+    1 << 24,
+    1 << 25,
+    1 << 26,
+    1 << 27,
+    1 << 28,
+    1 << 29,
+    1 << 30,
+    1 << 31,
+    1 << 32,
+];
+
+static DECODED_BYTES_BUCKETS: [std::sync::atomic::AtomicU64; DECODED_BYTES_BOUNDS.len() + 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; DECODED_BYTES_BOUNDS.len() + 1];
+static DECODED_BYTES_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_decoded_bytes(bytes: u64) {
+    let slot = DECODED_BYTES_BOUNDS
+        .iter()
+        .position(|b| bytes <= *b)
+        .unwrap_or(DECODED_BYTES_BOUNDS.len());
+    DECODED_BYTES_BUCKETS[slot].fetch_add(1, Ordering::Relaxed);
+    DECODED_BYTES_SUM.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// `(per-bound counts including the +Inf overflow slot, summed bytes)`.
+pub fn decoded_bytes_histogram() -> ([u64; DECODED_BYTES_BOUNDS.len() + 1], u64) {
+    let mut counts = [0u64; DECODED_BYTES_BOUNDS.len() + 1];
+    for (dst, src) in counts.iter_mut().zip(DECODED_BYTES_BUCKETS.iter()) {
+        *dst = src.load(Ordering::Relaxed);
+    }
+    (counts, DECODED_BYTES_SUM.load(Ordering::Relaxed))
+}
+
 pub(crate) fn check_src_pixels(w: usize, h: usize) -> Result<()> {
     let cap = crate::config::config().max_src_pixels;
     let px = (w as u64).saturating_mul(h as u64);

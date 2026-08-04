@@ -409,7 +409,8 @@ never silently falls back to a default.
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch — bounds how long a stalled upstream can hold a CPU permit; timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
-| `OXIMG_MAX_SRC_PIXELS` | 64,000,000 | Decoded-size cap, enforced after each format's header parse and before any pixel allocation (compressed size does not bound decoded size); over-cap sources answer 413 |
+| `OXIMG_MAX_SRC_PIXELS` | 64,000,000 | Cheap sanity guard on source dimensions, enforced after each format's header parse; over-cap sources answer 413. Not a memory budget — see the next row |
+| `OXIMG_MAX_DECODED_BYTES` | unset | Cap on what a single decode is *estimated* to allocate, in bytes — the unit a container limit is in. Source pixels cannot be mapped to memory here: cost per pixel varies ~16x with the encoding, because baseline JPEG decodes through DCT shrink-on-load (cost tracks the **output**) while progressive JPEG buffers whole-image coefficients and PNG/AVIF decode full frames (cost tracks the **source**), and CMYK stages four channels. The estimate covers the decode stage's dominant allocations — decoded pixels x bytes/px, plus progressive JPEG's coefficient arrays — and deliberately rounds up; resize scratch and encode buffers are not counted. Over-cap sources answer 413 naming the figure. Unset (the default) still computes and exposes the estimate as the `oximg_decoded_bytes_estimate` histogram, so a cap can be read off a real corpus before being enforced |
 
 ### Encoding
 

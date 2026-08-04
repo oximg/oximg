@@ -22,6 +22,19 @@ pub(super) fn process_png<R: std::io::Read>(
     {
         let hdr = png_reader.info();
         check_src_pixels(hdr.width as usize, hdr.height as usize)?;
+        // PNG has no shrink-on-load: the whole frame materializes,
+        // normalized to RGB8 or RGBA8 (EXPAND|STRIP_16 upstream).
+        let channels = match hdr.color_type {
+            png::ColorType::Rgba | png::ColorType::GrayscaleAlpha => 4,
+            // Palette sources can carry tRNS, which EXPAND resolves to
+            // RGBA; assume the wider staging rather than under-count.
+            png::ColorType::Indexed => 4,
+            _ => 3,
+        };
+        check_decoded_bytes(
+            DecodeCost::full_frame(hdr.width as usize, hdr.height as usize, channels),
+            "PNG",
+        )?;
     }
     // eXIf orientation (raw TIFF per the PNG spec; a stray JPEG-style
     // prefix is tolerated like browsers do). Only chunks ahead of the
@@ -320,6 +333,13 @@ pub(super) fn webp_decode_into_chunk8(
         let (src_w, src_h) = (config.input.width as usize, config.input.height as usize);
         check_src_pixels(src_w, src_h)?;
         let channels = if config.input.has_alpha != 0 { 4 } else { 3 };
+        // Conservative for WebP: libwebp's decode scaler may shrink
+        // this below the source (decided a few lines down), so the
+        // full frame is an upper bound, not the exact figure.
+        check_decoded_bytes(
+            DecodeCost::full_frame(src_w, src_h, channels as u64),
+            "WebP",
+        )?;
 
         // The stored-space resize target: fit the *displayed* frame,
         // swap back for axis-swapping orientations. Deciding the decode

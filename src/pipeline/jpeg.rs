@@ -44,7 +44,7 @@ fn decode_and_resize_inner(
         // OXIMG_ICC=0 downgrades CMYK sources to the naive composite
         // here exactly like the server path.
         let want_icc = icc_passthrough(&p);
-        let meta = if auto_rotate(&p) || want_icc {
+        let meta = if auto_rotate(&p) || want_icc || decoded_bytes_cap_set() {
             let mut prefix = Vec::new();
             let mut r = jpeg;
             crate::meta::scan_jpeg_meta(&mut r, &mut prefix, want_icc)
@@ -56,6 +56,7 @@ fn decode_and_resize_inner(
         } else {
             crate::meta::Orientation::UPRIGHT
         };
+        s.jpeg_progressive = meta.progressive;
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
         match decode_resize(
             s,
@@ -179,6 +180,31 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     };
 
     dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
+
+    // The decoded-bytes estimate has to come *after* the scale is set:
+    // shrink-on-load is exactly what makes baseline JPEG cheap, and an
+    // estimate from the header dimensions would miss it by the scale
+    // factor squared (issue #17). Progressive sources add libjpeg's
+    // whole-image coefficient arrays, which no output size reduces.
+    {
+        let (dec_w, dec_h) = (dec.width(), dec.height());
+        let comps = dec.components().len().max(1) as u64;
+        // CMYK/YCCK stages four channels below; every other colorspace
+        // is asked for RGB.
+        let staged = if matches!(
+            dec.color_space(),
+            ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+        ) {
+            4
+        } else {
+            3
+        };
+        let mut cost = DecodeCost::scaled(dec_w, dec_h, staged);
+        if s.jpeg_progressive {
+            cost = cost.with_progressive_coefficients(src_w, src_h, comps);
+        }
+        check_decoded_bytes(cost, "JPEG")?;
+    }
 
     // CMYK and YCCK sources (print-workflow JPEGs) take a buffered
     // serial path: libjpeg itself normalizes YCCK back to CMYK when
@@ -536,7 +562,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // this scan. (OXIMG_ICC=0 therefore also downgrades CMYK
         // sources to the naive conversion.)
         let want_icc = icc_passthrough(p);
-        let meta = if auto_rotate(p) || want_icc {
+        let meta = if auto_rotate(p) || want_icc || decoded_bytes_cap_set() {
             crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
@@ -546,6 +572,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         } else {
             crate::meta::Orientation::UPRIGHT
         };
+        s.jpeg_progressive = meta.progressive;
         let icc = meta.icc;
         let reader = std::io::Read::chain(&scan_prefix[..], reader);
         let dec = Decompress::new_reader(reader).context("parse JPEG")?;
