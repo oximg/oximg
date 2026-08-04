@@ -2908,3 +2908,128 @@ fn oriented_sources_are_capped_on_the_larger_fit() {
         );
     }
 }
+
+/// Issue #19: the cap can only ever name what it *rejects*, so a
+/// deployment learning its corpus needs expensive requests named while
+/// they are still served. The threshold is orthogonal to the cap, both
+/// unset by default, and the report carries the same per-term
+/// breakdown a rejection does.
+#[test]
+fn expensive_requests_are_reported_without_being_refused() {
+    let dir = std::env::temp_dir().join(format!("oximg-report-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // 800x800 RGB: 1.9 MB staged plus 3.8 MB as the linear-light input.
+    let (w, h) = (800u32, 800u32);
+    let mut png = Vec::new();
+    let mut enc = png::Encoder::new(&mut png, w, h);
+    enc.set_color(png::ColorType::Rgb);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().unwrap();
+    writer
+        .write_image_data(&vec![55u8; (w * h * 3) as usize])
+        .unwrap();
+    writer.finish().unwrap();
+    std::fs::write(dir.join("costly.png"), &png).unwrap();
+    let images = dir.to_str().unwrap().to_string();
+
+    /// Run one server with `envs`, issue `path`, then stop it and drain
+    /// stderr to EOF. Killing first is what makes the read terminate —
+    /// reading a live process's stderr for a line that may never come
+    /// is how this test first hung.
+    fn run(images: &str, envs: &[(&str, String)], path: &str) -> (u16, Vec<String>) {
+        use std::io::BufRead;
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .env("IMAGES_DIR", images)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let stderr = child.stderr.take().unwrap();
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut port = None;
+        let mut line = String::new();
+        for _ in 0..100 {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some(rest) = line.strip_prefix("oximg listening on :") {
+                        port = rest.split_whitespace().next().and_then(|p| p.parse().ok());
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let port: u16 = port.expect("listening line");
+        let status = match ureq::get(format!("http://127.0.0.1:{port}{path}")).call() {
+            Ok(r) => r.status().as_u16(),
+            Err(ureq::Error::StatusCode(s)) => s,
+            Err(e) => panic!("transport error: {e}"),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let rest = reader.lines().map_while(Result::ok).collect();
+        (status, rest)
+    }
+
+    // Threshold below the estimate: served *and* named, with the
+    // filename and the terms.
+    let (status, logs) = run(
+        &images,
+        &[("OXIMG_LOG_DECODED_BYTES_ABOVE", (1024 * 1024).to_string())],
+        "/resize/200/200/costly.png",
+    );
+    assert_eq!(status, 200);
+    let line = logs
+        .iter()
+        .find(|l| l.contains("decoded-bytes"))
+        .unwrap_or_else(|| panic!("an above-threshold request must be reported: {logs:?}"));
+    assert!(line.contains("costly.png"), "must name the source: {line}");
+    assert!(line.contains("staged"), "must carry the terms: {line}");
+    assert!(line.contains("resize input"), "{line}");
+
+    // Threshold above the estimate: nothing reported, request served.
+    let (status, logs) = run(
+        &images,
+        &[(
+            "OXIMG_LOG_DECODED_BYTES_ABOVE",
+            (512 * 1024 * 1024).to_string(),
+        )],
+        "/resize/200/200/costly.png",
+    );
+    assert_eq!(status, 200);
+    assert!(
+        !logs.iter().any(|l| l.contains("decoded-bytes")),
+        "nothing below the threshold may be reported: {logs:?}"
+    );
+
+    // Unset: byte-identical behaviour to before the feature.
+    let (status, logs) = run(&images, &[], "/resize/200/200/costly.png");
+    assert_eq!(status, 200);
+    assert!(!logs.iter().any(|l| l.contains("decoded-bytes")));
+
+    // The knobs are orthogonal, and one request never logs the same
+    // terms twice: a refusal names itself with its limit clause and
+    // does not also emit the served-request report.
+    let (status, logs) = run(
+        &images,
+        &[
+            ("OXIMG_LOG_DECODED_BYTES_ABOVE", "1048576".to_string()),
+            ("OXIMG_MAX_DECODED_BYTES", (2 * 1024 * 1024).to_string()),
+        ],
+        "/resize/200/200/costly.png",
+    );
+    assert_eq!(status, 413);
+    assert!(
+        logs.iter().any(|l| l.contains("status=413")),
+        "the rejection must be logged: {logs:?}"
+    );
+    assert!(
+        !logs.iter().any(|l| l.contains("decoded-bytes")),
+        "a refused request must not also emit the served report: {logs:?}"
+    );
+}

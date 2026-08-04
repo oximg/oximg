@@ -10,6 +10,30 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`OXIMG_LOG_DECODED_BYTES_ABOVE`** ([#19]): report any decode whose
+  estimated cost exceeds this — filename plus the same per-term
+  breakdown a rejection carries — and serve the request normally.
+  Unset by default; behaviour is byte-identical to before when unset.
+
+  The cap from #17 can only ever name what it *rejects*, and the
+  histogram counts an expensive request without identifying it. So a
+  deployment had no way to learn which images are expensive: a cap high
+  enough to be safe names nothing, and one set at the observed tail
+  buys names by refusing live traffic (0.187% of production requests in
+  the reporter's measurement). Sorting the bucket by file size does not
+  substitute, for the reason #17 established — file size is not a proxy
+  for decode cost, so the dangerous class (small file, enormous decode)
+  is exactly what a size scan cannot see.
+
+  The two knobs are orthogonal and a single request never logs the same
+  terms twice: `OXIMG_MAX_DECODED_BYTES` refuses and logs, this logs
+  and serves. Also honored by the CLI, for sizing a cap against a
+  corpus offline.
+
+[#19]: https://github.com/oximg/oximg/issues/19
+
 ## [0.8.0] - 2026-08-04
 
 A memory limit an operator can actually set: `OXIMG_MAX_DECODED_BYTES`
