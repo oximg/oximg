@@ -282,6 +282,19 @@ Connection-level transients (reset, refused, DNS blips) are retried
 once before any body bytes are consumed, and the `gs://` mode also
 retries 429/5xx SDK-style; `oximg_upstream_retries_total` counts both.
 
+**Error classes follow fault, not convenience**: a source key that no
+store can serve — past an object store's key-length limit, or refused
+by the origin as a malformed request (400/414) — answers **400**, and
+an absent object **404**. Only a genuinely unwell upstream (connect
+failure, reset, 5xx) answers **502**, with slow origins split off as
+**504**. This matters downstream: CDNs retry and fail over on 5xx but
+pass 4xx through to their error cache, so misfiling a client error as
+an upstream failure both inflates the 5xx rate an operator watches and
+turns a crawler into origin load. `oximg_upstream_fetch_total` splits
+the same way (`rejected` and `not_found` apart from `error`), so that
+series stays a signal of upstream health. Over-length keys are refused
+locally, without a round trip.
+
 **Source paths** are validated component-wise — `.`/`..` components,
 empty components, `\`, `?`, `#`, and control bytes answer 400. Local
 sources also pass a symlink-containment check (a path resolving

@@ -35,6 +35,13 @@ pub enum ErrorKind {
     /// refused redirect, or a body that died mid-stream. Only produced
     /// by `process_url`. (HTTP: 502.)
     Upstream,
+    /// The source key itself is impossible: past the object store's
+    /// key-length limit, or rejected by the origin as a malformed
+    /// request (400/414). The requester's fault, not the upstream's —
+    /// reporting it as [`ErrorKind::Upstream`] made a crawler
+    /// scraping whole `srcset` attributes look like an origin outage.
+    /// (HTTP: 400.)
+    SourceRejected,
     /// A remote origin exceeded the fetch deadline
     /// (`OXIMG_UPSTREAM_TIMEOUT` / `OXIMG_UPSTREAM_CONNECT_TIMEOUT`).
     /// Distinct from [`ErrorKind::Upstream`] so "the origin is slow"
@@ -86,6 +93,8 @@ impl Error {
                 }
                 _ => ErrorKind::Undecodable,
             }
+        } else if inner.downcast_ref::<super::SourceRejected>().is_some() {
+            ErrorKind::SourceRejected
         } else if inner.downcast_ref::<super::UpstreamFault>().is_some() {
             ErrorKind::Upstream
         } else if inner.downcast_ref::<super::ServerFault>().is_some() {
@@ -197,6 +206,17 @@ mod tests {
                 anyhow::anyhow!("worker died").context(super::super::ServerFault),
                 false,
                 ErrorKind::Internal,
+            ),
+            // an impossible key is the requester's fault either way
+            (
+                anyhow::anyhow!("key too long").context(super::super::SourceRejected),
+                true,
+                ErrorKind::SourceRejected,
+            ),
+            (
+                anyhow::anyhow!("origin 414").context(super::super::SourceRejected),
+                false,
+                ErrorKind::SourceRejected,
             ),
             // plain message: undecodable client input
             (

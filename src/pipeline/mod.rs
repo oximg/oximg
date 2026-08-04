@@ -523,6 +523,19 @@ impl std::fmt::Display for ServerFault {
     }
 }
 
+/// Marker for a source key the origin can never serve: past the
+/// store's key-length limit, or refused as a malformed request
+/// (400/414). Consumed by [`Error::classify`] into
+/// [`ErrorKind::SourceRejected`]; not part of the public surface.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SourceRejected;
+
+impl std::fmt::Display for SourceRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("source key rejected")
+    }
+}
+
 /// Marker for remote-origin failures (transport errors, non-404 error
 /// statuses): the client's request was fine, the upstream wasn't.
 /// Consumed by [`Error::classify`] into [`ErrorKind::Upstream`]; not
@@ -610,8 +623,15 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
             std::io::ErrorKind::NotFound,
             "source returned 404",
         )),
-        // Origin 5xx/4xx and transport failures are the upstream's
-        // fault, not the request's.
+        // 400/414 are the origin saying the request itself is
+        // impossible — an over-long URL is the common shape. That is
+        // the requester's fault, and reporting it as an upstream
+        // failure makes a crawler look like an outage (issue #13).
+        ureq::Error::StatusCode(code @ (400 | 414)) => {
+            anyhow::anyhow!("origin rejected the request ({code})").context(SourceRejected)
+        }
+        // Origin 5xx/other 4xx and transport failures are the
+        // upstream's fault, not the request's.
         other => anyhow::Error::new(other)
             .context("fetch source")
             .context(UpstreamFault),

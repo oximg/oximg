@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use super::UpstreamFault;
+use super::{SourceRejected, UpstreamFault};
 
 fn endpoint() -> String {
     std::env::var("OXIMG_GCS_ENDPOINT")
@@ -114,6 +114,18 @@ pub(crate) fn startup() -> Result<(), String> {
     })
 }
 
+/// GCS caps object names at 1024 bytes of UTF-8 (a documented
+/// constant), so an over-length key is checkable locally: the store
+/// would reject it, and no round trip can change that. `key` arrives
+/// percent-encoded, and every escape this crate emits is a %XX
+/// triplet standing for one byte, so the decoded length is the
+/// encoded length minus two per escape.
+const GCS_MAX_KEY_BYTES: usize = 1024;
+
+fn decoded_key_len(key: &str) -> usize {
+    key.len() - 2 * key.bytes().filter(|b| *b == b'%').count()
+}
+
 /// Statuses worth one retry, mirroring what the SDKs retry on reads:
 /// throttling and transient server-side errors. 401 also retries, but
 /// with a forced token refresh.
@@ -124,6 +136,20 @@ fn retryable_status(code: u16) -> bool {
 /// GET one object, authenticated. `key` is already percent-encoded by
 /// the caller (the same segment-wise encoding as the HTTP mode).
 pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq::Body>> {
+    // Refuse impossible keys before the request leaves: an object
+    // with this name cannot exist, so from the requester's side this
+    // is indistinguishable from an absent object — and answering it
+    // locally spends no round trip on traffic that is, in practice,
+    // crawlers fetching whole srcset attributes as one URL (#13).
+    if decoded_key_len(key) > GCS_MAX_KEY_BYTES {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "object name is {} bytes, over the {GCS_MAX_KEY_BYTES}-byte GCS limit",
+                decoded_key_len(key)
+            ),
+        )));
+    }
     let url = format!("{}/{bucket}/{key}", endpoint());
     let attempt = |force_token: bool| -> Result<_, anyhow::Error> {
         let bearer = bearer(force_token)?;
@@ -158,19 +184,52 @@ pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq
 }
 
 /// GCS status semantics: 404 is an absent object (a client-facing
-/// 404); 401/403 is a real permission problem — a deployment fault,
-/// never the requester's (PermissionDenied classifies as
-/// SourceUnreadable, HTTP 500). Everything else indicts the origin.
+/// 404); 400/414 is the store refusing an impossible request — the
+/// requester's fault, not the store's (#13); 401/403 is a real
+/// permission problem — a deployment fault, never the requester's
+/// (PermissionDenied classifies as SourceUnreadable, HTTP 500).
+/// Everything else indicts the origin.
 fn map_fetch_err(e: anyhow::Error, bucket: &str) -> anyhow::Error {
     match e.downcast_ref::<ureq::Error>() {
         Some(ureq::Error::StatusCode(404)) => anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "object not found in bucket",
         )),
+        Some(ureq::Error::StatusCode(code @ (400 | 414))) => {
+            anyhow::anyhow!("object store rejected the request ({code})").context(SourceRejected)
+        }
         Some(ureq::Error::StatusCode(401 | 403)) => anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("access to bucket {bucket:?} denied (check the service account's roles)"),
         )),
         _ => e.context("fetch gcs object").context(UpstreamFault),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decoded-length accounting behind the pre-check: escapes
+    /// stand for one byte each, so a percent-heavy key must not be
+    /// mistaken for an over-length one.
+    #[test]
+    fn decoded_key_len_counts_escapes_as_one_byte() {
+        assert_eq!(decoded_key_len("photo.jpg"), 9);
+        assert_eq!(decoded_key_len("a%20b.jpg"), 7);
+        // Three-byte UTF-8 encoded as three escapes decodes to 3 bytes.
+        assert_eq!(decoded_key_len("%E4%B8%AD.jpg"), 7);
+    }
+
+    /// The GCS limit is inclusive: 1024 bytes is a legal object name,
+    /// 1025 is not.
+    #[test]
+    fn key_length_boundary_is_the_documented_limit() {
+        let at = |n: usize| decoded_key_len(&"x".repeat(n)) > GCS_MAX_KEY_BYTES;
+        assert!(!at(1023));
+        assert!(!at(1024));
+        assert!(at(1025));
+        // Escaped bytes count once, so this 2048-char key is legal.
+        assert!(!(decoded_key_len(&"%20".repeat(341)) > GCS_MAX_KEY_BYTES));
     }
 }

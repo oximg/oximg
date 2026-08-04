@@ -20,7 +20,10 @@ const CLASSES: [&str; 4] = ["2xx", "3xx", "4xx", "5xx"];
 /// "source" = no explicit/negotiated target (the source's own format);
 /// "none" = the request failed before format resolution.
 const FORMATS: [&str; 6] = ["jpeg", "png", "webp", "avif", "source", "none"];
-const OUTCOMES: [&str; 4] = ["ok", "not_found", "timeout", "error"];
+/// "rejected" is a key the store can never serve (over-length, or a
+/// 400/414 from the origin): a client error, deliberately kept out of
+/// "error" so that series stays a signal of upstream health.
+const OUTCOMES: [&str; 5] = ["ok", "not_found", "timeout", "rejected", "error"];
 /// Prometheus' default duration buckets: request work here spans
 /// single-digit milliseconds (cache-warm small images) to seconds
 /// (cold AVIF encodes), which is exactly the range these cover.

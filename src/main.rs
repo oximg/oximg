@@ -1077,12 +1077,24 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             metrics::METRICS.record_upstream(match e.kind() {
                 ErrorKind::SourceNotFound => "not_found",
                 ErrorKind::UpstreamTimeout => "timeout",
+                // An impossible key is not upstream ill-health: keeping
+                // it out of "error" is what lets that series answer
+                // "is the origin actually unwell" (issue #13).
+                ErrorKind::SourceRejected => "rejected",
                 ErrorKind::Upstream => "error",
                 _ => "ok",
             });
         }
         match e.kind() {
             ErrorKind::SourceNotFound => (StatusCode::NOT_FOUND, "image not found".to_string()),
+            // The requester asked for something no origin can serve.
+            // 400 keeps it out of the 5xx rate an operator watches and
+            // out of the retry/failover paths a CDN reserves for
+            // origin failure.
+            ErrorKind::SourceRejected => (
+                StatusCode::BAD_REQUEST,
+                "source key rejected by the origin".to_string(),
+            ),
             ErrorKind::SourceTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "source image exceeds the configured size limit".to_string(),
