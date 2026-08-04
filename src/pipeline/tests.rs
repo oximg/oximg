@@ -786,3 +786,39 @@ fn decode_cost_separates_what_pixel_counts_cannot() {
         "spread across shapes: {cheap:.3} vs {dear:.3} B per source pixel"
     );
 }
+
+/// `larger_fit` is what keeps the output-side estimate conservative
+/// before a source's orientation is known (issue #17 review): it must
+/// return whichever of the two candidate fits covers more pixels, with
+/// the axes back in stored order.
+#[test]
+fn larger_fit_covers_the_swapped_orientation() {
+    let box_ = |w: u32, h: u32| Params {
+        max_width: w,
+        max_height: h,
+        ..Params::default()
+    };
+    // The review's shape: 4000x1000 under a width-only box. Upright it
+    // fits to 1920x480; presented as 1000x4000 by orientation 6 it fits
+    // to 1000x4000 — four times the pixels, and what must be counted.
+    assert_eq!(
+        super::formats::larger_fit(4000, 1000, &box_(1920, u32::MAX)),
+        (4000, 1000)
+    );
+    // The mirror case: the unoriented fit is already the larger one.
+    assert_eq!(
+        super::formats::larger_fit(1000, 4000, &box_(1920, u32::MAX)),
+        (1000, 4000)
+    );
+    // A symmetric box makes both candidates equal, so the stored
+    // orientation is returned unchanged.
+    assert_eq!(
+        super::formats::larger_fit(4000, 1000, &box_(500, 500)),
+        (500, 125)
+    );
+    // Sources inside the box are never enlarged either way.
+    assert_eq!(
+        super::formats::larger_fit(300, 200, &box_(1920, u32::MAX)),
+        (300, 200)
+    );
+}

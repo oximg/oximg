@@ -185,7 +185,7 @@ pub(super) fn process_png<R: std::io::Read>(
 /// with an asymmetric box that can be several times the unoriented
 /// result. Used where the estimate runs before the orientation is
 /// parsed — over-counting the output side keeps a limit safe.
-fn larger_fit(w: usize, h: usize, p: &Params) -> (usize, usize) {
+pub(super) fn larger_fit(w: usize, h: usize, p: &Params) -> (usize, usize) {
     let a = fit_dims(w, h, p.max_width, p.max_height);
     let b = fit_dims(h, w, p.max_width, p.max_height);
     if a.0 * a.1 >= b.0 * b.1 {
