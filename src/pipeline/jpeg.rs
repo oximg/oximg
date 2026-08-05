@@ -217,6 +217,10 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
         if s.jpeg_progressive {
             cost = cost.with_progressive_coefficients(src_w, src_h, comps);
         }
+        // The decoder streams, so the only compressed-source residency
+        // is a buffer the caller holds (buffered remote sources — the
+        // term issue #22 added; zero on the streaming entry points).
+        cost = cost.with_compressed(s.held_source_bytes);
         check_decoded_bytes(cost, "JPEG")?;
     }
 

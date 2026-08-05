@@ -427,7 +427,8 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
-    process_reader(std::io::Cursor::new(bytes), p).map_err(|e| Error::classify(e, false))
+    process_reader(std::io::Cursor::new(bytes), p, bytes.len())
+        .map_err(|e| Error::classify(e, false))
 }
 
 /// Sniff the source format, then resize + re-encode in the target
@@ -437,7 +438,18 @@ pub fn process(bytes: &[u8], p: &Params) -> Result<(Vec<u8>, ImageFormat), Error
 /// incremental one-shot API). Decode-side optimizations (DCT
 /// shrink-on-load, WebP decode-scaler) are per-source and stay active
 /// for every target.
-fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+///
+/// `held_source_bytes` is the compressed source the *caller* keeps
+/// resident for the duration of the call — `bytes.len()` for the
+/// in-memory entry point, zero for the streaming ones. It feeds the
+/// decoded-bytes estimate: a buffered remote source is exactly as
+/// resident as `srcbuf`, and omitting it would under-estimate in the
+/// direction that gets a container OOM-killed (issue #22).
+fn process_reader<R: std::io::Read>(
+    mut reader: R,
+    p: &Params,
+    held_source_bytes: usize,
+) -> Result<(Vec<u8>, ImageFormat)> {
     let mut header = [0u8; 12];
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
@@ -461,6 +473,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
     let _active = ActiveGuard::enter();
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
+        s.held_source_bytes = held_source_bytes;
         let out = match format {
             // The whole JPEG decode is unwind-guarded, not just the
             // header parse: libjpeg signals fatal errors (bogus
@@ -489,7 +502,7 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
 pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
     let inner = || -> Result<(Vec<u8>, ImageFormat)> {
         let file = std::fs::File::open(path).context("open source")?;
-        process_reader(file, p)
+        process_reader(file, p, 0)
     };
     inner().map_err(|e| Error::classify(e, false))
 }
@@ -660,6 +673,16 @@ pub fn gcs_startup() -> Result<(), String> {
 
 #[cfg(feature = "server")]
 fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+    let resp = fetch_url_head(url)?;
+    process_response(resp, p)
+}
+
+/// The head of every plain-HTTP fetch: GET with one retry on
+/// connection-level transients, status mapping (404, the 400/414
+/// rejection, upstream faults), and the fetch-time record. Shared by
+/// the streaming and buffered tails so the two cannot drift.
+#[cfg(feature = "server")]
+fn fetch_url_head(url: &str) -> Result<ureq::http::Response<ureq::Body>> {
     clear_fetch_time();
     let map_fetch_err = |e: ureq::Error| match e {
         // Preserve source 404s so the HTTP layer can pass them through.
@@ -702,27 +725,83 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
         }
     };
     record_fetch_time(head.elapsed().as_secs_f64());
-    process_response(resp, p)
+    Ok(resp)
 }
 
-/// The shared tail of every remote fetch (plain HTTP and object-store
-/// schemes alike): size caps, the no-redirect rule, and the streaming
-/// hand-off into the decoder.
+/// Buffered remote fetch: download `url` whole, bounded by
+/// `OXIMG_MAX_SOURCE_BYTES`, and return the bytes without decoding
+/// anything. Client behavior (deadlines, the no-redirect rule, one
+/// retry on connection transients) and error classification are
+/// exactly [`process_url`]'s — the split exists so a caller can put
+/// the network wait and the CPU work under different concurrency
+/// bounds (issue #22: the server buffers first, then takes a CPU
+/// permit and calls [`process`]). Requires the `server` feature.
+#[cfg(feature = "server")]
+pub fn fetch_url(url: &str) -> Result<Vec<u8>, Error> {
+    let inner = || buffer_response(fetch_url_head(url)?);
+    inner().map_err(|e| Error::classify(e, true))
+}
+
+/// Buffered GCS fetch: [`fetch_url`]'s contract for the `gs://` mode —
+/// authenticated via GCP-attached credentials, same caps and
+/// classification as [`process_gcs`]. `key` must already be
+/// percent-encoded segment-wise. Requires the `server` feature.
+#[cfg(feature = "server")]
+pub fn fetch_gcs(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let inner = || buffer_response(gcs::fetch(bucket, key)?);
+    inner().map_err(|e| Error::classify(e, true))
+}
+
+/// The streaming tail of a remote fetch: size caps, the no-redirect
+/// rule, and the streaming hand-off into the decoder.
 #[cfg(feature = "server")]
 fn process_response(
     resp: ureq::http::Response<ureq::Body>,
     p: &Params,
 ) -> Result<(Vec<u8>, ImageFormat)> {
-    // Content-Length lets us refuse before decoding a byte; the capped
-    // reader below backstops chunked (or lying) origins. Streaming
-    // decoders may translate the mid-read error into their own decode
-    // failure, but buffered formats surface it precisely.
     let cap = max_source_bytes();
-    if let Some(len) = resp
+    precheck_response(&resp, cap)?;
+    let reader = CappedReader {
+        inner: resp.into_body().into_reader(),
+        remaining: cap,
+    };
+    process_reader(reader, p, 0)
+}
+
+/// The buffered tail: same caps and redirect rule, but the body lands
+/// whole in a `Vec` instead of streaming into a decoder. Mid-body
+/// failures keep their I/O shape (reset, EOF, the capped reader's
+/// FileTooLarge, ureq's boxed timeout) so `Error::classify` sees them
+/// exactly as it did on the streaming path.
+#[cfg(feature = "server")]
+fn buffer_response(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
+    let cap = max_source_bytes();
+    let declared = precheck_response(&resp, cap)?;
+    let mut reader = CappedReader {
+        inner: resp.into_body().into_reader(),
+        remaining: cap,
+    };
+    // The declared size is already checked against the cap, so a
+    // well-behaved origin costs one allocation; chunked origins grow.
+    let mut buf = Vec::with_capacity(usize::try_from(declared.unwrap_or(0)).unwrap_or(0));
+    std::io::Read::read_to_end(&mut reader, &mut buf).context("read source body")?;
+    Ok(buf)
+}
+
+/// Refusals available before reading a body byte, shared by both
+/// tails: an over-cap Content-Length (the capped reader backstops
+/// chunked or lying origins; streaming decoders may translate that
+/// mid-read error into their own decode failure, but the buffered
+/// tail surfaces it precisely), and any redirect. Returns the declared
+/// length, when there is one, as an allocation hint.
+#[cfg(feature = "server")]
+fn precheck_response(resp: &ureq::http::Response<ureq::Body>, cap: u64) -> Result<Option<u64>> {
+    let declared = resp
         .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(len) = declared
         && len > cap
     {
         return Err(anyhow::Error::new(std::io::Error::new(
@@ -737,11 +816,7 @@ fn process_response(
         )
         .context(UpstreamFault));
     }
-    let reader = CappedReader {
-        inner: resp.into_body().into_reader(),
-        remaining: cap,
-    };
-    process_reader(reader, p)
+    Ok(declared)
 }
 
 thread_local! {
@@ -759,6 +834,13 @@ struct Scratch {
     /// reset per request by its setters (both JPEG entry points assign
     /// it unconditionally).
     jpeg_progressive: bool,
+    /// Compressed source bytes the *caller* holds resident for this
+    /// request (a buffered remote source, or any `process(&bytes, ..)`
+    /// input); zero on the streaming entry points. Carried here like
+    /// `jpeg_progressive` — set unconditionally by `process_reader` —
+    /// so the per-format cost sites can count it without a new
+    /// parameter on every decode path.
+    held_source_bytes: usize,
     chunk8: Vec<u8>,
     src16: Vec<u16>,
     dst16: Vec<u16>,
@@ -1092,8 +1174,11 @@ pub(crate) struct DecodeCost {
     /// Whole-source buffering no output size reduces — progressive
     /// JPEG's coefficient arrays.
     pub whole_source_bytes: u64,
-    /// The compressed source, held whole by the buffered formats
-    /// (`srcbuf`); the JPEG path streams and never does.
+    /// The compressed source held whole for the request: `srcbuf` for
+    /// the buffered formats, plus any caller-held input buffer (a
+    /// buffered remote source, or `process(&bytes, ..)`). The JPEG
+    /// decoder itself streams, so on that path only the caller's
+    /// buffer — if any — contributes.
     pub compressed_bytes: u64,
 }
 
@@ -1147,7 +1232,10 @@ impl DecodeCost {
         self
     }
 
-    /// The compressed source held whole by the buffered formats.
+    /// The compressed source held whole for this request — `srcbuf`
+    /// and/or the caller's own input buffer (`Scratch::
+    /// held_source_bytes`); callers sum the copies that are actually
+    /// resident.
     pub fn with_compressed(mut self, bytes: usize) -> Self {
         self.compressed_bytes = bytes as u64;
         self

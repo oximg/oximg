@@ -787,6 +787,63 @@ fn decode_cost_separates_what_pixel_counts_cannot() {
     );
 }
 
+/// Issue #22: a caller-held source buffer is resident for the whole
+/// decode, so the in-memory entry point must count it in the estimate
+/// — the streaming-JPEG path otherwise carries no compressed term at
+/// all, and a buffered remote source would be under-counted by exactly
+/// its own size (the direction that gets a container OOM-killed).
+/// The streaming entry points must keep counting zero.
+#[test]
+fn caller_held_source_counts_in_the_decode_estimate() {
+    let jpeg = make_test_jpeg(320, 240, false);
+    let p = Params {
+        max_width: 100,
+        max_height: 100,
+        ..Params::default()
+    };
+
+    process(&jpeg, &p).unwrap();
+    let (cost, _) = LAST_COST.get().expect("a decode just ran");
+    assert_eq!(
+        cost.compressed_bytes,
+        jpeg.len() as u64,
+        "process(&bytes) must count the caller's buffer"
+    );
+
+    let dir = std::env::temp_dir().join(format!("oximg-held-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("held.jpg");
+    std::fs::write(&path, &jpeg).unwrap();
+    process_path(&path, &p).unwrap();
+    let (cost, _) = LAST_COST.get().expect("a decode just ran");
+    assert_eq!(
+        cost.compressed_bytes, 0,
+        "the streaming path holds no source buffer"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // A buffered format counts both copies: srcbuf and the caller's.
+    let png = {
+        let (out, fmt) = process(
+            &jpeg,
+            &Params {
+                output: Some(ImageFormat::Png),
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fmt, ImageFormat::Png);
+        out
+    };
+    process(&png, &p).unwrap();
+    let (cost, _) = LAST_COST.get().expect("a decode just ran");
+    assert_eq!(
+        cost.compressed_bytes,
+        2 * png.len() as u64,
+        "a buffered format holds the source twice: srcbuf + the caller's copy"
+    );
+}
+
 /// `larger_fit` is what keeps the output-side estimate conservative
 /// before a source's orientation is known (issue #17 review): it must
 /// return whichever of the two candidate fits covers more pixels, with

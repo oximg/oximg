@@ -42,7 +42,7 @@ pub(super) fn process_png<R: std::io::Read>(
         check_decoded_bytes(
             DecodeCost::full_frame(sw, sh, channels, p)
                 .with_output(ow, oh, channels)
-                .with_compressed(s.srcbuf.len()),
+                .with_compressed(s.srcbuf.len() + s.held_source_bytes),
             "PNG",
         )?;
     }
@@ -318,7 +318,7 @@ pub(super) fn process_avif<R: std::io::Read>(
         check_decoded_bytes(
             DecodeCost::full_frame(pw, ph, 4, p)
                 .with_output(ow, oh, 4)
-                .with_compressed(s.srcbuf.len()),
+                .with_compressed(s.srcbuf.len() + s.held_source_bytes),
             "AVIF",
         )?;
     }
@@ -381,7 +381,7 @@ pub(super) fn webp_decode_into_chunk8(
         check_decoded_bytes(
             DecodeCost::full_frame(src_w, src_h, channels as u64, p)
                 .with_output(ow, oh, channels as u64)
-                .with_compressed(s.srcbuf.len()),
+                .with_compressed(s.srcbuf.len() + s.held_source_bytes),
             "WebP",
         )?;
 
