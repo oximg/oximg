@@ -18,7 +18,11 @@ avif-parse = { version = "2", optional = true }
 avif-serialize = { version = "0.8", optional = true }
 dav1d-sys = { version = "0.8", optional = true }
 axum = { version = "0.8", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "fs"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal", "fs", "time"], optional = true }
+# Async HTTP client for the remote-source fetches: rustls only (no
+# system TLS), h2 so fetches to one origin multiplex over a single
+# connection instead of churning a pool.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"], optional = true }
 mozjpeg = "0.10"
 fast_image_resize = "5"
 anyhow = "1"
@@ -50,7 +54,7 @@ pic-scale = "0.7"
 # `pipeline` API build with `--no-default-features` to drop the whole
 # HTTP stack (axum, tokio, ureq, hmac, sha2).
 default = ["server"]
-server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:hmac", "dep:sha2", "dep:serde_json"]
+server = ["dep:axum", "dep:tokio", "dep:ureq", "dep:reqwest", "dep:hmac", "dep:sha2", "dep:serde_json"]
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
 # Re-exposes the internal SIMD resize kernels for the resize_bench
 # examples; not part of the public API.

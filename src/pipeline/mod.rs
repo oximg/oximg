@@ -641,13 +641,200 @@ impl<R: std::io::Read> std::io::Read for CappedReader<R> {
     }
 }
 
-/// Remote-source variant: stream the HTTP response body straight into the
-/// decoder — decoding overlaps the download and the source is never
-/// buffered whole, same as the file path. Requires the `server`
-/// feature (the HTTP client stack).
+/// The shared async HTTP client — one client, and therefore one
+/// connection pool, for the async server paths and the sync embedder
+/// wrappers alike. reqwest over rustls with h2 enabled: against an
+/// h2-speaking origin (GCS, most CDNs) every concurrent fetch
+/// multiplexes over a single connection, which retires the
+/// connection-churn cost the permit-lab churn cell measured; against
+/// HTTP/1.1 origins the pool keeps idle connections per host without
+/// ureq 3.3's 3-per-host ceiling (whose idle-age check was also a
+/// no-op: `age()` computed `now - now`).
+#[cfg(feature = "server")]
+fn fetch_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let cfg = crate::config::config();
+        reqwest::Client::builder()
+            // The whole-fetch deadline — connect through the last body
+            // byte — bounds how long a stalled origin can hold a fetch
+            // slot (and its buffer); the connect timeout separates
+            // "origin unreachable" from "origin slow" without waiting
+            // out the full budget.
+            .timeout(std::time::Duration::from_secs(cfg.upstream_timeout))
+            .connect_timeout(std::time::Duration::from_secs(cfg.upstream_connect_timeout))
+            // No redirects: the operator points OXIMG_SOURCE_BASE_URL
+            // at the right place, and an origin that can be induced to
+            // redirect (e.g. object-store website endpoints honoring
+            // user-settable redirect metadata) must not turn this
+            // fetcher into an SSRF proxy.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("construct the HTTP client")
+    })
+}
+
+/// Timeouts get their own io shape so [`Error::classify`] files them
+/// as [`ErrorKind::UpstreamTimeout`]; everything else at send time is
+/// the upstream's fault (statuses never appear here — with redirects
+/// off, every response returns Ok and is judged by `refuse_status`).
+#[cfg(feature = "server")]
+fn map_send_err(e: reqwest::Error) -> anyhow::Error {
+    if e.is_timeout() {
+        anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, e))
+    } else {
+        anyhow::Error::new(e)
+            .context("fetch source")
+            .context(UpstreamFault)
+    }
+}
+
+/// The status table, unchanged from the ureq implementation: 404
+/// passes through, 400/414 is the origin refusing the request itself
+/// (the requester's fault — issue #13), redirects are refused, and
+/// any other non-success indicts the origin.
+#[cfg(feature = "server")]
+fn refuse_status(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.as_u16() == 404 {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "source returned 404",
+        )));
+    }
+    if matches!(status.as_u16(), 400 | 414) {
+        return Err(
+            anyhow::anyhow!("origin rejected the request ({status})").context(SourceRejected)
+        );
+    }
+    if status.is_redirection() {
+        return Err(
+            anyhow::anyhow!("origin answered {status} (redirects are not followed)")
+                .context(UpstreamFault),
+        );
+    }
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("origin answered {status}")
+            .context("fetch source")
+            .context(UpstreamFault));
+    }
+    Ok(resp)
+}
+
+/// One retry on connection-level transients: a GET is idempotent and
+/// no response bytes have been consumed yet, so retrying here is safe
+/// — and it is the difference between "a network blip" and "a broken
+/// image at the CDN" (issue #11, a production rollback). Timeouts are
+/// excluded (the deadline budget is already spent, and doubling the
+/// hold is worse than failing); origin answers are never errors here,
+/// so a status can never be retried by accident.
+#[cfg(feature = "server")]
+async fn fetch_head_async(url: &str) -> Result<reqwest::Response> {
+    let resp = match fetch_client().get(url).send().await {
+        Ok(r) => r,
+        Err(e) if !e.is_timeout() && (e.is_connect() || e.is_request()) => {
+            UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            fetch_client().get(url).send().await.map_err(map_send_err)?
+        }
+        Err(e) => return Err(map_send_err(e)),
+    };
+    refuse_status(resp)
+}
+
+/// The buffered tail: refuse an over-cap Content-Length before
+/// reading a byte, then accumulate the body under the same cap (the
+/// count is what catches chunked or lying origins — exactly-cap-sized
+/// sources are fine). Mid-body timeouts keep their io shape for
+/// classification; other body failures indict the origin.
+#[cfg(feature = "server")]
+async fn buffer_body_async(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    let cap = max_source_bytes();
+    if let Some(len) = resp.content_length()
+        && len > cap
+    {
+        return Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("source is {len} bytes, over the {cap}-byte limit"),
+        )));
+    }
+    let map_body_err = |e: reqwest::Error| {
+        if e.is_timeout() {
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, e))
+        } else {
+            anyhow::Error::new(e)
+                .context("read source body")
+                .context(UpstreamFault)
+        }
+    };
+    // The declared size is already checked against the cap, so a
+    // well-behaved origin costs one allocation; chunked origins grow.
+    let mut buf =
+        Vec::with_capacity(usize::try_from(resp.content_length().unwrap_or(0)).unwrap_or(0));
+    while let Some(chunk) = resp.chunk().await.map_err(map_body_err)? {
+        if (buf.len() as u64).saturating_add(chunk.len() as u64) > cap {
+            return Err(anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "source exceeds OXIMG_MAX_SOURCE_BYTES",
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Async buffered fetch: [`fetch_url`] for callers already inside a
+/// runtime — the server awaits this directly, so a fetch occupies no
+/// thread at all while it waits. Requires the `server` feature.
+#[cfg(feature = "server")]
+pub async fn fetch_url_async(url: &str) -> Result<Vec<u8>, Error> {
+    let inner = async { buffer_body_async(fetch_head_async(url).await?).await };
+    inner.await.map_err(|e| Error::classify(e, true))
+}
+
+/// Run a fetch future to completion from sync code, from any thread —
+/// including a tokio worker, where `Runtime::block_on` would panic:
+/// the future runs on one dedicated background runtime thread and the
+/// caller blocks on a channel. The dedicated runtime drives I/O only
+/// (fetches are network-bound); CPU work never lands here.
+#[cfg(feature = "server")]
+fn block_on_fetch<F>(fut: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    static HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+    let handle = HANDLE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("oximg-fetch".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build the fetch runtime");
+                let _ = tx.send(rt.handle().clone());
+                rt.block_on(std::future::pending::<()>());
+            })
+            .expect("spawn the fetch runtime thread");
+        rx.recv().expect("fetch runtime failed to start")
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    handle.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv().expect("fetch task dropped without a result")
+}
+
+/// Remote-source variant: fetch `url` whole (bounded by
+/// `OXIMG_MAX_SOURCE_BYTES`), then decode from the buffer — the same
+/// two steps as [`fetch_url`] + [`process`], packaged for callers that
+/// want one call. Requires the `server` feature (the HTTP client
+/// stack).
 #[cfg(feature = "server")]
 pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
-    process_url_inner(url, p).map_err(|e| Error::classify(e, true))
+    let bytes = fetch_url(url)?;
+    process(&bytes, p)
 }
 
 /// GCS-source variant (`gs://` mode): fetch `key` from `bucket` with
@@ -671,75 +858,21 @@ pub fn gcs_startup() -> Result<(), String> {
     gcs::startup()
 }
 
-#[cfg(feature = "server")]
-fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
-    let resp = fetch_url_head(url)?;
-    process_response(resp, p)
-}
-
-/// The head of every plain-HTTP fetch: GET with one retry on
-/// connection-level transients, status mapping (404, the 400/414
-/// rejection, upstream faults), and the fetch-time record. Shared by
-/// the streaming and buffered tails so the two cannot drift.
-#[cfg(feature = "server")]
-fn fetch_url_head(url: &str) -> Result<ureq::http::Response<ureq::Body>> {
-    clear_fetch_time();
-    let map_fetch_err = |e: ureq::Error| match e {
-        // Preserve source 404s so the HTTP layer can pass them through.
-        ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "source returned 404",
-        )),
-        // 400/414 are the origin saying the request itself is
-        // impossible — an over-long URL is the common shape. That is
-        // the requester's fault, and reporting it as an upstream
-        // failure makes a crawler look like an outage (issue #13).
-        ureq::Error::StatusCode(code @ (400 | 414)) => {
-            anyhow::anyhow!("origin rejected the request ({code})").context(SourceRejected)
-        }
-        // Origin 5xx/other 4xx and transport failures are the
-        // upstream's fault, not the request's.
-        other => anyhow::Error::new(other)
-            .context("fetch source")
-            .context(UpstreamFault),
-    };
-    // One retry on connection-level transients: a GET is idempotent
-    // and no response bytes have been consumed yet, so retrying here
-    // is safe — and it is the difference between "a network blip" and
-    // "a broken image at the CDN" (issue #11, a production rollback).
-    // Failures after this point (mid-body, during streaming decode)
-    // are NOT retried: the decoder has already consumed part of the
-    // stream, and restarting would mean re-decoding from scratch while
-    // holding a CPU permit.
-    let head = std::time::Instant::now();
-    let resp = match http_agent().get(url).call() {
-        Ok(r) => r,
-        Err(e) if transient_fetch_error(&e) => {
-            UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            http_agent().get(url).call().map_err(map_fetch_err)?
-        }
-        Err(e) => {
-            record_fetch_time(head.elapsed().as_secs_f64());
-            return Err(map_fetch_err(e));
-        }
-    };
-    record_fetch_time(head.elapsed().as_secs_f64());
-    Ok(resp)
-}
-
 /// Buffered remote fetch: download `url` whole, bounded by
 /// `OXIMG_MAX_SOURCE_BYTES`, and return the bytes without decoding
-/// anything. Client behavior (deadlines, the no-redirect rule, one
-/// retry on connection transients) and error classification are
-/// exactly [`process_url`]'s — the split exists so a caller can put
+/// anything. The split from [`process`] exists so a caller can put
 /// the network wait and the CPU work under different concurrency
 /// bounds (issue #22: the server buffers first, then takes a CPU
-/// permit and calls [`process`]). Requires the `server` feature.
+/// permit). Sync bridge over [`fetch_url_async`]; the whole fetch is
+/// recorded for [`last_fetch_seconds`]. Requires the `server` feature.
 #[cfg(feature = "server")]
 pub fn fetch_url(url: &str) -> Result<Vec<u8>, Error> {
-    let inner = || buffer_response(fetch_url_head(url)?);
-    inner().map_err(|e| Error::classify(e, true))
+    clear_fetch_time();
+    let t0 = std::time::Instant::now();
+    let owned = url.to_string();
+    let result = block_on_fetch(async move { fetch_url_async(&owned).await });
+    record_fetch_time(t0.elapsed().as_secs_f64());
+    result
 }
 
 /// Buffered GCS fetch: [`fetch_url`]'s contract for the `gs://` mode —
