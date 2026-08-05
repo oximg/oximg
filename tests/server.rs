@@ -884,6 +884,62 @@ fn error_statuses_are_honest() {
     assert_eq!(s.status_of("/resize/100/100/list.txt"), 422);
 }
 
+/// The compressed-size cap must hold with NO Content-Length to
+/// precheck: a chunked origin (or a lying one) is only caught by the
+/// capped reader while the body streams, and that mid-body failure
+/// must still classify as 413 — not surface as a decode error or, in
+/// clients that buffer bodies internally, buffer past the cap. This
+/// pins the enforcement point any HTTP-client migration must
+/// reimplement.
+#[test]
+fn oversize_source_without_content_length_is_413() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                // A valid JPEG prefix, then chunks forever past any
+                // cap: only the streaming byte count can refuse this.
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                );
+                let chunk = [0xAAu8; 4096];
+                let _ = write!(stream, "2\r\n");
+                let _ = stream.write_all(&[0xFF, 0xD8]);
+                let _ = write!(stream, "\r\n");
+                for _ in 0..64 {
+                    if write!(stream, "{:x}\r\n", chunk.len()).is_err()
+                        || stream.write_all(&chunk).is_err()
+                        || write!(stream, "\r\n").is_err()
+                    {
+                        return; // client hung up at the cap, as it should
+                    }
+                }
+                let _ = write!(stream, "0\r\n\r\n");
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_MAX_SOURCE_BYTES", "100000".into()),
+    ]);
+    assert_eq!(
+        s.status_of("/resize/100/100/endless.jpg"),
+        413,
+        "an unbounded chunked body must hit the cap, not a decode error"
+    );
+}
+
 /// The existing coalescing test only proves identical bytes — it
 /// passes even if singleflight is completely broken. This one proves
 /// the flight actually coalesces: a slow origin counts its fetches,
@@ -1545,6 +1601,7 @@ fn stalled_origin_times_out_as_504_and_releases_the_permit() {
             format!("http://127.0.0.1:{origin_port}"),
         ),
         ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+        ("OXIMG_METRICS", "1".into()),
     ]);
 
     for path in ["stall.jpg", "drip.jpg"] {
@@ -1568,6 +1625,16 @@ fn stalled_origin_times_out_as_504_and_releases_the_permit() {
             "{path}: follow-up request stalled — permit not released?"
         );
     }
+
+    // Timeouts are deliberately excluded from the transient retry: the
+    // deadline budget is already spent, and doubling the hold is worse
+    // than failing (see transient_fetch_error). Two 504s, zero retries.
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(&body, "oximg_upstream_retries_total"),
+        0.0,
+        "a timed-out fetch must not be retried"
+    );
 }
 
 /// Extract a metric value by its exact exposition-line prefix.
@@ -2170,6 +2237,67 @@ fn gcs_source_mode_authenticates_and_maps_statuses() {
         1,
         "token must be fetched once and cached"
     );
+}
+
+/// A 401 mid-lifetime means the token was revoked before its stated
+/// expiry: the retry must FORCE a metadata refresh and succeed with
+/// the fresh token — retrying with the cached one would just 401
+/// again. Pins gcs.rs's force_token path, which no other test reaches
+/// (the happy-path test never invalidates a token).
+#[test]
+fn gcs_revoked_token_is_refreshed_and_retried() {
+    use std::io::Write;
+
+    let (md_port, md_count) = fake_metadata_server(3600);
+
+    // An object store that has revoked token-1: only the SECOND token
+    // the metadata server mints is accepted.
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let gcs_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                if !req.contains("authorization: bearer test-token-2") {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                }
+                let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        ("OXIMG_SOURCE_BASE_URL", "gs://test-bucket".into()),
+        ("GCE_METADATA_HOST", format!("127.0.0.1:{md_port}")),
+        ("OXIMG_GCS_ENDPOINT", format!("http://127.0.0.1:{gcs_port}")),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+
+    // Boot probe cached token-1; the request 401s with it, refreshes,
+    // and succeeds with token-2 — invisibly to the client.
+    assert_eq!(s.get("/resize/100/100/photo.jpg").unwrap().0, 200);
+    assert_eq!(
+        md_count.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the 401 retry must force a token refresh, not reuse the cache"
+    );
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    assert!(metric(&body, "oximg_upstream_retries_total") >= 1.0);
 }
 
 /// gs:// without reachable credentials refuses to boot (fail closed,
