@@ -72,6 +72,11 @@ name = "decode_bench"
 path = "bench/tools/decode_bench.rs"
 
 [[example]]
+name = "resolve_bench"
+path = "bench/tools/resolve_bench.rs"
+required-features = ["bench-internals"]
+
+[[example]]
 name = "resize_bench"
 path = "bench/tools/resize_bench.rs"
 required-features = ["bench-internals"]

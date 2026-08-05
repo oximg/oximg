@@ -1020,6 +1020,25 @@ fn icc_passthrough(p: &Params) -> bool {
         .unwrap_or_else(|| crate::config::config().icc_passthrough)
 }
 
+/// Re-exposed for `bench/tools/resolve_bench.rs` only: the knob
+/// resolution work one JPEG->WebP request performs — the resolver
+/// calls jpeg.rs and encode.rs actually make on that path (auto_rotate
+/// twice, matching the two reads in the JPEG entry) — so a resolution
+/// refactor is measured against a baseline instead of asserted free.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub fn bench_resolve(p: &Params) -> (bool, bool, bool, bool, f64, f32, i32) {
+    (
+        icc_passthrough(p),
+        auto_rotate(p),
+        auto_rotate(p),
+        linear_light(p),
+        dct_margin(),
+        encode::webp_quality(p),
+        encode::webp_effort(),
+    )
+}
+
 /// Targets that can carry an ICC profile — all of them when the avif
 /// feature is on (AVIF embeds via the container splice in
 /// `avif::embed_icc`).
