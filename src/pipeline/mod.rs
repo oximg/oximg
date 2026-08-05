@@ -1222,6 +1222,7 @@ pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &'static str) -> Resul
     Ok(())
 }
 
+#[cfg(feature = "server")]
 thread_local! {
     /// Seconds spent getting a remote source's response *head* on this
     /// thread — connect, request, TTFB, plus any retry wait or token
@@ -1237,16 +1238,20 @@ thread_local! {
     static FETCH_SECS: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(feature = "server")]
 pub(crate) fn clear_fetch_time() {
     FETCH_SECS.set(None);
 }
 
+#[cfg(feature = "server")]
 pub(crate) fn record_fetch_time(seconds: f64) {
     FETCH_SECS.set(Some(FETCH_SECS.get().unwrap_or(0.0) + seconds));
 }
 
 /// Seconds the last remote fetch spent before its first decodable byte,
-/// or `None` if this thread's last source was local.
+/// or `None` if this thread's last source was local. Requires the
+/// `server` feature, like the remote source paths themselves.
+#[cfg(feature = "server")]
 pub fn last_fetch_seconds() -> Option<f64> {
     FETCH_SECS.get()
 }
