@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-05
+
+Makes the permit's hold time legible: a deployment can now read what
+share of its paid CPU time is spent waiting on the origin, which is the
+input for deciding whether to add permits (#20). Released so the
+before/after can be compared against a pinned version.
+
 ### Added
 
 - **`phase="fetch"` in `oximg_request_duration_seconds`** ([#20]
