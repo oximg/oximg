@@ -396,9 +396,9 @@ never silently falls back to a default.
 | `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |
-| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes; **verify with the `oximg_cpu_workers` gauge**, which is the only way to know what a given deployment actually got. What "observed" observes is worth knowing — see below |
+| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes — and for **remote sources, where above the CPU count is often right**: a permit is held across the origin fetch, so a deployment reading `fetch/process` from the duration histogram can expect roughly that fraction of throughput back by adding permits (measured: a 43% fetch share recovered +34% at an unchanged 1-CPU quota, see [bench/permit-lab](bench/permit-lab/)). **Verify with the `oximg_cpu_workers` gauge**, which is the only way to know what a given deployment actually got. What "observed" observes is worth knowing — see below |
 | `OXIMG_LOG` | `error` | `error` = one stderr line per failure; `request` also logs successes. The only accepted values |
-| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), queue-wait vs processing histograms, permit/coalescing gauges. Outside the signing scheme — expose it to your scrape network only |
+| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), duration histograms split into CPU-permit queue wait, processing, and — a *subset* of processing — remote-source `fetch` (the part of a held permit during which no byte could be decoded; `fetch/process` is the share of paid CPU time spent waiting on the origin), permit/coalescing gauges. Outside the signing scheme — expose it to your scrape network only |
 
 ### Sources
 
@@ -460,6 +460,16 @@ Three consequences that catch people out:
   single permit as `1000m` while costing 50% more, and `1900m` is still
   1. Whole numbers are the only way to buy concurrency — the second
   permit arrives at `2`, not at `1001m`.
+- **A pod with only `requests.cpu` and no limit is the dangerous
+  shape**: it sizes itself to the *node*, so on a 64-core node it will
+  admit 64 concurrent decodes while being scheduled for a fraction of
+  one core — and since peak memory is permits x per-request decode cost
+  (`OXIMG_MAX_DECODED_BYTES`), that presents as unexplained memory
+  pressure rather than as queue latency, with nothing in the pod spec
+  looking wrong. oximg prints a startup note when it takes its permit
+  count from full host parallelism with no CPU quota visible; a
+  deliberately restricted cpuset (Kubernetes' static CPU-manager
+  policy) is not warned about, because that count is correct.
 - **Platforms without a hard quota fall back to host parallelism**,
   which is why an equivalently-sized container reports a different
   number on Cloud Run (`cpu: "1"` there observes 2 — see

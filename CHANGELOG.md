@@ -10,6 +10,37 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`phase="fetch"` in `oximg_request_duration_seconds`** ([#20]
+  follow-up): for remote sources, the part of a held CPU permit spent
+  getting the origin's response head — during which no byte can be
+  decoded. It is a *subset* of `process`, not a sibling, because the
+  permit is held throughout, so `fetch/process` is the share of paid
+  CPU time spent waiting on the origin. Validated against injected
+  latencies (0/10/30/60 ms measured as 0.7/10.8/30.8/60.8 ms), and the
+  share predicts the effect: adding a permit recovered +0/+14/+34/+49%
+  throughput at an unchanged 1-CPU quota. Local sources record no fetch
+  phase.
+- **A startup note when permits come from full host parallelism with no
+  cgroup CPU quota** ([#20]): the shape a Kubernetes pod gets when only
+  `requests.cpu` is set, where it sizes itself to the *node* — 64
+  concurrent decodes on a 64-core node while scheduled for a fraction
+  of a core. Peak memory is permits x per-request decode cost, so that
+  presents as unexplained memory pressure with nothing in the pod spec
+  looking wrong. A deliberately restricted cpuset (static CPU-manager
+  policy) is not warned about: that count is correct.
+
+### Changed
+
+- Documented that `OXIMG_WORKERS` above the CPU count is often right
+  for **remote-source** deployments, with the measured relationship
+  between the fetch share and the throughput it recovers — the
+  opposite-looking advice to issue #10's, because the knob is being
+  asked to do two different jobs.
+
+[#20]: https://github.com/oximg/oximg/issues/20
+
 ### Changed
 
 - Documented what `OXIMG_WORKERS`'s "observed parallelism" actually

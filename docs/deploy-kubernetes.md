@@ -115,6 +115,15 @@ object storage.
   If `oximg_request_duration_seconds{phase="queue"}` is where your
   latency lives, permits are what to raise — and on Kubernetes that
   means raising `limits.cpu` to the next **whole** number.
+
+  With a **remote source** there is a second lever that costs no CPU.
+  A permit is held across the origin fetch, so
+  `phase="fetch"` / `phase="process"` is the share of your paid CPU time
+  spent waiting on the origin, and raising `OXIMG_WORKERS` above the
+  CPU count recovers roughly that share (measured: 43% fetch share ->
+  +34% throughput and a 24% cut in p95, at an unchanged 1-CPU quota;
+  see [bench/permit-lab](../bench/permit-lab/)). Local-file sources
+  have no such share, and there the same change costs ~7%.
 - **Memory**: bounded by concurrency × per-request buffers, which
   `OXIMG_MAX_SRC_PIXELS` caps. The 64 MP default admits large
   sources; 30 MP is a sensible cap when your originals are phone

@@ -3033,3 +3033,92 @@ fn expensive_requests_are_reported_without_being_refused() {
         "a refused request must not also emit the served report: {logs:?}"
     );
 }
+
+/// The `phase="fetch"` split (issue #20 follow-up): with a remote
+/// source, part of the CPU permit's hold time is spent waiting for the
+/// origin's response head, during which no byte can be decoded. The
+/// metric is validated against a *known* injected latency — a timing
+/// metric nobody has checked against a reference is not evidence.
+#[test]
+fn fetch_phase_measures_the_origin_wait_inside_the_permit() {
+    use std::io::Write;
+
+    // An origin that stalls a known 120ms before answering.
+    const DELAY_MS: u64 = 120;
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+                let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    for w in [100, 120, 140] {
+        assert_eq!(s.get(&format!("/resize/{w}/0/photo.jpg")).unwrap().0, 200);
+    }
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    let m = |p: &str| metric(&body, p);
+
+    // One observation per request, same as the other phases.
+    assert_eq!(
+        m("oximg_request_duration_seconds_count{phase=\"fetch\"}"),
+        3.0
+    );
+    let fetch_mean = m("oximg_request_duration_seconds_sum{phase=\"fetch\"}") / 3.0;
+    let process_mean = m("oximg_request_duration_seconds_sum{phase=\"process\"}") / 3.0;
+    let injected = DELAY_MS as f64 / 1000.0;
+    // The measurement must find the injected wait, and must not invent
+    // much beyond it: a local origin adds only connect + loopback.
+    assert!(
+        (injected..injected + 0.15).contains(&fetch_mean),
+        "fetch mean {fetch_mean:.3}s must reflect the injected {injected:.3}s"
+    );
+    // And it is a *subset* of the permit's hold time, never larger.
+    assert!(
+        fetch_mean <= process_mean + 1e-6,
+        "fetch {fetch_mean:.3}s cannot exceed process {process_mean:.3}s"
+    );
+    // On this source the origin wait dominates the permit, which is the
+    // whole point of measuring it.
+    assert!(
+        fetch_mean / process_mean > 0.5,
+        "the origin wait should dominate here: {:.0}% of the permit",
+        100.0 * fetch_mean / process_mean
+    );
+    drop(s);
+
+    // Local sources have no fetch phase at all — no stale value from a
+    // previous remote request may leak onto a reused thread.
+    let local = Server::start(&[("OXIMG_METRICS", "1".into())]);
+    assert_eq!(local.get("/resize/100/0/photo.jpg").unwrap().0, 200);
+    let body = String::from_utf8(local.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(
+            &body,
+            "oximg_request_duration_seconds_count{phase=\"fetch\"}"
+        ),
+        0.0,
+        "a local source records no fetch time"
+    );
+}

@@ -70,6 +70,26 @@ is 59% waste. A deployment with heavier work dilutes it: at the 138 ms
 service time reported in issue #20, a 20 ms RTT is ~14% waste and the
 expected `W=2` gain is ~16%, not 51%. Read the ratio, not the headline.
 
+## The fetch share, measured directly (2026-08-05)
+
+`phase="fetch"` landed after the sweep above, so the same cells can now
+report the quantity instead of having it inferred from a latency curve.
+Same host and settings, `W=1` vs `W=2` interleaved:
+
+| injected RTT | measured `srv_fetch` | `fetch/process` | W=2 throughput |
+|---|---|---|---|
+| 0 ms | 0.7 ms | 2% | 0% |
+| 10 ms | 10.8 ms | 21% | +14% |
+| 30 ms | 30.8 ms | 43% | +34% |
+| 60 ms | 60.8 ms | 60% | +49% |
+
+Two things worth having in writing. The metric finds each injected
+latency to within 0.8 ms, which is the only reason to trust it — a
+timing metric nobody checked against a reference is not evidence. And
+the share **predicts the effect**: recoverable throughput tracks
+`fetch/process` closely enough that a deployment can read its own
+number and know what a permit is worth, rather than running this sweep.
+
 ## What follows from this
 
 1. `OXIMG_WORKERS` above the CPU count is *correct* for remote-source
@@ -81,6 +101,7 @@ expected `W=2` gain is ~16%, not 51%. Read the ratio, not the headline.
    (buffer the source, bounded by `OXIMG_MAX_SOURCE_BYTES`, then
    acquire) — worth it exactly to the extent that the fetch fraction is
    large, which is now a measurable quantity rather than a guess.
-3. Either way a `phase="fetch"` split in
-   `oximg_request_duration_seconds` would let a deployment read its own
-   fetch fraction instead of inferring it from a latency sweep.
+3. ~~Either way a `phase="fetch"` split would let a deployment read its
+   own fetch fraction~~ — done, and it turned out to predict the effect
+   size, not just describe the cause. Read `fetch/process` first; if it
+   is small, item 2 is not worth implementing for that deployment.

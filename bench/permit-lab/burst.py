@@ -115,12 +115,23 @@ def main():
     p_cnt = series(after, 'oximg_request_duration_seconds_count{phase="process"}') - series(
         before, 'oximg_request_duration_seconds_count{phase="process"}'
     )
+    f_sum = series(after, 'oximg_request_duration_seconds_sum{phase="fetch"}') - series(
+        before, 'oximg_request_duration_seconds_sum{phase="fetch"}'
+    )
+    f_cnt = series(after, 'oximg_request_duration_seconds_count{phase="fetch"}') - series(
+        before, 'oximg_request_duration_seconds_count{phase="fetch"}'
+    )
     ok = sum(1 for c in codes if c == 200)
     print(
         f"rps={n / wall:6.2f} ok={ok}/{n} "
         f"p50={pct(50):7.1f} p95={pct(95):7.1f} p99={pct(99):7.1f} max={lat[-1]:7.1f} "
         f"srv_queue={1000 * q_sum / max(1, q_cnt):7.1f} "
         f"srv_process={1000 * p_sum / max(1, p_cnt):7.1f} "
+        # The share of a held permit during which no byte could be
+        # decoded — the quantity that decides whether bounding whole
+        # requests instead of CPU work is costing anything.
+        f"srv_fetch={1000 * f_sum / max(1, f_cnt):6.1f} "
+        f"fetch/process={100 * f_sum / max(1e-9, p_sum):4.0f}% "
         f"workers={series(after, 'oximg_cpu_workers'):.0f}"
     )
 
