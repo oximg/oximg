@@ -235,6 +235,7 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }),
     };
+    warn_if_unquota_ed(workers);
     // Cap the blocking pool at CPU slots + a little IO headroom: this
     // bounds the number of thread-local scratch copies (tokio's default of
     // 512 threads would multiply RSS).
@@ -244,6 +245,69 @@ fn main() -> anyhow::Result<()> {
         .build()?
         .block_on(async_main(workers))
 }
+
+/// A container with many visible CPUs and *no* cgroup CPU quota sizes
+/// its permit count to the host — which on Kubernetes is what a pod
+/// with only `requests.cpu` set gets: the node's core count, while
+/// being scheduled for a fraction of one core. That is the one shape
+/// where the default is dangerous rather than merely surprising, and
+/// nothing in the pod spec looks wrong: it presents as memory
+/// pressure, since peak memory is permits x per-request decode cost
+/// (see OXIMG_MAX_DECODED_BYTES). A 64-core node would admit 64
+/// concurrent decodes.
+///
+/// One startup line, only when both conditions hold, naming the two
+/// fixes. Advisory: the default stays what it is, because a real
+/// 64-core host *should* use 64 permits (issue #20).
+#[cfg(target_os = "linux")]
+fn warn_if_unquota_ed(workers: usize) {
+    const MANY: usize = 8;
+    if workers < MANY {
+        return;
+    }
+    // cgroup v2 first, then v1; "max" (or an absent file) means no
+    // quota, so the count came from the host, not from a share.
+    let v2 = std::fs::read_to_string("/sys/fs/cgroup/cpu.max").ok();
+    let quota_set = match v2 {
+        Some(v) => !v.split_whitespace().next().is_none_or(|q| q == "max"),
+        None => std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|q| q > 0),
+    };
+    if quota_set {
+        return;
+    }
+    // A cpuset smaller than the machine is somebody constraining this
+    // deliberately — Kubernetes' static CPU-manager policy gives a pod
+    // exclusive cores that way, and its permit count is then correct.
+    // The dangerous shape is specifically "nothing constrained us", so
+    // only warn when the permits cover every CPU present.
+    let present = std::fs::read_to_string("/sys/devices/system/cpu/present")
+        .ok()
+        .and_then(|v| {
+            let last = v
+                .trim()
+                .rsplit(&[',', '-'][..])
+                .next()?
+                .parse::<usize>()
+                .ok()?;
+            Some(last + 1)
+        });
+    if present.is_some_and(|n| workers < n) {
+        return;
+    }
+    eprintln!(
+        "oximg: note: {workers} CPU permits from host parallelism, with no cgroup \
+         CPU quota visible. On Kubernetes a pod with only requests.cpu set gets the \
+         node's core count this way, and peak memory is permits x per-request decode \
+         cost — set limits.cpu (a whole number) or OXIMG_WORKERS if that is not what \
+         you meant."
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_if_unquota_ed(_workers: usize) {}
 
 async fn async_main(workers: usize) -> anyhow::Result<()> {
     let port: u16 = env_or("PORT", 8081);
@@ -1067,25 +1131,37 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     // — a dependency's blanket From impls otherwise make the inference
     // ambiguous here.
     type Processed = Result<(Vec<u8>, ImageFormat), pipeline::Error>;
-    let out = tokio::task::spawn_blocking(
-        move || -> Result<(Processed, Option<String>), (StatusCode, String)> {
-            let _permit = permit; // hold the CPU slot for the whole processing
-            // Streaming decode: the source is never buffered whole on the heap
-            // (saves concurrency x file-size for large sources under load);
-            // for remote sources decoding overlaps the download.
-            let processed = match fetch {
-                Fetch::Url(url) => pipeline::process_url(&url, &params),
-                Fetch::Gcs { bucket, key } => pipeline::process_gcs(&bucket, &key, &params),
-                Fetch::Local => {
-                    verify_within_root(&images_root, &path)?;
-                    pipeline::process_path(&path, &params)
-                }
-            };
-            // Read the estimate report on the thread that decoded, so the
-            // caller — which knows *which* source this was — can name it.
-            Ok((processed, pipeline::decode_report_above_threshold()))
-        },
-    )
+    /// What comes back out of the blocking task: the pipeline result
+    /// plus the two per-thread observations only that thread could
+    /// read — the decoded-bytes report (the caller supplies the
+    /// filename) and the remote fetch time (a subset of the permit's
+    /// hold, `None` for local sources).
+    type Outcome = (Processed, Option<String>, Option<f64>);
+    let out = tokio::task::spawn_blocking(move || -> Result<Outcome, (StatusCode, String)> {
+        let _permit = permit; // hold the CPU slot for the whole processing
+        // Streaming decode: the source is never buffered whole on the heap
+        // (saves concurrency x file-size for large sources under load);
+        // for remote sources decoding overlaps the download.
+        let processed = match fetch {
+            Fetch::Url(url) => pipeline::process_url(&url, &params),
+            Fetch::Gcs { bucket, key } => pipeline::process_gcs(&bucket, &key, &params),
+            Fetch::Local => {
+                verify_within_root(&images_root, &path)?;
+                pipeline::process_path(&path, &params)
+            }
+        };
+        // Read the per-thread observations on the thread that did
+        // the work: the estimate report (the caller knows which
+        // source it belongs to) and, for remote sources, how much
+        // of the permit went on the fetch before a byte could be
+        // decoded.
+        let fetch = if remote {
+            pipeline::last_fetch_seconds()
+        } else {
+            None
+        };
+        Ok((processed, pipeline::decode_report_above_threshold(), fetch))
+    })
     .await
     .map_err(|e| {
         eprintln!("oximg: error status=500 file={file:?} panic={e}");
@@ -1094,8 +1170,15 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             "image processing failed".to_string(),
         )
     })?
-    .map(|(processed, report)| {
+    .map(|(processed, report, fetch)| {
         metrics::METRICS.observe_process(t_process.elapsed().as_secs_f64());
+        // The fetch is a *subset* of the process phase, not a sibling of
+        // it: reported so a deployment can read what fraction of a
+        // permit's hold time was network wait rather than inferring it
+        // from a latency sweep (bench/permit-lab).
+        if let Some(secs) = fetch {
+            metrics::METRICS.observe_fetch(secs);
+        }
         // Report-without-refusing (issue #19): the cap can only ever
         // name what it *rejects*, so a deployment learning its corpus
         // needs expensive requests named while they are still served.

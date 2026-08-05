@@ -151,6 +151,8 @@ pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq
         )));
     }
     let url = format!("{}/{bucket}/{key}", endpoint());
+    super::clear_fetch_time();
+    let head = std::time::Instant::now();
     let attempt = |force_token: bool| -> Result<_, anyhow::Error> {
         let bearer = bearer(force_token)?;
         super::http_agent()
@@ -176,10 +178,16 @@ pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq
                     std::thread::sleep(Duration::from_millis(100));
                     attempt(force_token).map_err(|e| map_fetch_err(e, bucket))?
                 }
-                None => return Err(map_fetch_err(e, bucket)),
+                None => {
+                    super::record_fetch_time(head.elapsed().as_secs_f64());
+                    return Err(map_fetch_err(e, bucket));
+                }
             }
         }
     };
+    // Includes a token refresh when one happened: that round trip is
+    // permit time too.
+    super::record_fetch_time(head.elapsed().as_secs_f64());
     Ok(resp)
 }
 

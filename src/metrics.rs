@@ -82,6 +82,7 @@ pub struct Metrics {
     upstream: [AtomicU64; OUTCOMES.len()],
     queue: Histogram,
     process: Histogram,
+    fetch: Histogram,
     coalesced_leaders: AtomicU64,
     coalesced_followers: AtomicU64,
 }
@@ -120,6 +121,7 @@ impl Metrics {
             upstream: [const { AtomicU64::new(0) }; OUTCOMES.len()],
             queue: Histogram::new(),
             process: Histogram::new(),
+            fetch: Histogram::new(),
             coalesced_leaders: AtomicU64::new(0),
             coalesced_followers: AtomicU64::new(0),
         }
@@ -147,6 +149,10 @@ impl Metrics {
 
     pub fn observe_process(&self, seconds: f64) {
         self.process.observe(seconds);
+    }
+
+    pub fn observe_fetch(&self, seconds: f64) {
+        self.fetch.observe(seconds);
     }
 
     pub fn record_leader(&self) {
@@ -230,13 +236,19 @@ impl Metrics {
 
         let _ = writeln!(
             out,
-            "# HELP oximg_request_duration_seconds Time split into CPU-permit queue wait and processing."
+            "# HELP oximg_request_duration_seconds Time split into CPU-permit queue wait, processing, and (a subset of processing) remote-source fetch."
         );
         let _ = writeln!(out, "# TYPE oximg_request_duration_seconds histogram");
         self.queue
             .render(&mut out, "oximg_request_duration_seconds", "queue");
         self.process
             .render(&mut out, "oximg_request_duration_seconds", "process");
+        // A subset of "process", not a sibling: the permit is held
+        // throughout, and this is the part of that hold during which no
+        // byte could be decoded. fetch/process is the share of paid CPU
+        // time spent waiting on the origin.
+        self.fetch
+            .render(&mut out, "oximg_request_duration_seconds", "fetch");
 
         let _ = writeln!(
             out,

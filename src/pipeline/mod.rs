@@ -660,6 +660,7 @@ pub fn gcs_startup() -> Result<(), String> {
 
 #[cfg(feature = "server")]
 fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
+    clear_fetch_time();
     let map_fetch_err = |e: ureq::Error| match e {
         // Preserve source 404s so the HTTP layer can pass them through.
         ureq::Error::StatusCode(404) => anyhow::Error::new(std::io::Error::new(
@@ -687,6 +688,7 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
     // are NOT retried: the decoder has already consumed part of the
     // stream, and restarting would mean re-decoding from scratch while
     // holding a CPU permit.
+    let head = std::time::Instant::now();
     let resp = match http_agent().get(url).call() {
         Ok(r) => r,
         Err(e) if transient_fetch_error(&e) => {
@@ -694,8 +696,12 @@ fn process_url_inner(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat)> {
             std::thread::sleep(std::time::Duration::from_millis(100));
             http_agent().get(url).call().map_err(map_fetch_err)?
         }
-        Err(e) => return Err(map_fetch_err(e)),
+        Err(e) => {
+            record_fetch_time(head.elapsed().as_secs_f64());
+            return Err(map_fetch_err(e));
+        }
     };
+    record_fetch_time(head.elapsed().as_secs_f64());
     process_response(resp, p)
 }
 
@@ -1214,6 +1220,35 @@ pub(crate) fn check_decoded_bytes(cost: DecodeCost, what: &'static str) -> Resul
         ));
     }
     Ok(())
+}
+
+thread_local! {
+    /// Seconds spent getting a remote source's response *head* on this
+    /// thread — connect, request, TTFB, plus any retry wait or token
+    /// refresh. Set by the remote paths, cleared by them on entry so a
+    /// local-file request can never read a stale value.
+    ///
+    /// The body read is deliberately excluded: streaming decode
+    /// interleaves it with CPU work, so it cannot be attributed. What
+    /// this measures is the part of a CPU permit's hold time during
+    /// which not one byte could be decoded — the quantity that decides
+    /// whether bounding requests instead of CPU work is costing
+    /// anything (bench/permit-lab).
+    static FETCH_SECS: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn clear_fetch_time() {
+    FETCH_SECS.set(None);
+}
+
+pub(crate) fn record_fetch_time(seconds: f64) {
+    FETCH_SECS.set(Some(FETCH_SECS.get().unwrap_or(0.0) + seconds));
+}
+
+/// Seconds the last remote fetch spent before its first decodable byte,
+/// or `None` if this thread's last source was local.
+pub fn last_fetch_seconds() -> Option<f64> {
+    FETCH_SECS.get()
 }
 
 /// Whether an `OXIMG_MAX_DECODED_BYTES` cap is configured. The JPEG
