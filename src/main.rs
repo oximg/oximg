@@ -56,6 +56,12 @@ struct App {
     images_dir: Arc<PathBuf>,
     source: Option<SourceMode>,
     cpu_slots: Arc<Semaphore>,
+    /// Bounds concurrent origin fetches (OXIMG_FETCH_CONCURRENCY).
+    /// Fetches hold no CPU permit (issue #22), so without their own
+    /// bound N concurrent downloads x OXIMG_MAX_SOURCE_BYTES of buffer
+    /// would be a new unbounded-memory class — exactly what issue #17
+    /// finished cleaning up.
+    fetch_slots: Arc<Semaphore>,
     /// Total CPU permits (= core count); the /metrics permits-in-use
     /// gauge is workers minus available permits at scrape time.
     workers: usize,
@@ -236,14 +242,42 @@ fn main() -> anyhow::Result<()> {
             }),
     };
     warn_if_unquota_ed(workers);
-    // Cap the blocking pool at CPU slots + a little IO headroom: this
-    // bounds the number of thread-local scratch copies (tokio's default of
-    // 512 threads would multiply RSS).
+    // Fetch concurrency (issue #22): origin fetches run on the blocking
+    // pool *without* a CPU permit, so they need their own bound — the
+    // memory hazard is fetch slots x OXIMG_MAX_SOURCE_BYTES of buffered
+    // source. The default gives each permit enough fetch overlap to
+    // absorb an 8-wide srcset burst at production-like fetch shares
+    // (bench/permit-lab); deployments with slow origins and thin
+    // encodes (high RTT/encode ratios) are the ones that want it
+    // raised.
+    let fetch_limit = match std::env::var("OXIMG_FETCH_CONCURRENCY") {
+        Err(_) => (workers * 4).min(256),
+        Ok(v) if v.trim().is_empty() => (workers * 4).min(256),
+        Ok(v) => v
+            .trim()
+            .parse()
+            .ok()
+            .filter(|n| (1..=1024).contains(n))
+            .unwrap_or_else(|| {
+                eprintln!("oximg: fatal: OXIMG_FETCH_CONCURRENCY={v:?} must be 1-1024");
+                std::process::exit(2);
+            }),
+    };
+    // Cap the blocking pool at CPU slots + fetch slots + a little IO
+    // headroom. The CPU term bounds the number of thread-local scratch
+    // copies (tokio's default of 512 threads would multiply RSS); the
+    // fetch term exists because fetches queue on this same pool without
+    // holding a permit — at the old cap of workers + 4, a burst of
+    // fetches would serialize on pool threads and eat the issue #22
+    // gain. Fetch tasks never touch SCRATCH; pool threads are fungible,
+    // so the worst-case scratch count does rise with this cap, but only
+    // as far as threads that actually ran a decode, and idle blocking
+    // threads exit after tokio's keep-alive, releasing their scratch.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(workers + 4)
+        .max_blocking_threads(workers + fetch_limit + 4)
         .build()?
-        .block_on(async_main(workers))
+        .block_on(async_main(workers, fetch_limit))
 }
 
 /// A container with many visible CPUs and *no* cgroup CPU quota sizes
@@ -309,7 +343,7 @@ fn warn_if_unquota_ed(workers: usize) {
 #[cfg(not(target_os = "linux"))]
 fn warn_if_unquota_ed(_workers: usize) {}
 
-async fn async_main(workers: usize) -> anyhow::Result<()> {
+async fn async_main(workers: usize, fetch_limit: usize) -> anyhow::Result<()> {
     let port: u16 = env_or("PORT", 8081);
     let images_dir =
         PathBuf::from(std::env::var("IMAGES_DIR").unwrap_or_else(|_| "./images".to_string()));
@@ -318,6 +352,7 @@ async fn async_main(workers: usize) -> anyhow::Result<()> {
         images_dir: Arc::new(images_dir.clone()),
         source: source_mode_from_env(),
         cpu_slots: Arc::new(Semaphore::new(workers)),
+        fetch_slots: Arc::new(Semaphore::new(fetch_limit)),
         workers,
         quality: env_or("QUALITY", 80.0),
         encoder: pipeline::Encoder::from_preset(
@@ -1056,6 +1091,76 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let (w, h, file, output, quality) = key;
     let path = app.images_dir.join(file);
 
+    // Resolve the fetch target before anything blocks: the URL for
+    // the HTTP mode, the encoded (prefixed) key for the GCS mode.
+    enum Fetch {
+        Url(String),
+        Gcs { bucket: String, key: String },
+        Local,
+    }
+    let fetch = match &app.source {
+        Some(SourceMode::Http(base)) => {
+            Fetch::Url(format!("{base}/{}", encode_upstream_path(file)))
+        }
+        Some(SourceMode::Gcs { bucket, prefix }) => Fetch::Gcs {
+            bucket: bucket.to_string(),
+            key: match prefix {
+                Some(p) => encode_upstream_path(&format!("{p}/{file}")),
+                None => encode_upstream_path(file),
+            },
+        },
+        None => Fetch::Local,
+    };
+
+    // Remote sources are downloaded whole — bounded by
+    // OXIMG_MAX_SOURCE_BYTES — *before* a CPU permit is taken (issue
+    // #22): held across the round trip, a permit idles its core for
+    // the whole fetch, measured at ~50% of the permit's hold time in
+    // production (issue #20). Fetch concurrency has its own bound
+    // (fetch_slots); the timer starts before the slot acquire so
+    // waiting for a slot shows up in the fetch phase instead of
+    // nowhere.
+    let buffered: Option<Vec<u8>> = match fetch {
+        Fetch::Local => None,
+        remote => {
+            let t_fetch = std::time::Instant::now();
+            let slot = app
+                .fetch_slots
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore closed");
+            let fetched = tokio::task::spawn_blocking(move || {
+                let _slot = slot; // bound the buffers, not just the requests
+                match remote {
+                    Fetch::Url(url) => pipeline::fetch_url(&url),
+                    Fetch::Gcs { bucket, key } => pipeline::fetch_gcs(&bucket, &key),
+                    Fetch::Local => unreachable!("local sources are not fetched"),
+                }
+            })
+            .await
+            .map_err(|e| {
+                eprintln!("oximg: error status=500 file={file:?} panic={e}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "image processing failed".to_string(),
+                )
+            })?;
+            metrics::METRICS.observe_fetch(t_fetch.elapsed().as_secs_f64());
+            // Fetch-outcome accounting happens here, where the fetch
+            // ends: kinds that indict the origin count as their own
+            // outcomes, anything else (a post-fetch decode failure
+            // never reaches this match; an over-cap 413 is not origin
+            // ill-health) counts "ok" — the same totals as when the
+            // fetch lived inside the pipeline call.
+            match &fetched {
+                Ok(_) => metrics::METRICS.record_upstream("ok"),
+                Err(e) => metrics::METRICS.record_upstream(upstream_outcome(e.kind())),
+            }
+            Some(fetched.map_err(|e| error_response(&e, file))?)
+        }
+    };
+
     // CPU concurrency cap = core count; queueing happens here instead of
     // flooding the blocking pool. The wait is the queue-phase
     // observation: rising queue wait under flat processing time is the
@@ -1104,63 +1209,33 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             params.avif_quality = Some(*q);
         }
     }
-    // Resolve the fetch target outside the blocking task: the URL for
-    // the HTTP mode, the encoded (prefixed) key for the GCS mode.
-    enum Fetch {
-        Url(String),
-        Gcs { bucket: String, key: String },
-        Local,
-    }
-    let fetch = match &app.source {
-        Some(SourceMode::Http(base)) => {
-            Fetch::Url(format!("{base}/{}", encode_upstream_path(file)))
-        }
-        Some(SourceMode::Gcs { bucket, prefix }) => Fetch::Gcs {
-            bucket: bucket.to_string(),
-            key: match prefix {
-                Some(p) => encode_upstream_path(&format!("{p}/{file}")),
-                None => encode_upstream_path(file),
-            },
-        },
-        None => Fetch::Local,
-    };
     let images_root = Arc::clone(&app.images_dir);
-    let remote = app.source.is_some();
     let t_process = std::time::Instant::now();
     // The explicit return type pins `?`'s error to (StatusCode, String)
     // — a dependency's blanket From impls otherwise make the inference
     // ambiguous here.
     type Processed = Result<(Vec<u8>, ImageFormat), pipeline::Error>;
     /// What comes back out of the blocking task: the pipeline result
-    /// plus the two per-thread observations only that thread could
-    /// read — the decoded-bytes report (the caller supplies the
-    /// filename) and the remote fetch time (a subset of the permit's
-    /// hold, `None` for local sources).
-    type Outcome = (Processed, Option<String>, Option<f64>);
+    /// plus the per-thread observation only that thread could read —
+    /// the decoded-bytes report (the caller supplies the filename).
+    type Outcome = (Processed, Option<String>);
     let out = tokio::task::spawn_blocking(move || -> Result<Outcome, (StatusCode, String)> {
         let _permit = permit; // hold the CPU slot for the whole processing
-        // Streaming decode: the source is never buffered whole on the heap
-        // (saves concurrency x file-size for large sources under load);
-        // for remote sources decoding overlaps the download.
-        let processed = match fetch {
-            Fetch::Url(url) => pipeline::process_url(&url, &params),
-            Fetch::Gcs { bucket, key } => pipeline::process_gcs(&bucket, &key, &params),
-            Fetch::Local => {
+        let processed = match &buffered {
+            // Remote sources arrive pre-fetched (issue #22): the permit
+            // pays for decode + encode only. The buffer is counted in
+            // the decoded-bytes estimate by the pipeline.
+            Some(bytes) => pipeline::process(bytes, &params),
+            // Local sources keep the streaming decode: never buffered
+            // whole on the heap (saves concurrency x file-size for
+            // large sources under load), and the page cache serves the
+            // sequential read.
+            None => {
                 verify_within_root(&images_root, &path)?;
                 pipeline::process_path(&path, &params)
             }
         };
-        // Read the per-thread observations on the thread that did
-        // the work: the estimate report (the caller knows which
-        // source it belongs to) and, for remote sources, how much
-        // of the permit went on the fetch before a byte could be
-        // decoded.
-        let fetch = if remote {
-            pipeline::last_fetch_seconds()
-        } else {
-            None
-        };
-        Ok((processed, pipeline::decode_report_above_threshold(), fetch))
+        Ok((processed, pipeline::decode_report_above_threshold()))
     })
     .await
     .map_err(|e| {
@@ -1170,15 +1245,8 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             "image processing failed".to_string(),
         )
     })?
-    .map(|(processed, report, fetch)| {
+    .map(|(processed, report)| {
         metrics::METRICS.observe_process(t_process.elapsed().as_secs_f64());
-        // The fetch is a *subset* of the process phase, not a sibling of
-        // it: reported so a deployment can read what fraction of a
-        // permit's hold time was network wait rather than inferring it
-        // from a latency sweep (bench/permit-lab).
-        if let Some(secs) = fetch {
-            metrics::METRICS.observe_fetch(secs);
-        }
         // Report-without-refusing (issue #19): the cap can only ever
         // name what it *rejects*, so a deployment learning its corpus
         // needs expensive requests named while they are still served.
@@ -1193,101 +1261,104 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         }
         processed
     })?
-    // The pipeline classifies its own failures (pipeline::ErrorKind);
-    // this match only assigns statuses. Faults on our side (unreadable
-    // source, upstream, internal) answer with generic bodies — the
-    // detail (full context chain, {e:#}) goes to stderr, where an
-    // operator can see it, instead of to the client. Undecodable client
-    // input returns its top-level message, which is safe and useful.
-    .map_err(|e| {
-        use pipeline::ErrorKind;
-        // Fetch-outcome accounting (remote mode): kinds that indict the
-        // origin count as their own outcomes; anything else means the
-        // fetch itself delivered bytes (decode/encode failures are not
-        // the origin's problem).
-        if remote {
-            metrics::METRICS.record_upstream(match e.kind() {
-                ErrorKind::SourceNotFound => "not_found",
-                ErrorKind::UpstreamTimeout => "timeout",
-                // An impossible key is not upstream ill-health: keeping
-                // it out of "error" is what lets that series answer
-                // "is the origin actually unwell" (issue #13).
-                ErrorKind::SourceRejected => "rejected",
-                ErrorKind::Upstream => "error",
-                _ => "ok",
-            });
-        }
-        match e.kind() {
-            ErrorKind::SourceNotFound => (StatusCode::NOT_FOUND, "image not found".to_string()),
-            // The requester asked for something no origin can serve.
-            // 400 keeps it out of the 5xx rate an operator watches and
-            // out of the retry/failover paths a CDN reserves for
-            // origin failure.
-            ErrorKind::SourceRejected => (
-                StatusCode::BAD_REQUEST,
-                "source key rejected by the origin".to_string(),
-            ),
-            ErrorKind::SourceTooLarge => {
-                // The body stays generic across all three source caps —
-                // it would otherwise hand a client the configured limit
-                // values — so the chain, which names *which* limit and
-                // the figure, has to reach the log. Without this an
-                // operator sees one sentence and cannot tell
-                // MAX_SOURCE_BYTES from MAX_SRC_PIXELS from
-                // MAX_DECODED_BYTES (issue #17 follow-up).
-                eprintln!("oximg: error status=413 file={file:?} err={e:#}");
-                (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "source image exceeds the configured size limit".to_string(),
-                )
-            }
-            ErrorKind::SourceUnreadable => {
-                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "source could not be read".to_string(),
-                )
-            }
-            ErrorKind::Upstream => {
-                eprintln!("oximg: error status=502 file={file:?} err={e:#}");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "upstream image fetch failed".to_string(),
-                )
-            }
-            ErrorKind::UpstreamTimeout => {
-                eprintln!("oximg: error status=504 file={file:?} err={e:#}");
-                (
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "upstream image fetch timed out".to_string(),
-                )
-            }
-            ErrorKind::Internal => {
-                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal image-processing error".to_string(),
-                )
-            }
-            ErrorKind::Undecodable => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-            // ErrorKind is #[non_exhaustive] (the binary is a consumer
-            // of the library crate like any embedder): treat kinds this
-            // binary predates as internal faults — log, generic body.
-            _ => {
-                eprintln!("oximg: error status=500 file={file:?} err={e:#}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal image-processing error".to_string(),
-                )
-            }
-        }
-    })?;
+    .map_err(|e| error_response(&e, file))?;
 
-    if remote {
-        metrics::METRICS.record_upstream("ok");
-    }
     let (bytes, format) = out;
     Ok((Bytes::from(bytes), format.content_type()))
+}
+
+/// The upstream-outcome label for a failed fetch. Kinds that indict
+/// the origin count as their own outcomes; anything else (an over-cap
+/// 413, say) means the origin itself answered honestly — keeping those
+/// out of "error" is what lets the series answer "is the origin
+/// actually unwell" (issue #13).
+fn upstream_outcome(kind: pipeline::ErrorKind) -> &'static str {
+    use pipeline::ErrorKind;
+    match kind {
+        ErrorKind::SourceNotFound => "not_found",
+        ErrorKind::UpstreamTimeout => "timeout",
+        // An impossible key is not upstream ill-health.
+        ErrorKind::SourceRejected => "rejected",
+        ErrorKind::Upstream => "error",
+        _ => "ok",
+    }
+}
+
+/// The pipeline classifies its own failures (pipeline::ErrorKind);
+/// this match only assigns statuses. Faults on our side (unreadable
+/// source, upstream, internal) answer with generic bodies — the
+/// detail (full context chain, {e:#}) goes to stderr, where an
+/// operator can see it, instead of to the client. Undecodable client
+/// input returns its top-level message, which is safe and useful.
+/// One function for both failure sites — the off-permit fetch and the
+/// permit-held processing — so the status contract cannot drift
+/// between them.
+fn error_response(e: &pipeline::Error, file: &str) -> (StatusCode, String) {
+    use pipeline::ErrorKind;
+    match e.kind() {
+        ErrorKind::SourceNotFound => (StatusCode::NOT_FOUND, "image not found".to_string()),
+        // The requester asked for something no origin can serve.
+        // 400 keeps it out of the 5xx rate an operator watches and
+        // out of the retry/failover paths a CDN reserves for
+        // origin failure.
+        ErrorKind::SourceRejected => (
+            StatusCode::BAD_REQUEST,
+            "source key rejected by the origin".to_string(),
+        ),
+        ErrorKind::SourceTooLarge => {
+            // The body stays generic across all three source caps —
+            // it would otherwise hand a client the configured limit
+            // values — so the chain, which names *which* limit and
+            // the figure, has to reach the log. Without this an
+            // operator sees one sentence and cannot tell
+            // MAX_SOURCE_BYTES from MAX_SRC_PIXELS from
+            // MAX_DECODED_BYTES (issue #17 follow-up).
+            eprintln!("oximg: error status=413 file={file:?} err={e:#}");
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "source image exceeds the configured size limit".to_string(),
+            )
+        }
+        ErrorKind::SourceUnreadable => {
+            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "source could not be read".to_string(),
+            )
+        }
+        ErrorKind::Upstream => {
+            eprintln!("oximg: error status=502 file={file:?} err={e:#}");
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream image fetch failed".to_string(),
+            )
+        }
+        ErrorKind::UpstreamTimeout => {
+            eprintln!("oximg: error status=504 file={file:?} err={e:#}");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream image fetch timed out".to_string(),
+            )
+        }
+        ErrorKind::Internal => {
+            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal image-processing error".to_string(),
+            )
+        }
+        ErrorKind::Undecodable => (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+        // ErrorKind is #[non_exhaustive] (the binary is a consumer
+        // of the library crate like any embedder): treat kinds this
+        // binary predates as internal faults — log, generic body.
+        _ => {
+            eprintln!("oximg: error status=500 file={file:?} err={e:#}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal image-processing error".to_string(),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

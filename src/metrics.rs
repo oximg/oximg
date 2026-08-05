@@ -236,17 +236,20 @@ impl Metrics {
 
         let _ = writeln!(
             out,
-            "# HELP oximg_request_duration_seconds Time split into CPU-permit queue wait, processing, and (a subset of processing) remote-source fetch."
+            "# HELP oximg_request_duration_seconds Time split into remote-source fetch (no CPU permit held), CPU-permit queue wait, and processing (permit held)."
         );
         let _ = writeln!(out, "# TYPE oximg_request_duration_seconds histogram");
         self.queue
             .render(&mut out, "oximg_request_duration_seconds", "queue");
         self.process
             .render(&mut out, "oximg_request_duration_seconds", "process");
-        // A subset of "process", not a sibling: the permit is held
-        // throughout, and this is the part of that hold during which no
-        // byte could be decoded. fetch/process is the share of paid CPU
-        // time spent waiting on the origin.
+        // Since issue #22 the fetch *precedes* the permit instead of
+        // being a subset of its hold: it covers everything between
+        // "ready to fetch" and "source in hand" — the fetch-slot wait,
+        // the pool hand-off, and the whole download. A permit's hold
+        // time is now the process phase alone, so fetch/process no
+        // longer names recoverable throughput; it names what the
+        // permit no longer pays for.
         self.fetch
             .render(&mut out, "oximg_request_duration_seconds", "fetch");
 

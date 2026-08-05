@@ -366,6 +366,9 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_WORKERS", "600"),
         ("OXIMG_WORKERS", "two"),
         ("OXIMG_UPSTREAM_CONNECT_TIMEOUT", "fast"),
+        ("OXIMG_FETCH_CONCURRENCY", "0"),
+        ("OXIMG_FETCH_CONCURRENCY", "2000"),
+        ("OXIMG_FETCH_CONCURRENCY", "many"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
         ("QUALITY", "eighty"),
@@ -989,7 +992,7 @@ fn singleflight_coalesces_to_one_origin_fetch() {
 }
 
 #[test]
-fn remote_source_mode_streams_from_http_origin() {
+fn remote_source_mode_serves_from_http_origin() {
     // origin: a second oximg? No — a minimal static file server thread.
     let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3034,13 +3037,13 @@ fn expensive_requests_are_reported_without_being_refused() {
     );
 }
 
-/// The `phase="fetch"` split (issue #20 follow-up): with a remote
-/// source, part of the CPU permit's hold time is spent waiting for the
-/// origin's response head, during which no byte can be decoded. The
-/// metric is validated against a *known* injected latency — a timing
-/// metric nobody has checked against a reference is not evidence.
+/// The `phase="fetch"` split (issue #20 follow-up), with issue #22's
+/// contract: the origin wait is measured — validated against a *known*
+/// injected latency, since a timing metric nobody has checked against
+/// a reference is not evidence — and it happens *outside* the CPU
+/// permit, so the process phase must NOT contain it.
 #[test]
-fn fetch_phase_measures_the_origin_wait_inside_the_permit() {
+fn fetch_phase_measures_the_origin_wait_outside_the_permit() {
     use std::io::Write;
 
     // An origin that stalls a known 120ms before answering.
@@ -3089,22 +3092,20 @@ fn fetch_phase_measures_the_origin_wait_inside_the_permit() {
     let process_mean = m("oximg_request_duration_seconds_sum{phase=\"process\"}") / 3.0;
     let injected = DELAY_MS as f64 / 1000.0;
     // The measurement must find the injected wait, and must not invent
-    // much beyond it: a local origin adds only connect + loopback.
+    // much beyond it: a local origin adds only connect + loopback (and,
+    // since issue #22, the fetch-slot acquire — uncontended here).
     assert!(
         (injected..injected + 0.15).contains(&fetch_mean),
         "fetch mean {fetch_mean:.3}s must reflect the injected {injected:.3}s"
     );
-    // And it is a *subset* of the permit's hold time, never larger.
+    // Issue #22's contract, pinned: the wait does not hold a CPU
+    // permit, so the process phase — the permit's actual hold — must
+    // be pure decode+encode, far below the injected latency. (Before
+    // the change fetch was a subset of process and this read
+    // ~injected + decode.)
     assert!(
-        fetch_mean <= process_mean + 1e-6,
-        "fetch {fetch_mean:.3}s cannot exceed process {process_mean:.3}s"
-    );
-    // On this source the origin wait dominates the permit, which is the
-    // whole point of measuring it.
-    assert!(
-        fetch_mean / process_mean > 0.5,
-        "the origin wait should dominate here: {:.0}% of the permit",
-        100.0 * fetch_mean / process_mean
+        process_mean < injected,
+        "process {process_mean:.3}s must not contain the {injected:.3}s origin wait"
     );
     drop(s);
 
@@ -3120,5 +3121,66 @@ fn fetch_phase_measures_the_origin_wait_inside_the_permit() {
         ),
         0.0,
         "a local source records no fetch time"
+    );
+}
+
+/// Issue #22's throughput mechanism, pinned by wall clock: with ONE
+/// CPU permit and a slow origin, a burst of distinct requests must
+/// overlap their fetches. Before the change each fetch was serialized
+/// behind the single permit (4 requests x 500ms = 2s+ of fetching
+/// alone); after it, all four downloads run concurrently and the burst
+/// completes in roughly one origin round trip plus four decodes.
+#[test]
+fn burst_fetches_overlap_despite_one_cpu_permit() {
+    use std::io::Write;
+
+    const DELAY_MS: u64 = 500;
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
+                let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    data.len()
+                );
+                let _ = stream.write_all(&data);
+            });
+        }
+    });
+
+    let s = Server::start(&[
+        (
+            "OXIMG_SOURCE_BASE_URL",
+            format!("http://127.0.0.1:{origin_port}"),
+        ),
+        ("OXIMG_WORKERS", "1".into()),
+    ]);
+    // Distinct widths = distinct flight keys, so nothing coalesces.
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|sc| {
+        for w in [100, 110, 120, 130] {
+            let s = &s;
+            sc.spawn(move || {
+                assert_eq!(s.get(&format!("/resize/{w}/0/photo.jpg")).unwrap().0, 200);
+            });
+        }
+    });
+    let elapsed = t0.elapsed();
+    // Serialized fetches would need >= 4 x 500ms before decode even
+    // starts; overlapped ones need ~500ms + 4 small decodes. The bound
+    // sits far from both so a slow CI machine cannot flip it.
+    assert!(
+        elapsed < std::time::Duration::from_millis(2 * DELAY_MS),
+        "a 4-burst against a {DELAY_MS}ms origin took {elapsed:?} with one permit — \
+         fetches are serializing behind the CPU permit"
     );
 }
