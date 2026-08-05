@@ -10,6 +10,21 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Corrected a platform assumption in the `OXIMG_WORKERS` guidance**
+  ([#20]): "more permits at an unchanged quota" was written as though a
+  Kubernetes `limits.cpu` were the reservation. It is on Autopilot and
+  Cloud Run; on GKE Standard with a small `requests.cpu` the limit
+  reserves nothing, so raising it is free and only throttling changes —
+  and at a 49% fetch share two permits need ~1.02 CPU at saturation, so
+  a `limits.cpu: 1` ceiling would throttle exactly the change being
+  recommended. The docs now carry the arithmetic
+  (`permits x (1 - fetch/process)` = CPU at saturation), the independent
+  memory ceiling on permits (`(limit - idle) / decoded-bytes p99`), and
+  a note to read the fetch share from *warm* traffic, since a fresh
+  process reads several points high while it sets up connections.
+
 ## [0.8.2] - 2026-08-05
 
 Makes the permit's hold time legible: a deployment can now read what

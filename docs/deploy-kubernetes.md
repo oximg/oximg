@@ -116,14 +116,33 @@ object storage.
   latency lives, permits are what to raise — and on Kubernetes that
   means raising `limits.cpu` to the next **whole** number.
 
-  With a **remote source** there is a second lever that costs no CPU.
-  A permit is held across the origin fetch, so
-  `phase="fetch"` / `phase="process"` is the share of your paid CPU time
-  spent waiting on the origin, and raising `OXIMG_WORKERS` above the
-  CPU count recovers roughly that share (measured: 43% fetch share ->
-  +34% throughput and a 24% cut in p95, at an unchanged 1-CPU quota;
-  see [bench/permit-lab](../bench/permit-lab/)). Local-file sources
-  have no such share, and there the same change costs ~7%.
+  With a **remote source** there is a second lever. A permit is held
+  across the origin fetch, so `phase="fetch"` / `phase="process"` is the
+  share of your paid CPU time spent waiting on the origin, and raising
+  `OXIMG_WORKERS` above the CPU count recovers roughly that share
+  (measured: 43% fetch share -> +34% throughput and a 24% cut in p95;
+  a production `gs://` deployment measured 47-51%; see
+  [bench/permit-lab](../bench/permit-lab/)). Local-file sources have no
+  such share, and there the same change costs ~7%.
+
+  Size the two ceilings rather than guessing:
+
+  - **CPU**: `permits x (1 - fetch/process)` is the CPU needed at
+    saturation. Two permits at a 49% fetch share want ~1.02 CPU — so
+    `limits.cpu: 1` would throttle them, and this is where the whole
+    numbers matter again. Note what raising the limit costs *you*: on
+    GKE Standard with a small `requests.cpu`, limits reserve nothing, so
+    raising the ceiling is free and only throttling changes; on Autopilot
+    or Cloud Run the limit *is* the reservation and it is billed.
+  - **Memory**: `(memory limit - idle RSS) / decoded-bytes p99` bounds
+    permits independently, and on a small pod with a heavy decode tail
+    it is the binding one. A deployment with a 1320 MiB p99 decode
+    estimate, 814 MiB idle, and a 4 GiB limit cannot run three permits
+    whatever the CPU says.
+
+  Read `fetch/process` from **warm** traffic: a freshly started pod pays
+  connection and TLS setup and reads several points high over its first
+  requests.
 - **Memory**: bounded by concurrency × per-request buffers, which
   `OXIMG_MAX_SRC_PIXELS` caps. The 64 MP default admits large
   sources; 30 MP is a sensible cap when your originals are phone

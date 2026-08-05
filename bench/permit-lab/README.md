@@ -90,6 +90,34 @@ the share **predicts the effect**: recoverable throughput tracks
 `fetch/process` closely enough that a deployment can read its own
 number and know what a permit is worth, rather than running this sweep.
 
+## Production data point (2026-08-05)
+
+The deployment in issue #20 ran 0.8.2 and measured its own share over 30
+minutes of warm traffic, two pods, same-region `gs://` sources over a
+warm connection pool:
+
+```
+n=1093   fetch/process 47.0%   process 159.9ms   fetch 75.1ms   queue 234.7ms
+n=1116   fetch/process 50.9%   process 149.9ms   fetch 76.2ms   queue 280.1ms
+```
+
+Their prediction had been that a ~155 ms service time against this
+harness's ~43 ms would make the same round trip a much smaller share.
+Both premises held — the service time really is 3.6x, the reads really
+are same-region — and the conclusion did not follow: **about half of
+every held permit is spent with the core idle.** Which lands between the
+43% and 60% rows above, i.e. ~+40% recoverable.
+
+Two things that generalise from it:
+
+- Read the share from **warm** traffic. Their first ~100 requests per
+  fresh pod read 55-64%, connection and TLS setup inflating it.
+- `permits x (1 - fetch/process)` is the CPU needed at saturation. Two
+  permits at a 49% share want ~1.02 CPU, so a `limits.cpu: 1` ceiling
+  throttles them — the reason the earlier advice here ("more permits at
+  an unchanged quota") needed a platform caveat: it holds where the
+  limit is the reservation and misleads where it is not.
+
 ## What follows from this
 
 1. `OXIMG_WORKERS` above the CPU count is *correct* for remote-source
@@ -100,7 +128,10 @@ number and know what a permit is worth, rather than running this sweep.
 2. The implementation fix is to stop holding a permit across the fetch
    (buffer the source, bounded by `OXIMG_MAX_SOURCE_BYTES`, then
    acquire) — worth it exactly to the extent that the fetch fraction is
-   large, which is now a measurable quantity rather than a guess.
+   large, which is now a measured quantity: **49% on the one production
+   corpus that has reported.** At that share the fix recovers what a
+   second permit does, without needing the CPU headroom a second permit
+   needs at saturation.
 3. ~~Either way a `phase="fetch"` split would let a deployment read its
    own fetch fraction~~ — done, and it turned out to predict the effect
    size, not just describe the cause. Read `fetch/process` first; if it
