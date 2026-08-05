@@ -60,8 +60,8 @@ pic-scale = "0.7"
 default = ["server"]
 server = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:hmac", "dep:sha2", "dep:serde_json"]
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
-# Re-exposes the internal SIMD resize kernels for the resize_bench
-# examples; not part of the public API.
+# Re-exposes internals (the SIMD resize kernels, the knob-resolution
+# snapshot) for the bench examples; not part of the public API.
 bench-internals = []
 
 [[bin]]

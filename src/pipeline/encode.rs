@@ -4,58 +4,20 @@
 
 use super::*;
 
-/// Per-call override, else OXIMG_PNG_EFFORT, else a path-dependent
-/// default: `fast` for lossless output, `balanced` when this encode
-/// actually quantizes. Field data (issue #5): on quantized output,
-/// `balanced` nearly doubles the byte reduction over `fast` (1.7x ->
-/// 3.0x against lossless) while `high` adds only ~1% more — and the
-/// extra CPU is confined to a path the operator explicitly opted
-/// into. The lossless default stays `fast`, where effort buys much
-/// less; `quantizing` is per-encode, not per-knob, so alpha sources
-/// (which skip quantization) keep their bytes regardless of the
-/// quantize setting.
-pub(super) fn png_compression(p: &Params, quantizing: bool) -> png::Compression {
-    match p.png_effort {
-        Some(PngEffort::Fastest) => png::Compression::Fastest,
-        Some(PngEffort::Fast) => png::Compression::Fast,
-        Some(PngEffort::Balanced) => png::Compression::Balanced,
-        Some(PngEffort::High) => png::Compression::High,
-        None => crate::config::config().png_compression.unwrap_or({
-            if quantizing {
-                png::Compression::Balanced
-            } else {
-                png::Compression::Fast
-            }
-        }),
-    }
-}
-
-/// Per-call override, else OXIMG_PNG_QUANTIZE(_COLORS): Some(palette
-/// size) when quantization applies. Off by default — silent quality
-/// loss on a lossless format must be a deliberate choice.
-pub(super) fn png_quantize(p: &Params) -> Option<u16> {
-    let cfg = crate::config::config();
-    let on = p.png_quantize.unwrap_or(cfg.png_quantize);
-    let colors = p
-        .png_quantize_colors
-        .unwrap_or(cfg.png_quantize_colors)
-        .clamp(2, 256);
-    on.then_some(colors)
-}
-
 pub(super) fn encode_png(
     pixels: &[u8],
     w: usize,
     h: usize,
     channels: usize,
     icc: Option<&[u8]>,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     // Opaque output only: quantette has no alpha-aware quantizer, and
     // approximating one (per-palette-cell alpha) would produce fringes
     // exactly where alpha matters. Alpha sources stay lossless RGBA.
     let quantized = if channels == 3 {
-        png_quantize(p).map(|colors| quantize_rgb(pixels, w, h, colors))
+        p.png_quantize
+            .map(|colors| quantize_rgb(pixels, w, h, colors))
     } else {
         None
     };
@@ -71,7 +33,7 @@ pub(super) fn encode_png(
         None => png::Encoder::new(&mut out, w as u32, h as u32),
     };
     enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png_compression(p, quantized.is_some()));
+    enc.set_compression(p.png_compression(quantized.is_some()));
     match &quantized {
         Some((palette, indices)) => {
             enc.set_color(png::ColorType::Indexed);
@@ -118,58 +80,23 @@ fn quantize_rgb(pixels: &[u8], w: usize, h: usize, colors: u16) -> (Vec<u8>, Vec
     (plte, indices)
 }
 
-/// AVIF quality (libavif semantics): per-call override, else
-/// OXIMG_AVIF_QUALITY. Nominal quality numbers are not comparable
-/// across encoders; the default is chosen by operating point: at 55,
-/// the 10-bit SVT-AV1 output is smaller than what the common
-/// imgproxy/libvips default (q65, 8-bit aom) produces and still
-/// scores several SSIMULACRA2 points higher (see bench/quality).
-#[cfg(feature = "avif")]
-pub(super) fn avif_quality(p: &Params) -> u8 {
-    p.avif_quality
-        .unwrap_or_else(|| crate::config::config().avif_quality)
-}
-
-/// Alpha-item quality; defaults to the color quality.
-#[cfg(feature = "avif")]
-pub(super) fn avif_alpha_quality(color_quality: u8) -> u8 {
-    crate::config::config()
-        .avif_alpha_quality
-        .unwrap_or(color_quality)
-}
-
-/// OXIMG_AVIF_SPEED: SVT preset (enc_mode). The default (8) is the
-/// benchmarked sync-path operating point; 9 trades some quality per
-/// byte for a faster encode (see QUALITY.md before changing it fleet-
-/// wide).
-#[cfg(feature = "avif")]
-pub(super) fn avif_speed() -> i8 {
-    crate::config::config().avif_speed
-}
-
-/// Per-call override, else OXIMG_WEBP_QUALITY.
-pub(super) fn webp_quality(p: &Params) -> f32 {
-    p.webp_quality
-        .unwrap_or_else(|| crate::config::config().webp_quality)
-}
-
-pub(super) fn webp_effort() -> i32 {
-    crate::config::config().webp_effort
-}
-
 pub(super) fn encode_webp(
     pixels: &[u8],
     w: usize,
     h: usize,
     channels: usize,
     icc: Option<&[u8]>,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     let out = encode_webp_bare(pixels, w, h, channels, p)?;
     match icc {
         Some(icc) => wrap_webp_icc(&out, icc),
         None => Ok(out),
     }
+}
+
+pub(super) fn webp_effort() -> i32 {
+    crate::config::config().webp_effort
 }
 
 // SAFETY: zeroed config/pic/writer are libwebp's documented pre-init states,
@@ -182,13 +109,13 @@ pub(super) fn encode_webp_bare(
     w: usize,
     h: usize,
     channels: usize,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     use libwebp_sys as wp;
     unsafe {
         let mut config: wp::WebPConfig = std::mem::zeroed();
         anyhow::ensure!(wp::WebPInitConfig(&mut config), "libwebp ABI mismatch");
-        config.quality = webp_quality(p);
+        config.quality = p.webp_quality;
         config.method = webp_effort().clamp(0, 6);
 
         let mut pic: wp::WebPPicture = std::mem::zeroed();
@@ -376,7 +303,7 @@ pub(super) fn encode_output(
     dst_h: usize,
     channels: usize,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     // By this point the input decoded fine: anything that fails now is
@@ -391,7 +318,7 @@ fn encode_output_inner(
     dst_h: usize,
     channels: usize,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     match target {
@@ -421,13 +348,7 @@ fn encode_output_inner(
         // (skipping the second SVT session entirely).
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
-            let quality = avif_quality(p);
-            let params = crate::avif::AvifParams {
-                quality,
-                alpha_quality: avif_alpha_quality(quality),
-                speed: avif_speed(),
-                ..Default::default()
-            };
+            let params = p.avif_params();
             crate::avif::encode_avif(
                 &s.out8[..dst_w * dst_h * channels],
                 dst_w,
@@ -442,20 +363,13 @@ fn encode_output_inner(
     }
 }
 
-/// Per-call override, else OXIMG_FLATTEN_BG: background for alpha ->
-/// JPEG flattening; default white.
-pub(super) fn flatten_bg(p: &Params) -> [u8; 3] {
-    p.flatten_bg
-        .unwrap_or_else(|| crate::config::config().flatten_bg)
-}
-
 /// Composite the straight-alpha RGBA8 pixels in `out8` onto the
 /// flatten background in linear light, compacting to RGB8 in place
 /// (pixel i writes 3i..3i+3 after reading 4i..4i+4, so the forward
 /// pass never clobbers unread input).
-pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize, p: &Params) {
+pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize, p: &Resolved) {
     let (fwd, back) = (fwd_lut(), back_lut());
-    let bg = flatten_bg(p);
+    let bg = p.flatten_bg;
     let bg_lin = [
         fwd[bg[0] as usize] as u32,
         fwd[bg[1] as usize] as u32,
@@ -472,7 +386,8 @@ pub(super) fn flatten_alpha_in_out8(s: &mut Scratch, dst_w: usize, dst_h: usize,
 }
 
 pub fn encode(rgb: &[u8], w: usize, h: usize, p: &Params) -> Result<Vec<u8>, super::Error> {
-    encode_with_icc(rgb, w, h, p, None).map_err(|e| super::Error::classify(e, false))
+    encode_with_icc(rgb, w, h, &Resolved::new(p), None)
+        .map_err(|e| super::Error::classify(e, false))
 }
 
 /// JPEG encode with an optional ICC profile written ahead of the
@@ -482,7 +397,7 @@ pub(super) fn encode_with_icc(
     rgb: &[u8],
     w: usize,
     h: usize,
-    p: &Params,
+    p: &Resolved,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     if p.encoder == Encoder::Jpegli {

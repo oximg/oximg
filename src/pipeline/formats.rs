@@ -8,7 +8,7 @@ pub(super) fn process_png<R: std::io::Read>(
     s: &mut Scratch,
     mut reader: R,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     let timing = crate::config::config().timing;
     let t0 = std::time::Instant::now();
@@ -53,7 +53,7 @@ pub(super) fn process_png<R: std::io::Read>(
     // post-IDAT placement, but Chrome and Firefox also honor only
     // pre-IDAT eXIf, so serving those unrotated is browser parity, and
     // fail-safe besides.
-    let orientation = if auto_rotate(p) {
+    let orientation = if p.auto_rotate {
         png_reader
             .info()
             .exif_metadata
@@ -65,7 +65,7 @@ pub(super) fn process_png<R: std::io::Read>(
     };
     // iCCP profile (the png crate has already inflated it), bytes
     // passed through untouched.
-    let icc: Option<Vec<u8>> = if icc_passthrough(p) && target_supports_icc(target) {
+    let icc: Option<Vec<u8>> = if p.icc_passthrough && target_supports_icc(target) {
         png_reader
             .info()
             .icc_profile
@@ -88,7 +88,7 @@ pub(super) fn process_png<R: std::io::Read>(
             && bits == png::BitDepth::Eight
             && !hdr.interlaced
             && (src_w, src_h) != (dst_w, dst_h)
-            && linear_light(p)
+            && p.linear_light
             // Oriented PNGs are rare; they take the general arm below
             // rather than teaching the row-streaming path to rotate.
             && orientation.is_upright()
@@ -185,7 +185,7 @@ pub(super) fn process_png<R: std::io::Read>(
 /// with an asymmetric box that can be several times the unoriented
 /// result. Used where the estimate runs before the orientation is
 /// parsed — over-counting the output side keeps a limit safe.
-pub(super) fn larger_fit(w: usize, h: usize, p: &Params) -> (usize, usize) {
+pub(super) fn larger_fit(w: usize, h: usize, p: &Resolved) -> (usize, usize) {
     let a = fit_dims(w, h, p.max_width, p.max_height);
     let b = fit_dims(h, w, p.max_width, p.max_height);
     if a.0 * a.1 >= b.0 * b.1 {
@@ -222,7 +222,7 @@ pub(super) fn process_webp<R: std::io::Read>(
     s: &mut Scratch,
     mut reader: R,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     s.srcbuf.clear();
     reader
@@ -241,8 +241,8 @@ pub(super) fn process_webp<R: std::io::Read>(
     // disagree, browsers accept both).
     let (icc, exif) = webp_metadata(
         &s.srcbuf,
-        icc_passthrough(p) && target_supports_icc(target),
-        auto_rotate(p),
+        p.icc_passthrough && target_supports_icc(target),
+        p.auto_rotate,
     );
     let orientation = exif
         .and_then(|d| crate::meta::Orientation::from_exif_payload(&d))
@@ -285,7 +285,7 @@ pub(super) fn process_avif<R: std::io::Read>(
     s: &mut Scratch,
     mut reader: R,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     s.srcbuf.clear();
     reader
@@ -296,12 +296,12 @@ pub(super) fn process_avif<R: std::io::Read>(
     let t0 = std::time::Instant::now();
     // avif-parse exposes neither colr nor irot/imir; both come from
     // our own bounded container walk.
-    let icc = if icc_passthrough(p) && target_supports_icc(target) {
+    let icc = if p.icc_passthrough && target_supports_icc(target) {
         crate::avif::extract_icc(&s.srcbuf)
     } else {
         None
     };
-    let orientation = if auto_rotate(p) {
+    let orientation = if p.auto_rotate {
         crate::avif::extract_orientation(&s.srcbuf)
     } else {
         crate::meta::Orientation::UPRIGHT
@@ -348,7 +348,7 @@ pub(super) fn process_avif<R: std::io::Read>(
 pub(super) fn webp_decode_into_chunk8(
     s: &mut Scratch,
     orientation: crate::meta::Orientation,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<(usize, usize, usize, usize, usize)> {
     use libwebp_sys as w;
     // SAFETY: FFI cluster reading only `s.srcbuf`, which is live for the whole
@@ -458,7 +458,7 @@ pub(super) fn resize_pixels_oriented(
     src_w: usize,
     src_h: usize,
     orientation: crate::meta::Orientation,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<(usize, usize)> {
     let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
     let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
@@ -496,7 +496,7 @@ pub(super) fn resize_pixels_to(
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<(usize, usize)> {
     let src_len = src_w * src_h * channels;
     if (src_w, src_h) == (dst_w, dst_h) {
@@ -506,7 +506,7 @@ pub(super) fn resize_pixels_to(
         return Ok((dst_w, dst_h));
     }
 
-    if linear_light(p) {
+    if p.linear_light {
         let (fwd, back) = (fwd_lut(), back_lut());
         // Fully overwritten by the LUT/premultiply loops just below.
         scratch_u16(&mut s.src16, src_len);

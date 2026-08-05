@@ -3,6 +3,10 @@
 //! rule ("set at startup"), typed fields instead of scattered string
 //! compares — and a test pinning every knob to its README entry.
 //!
+//! Knobs with a per-call `Params` override are merged (override >
+//! env > default) in `pipeline/resolved.rs`: when adding one, give it
+//! a `Resolved` field there — do not write a new resolver fn.
+//!
 //! (Server-startup settings like `PORT`, `IMAGES_DIR`, `OXIMG_KEY`
 //! live in `main.rs`, which already reads them exactly once.)
 
@@ -29,7 +33,7 @@ pub(crate) struct Config {
     /// OXIMG_PNG_EFFORT: fastest / fast / balanced / high. `None` =
     /// unset, so the effective default can depend on the path: `fast`
     /// for lossless output, `balanced` when quantization is active
-    /// (see `pipeline::encode::png_compression`).
+    /// (see `Resolved::png_compression`).
     pub png_compression: Option<png::Compression>,
     /// OXIMG_PNG_QUANTIZE ("1" enables palette quantization for opaque
     /// PNG output; off by default — silent quality loss on a lossless
@@ -277,6 +281,7 @@ mod tests {
             include_str!("pipeline/jpeg.rs"),
             include_str!("pipeline/fuse.rs"),
             include_str!("pipeline/formats.rs"),
+            include_str!("pipeline/resolved.rs"),
             #[cfg(feature = "server")]
             include_str!("pipeline/gcs.rs"),
             include_str!("pipeline/encode.rs"),
