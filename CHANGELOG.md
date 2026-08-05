@@ -8,7 +8,15 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
-## [Unreleased]
+## [0.10.0] - 2026-08-05
+
+One HTTP stack instead of two: the client becomes reqwest (already
+sharing hyper with the server via axum), chosen and verified by
+measurement — the connection-churn cell in bench/permit-lab, plus a
+no-regression run of the production-equivalent cell. Minor version
+because the remote-source library functions change behavior (buffered,
+not streaming) and one error edge moves (422 vs 502 for a
+complete-but-truncated body).
 
 ### Changed
 
