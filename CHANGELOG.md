@@ -8,6 +8,44 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
+## [0.10.1] - 2026-08-05
+
+Internal only, and a patch because the output is byte-identical: 3,372
+(fixture x box x output format x knob) CLI outputs compared against the
+0.10.0 build across both feature sets, all identical. Thanks to
+@lipowen, who contributed the refactor in #21.
+
+### Changed
+
+- **One resolved snapshot per request instead of ten resolver
+  functions** (#21). The `override > env > default` precedence used to
+  be restated in a one-line helper per knob, spread across three files.
+  It now exists once, in `Resolved::with_config` — a pure function of
+  `(Params, Config)` that touches neither the environment nor a
+  `OnceLock`, so the precedence table is finally unit-testable instead
+  of being covered only indirectly through full encodes with
+  process-global env vars. Two rules also move from call-site
+  discipline into construction: AVIF alpha quality defaults to the
+  *resolved* color quality (the ordering was previously maintained by
+  hand at two call sites, where getting it wrong silently encodes a
+  wrong image), and the PNG quantize flag, palette size and 2..=256
+  clamp collapse into one pre-validated value. Config-only knobs with
+  no per-call tier keep their direct reads — they have no precedence
+  to resolve.
+
+### Added
+
+- A source-scan test pinning the resolve-once rule, in the style of
+  the config inventory's: every `Option` field of `Params` must be
+  read in `resolved.rs` (forget the line and the override is ignored
+  at runtime with every other test still green), and the one-line
+  resolver idiom must not reappear in a stage. Both nets
+  mutation-checked in the failing direction.
+- CI compiles and lints the `bench-internals` examples
+  (`resize_bench`, `resolve_bench`), which `cargo build --all-targets`
+  had been skipping silently: the instruments whose numbers we quote
+  could rot while every check stayed green.
+
 ## [0.10.0] - 2026-08-05
 
 One HTTP stack instead of two: the client becomes reqwest (already
