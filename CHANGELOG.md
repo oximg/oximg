@@ -8,7 +8,11 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
-## [Unreleased]
+## [0.9.0] - 2026-08-05
+
+The permit becomes what its name says (#22): a bound on CPU work, not
+on whole requests. Minor version rather than patch because the duration
+metric changes meaning and the remote-source sizing guidance inverts.
 
 ### Changed
 
