@@ -363,9 +363,11 @@ The `oximg::pipeline` module is usable without the HTTP server —
 `process`/`process_path` take a `Params` and return the re-encoded
 bytes plus their format, `probe` reads just the header. Depend on it
 with `default-features = false` to drop the entire HTTP stack (axum,
-tokio, ureq, hmac, sha2, serde_json); add `features = ["avif"]` for
-AVIF. `process_url` and `process_gcs` (remote sources) need the
-`server` feature.
+tokio, reqwest, hmac, sha2, serde_json); add `features = ["avif"]`
+for AVIF. The remote-source functions need the `server` feature:
+`fetch_url`/`fetch_gcs` download a bounded buffer (with `_async`
+variants for callers already inside a runtime), and
+`process_url`/`process_gcs` are fetch-then-decode in one call.
 
 Failures are typed: every entry point returns `pipeline::Error`, whose
 `kind()` (`ErrorKind`: SourceNotFound / SourceTooLarge /

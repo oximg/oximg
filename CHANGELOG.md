@@ -8,6 +8,44 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
+## [Unreleased]
+
+### Changed
+
+- **The HTTP client is reqwest (rustls, h2) instead of ureq**. Two
+  measured motivations (bench/permit-lab's churn cell): ureq 3.3 keeps
+  at most 3 idle connections per host — 5 of every 8-wide fetch burst
+  re-established, a ~12ms `srv_fetch` cost at a modeled 20ms
+  per-connection setup — and its idle-age check is a no-op in the
+  released version (`age()` computes `now - now`), so configuration
+  could not fix it. With h2, fetches to one origin multiplex over a
+  single connection and the churn class disappears; the hyper stack
+  was already in-tree via axum, so the binary now carries one HTTP
+  stack, not two. Consequences:
+  - The server awaits fetches directly: a download occupies no thread
+    while it waits, the blocking pool returns to `permits + 4` (0.9.0
+    briefly sized it by the fetch bound), and a client disconnect
+    cancels the fetch and frees its slot instead of letting it run to
+    completion detached.
+  - `process_url`/`process_gcs` are now fetch-then-decode from a
+    bounded buffer, like the server since 0.9.0; the streaming decode
+    overlap is gone, and a complete-but-truncated body classifies as
+    422 (undecodable) rather than 502 from the library as well.
+  - The GCS token cache refreshes under an async mutex: concurrent
+    fetches yield during the metadata round trip instead of stalling
+    behind a held lock.
+  - Error classification, the status tables, the timeout-excluded
+    single retry, and the size-cap semantics are pinned unchanged by
+    tests/remote_api.rs and the server suite.
+
+### Added
+
+- **`pipeline::fetch_url_async` / `pipeline::fetch_gcs_async`**:
+  the buffered fetches for callers already inside a runtime — what
+  the server itself uses. The sync `fetch_url`/`fetch_gcs` keep their
+  signatures over a dedicated fetch runtime and stay safe to call
+  from any thread.
+
 ## [0.9.0] - 2026-08-05
 
 The permit becomes what its name says (#22): a bound on CPU work, not
