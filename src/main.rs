@@ -263,19 +263,15 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }),
     };
-    // Cap the blocking pool at CPU slots + fetch slots + a little IO
-    // headroom. The CPU term bounds the number of thread-local scratch
-    // copies (tokio's default of 512 threads would multiply RSS); the
-    // fetch term exists because fetches queue on this same pool without
-    // holding a permit — at the old cap of workers + 4, a burst of
-    // fetches would serialize on pool threads and eat the issue #22
-    // gain. Fetch tasks never touch SCRATCH; pool threads are fungible,
-    // so the worst-case scratch count does rise with this cap, but only
-    // as far as threads that actually ran a decode, and idle blocking
-    // threads exit after tokio's keep-alive, releasing their scratch.
+    // Cap the blocking pool at CPU slots + a little IO headroom: this
+    // bounds the number of thread-local scratch copies (tokio's default
+    // of 512 threads would multiply RSS). Fetches no longer figure in
+    // the sizing — they are awaited on the async client and occupy no
+    // thread while they wait (the brief issue #22 shape ran each
+    // download on this pool and had to grow it by the fetch bound).
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .max_blocking_threads(workers + fetch_limit + 4)
+        .max_blocking_threads(workers + 4)
         .build()?
         .block_on(async_main(workers, fetch_limit))
 }
@@ -1124,28 +1120,24 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         Fetch::Local => None,
         remote => {
             let t_fetch = std::time::Instant::now();
-            let slot = app
+            // Held across the await: the bound is on buffers in
+            // flight, not merely on requests admitted. A client that
+            // disconnects mid-fetch cancels the future and releases
+            // the slot with it.
+            let _slot = app
                 .fetch_slots
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("semaphore closed");
-            let fetched = tokio::task::spawn_blocking(move || {
-                let _slot = slot; // bound the buffers, not just the requests
-                match remote {
-                    Fetch::Url(url) => pipeline::fetch_url(&url),
-                    Fetch::Gcs { bucket, key } => pipeline::fetch_gcs(&bucket, &key),
-                    Fetch::Local => unreachable!("local sources are not fetched"),
-                }
-            })
-            .await
-            .map_err(|e| {
-                eprintln!("oximg: error status=500 file={file:?} panic={e}");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "image processing failed".to_string(),
-                )
-            })?;
+            // Awaited directly: a fetch is pure I/O on the async
+            // client and occupies no thread while it waits (it used
+            // to burn a blocking-pool thread per download).
+            let fetched = match remote {
+                Fetch::Url(url) => pipeline::fetch_url_async(&url).await,
+                Fetch::Gcs { bucket, key } => pipeline::fetch_gcs_async(&bucket, &key).await,
+                Fetch::Local => unreachable!("local sources are not fetched"),
+            };
             metrics::METRICS.observe_fetch(t_fetch.elapsed().as_secs_f64());
             // Fetch-outcome accounting happens here, where the fetch
             // ends: kinds that indict the origin count as their own
