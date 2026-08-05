@@ -31,43 +31,34 @@ fn decode_and_resize_inner(
 ) -> Result<(Vec<u8>, usize, usize)> {
     // No override surface on this helper: a default Params resolves
     // every knob from the environment, like the server path.
-    let p = Params {
+    let p = Resolved::new(&Params {
         max_width: max_w,
         max_height: max_h,
         parallel,
         ..Params::default()
-    };
+    });
     SCRATCH.with(|s| {
         let s = &mut *s.borrow_mut();
         // The ICC scan feeds the CMYK→RGB conversion only (this
         // helper returns raw pixels, so there is no pass-through);
         // OXIMG_ICC=0 downgrades CMYK sources to the naive composite
         // here exactly like the server path.
-        let want_icc = icc_passthrough(&p);
-        let meta = if auto_rotate(&p) || want_icc || decoded_bytes_cap_set() {
+        let want_icc = p.icc_passthrough;
+        let meta = if p.auto_rotate || want_icc || decoded_bytes_cap_set() {
             let mut prefix = Vec::new();
             let mut r = jpeg;
             crate::meta::scan_jpeg_meta(&mut r, &mut prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
         };
-        let orientation = if auto_rotate(&p) {
+        let orientation = if p.auto_rotate {
             meta.orientation
         } else {
             crate::meta::Orientation::UPRIGHT
         };
         s.jpeg_progressive = meta.progressive;
         let dec = Decompress::new_mem(jpeg).context("invalid JPEG")?;
-        match decode_resize(
-            s,
-            dec,
-            max_w,
-            max_h,
-            &p,
-            orientation,
-            Fuse::Off,
-            meta.icc.as_deref(),
-        )? {
+        match decode_resize(s, dec, &p, orientation, Fuse::Off, meta.icc.as_deref())? {
             Decoded::Pixels { dst_w, dst_h } => {
                 if orientation.is_upright() {
                     Ok((s.out8[..dst_w * dst_h * 3].to_vec(), dst_w, dst_h))
@@ -147,13 +138,10 @@ pub(super) enum Fuse {
     Yuv { params: crate::avif::AvifParams },
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn decode_resize<R: std::io::BufRead>(
     s: &mut Scratch,
     mut dec: Decompress<R>,
-    max_w: u32,
-    max_h: u32,
-    p: &Params,
+    p: &Resolved,
     orientation: crate::meta::Orientation,
     fuse: Fuse,
     // The source's profile, dual-purpose by path: the fused jpegli
@@ -172,7 +160,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     // orientation — the rotation happens on the resized frame) is the
     // fitted box with its axes swapped back.
     let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
-    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, max_w, max_h);
+    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
     let (dst_w, dst_h) = if orientation.swaps_axes() {
         (fit_h, fit_w)
     } else {
@@ -267,7 +255,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     let mut started = dec.rgb().context("decode start failed")?;
     let (dec_w, dec_h) = (started.width(), started.height());
     let row_bytes = dec_w * 3;
-    let linear = linear_light(p) && (dec_w, dec_h) != (dst_w, dst_h);
+    let linear = p.linear_light && (dec_w, dec_h) != (dst_w, dst_h);
 
     if (dec_w, dec_h) == (dst_w, dst_h) {
         // Decoded size is already the target size: output directly; a
@@ -555,7 +543,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
     s: &mut Scratch,
     reader: R,
     target: ImageFormat,
-    p: &Params,
+    p: &Resolved,
 ) -> Result<Vec<u8>> {
     Ok({
         // A bounded pre-scan of the header segments (through
@@ -575,13 +563,13 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // is CMYK is unknown until the frame header parses, after
         // this scan. (OXIMG_ICC=0 therefore also downgrades CMYK
         // sources to the naive conversion.)
-        let want_icc = icc_passthrough(p);
-        let meta = if auto_rotate(p) || want_icc || decoded_bytes_cap_set() {
+        let want_icc = p.icc_passthrough;
+        let meta = if p.auto_rotate || want_icc || decoded_bytes_cap_set() {
             crate::meta::scan_jpeg_meta(&mut reader, &mut scan_prefix, want_icc)
         } else {
             crate::meta::JpegMeta::NONE
         };
-        let orientation = if auto_rotate(p) {
+        let orientation = if p.auto_rotate {
             meta.orientation
         } else {
             crate::meta::Orientation::UPRIGHT
@@ -623,21 +611,11 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // Mirrors encode_output's AVIF arm (the tuned operating
         // point); the session the fused workers create from
         // these is what encodes the frame.
-        #[cfg(feature = "avif")]
-        let avif_params = || {
-            let quality = avif_quality(p);
-            crate::avif::AvifParams {
-                quality,
-                alpha_quality: avif_alpha_quality(quality),
-                speed: avif_speed(),
-                ..Default::default()
-            }
-        };
         let cross_fuse = || -> Fuse {
             #[cfg(feature = "avif")]
             if target == ImageFormat::Avif {
                 return Fuse::Yuv {
-                    params: avif_params(),
+                    params: p.avif_params(),
                 };
             }
             Fuse::Pixels
@@ -663,7 +641,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             #[cfg(feature = "avif")]
             if target == ImageFormat::Avif {
                 Fuse::PixelsPreheat {
-                    params: avif_params(),
+                    params: p.avif_params(),
                 }
             } else {
                 Fuse::Pixels
@@ -683,16 +661,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         } else {
             cross_fuse()
         };
-        match decode_resize(
-            s,
-            dec,
-            p.max_width,
-            p.max_height,
-            p,
-            orientation,
-            fuse,
-            icc_dec,
-        )? {
+        match decode_resize(s, dec, p, orientation, fuse, icc_dec)? {
             Decoded::Encoded(out) => out,
             Decoded::Pixels { dst_w, dst_h } => {
                 let (dw, dh) = if orientation.is_upright() {

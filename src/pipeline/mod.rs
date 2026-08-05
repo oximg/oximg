@@ -215,23 +215,18 @@ fn format_max_dimension(format: ImageFormat) -> Option<u32> {
 /// width=1920 as WebP comes out 1663x16383, the largest WebP that
 /// still has the source's shape. Sources already inside the ceiling
 /// are untouched — the box only ever shrinks, and never enlarges.
-fn clamp_to_format(p: &Params, target: ImageFormat) -> Params {
+fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
     let Some(cap) = format_max_dimension(target) else {
-        return p.clone();
+        return p;
     };
-    if p.max_width <= cap && p.max_height <= cap {
-        return p.clone();
-    }
     // Not counted anywhere: the box is `u32::MAX` on an unconstrained
     // axis, so "the box was tightened" fires on almost every WebP
     // request while "the output was actually reduced" is only knowable
     // where the source dimensions are (four fit_dims call sites down).
     // The returned dimensions describe themselves; the README says so.
-    Params {
-        max_width: p.max_width.min(cap),
-        max_height: p.max_height.min(cap),
-        ..p.clone()
-    }
+    p.max_width = p.max_width.min(cap);
+    p.max_height = p.max_height.min(cap);
+    p
 }
 
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).
@@ -442,13 +437,15 @@ fn process_reader<R: std::io::Read>(mut reader: R, p: &Params) -> Result<(Vec<u8
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
     let target = p.output.unwrap_or(format);
+    // Every knob resolves here, once (override > env > default); the
+    // stages below read plain data and never consult the environment.
     // The output format's own dimension ceiling is one more constraint
     // on the same fit box, so fold it in before any decode work: the
     // resize then lands inside it in one pass, with the aspect ratio
     // preserved. Without this, a tall source encoded to WebP failed at
     // the encoder (issue #14) — a 500 for a request the format simply
     // cannot express at the asked-for size.
-    let p = &clamp_to_format(p, target);
+    let p = &clamp_to_format(Resolved::new(p), target);
     // Fail before decode work; the HTTP layer rejects earlier still,
     // this covers library callers.
     #[cfg(not(feature = "avif"))]
@@ -996,47 +993,15 @@ fn overlap_gate() -> bool {
     }
 }
 
-/// Per-call override, else OXIMG_RESIZE (linear unless "srgb").
-fn linear_light(p: &Params) -> bool {
-    p.linear_light
-        .unwrap_or_else(|| crate::config::config().linear_light)
-}
-
-/// Per-call override, else OXIMG_AUTO_ROTATE: apply EXIF orientation
-/// (default on; off also skips the pre-decode segment scan entirely).
-fn auto_rotate(p: &Params) -> bool {
-    p.auto_rotate
-        .unwrap_or_else(|| crate::config::config().auto_rotate)
-}
-
-/// Per-call override, else OXIMG_ICC: carry the source's ICC profile
-/// into the output (default on; off disables and skips profile
-/// extraction entirely). RGB pixels are never color-converted — the
-/// profile bytes are passed through. CMYK JPEG sources are the
-/// exception: their profile is *consumed* by the CMYK→sRGB conversion
-/// (never emitted), so off also selects the naive conversion there.
-fn icc_passthrough(p: &Params) -> bool {
-    p.icc
-        .unwrap_or_else(|| crate::config::config().icc_passthrough)
-}
-
-/// Re-exposed for `bench/tools/resolve_bench.rs` only: the knob
-/// resolution work one JPEG->WebP request performs — the resolver
-/// calls jpeg.rs and encode.rs actually make on that path (auto_rotate
-/// twice, matching the two reads in the JPEG entry) — so a resolution
-/// refactor is measured against a baseline instead of asserted free.
+/// Re-exposed for `bench/tools/resolve_bench.rs` only: one request's
+/// full [`Resolved`] snapshot. Guards against resolution creep as
+/// knobs are added — the baseline it was measured against (the old
+/// per-stage resolver chain, 2.7-2.8ns) is recorded in this commit's
+/// history.
 #[cfg(feature = "bench-internals")]
 #[doc(hidden)]
-pub fn bench_resolve(p: &Params) -> (bool, bool, bool, bool, f64, f32, i32) {
-    (
-        icc_passthrough(p),
-        auto_rotate(p),
-        auto_rotate(p),
-        linear_light(p),
-        dct_margin(),
-        encode::webp_quality(p),
-        encode::webp_effort(),
-    )
+pub fn bench_resolve(p: &Params) -> impl Sized {
+    Resolved::new(p)
 }
 
 /// Targets that can carry an ICC profile — all of them when the avif
@@ -1122,12 +1087,12 @@ impl DecodeCost {
     /// A path that materializes the whole `w x h` frame at `channels`
     /// bytes per pixel and feeds the full-frame resize: `chunk8` plus,
     /// under linear light (the default), the same frame as u16.
-    pub fn full_frame(w: usize, h: usize, channels: u64, p: &Params) -> Self {
+    pub fn full_frame(w: usize, h: usize, channels: u64, p: &Resolved) -> Self {
         let px = (w as u64).saturating_mul(h as u64);
         let staged = px.saturating_mul(channels);
         DecodeCost {
             staged_bytes: staged,
-            resize_input_bytes: if linear_light(p) { staged * 2 } else { 0 },
+            resize_input_bytes: if p.linear_light { staged * 2 } else { 0 },
             ..Default::default()
         }
     }
@@ -1308,6 +1273,7 @@ mod fuse;
 #[cfg(feature = "server")]
 mod gcs;
 mod jpeg;
+mod resolved;
 #[cfg(test)]
 mod tests;
 
@@ -1320,3 +1286,4 @@ use fuse::*;
 pub use jpeg::decode_and_resize;
 #[cfg_attr(not(test), allow(unused_imports))] // tests.rs reaches these via super::*
 use jpeg::*;
+use resolved::Resolved;

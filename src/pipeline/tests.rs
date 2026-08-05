@@ -1,5 +1,16 @@
 use super::*;
 
+/// A resolved snapshot for a plain fit box — the shape most decode
+/// tests use (every knob at the env-configured behavior, like the
+/// old `&Params::default()` argument).
+fn rbox(max_w: u32, max_h: u32) -> Resolved {
+    Resolved::new(&Params {
+        max_width: max_w,
+        max_height: max_h,
+        ..Params::default()
+    })
+}
+
 /// Deterministic RGB test frame encoded to a real JPEG source.
 fn make_test_jpeg(w: usize, h: usize, gray: bool) -> Vec<u8> {
     let ch = if gray { 1 } else { 3 };
@@ -48,9 +59,7 @@ fn run_jpeg_icc(jpeg: &[u8], fuse_quality: Option<f32>, icc: Option<&[u8]>) -> V
     match decode_resize(
         &mut s,
         dec,
-        320,
-        320,
-        &Params::default(),
+        &rbox(320, 320),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         icc,
@@ -66,7 +75,14 @@ fn run_jpeg_icc(jpeg: &[u8], fuse_quality: Option<f32>, icc: Option<&[u8]>) -> V
                 fuse_quality.is_none(),
                 "fused path was requested but not taken"
             );
-            encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p, icc).unwrap()
+            encode_with_icc(
+                &s.out8[..dst_w * dst_h * 3],
+                dst_w,
+                dst_h,
+                &Resolved::new(&p),
+                icc,
+            )
+            .unwrap()
         }
         #[cfg(feature = "avif")]
         Decoded::YuvPlanes { .. } => panic!("yuv fuse was not requested"),
@@ -116,9 +132,7 @@ fn run_jpeg_pixels(jpeg: &[u8], fuse: Fuse) -> Vec<u8> {
     match decode_resize(
         &mut s,
         dec,
-        320,
-        320,
-        &Params::default(),
+        &rbox(320, 320),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         None,
@@ -165,9 +179,7 @@ fn run_jpeg_avif_icc(jpeg: &[u8], yuv_fuse: bool, icc: Option<&[u8]>) -> Vec<u8>
     match decode_resize(
         &mut s,
         dec,
-        320,
-        320,
-        &Params::default(),
+        &rbox(320, 320),
         crate::meta::Orientation::UPRIGHT,
         fuse,
         None,
@@ -201,18 +213,7 @@ fn preheated_session_bytes_match_serial_oriented_avif() {
     let run = |fuse: Fuse| -> Vec<u8> {
         let mut s = Scratch::default();
         let dec = Decompress::new_mem(&jpeg).unwrap();
-        match decode_resize(
-            &mut s,
-            dec,
-            320,
-            320,
-            &Params::default(),
-            orientation,
-            fuse,
-            None,
-        )
-        .unwrap()
-        {
+        match decode_resize(&mut s, dec, &rbox(320, 320), orientation, fuse, None).unwrap() {
             Decoded::PixelsSession {
                 dst_w,
                 dst_h,
@@ -300,9 +301,7 @@ fn fused_yuv_survives_truncated_sources() {
         let _ = decode_resize(
             &mut s,
             dec,
-            320,
-            320,
-            &Params::default(),
+            &rbox(320, 320),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Yuv {
                 params: test_avif_params(),
@@ -395,9 +394,7 @@ fn fused_pixels_survive_truncated_sources() {
         let _ = decode_resize(
             &mut s,
             dec,
-            320,
-            320,
-            &Params::default(),
+            &rbox(320, 320),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Pixels,
             None,
@@ -425,9 +422,7 @@ fn fused_path_survives_truncated_sources() {
         let _ = decode_resize(
             &mut s,
             dec,
-            320,
-            320,
-            &Params::default(),
+            &rbox(320, 320),
             crate::meta::Orientation::UPRIGHT,
             Fuse::Jpegli { quality: p.quality },
             None,
@@ -611,10 +606,10 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
             d[c] = ((v as u32 * k + 127) / 255) as u8;
         }
     }
-    let p = Params {
+    let p = Resolved::new(&Params {
         parallel,
         ..Params::default()
-    };
+    });
     resize_pixels_to(&mut s, 3, dec_w, dec_h, w, h, &p).unwrap();
     assert_eq!(
         got,
@@ -670,7 +665,7 @@ fn webp_output_is_clamped_to_the_format_ceiling() {
             output: Some(ImageFormat::Webp),
             ..Params::default()
         };
-        let c = clamp_to_format(&p, ImageFormat::Webp);
+        let c = clamp_to_format(Resolved::new(&p), ImageFormat::Webp);
         (c.max_width, c.max_height)
     };
     // The reporter's case: width=1920 on a 2000x19708 source. The box
@@ -696,7 +691,7 @@ fn webp_output_is_clamped_to_the_format_ceiling() {
             output: Some(target),
             ..Params::default()
         };
-        let c = clamp_to_format(&p, target);
+        let c = clamp_to_format(Resolved::new(&p), target);
         assert_eq!(
             (c.max_width, c.max_height),
             (1920, u32::MAX),
@@ -712,7 +707,7 @@ fn webp_output_is_clamped_to_the_format_ceiling() {
 #[test]
 fn decode_cost_separates_what_pixel_counts_cannot() {
     let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
-    let p = &Params::default();
+    let p = &Resolved::new(&Params::default());
 
     // Baseline JPEG, 3980x59828 (238 MP) at width=1920, whose WebP
     // output clamps to 16383 tall: streaming, so only the output side
@@ -793,11 +788,7 @@ fn decode_cost_separates_what_pixel_counts_cannot() {
 /// the axes back in stored order.
 #[test]
 fn larger_fit_covers_the_swapped_orientation() {
-    let box_ = |w: u32, h: u32| Params {
-        max_width: w,
-        max_height: h,
-        ..Params::default()
-    };
+    let box_ = |w: u32, h: u32| rbox(w, h);
     // The review's shape: 4000x1000 under a width-only box. Upright it
     // fits to 1920x480; presented as 1000x4000 by orientation 6 it fits
     // to 1000x4000 — four times the pixels, and what must be counted.
