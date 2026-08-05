@@ -396,7 +396,7 @@ never silently falls back to a default.
 | `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |
-| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes; verify with the `oximg_cpu_workers` gauge |
+| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes; **verify with the `oximg_cpu_workers` gauge**, which is the only way to know what a given deployment actually got. What "observed" observes is worth knowing — see below |
 | `OXIMG_LOG` | `error` | `error` = one stderr line per failure; `request` also logs successes. The only accepted values |
 | `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), queue-wait vs processing histograms, permit/coalescing gauges. Outside the signing scheme — expose it to your scrape network only |
 
@@ -430,6 +430,41 @@ never silently falls back to a default.
 | `OXIMG_PNG_QUANTIZE_COLORS` | `256` | Palette size, 2-256; 64 trades visible-on-inspection banding for another ~15% |
 | `OXIMG_AUTO_FORMAT` | unset | Comma-separated `Accept`-negotiation preference list (e.g. `avif,webp`); see the ordering guidance under [Supported formats](#supported-formats) |
 | `OXIMG_FLATTEN_BG` | `ffffff` | Background for alpha → JPEG flattening |
+
+#### What "observed parallelism" observes
+
+On a Linux container the count comes from the cgroup CPU quota and the
+process's CPU affinity, whichever is smaller, floored at 1 — measured
+on cgroup v2 (`workers` is the `oximg_cpu_workers` gauge):
+
+| container CPU config | cgroup | workers |
+|---|---|---|
+| no limit | `cpu.max: max` | host CPU count |
+| 1 CPU | quota 1.0 | 1 |
+| 1.5 CPU (`1500m`) | quota 1.5 | **1** |
+| 1.9 CPU (`1900m`) | quota 1.9 | **1** |
+| 2 CPU | quota 2.0 | 2 |
+| 2.5 CPU (`2500m`) | quota 2.5 | 2 |
+| 0.5 CPU (`500m`) | quota 0.5 | 1 (the floor) |
+| CPU shares only, no quota | `cpu.weight` set, `cpu.max: max` | host CPU count |
+| pinned to 2 cores | affinity `0-1`, no quota | 2 |
+| pinned to 3 cores + quota 1 | both | 1 (the smaller) |
+
+Three consequences that catch people out:
+
+- **On Kubernetes this is `limits.cpu`.** `requests.cpu` has no effect:
+  it becomes `cpu.weight`, a scheduling share with no count in it, so
+  there is nothing there to observe. A `limits.cpu` set as a
+  blast-radius guard silently becomes a concurrency decision.
+- **Fractional limits round down.** `limits.cpu: 1500m` yields the same
+  single permit as `1000m` while costing 50% more, and `1900m` is still
+  1. Whole numbers are the only way to buy concurrency — the second
+  permit arrives at `2`, not at `1001m`.
+- **Platforms without a hard quota fall back to host parallelism**,
+  which is why an equivalently-sized container reports a different
+  number on Cloud Run (`cpu: "1"` there observes 2 — see
+  [the Cloud Run guide](docs/deploy-cloud-run.md), where pinning it
+  down measured *slower*).
 
 ### Pixel pipeline
 

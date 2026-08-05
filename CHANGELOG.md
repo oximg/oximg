@@ -10,6 +10,21 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- Documented what `OXIMG_WORKERS`'s "observed parallelism" actually
+  observes ([#20]), measured on cgroup v2 rather than reasoned about:
+  the smaller of the cgroup CPU quota and the process's CPU affinity,
+  floored at 1. On Kubernetes that is **`limits.cpu`** — `requests.cpu`
+  becomes `cpu.weight`, a share with no count in it, so a pod with only
+  requests set sizes itself to the *node*. Fractional limits round
+  down, so `limits.cpu: 1500m` buys the same single permit as `1000m`
+  and the second arrives only at `2`; that last part was not in the
+  report and is the one that costs money silently. The README carries
+  the measured table and the Kubernetes guide the sizing consequences.
+
+[#20]: https://github.com/oximg/oximg/issues/20
+
 ## [0.8.1] - 2026-08-04
 
 The other half of the decoded-bytes work: an expensive request can now

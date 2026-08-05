@@ -81,10 +81,40 @@ object storage.
 ## Sizing and scaling
 
 - **CPU**: oximg saturates whatever it is given — an internal
-  semaphore pins concurrent pixel work to the visible core count, and
-  the count respects cgroup CPU limits. Whole-number CPU limits give
-  predictable behavior; throughput scales close to linearly with
-  cores (see [BENCH.md](../BENCH.md)).
+  semaphore pins concurrent pixel work to the observed core count, and
+  throughput scales close to linearly with cores (see
+  [BENCH.md](../BENCH.md)). What "observed" means here is specific and
+  worth setting deliberately:
+
+  | you set | oximg permits |
+  |---|---|
+  | `limits.cpu: 1` | 1 |
+  | `limits.cpu: 1500m` | **1** |
+  | `limits.cpu: 1900m` | **1** |
+  | `limits.cpu: 2` | 2 |
+  | `limits.cpu: 2500m` | 2 |
+  | `limits.cpu: 500m` | 1 (the floor) |
+  | only `requests.cpu`, no limit | the **node's** core count |
+
+  (Measured on cgroup v2 with the released image; confirm any
+  deployment with the `oximg_cpu_workers` gauge under
+  `OXIMG_METRICS=1`.)
+
+  Three things follow. **It reads `limits.cpu`, not `requests.cpu`** —
+  requests becomes `cpu.weight`, a scheduling share with no count in
+  it, so there is nothing there to observe; a limit set purely as a
+  blast-radius guard silently becomes a concurrency decision.
+  **Fractional limits round down**, so `1500m` buys the same single
+  permit as `1000m` while costing 50% more — the second permit arrives
+  at `2`, not at `1001m`. And **with no limit at all, a pod sizes
+  itself to the node**, which on a large node is far more concurrency
+  than its share of CPU can serve. CPU-manager `static` policy
+  (exclusive cores via cpuset) is also respected, and when both a
+  cpuset and a quota apply the smaller wins.
+
+  If `oximg_request_duration_seconds{phase="queue"}` is where your
+  latency lives, permits are what to raise — and on Kubernetes that
+  means raising `limits.cpu` to the next **whole** number.
 - **Memory**: bounded by concurrency × per-request buffers, which
   `OXIMG_MAX_SRC_PIXELS` caps. The 64 MP default admits large
   sources; 30 MP is a sensible cap when your originals are phone
