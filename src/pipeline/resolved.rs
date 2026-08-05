@@ -331,4 +331,77 @@ mod tests {
         };
         assert_eq!(Resolved::with_config(&p, &cfg).png_quantize, Some(256));
     }
+
+    /// All whitespace removed, so a needle still matches source that
+    /// rustfmt has broken across lines.
+    fn squeeze(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The resolve-once rule, pinned so it survives the next knob.
+    ///
+    /// Two nets. Every `Option` field of [`Params`] is an override
+    /// tier, so this file must read it: add a field, forget the
+    /// `Resolved` line, and the override would be silently ignored at
+    /// runtime with every existing test still green. And the one-line
+    /// resolver idiom the ten deleted helpers shared must not come
+    /// back in a stage — that copy-paste is how the duplication grew
+    /// the first time. Direct config-only reads (`config().timing`,
+    /// `webp_effort()`, the caps) are untouched by either net: they
+    /// have no per-call tier to merge.
+    #[test]
+    fn every_override_resolves_here() {
+        let this = squeeze(include_str!("resolved.rs"));
+        let mod_rs = include_str!("mod.rs");
+        // The `Params` declaration alone: other structs in mod.rs
+        // carry `Option` fields that are not knobs.
+        let decl = mod_rs
+            .split_once("pub struct Params {")
+            .expect("Params declaration")
+            .1
+            .split_once("\n}\n")
+            .expect("end of the Params declaration")
+            .0;
+        let mut checked = 0;
+        for line in decl.lines() {
+            let Some(name) = line
+                .trim()
+                .strip_prefix("pub ")
+                .and_then(|f| f.split_once(": Option<"))
+                .map(|(name, _)| name)
+            else {
+                continue;
+            };
+            // `output` is the target format, not a knob: it selects
+            // the encoder path before resolution and has no env tier.
+            if name == "output" {
+                continue;
+            }
+            assert!(
+                this.contains(&format!("p.{name}")),
+                "Params::{name} is a per-call override that Resolved::with_config never reads"
+            );
+            checked += 1;
+        }
+        // The scan itself must not silently find nothing.
+        assert!(checked >= 8, "only {checked} override fields found");
+
+        for stage in [
+            include_str!("mod.rs"),
+            include_str!("encode.rs"),
+            include_str!("formats.rs"),
+            include_str!("jpeg.rs"),
+            include_str!("fuse.rs"),
+        ] {
+            for idiom in [
+                "unwrap_or_else(||crate::config::config()",
+                "unwrap_or(crate::config::config()",
+            ] {
+                assert!(
+                    !squeeze(stage).contains(idiom),
+                    "a per-knob resolver is back; merge the knob in Resolved::with_config instead"
+                );
+            }
+        }
+    }
 }
