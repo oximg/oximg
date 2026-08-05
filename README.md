@@ -29,9 +29,10 @@ while resizing in linear light at measurably higher output quality
   per-request quality included.
 - **Sources**: a local directory, any HTTP(S) origin, or a **private
   GCS bucket** (`gs://` with GCP-attached credentials — no public
-  bucket, no public-endpoint egress). Streaming decode overlaps the
-  download; transient fetch failures are retried, so a network blip is
-  a slower response, not a broken image.
+  bucket, no public-endpoint egress). The origin round trip never
+  holds a CPU slot (fetches are buffered and separately bounded), and
+  transient fetch failures are retried, so a network blip is a slower
+  response, not a broken image.
 - **Production operability**: graceful SIGTERM drain, upstream fetch
   deadlines (slow-origin 504s distinct from broken-origin 502s), and
   an opt-in Prometheus `/metrics` page whose queue-wait/processing
@@ -277,7 +278,12 @@ filename is taken literally on this route (no `@fmt` token).
   `service_account` JSON keys are not supported — on GCP use Workload
   Identity, off GCP use the HTTP mode. `s3://` is planned (issue #11).
 
-Streaming decode overlaps the download in every mode.
+Remote sources are downloaded into a bounded buffer (`OXIMG_MAX_SOURCE_BYTES`)
+*before* the request takes a CPU slot, so the origin round trip never
+holds one — measured at ~50% of a permit's hold time on a production
+corpus before the split (issue #20/#22). Download concurrency has its
+own bound, `OXIMG_FETCH_CONCURRENCY`, and local sources keep the
+streaming decode (no buffering, the page cache serves the read).
 Connection-level transients (reset, refused, DNS blips) are retried
 once before any body bytes are consumed, and the `gs://` mode also
 retries 429/5xx SDK-style; `oximg_upstream_retries_total` counts both.
@@ -396,9 +402,10 @@ never silently falls back to a default.
 | `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |
-| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). For noisy-neighbor hosts or tail-latency-over-throughput shapes — and for **remote sources, where above the CPU count is often right**: a permit is held across the origin fetch, so a deployment reading `fetch/process` from the duration histogram can expect roughly that fraction of throughput back by adding permits (measured: a 43% fetch share recovered +34% at an unchanged 1-CPU quota, see [bench/permit-lab](bench/permit-lab/); a production `gs://` deployment measured 47-51%). **Size it, do not guess it**: `permits x (1 - fetch/process)` is the CPU needed at saturation, so two permits at a 49% fetch share want ~1.02 CPU and a `limits.cpu: 1` ceiling would throttle them. Whether raising permits is "free" depends on the platform — where limits *are* the reservation (Cloud Run, GKE Autopilot) raising the ceiling costs money, and where they are not (GKE Standard with small `requests.cpu`) it costs nothing and only the throttling changes. Permits are also bounded by memory, not just CPU: `(memory limit - idle RSS) / decoded-bytes p99` (see `OXIMG_MAX_DECODED_BYTES`) is the other ceiling, and it is the binding one on small pods with a heavy decode tail. **Verify with the `oximg_cpu_workers` gauge**, which is the only way to know what a given deployment actually got. What "observed" observes is worth knowing — see below |
+| `OXIMG_WORKERS` | observed parallelism | Pins the CPU permit count (1-512). The default is right almost everywhere — on quota-scheduled platforms like Cloud Run, "pinning to the billed number" measured 17-36% slower (issue #10). The knob exists for noisy-neighbor hosts, tail-latency-over-throughput shapes, and platforms where observed parallelism is unrelated to what is available. **The remote-source reason to raise it is gone** (issue #22): permits are no longer held across the origin fetch, so `fetch/process` no longer names throughput that extra permits would recover — the earlier guidance ("above the CPU count is often right for remote sources", with its `permits x (1 - fetch/process)` saturation arithmetic) applied to 0.8.x and earlier. Permits are still bounded by memory, not just CPU: `(memory limit - idle RSS) / decoded-bytes p99` (see `OXIMG_MAX_DECODED_BYTES`) is the other ceiling, and it is the binding one on small pods with a heavy decode tail. **Verify with the `oximg_cpu_workers` gauge**, which is the only way to know what a given deployment actually got. What "observed" observes is worth knowing — see below |
+| `OXIMG_FETCH_CONCURRENCY` | `4 x permits`, max 256 | Bounds concurrent origin downloads (1-1024). Fetches hold no CPU permit (issue #22), so they need their own bound: the buffered-source memory hazard is this knob times `OXIMG_MAX_SOURCE_BYTES` at worst case. The default absorbs an 8-wide `srcset` burst per permit at production-like fetch shares; raise it when the origin RTT is large relative to per-request CPU work (many fetches must overlap to keep one core fed) and the sources are known-small |
 | `OXIMG_LOG` | `error` | `error` = one stderr line per failure; `request` also logs successes. The only accepted values |
-| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), duration histograms split into CPU-permit queue wait, processing, and — a *subset* of processing — remote-source `fetch` (the part of a held permit during which no byte could be decoded; `fetch/process` is the share of paid CPU time spent waiting on the origin — read it from *warm* traffic, since a fresh process pays connection and TLS setup and reads 5-15 points high for its first requests), permit/coalescing gauges. Outside the signing scheme — expose it to your scrape network only |
+| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault), duration histograms split into remote-source `fetch` (everything between "ready to fetch" and "source in hand" — fetch-slot wait plus the whole download — none of it holding a CPU permit since issue #22), CPU-permit queue wait, and processing (the permit's actual hold). `fetch/process` therefore no longer names recoverable throughput; it names the wait the permit no longer pays for. Read fetch numbers from *warm* traffic, since a fresh process pays connection and TLS setup and reads high for its first requests. Permit/coalescing gauges included. Outside the signing scheme — expose it to your scrape network only |
 
 ### Sources
 
@@ -406,7 +413,7 @@ never silently falls back to a default.
 |---|---|---|
 | `OXIMG_SOURCE_BASE_URL` | unset | `https://…` or `gs://bucket[/prefix]` (see [Serving](#serving)) |
 | `OXIMG_GCS_ENDPOINT` | `https://storage.googleapis.com` | Override for Private Service Connect or emulators; `GCE_METADATA_HOST` is honored the same way for the token source |
-| `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch — bounds how long a stalled upstream can hold a CPU permit; timeouts answer 504, distinct from other upstream failures' 502 |
+| `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch — bounds how long a stalled upstream can hold a fetch slot (and its buffer); timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
 | `OXIMG_MAX_SRC_PIXELS` | 64,000,000 | Cheap sanity guard on source dimensions, enforced after each format's header parse; over-cap sources answer 413. Not a memory budget — see the next row |

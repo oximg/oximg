@@ -116,31 +116,30 @@ object storage.
   latency lives, permits are what to raise — and on Kubernetes that
   means raising `limits.cpu` to the next **whole** number.
 
-  With a **remote source** there is a second lever. A permit is held
-  across the origin fetch, so `phase="fetch"` / `phase="process"` is the
-  share of your paid CPU time spent waiting on the origin, and raising
-  `OXIMG_WORKERS` above the CPU count recovers roughly that share
-  (measured: 43% fetch share -> +34% throughput and a 24% cut in p95;
-  a production `gs://` deployment measured 47-51%; see
-  [bench/permit-lab](../bench/permit-lab/)). Local-file sources have no
-  such share, and there the same change costs ~7%.
+  With a **remote source**, permits are *not* held across the origin
+  fetch (since issue #22 — downloads are buffered off-permit, bounded
+  by `OXIMG_FETCH_CONCURRENCY`), so `phase="fetch"` no longer names
+  throughput that extra permits would recover. On 0.8.x and earlier,
+  where the fetch did hold a permit, raising `OXIMG_WORKERS` above the
+  CPU count recovered roughly the `fetch/process` share (measured: 43%
+  fetch share -> +34% throughput; a production `gs://` deployment
+  measured 47-51%; see [bench/permit-lab](../bench/permit-lab/)) — if
+  you run those versions with remote sources, that guidance still
+  applies, together with its saturation arithmetic:
+  `permits x (1 - fetch/process)` is the CPU needed at saturation, so
+  two permits at a 49% fetch share want ~1.02 CPU and `limits.cpu: 1`
+  would throttle them.
 
-  Size the two ceilings rather than guessing:
+  The memory ceiling on permits is version-independent:
+  `(memory limit - idle RSS) / decoded-bytes p99` bounds permits, and
+  on a small pod with a heavy decode tail it is the binding one. A
+  deployment with a 1320 MiB p99 decode estimate, 814 MiB idle, and a
+  4 GiB limit cannot run three permits whatever the CPU says. Buffered
+  remote sources add `OXIMG_FETCH_CONCURRENCY x OXIMG_MAX_SOURCE_BYTES`
+  as the worst-case fetch-buffer term, and the decoded-bytes estimate
+  counts each request's buffer while it decodes.
 
-  - **CPU**: `permits x (1 - fetch/process)` is the CPU needed at
-    saturation. Two permits at a 49% fetch share want ~1.02 CPU — so
-    `limits.cpu: 1` would throttle them, and this is where the whole
-    numbers matter again. Note what raising the limit costs *you*: on
-    GKE Standard with a small `requests.cpu`, limits reserve nothing, so
-    raising the ceiling is free and only throttling changes; on Autopilot
-    or Cloud Run the limit *is* the reservation and it is billed.
-  - **Memory**: `(memory limit - idle RSS) / decoded-bytes p99` bounds
-    permits independently, and on a small pod with a heavy decode tail
-    it is the binding one. A deployment with a 1320 MiB p99 decode
-    estimate, 814 MiB idle, and a 4 GiB limit cannot run three permits
-    whatever the CPU says.
-
-  Read `fetch/process` from **warm** traffic: a freshly started pod pays
+  Read fetch numbers from **warm** traffic: a freshly started pod pays
   connection and TLS setup and reads several points high over its first
   requests.
 - **Memory**: bounded by concurrency × per-request buffers, which

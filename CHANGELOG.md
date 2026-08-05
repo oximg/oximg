@@ -10,6 +10,55 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **The origin fetch no longer holds a CPU permit** ([#22]): remote
+  sources (HTTP and `gs://`) are downloaded into a bounded buffer
+  first, and the permit is taken only for decode + encode. Production
+  measurement (issue #20) put the fetch at 47-51% of every permit's
+  hold time — a core idling for half of what it was scheduled for.
+  Verified against the falsifiable target in
+  [bench/permit-lab](bench/permit-lab/): at a 1-CPU quota against a
+  60 ms origin, one permit went from 8.36 to 14.95 rps (+79%, p95
+  957 → 533 ms), past the 11.4 rps the issue demanded, and a second
+  permit now measures nothing — permits bound CPU work.
+  Consequences, deliberate:
+  - `phase="fetch"` in the duration histogram now *precedes* the
+    permit instead of being a subset of its hold, and covers the whole
+    download (fetch-slot wait included) rather than just the response
+    head. `fetch/process` no longer names recoverable throughput.
+  - The `OXIMG_WORKERS`-above-CPU-count workaround for remote sources
+    is obsolete (the guidance now says so, and notes it still applies
+    to 0.8.x).
+  - Error classification (404 / 413 / 502 / 504 / the 400 key
+    rejection) and upstream-outcome accounting are unchanged; a
+    complete-but-truncated body that previously surfaced as a
+    mid-decode upstream error now decodes from the buffer and answers
+    422 (undecodable) instead of 502.
+  - Low-load first-byte latency for a large source on a slow origin
+    gets strictly worse (decode no longer overlaps the download);
+    the ~50% measured contention share is the regime this trades for.
+
+### Added
+
+- **`OXIMG_FETCH_CONCURRENCY`** ([#22]): bounds concurrent origin
+  downloads, default `4 x permits` capped at 256, because fetches no
+  longer queue on CPU permits — without a bound, N concurrent fetches
+  x `OXIMG_MAX_SOURCE_BYTES` would be a new unbounded-memory class
+  (the one #17 closed). The blocking pool is sized `permits + fetch
+  slots + 4` so bursts of fetches do not serialize behind it.
+- **Buffered fetch in the library**: `pipeline::fetch_url` /
+  `pipeline::fetch_gcs` download a source whole (same caps, deadlines,
+  retry, redirect refusal, and error classification as the streaming
+  `process_url`/`process_gcs`, which remain available) so an embedder
+  can put the network wait and the CPU work under different bounds.
+- **The decoded-bytes estimate counts caller-held buffers**: a source
+  processed from memory (`pipeline::process`, and therefore every
+  buffered remote fetch) adds its compressed size to the estimate —
+  previously only the formats that buffer internally carried a
+  `compressed_bytes` term, so the streaming-JPEG path under-counted
+  exactly the bytes the server now holds.
+
 ### Fixed
 
 - **Corrected a platform assumption in the `OXIMG_WORKERS` guidance**
@@ -24,6 +73,8 @@ HTTP interface without notice.
   memory ceiling on permits (`(limit - idle) / decoded-bytes p99`), and
   a note to read the fetch share from *warm* traffic, since a fresh
   process reads several points high while it sets up connections.
+
+[#22]: https://github.com/oximg/oximg/issues/22
 
 ## [0.8.2] - 2026-08-05
 

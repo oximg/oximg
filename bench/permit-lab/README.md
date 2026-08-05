@@ -2,11 +2,14 @@
 
 Does oximg's CPU permit bound *CPU work*, or whole requests?
 
-It bounds whole requests: `main.rs` acquires a permit, then the
-blocking task does the origin fetch **and** the decode. With remote
-sources (`OXIMG_SOURCE_BASE_URL`, `gs://`) the network round trip is
-therefore paid while holding a permit — so on a one-CPU quota the core
-sits idle during the fetch while other requests queue.
+Through 0.8.x it bounded whole requests: `main.rs` acquired a permit,
+then the blocking task did the origin fetch **and** the decode. With
+remote sources (`OXIMG_SOURCE_BASE_URL`, `gs://`) the network round
+trip was therefore paid while holding a permit — so on a one-CPU quota
+the core sat idle during the fetch while other requests queued. This
+lab measured that cost, set the falsifiable target for fixing it, and
+then measured the fix (issue #22, the last section): permits now bound
+CPU work.
 
 This harness answers the question without implementing the change: at a
 fixed 1-CPU budget, a *second* permit should recover throughput if and
@@ -152,20 +155,53 @@ same 1-CPU quota, with `fetch/process` unchanged in the metric (the wait
 still happens, it just stops holding a permit). If it does not, the
 model is wrong and the change should not land.
 
+## The change, measured (2026-08-05)
+
+Issue #22 implemented (fetch buffered off-permit, `oximg:issue22`),
+same cell, same window as a re-run of the pre-change build:
+
+```
+pre-change  W=1   8.36 rps  p95 957ms  process=120ms  fetch= 61ms
+pre-change  W=2  11.55 rps  p95 703ms  process=171ms  fetch= 61ms
+issue #22   W=1  14.95 rps  p95 533ms  process= 62ms  fetch= 94ms
+issue #22   W=2  14.74 rps  p95 543ms  process=120ms  fetch= 65ms
+```
+
+(The pre-change arm re-ran in the same window and reproduced the
+baseline table above to within 0.1 rps — the comparison is not ambient
+drift.)
+
+The prediction held with room to spare: one permit did not just reach
+the two-permit 11.4 rps, it passed it — because the old W=2 still paid
+`permits x (1 - fetch/process)` ≈ 1.3 CPU against a 1-CPU quota, while
+the new W=1 runs pure CPU at 62 ms/request (the fixture's measured
+encode cost exactly). A second permit now buys nothing, as the local
+control always said it should for pure CPU work.
+
+Reading the new metric shape: `process` is the permit's actual hold
+(120 → 62 ms at W=1), and `fetch` is a *sibling* phase that includes
+waiting for a fetch slot — at W=1 the default `OXIMG_FETCH_CONCURRENCY`
+is 4, so an 8-burst fetches in two waves and the mean reads ~94 ms
+against a 60 ms RTT; at W=2 (8 slots) one wave, ~65 ms. `fetch/process`
+above 100% is therefore expected, not an accounting bug: the wait still
+happens, it just no longer holds a permit.
+
 ## What follows from this
 
-1. `OXIMG_WORKERS` above the CPU count is *correct* for remote-source
-   deployments — the opposite of the guidance in issue #10, which was
-   about pinning it *below* observed parallelism on quota-scheduled
-   platforms. Both are true because the knob is being asked to do two
-   different jobs.
-2. The implementation fix is to stop holding a permit across the fetch
-   (buffer the source, bounded by `OXIMG_MAX_SOURCE_BYTES`, then
-   acquire) — worth it exactly to the extent that the fetch fraction is
-   large, which is now a measured quantity: **49% on the one production
-   corpus that has reported.** At that share the fix recovers what a
-   second permit does, without needing the CPU headroom a second permit
-   needs at saturation.
+1. ~~`OXIMG_WORKERS` above the CPU count is *correct* for remote-source
+   deployments~~ — was, through 0.8.x (the opposite of the guidance in
+   issue #10, which was about pinning it *below* observed parallelism
+   on quota-scheduled platforms; both were true because the knob was
+   being asked to do two different jobs). With the fetch out of the
+   permit the workaround is obsolete: the second permit measured
+   *nothing* at the same quota, and the knob goes back to doing one
+   job.
+2. ~~The implementation fix is to stop holding a permit across the
+   fetch~~ — done (issue #22: buffer the source, bounded by
+   `OXIMG_MAX_SOURCE_BYTES` and `OXIMG_FETCH_CONCURRENCY`, then
+   acquire), and it beat its own target: the fix recovers *more* than a
+   second permit did, because it also stops paying the CPU headroom a
+   second permit needs at saturation.
 3. ~~Either way a `phase="fetch"` split would let a deployment read its
    own fetch fraction~~ — done, and it turned out to predict the effect
    size, not just describe the cause. Read `fetch/process` first; if it
