@@ -68,6 +68,14 @@ jobs:
         run: cargo test --release --features avif
       - name: Build all targets
         run: cargo build --release --all-targets --features avif
+      # `--all-targets` above silently skips examples whose
+      # required-features are off, so the bench tools never compiled in
+      # CI at all: resize_bench and resolve_bench could rot unnoticed
+      # while still being the instruments whose numbers we quote. Lint
+      # only — running them is a benchmark, not a smoke test.
+      - name: Clippy (bench tools)
+        if: matrix.arch == 'amd64'
+        run: cargo clippy --release --examples --features avif,bench-internals -- -D warnings
       # The library must build without the HTTP stack (no server feature).
       - name: Check (library only)
         if: matrix.arch == 'amd64'
