@@ -21,6 +21,11 @@ BURST=${BURST:-8}
 ROUNDS=${ROUNDS:-20}
 REPEATS=${REPEATS:-3}
 FILE=${FILE:-photo.jpg}
+# Output widths decide the encode cost, which dominates CPU time. Set
+# these near the widths a real deployment serves (production reports
+# 1920) rather than leaving the default spread, or the cell measures a
+# much cheaper service than the one being reasoned about.
+WIDTHS=${WIDTHS:-}
 WORKERS_A=${WORKERS_A:-1}
 WORKERS_B=${WORKERS_B:-2}
 PORT=${PORT:-18100}   # oximg's own listen port (host network)
@@ -58,7 +63,7 @@ run() { # workers -> one result line
   for _ in $(seq 1 100); do curl -sf "localhost:$PORT/health" >/dev/null && break; sleep 0.2; done
   printf 'W=%-2s src=%-5s lat=%-4s ' "$workers" "$SRC" "$LATENCY_MS"
   taskset -c "$LOAD_CPUSET" python3 "$LAB/burst.py" --base "http://localhost:$PORT" \
-    --file "$FILE" --burst "$BURST" --rounds "$ROUNDS"
+    --file "$FILE" --burst "$BURST" --rounds "$ROUNDS" ${WIDTHS:+--widths "$WIDTHS"}
   docker rm -f permitlab >/dev/null 2>&1 || true
 }
 

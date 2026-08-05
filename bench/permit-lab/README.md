@@ -118,6 +118,40 @@ Two things that generalise from it:
   an unchanged quota") needed a platform caveat: it holds where the
   limit is the reservation and misleads where it is not.
 
+## The production-equivalent cell (2026-08-05)
+
+The default cells run ~43 ms of CPU; the reporting deployment runs
+~155 ms, so a conclusion drawn at the toy scale is not transferable.
+The lever that closes the gap is **output width** — encode cost
+dominates, and the default burst spreads 320..1920 while production
+serves 1920. `photo.jpg` at widths 1200..1900 costs 62.5 ms of CPU, so a
+60 ms origin puts the fetch share where production reports it:
+
+```
+W=1  lat=60  rps= 8.34  p95=958ms  queue=400ms  process=120ms  fetch=61ms  fetch/process=51%
+W=2  lat=60  rps=11.41  p95=712ms  queue=248ms  process=172ms  fetch=61ms  fetch/process=35%
+```
+
+| | production | this cell |
+|---|---|---|
+| `fetch/process` | 47-51% | **51%** |
+| `process` | 150-160 ms | 120 ms |
+| queue | 235-280 ms | 400 ms (a harsher burst) |
+
+Reproduce it with:
+
+```sh
+IMAGE=<tag> SRC=http LATENCY_MS=60 BURST=8 ROUNDS=12 REPEATS=2 \
+  FILE=photo.jpg WIDTHS=1200,1300,1400,1500,1600,1700,1800,1900 bash ab.sh
+```
+
+**This is the baseline any permit-scoping change has to beat.** The
+prediction to test: buffering the source *outside* the permit should let
+**one** permit reach the 11.4 rps that two permits reach here, at the
+same 1-CPU quota, with `fetch/process` unchanged in the metric (the wait
+still happens, it just stops holding a permit). If it does not, the
+model is wrong and the change should not land.
+
 ## What follows from this
 
 1. `OXIMG_WORKERS` above the CPU count is *correct* for remote-source
