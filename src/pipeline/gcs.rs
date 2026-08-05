@@ -1,8 +1,9 @@
 //! `gs://` source fetching (issue #11): read objects from a private
 //! GCS bucket with GCP-attached credentials, instead of requiring the
-//! bucket to be world-readable for the HTTP mode. In-tree on the same
-//! blocking ureq stack as every other fetch — streaming decode, size
-//! caps, deadlines, and the transient retry all apply unchanged.
+//! bucket to be world-readable for the HTTP mode. Runs on the same
+//! shared reqwest client as every other fetch — size caps, deadlines,
+//! and the transient retry all apply unchanged, and h2 multiplexes
+//! every fetch to the storage endpoint over one connection.
 //!
 //! Credentials, v1: the GCP metadata server only — which is what GKE
 //! Workload Identity, Cloud Run, and GCE all provide. `service_account`
@@ -15,7 +16,6 @@
 //! Service Connect endpoints).
 
 use anyhow::{Context, Result};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::{SourceRejected, UpstreamFault};
@@ -40,26 +40,27 @@ struct CachedToken {
     expires_at: Instant,
 }
 
-/// One token for the process, refreshed under the lock — a refresh is
-/// one local metadata-server round trip (single-digit ms on GCP), so
-/// single-flighting it behind a Mutex is simpler than any scheme that
-/// lets N threads race to refresh the same token.
-static TOKEN: Mutex<Option<CachedToken>> = Mutex::new(None);
+/// One token for the process, refreshed under an async mutex: a
+/// refresh is one local metadata-server round trip (single-digit ms
+/// on GCP), so single-flighting it behind the lock is simpler than
+/// any scheme that lets N tasks race to refresh the same token. The
+/// mutex being async matters: waiting fetches yield instead of
+/// pinning threads while the refresh is in flight (the sync version
+/// held a std::sync::Mutex across the round trip).
+static TOKEN: tokio::sync::Mutex<Option<CachedToken>> = tokio::sync::Mutex::const_new(None);
 
-fn fetch_token() -> Result<CachedToken> {
+async fn fetch_token() -> Result<CachedToken> {
     let url = format!(
         "http://{}/computeMetadata/v1/instance/service-accounts/default/token",
         metadata_host()
     );
-    let mut resp = super::http_agent()
+    let resp = super::fetch_client()
         .get(&url)
         .header("Metadata-Flavor", "Google")
-        .call()
+        .send()
+        .await
         .context("GCP metadata server token request")?;
-    let body = resp
-        .body_mut()
-        .read_to_string()
-        .context("read metadata token response")?;
+    let body = resp.text().await.context("read metadata token response")?;
     let v: serde_json::Value =
         serde_json::from_str(&body).context("parse metadata token response")?;
     let token = v["access_token"]
@@ -81,18 +82,15 @@ fn fetch_token() -> Result<CachedToken> {
 /// The current Bearer header value, refreshing if needed. `force`
 /// discards the cache first (after a 401: the token may have been
 /// revoked before its stated expiry).
-fn bearer(force: bool) -> Result<String> {
-    let mut guard = match TOKEN.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+async fn bearer(force: bool) -> Result<String> {
+    let mut guard = TOKEN.lock().await;
     if !force
         && let Some(t) = guard.as_ref()
         && t.expires_at > Instant::now()
     {
         return Ok(t.bearer.clone());
     }
-    let fresh = fetch_token()?;
+    let fresh = fetch_token().await?;
     let bearer = fresh.bearer.clone();
     *guard = Some(fresh);
     Ok(bearer)
@@ -103,7 +101,7 @@ fn bearer(force: bool) -> Result<String> {
 /// are still per-request territory — this only proves credentials
 /// exist.
 pub(crate) fn startup() -> Result<(), String> {
-    bearer(false).map(|_| ()).map_err(|e| {
+    super::block_on_fetch(async { bearer(false).await.map(|_| ()) }).map_err(|e| {
         format!(
             "gs:// source needs GCP-attached credentials \
              (metadata server at {:?} unreachable: {e:#}) — GKE Workload \
@@ -135,7 +133,7 @@ fn retryable_status(code: u16) -> bool {
 
 /// GET one object, authenticated. `key` is already percent-encoded by
 /// the caller (the same segment-wise encoding as the HTTP mode).
-pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq::Body>> {
+pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> {
     // Refuse impossible keys before the request leaves: an object
     // with this name cannot exist, so from the requester's side this
     // is indistinguishable from an absent object — and answering it
@@ -151,44 +149,52 @@ pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq
         )));
     }
     let url = format!("{}/{bucket}/{key}", endpoint());
-    super::clear_fetch_time();
-    let head = std::time::Instant::now();
-    let attempt = |force_token: bool| -> Result<_, anyhow::Error> {
-        let bearer = bearer(force_token)?;
-        super::http_agent()
+    let attempt = async |force_token: bool| -> Result<reqwest::Response> {
+        let bearer = bearer(force_token).await?;
+        super::fetch_client()
             .get(&url)
             .header("Authorization", &bearer)
-            .call()
+            .send()
+            .await
             .map_err(anyhow::Error::new)
     };
-    let first = attempt(false);
-    let resp = match first {
-        Ok(r) => r,
+    // One retry, three triggers, mirroring the plain-HTTP path plus
+    // the SDKs' read semantics: connection transients (as-is),
+    // retryable statuses (as-is), and 401 with a *forced* token
+    // refresh — a revoked token would just 401 again from the cache.
+    let resp = match attempt(false).await {
+        Ok(resp) if retryable_status(resp.status().as_u16()) => {
+            let force_token = resp.status().as_u16() == 401;
+            super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            attempt(force_token).await.map_err(map_transport_err)?
+        }
+        Ok(resp) => resp,
         Err(e) => {
-            let retry = match e.downcast_ref::<ureq::Error>() {
-                Some(ue) if super::transient_fetch_error(ue) => Some(false),
-                Some(ureq::Error::StatusCode(code)) if retryable_status(*code) => {
-                    Some(*code == 401)
-                }
-                _ => None,
-            };
-            match retry {
-                Some(force_token) => {
-                    super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    std::thread::sleep(Duration::from_millis(100));
-                    attempt(force_token).map_err(|e| map_fetch_err(e, bucket))?
-                }
-                None => {
-                    super::record_fetch_time(head.elapsed().as_secs_f64());
-                    return Err(map_fetch_err(e, bucket));
-                }
+            let transient = e
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|re| !re.is_timeout() && (re.is_connect() || re.is_request()));
+            if !transient {
+                return Err(map_transport_err(e));
             }
+            super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            attempt(false).await.map_err(map_transport_err)?
         }
     };
-    // Includes a token refresh when one happened: that round trip is
-    // permit time too.
-    super::record_fetch_time(head.elapsed().as_secs_f64());
-    Ok(resp)
+    refuse_status(resp, bucket)
+}
+
+/// Transport-level failures (or a bearer that could not be minted):
+/// timeouts keep their io shape for classification, everything else
+/// indicts the upstream.
+fn map_transport_err(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+    {
+        return anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, e));
+    }
+    e.context("fetch gcs object").context(UpstreamFault)
 }
 
 /// GCS status semantics: 404 is an absent object (a client-facing
@@ -196,21 +202,30 @@ pub(crate) fn fetch(bucket: &str, key: &str) -> Result<ureq::http::Response<ureq
 /// requester's fault, not the store's (#13); 401/403 is a real
 /// permission problem — a deployment fault, never the requester's
 /// (PermissionDenied classifies as SourceUnreadable, HTTP 500).
-/// Everything else indicts the origin.
-fn map_fetch_err(e: anyhow::Error, bucket: &str) -> anyhow::Error {
-    match e.downcast_ref::<ureq::Error>() {
-        Some(ureq::Error::StatusCode(404)) => anyhow::Error::new(std::io::Error::new(
+/// Redirects are refused like every fetch in this crate. Everything
+/// else non-success indicts the origin.
+fn refuse_status(resp: reqwest::Response, bucket: &str) -> Result<reqwest::Response> {
+    let status = resp.status();
+    match status.as_u16() {
+        404 => Err(anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "object not found in bucket",
-        )),
-        Some(ureq::Error::StatusCode(code @ (400 | 414))) => {
-            anyhow::anyhow!("object store rejected the request ({code})").context(SourceRejected)
-        }
-        Some(ureq::Error::StatusCode(401 | 403)) => anyhow::Error::new(std::io::Error::new(
+        ))),
+        code @ (400 | 414) => Err(
+            anyhow::anyhow!("object store rejected the request ({code})").context(SourceRejected),
+        ),
+        401 | 403 => Err(anyhow::Error::new(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("access to bucket {bucket:?} denied (check the service account's roles)"),
-        )),
-        _ => e.context("fetch gcs object").context(UpstreamFault),
+        ))),
+        _ if status.is_redirection() => Err(anyhow::anyhow!(
+            "object store answered {status} (redirects are not followed)"
+        )
+        .context(UpstreamFault)),
+        _ if !status.is_success() => Err(anyhow::anyhow!("object store answered {status}")
+            .context("fetch gcs object")
+            .context(UpstreamFault)),
+        _ => Ok(resp),
     }
 }
 

@@ -106,38 +106,16 @@ impl Error {
     }
 }
 
-/// Walk the full source chain for timeout evidence. Timeouts surface
-/// in three shapes depending on where the deadline fires: an
-/// `io::Error` with kind `TimedOut` (socket-level, possibly re-wrapped
-/// by a streaming decoder that preserves sources), a `ureq::Error::
-/// Timeout` at the root (the `.call()` phase), or a ureq timeout boxed
-/// inside `io::Error::other` (mid-body, ureq's reader adapter).
-/// `chain()` descends through arbitrary `source()` links, so all three
-/// are reachable from here.
+/// Walk the full source chain for timeout evidence: an `io::Error`
+/// with kind `TimedOut`, however deep it sits — the fetch layer
+/// normalizes every client-level deadline (send-time and mid-body
+/// alike) into that shape, and a streaming decoder may re-wrap it
+/// while preserving sources. `chain()` descends through arbitrary
+/// `source()` links, so both are reachable from here.
 fn chain_has_timeout(inner: &anyhow::Error) -> bool {
     inner.chain().any(|c| {
-        if let Some(io) = c.downcast_ref::<std::io::Error>() {
-            if io.kind() == IoKind::TimedOut {
-                return true;
-            }
-            #[cfg(feature = "server")]
-            if let Some(r) = io.get_ref()
-                && matches!(
-                    r.downcast_ref::<ureq::Error>(),
-                    Some(ureq::Error::Timeout(_))
-                )
-            {
-                return true;
-            }
-        }
-        #[cfg(feature = "server")]
-        if matches!(
-            c.downcast_ref::<ureq::Error>(),
-            Some(ureq::Error::Timeout(_))
-        ) {
-            return true;
-        }
-        false
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == IoKind::TimedOut)
     })
 }
 

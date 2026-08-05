@@ -507,34 +507,6 @@ pub fn process_path(path: &std::path::Path, p: &Params) -> Result<(Vec<u8>, Imag
     inner().map_err(|e| Error::classify(e, false))
 }
 
-/// Remote-source HTTP client (the `server` feature). ureq and the rest
-/// of the HTTP stack are not compiled for library-only builds.
-#[cfg(feature = "server")]
-fn http_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let cfg = crate::config::config();
-        ureq::Agent::config_builder()
-            // The whole-fetch deadline is the bound on how long a
-            // stalled origin can hold a CPU permit (the body is read
-            // through the decoder while the permit is held); the
-            // connect timeout separates "origin unreachable" from
-            // "origin slow" without waiting out the full budget.
-            .timeout_global(Some(std::time::Duration::from_secs(cfg.upstream_timeout)))
-            .timeout_connect(Some(std::time::Duration::from_secs(
-                cfg.upstream_connect_timeout,
-            )))
-            // No redirects: the operator points OXIMG_SOURCE_BASE_URL
-            // at the right place, and an origin that can be induced to
-            // redirect (e.g. object-store website endpoints honoring
-            // user-settable redirect metadata) must not turn this
-            // fetcher into an SSRF proxy.
-            .max_redirects(0)
-            .build()
-            .into()
-    })
-}
-
 #[cfg(feature = "server")]
 fn max_source_bytes() -> u64 {
     crate::config::config().max_source_bytes
@@ -551,19 +523,6 @@ static UPSTREAM_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 #[cfg(feature = "server")]
 pub fn upstream_retry_count() -> u64 {
     UPSTREAM_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Connection-level failures worth one retry: the socket broke, the
-/// connector produced nothing, or DNS blinked. Timeouts are excluded
-/// (the deadline budget is already spent, and doubling the permit
-/// hold is worse than failing), and status-code errors are the
-/// origin's answer, not a transient.
-#[cfg(feature = "server")]
-fn transient_fetch_error(e: &ureq::Error) -> bool {
-    matches!(
-        e,
-        ureq::Error::Io(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound
-    )
 }
 
 /// Marker attached (as anyhow context) to failures that are the
@@ -607,40 +566,6 @@ impl std::fmt::Display for UpstreamFault {
     }
 }
 
-/// Read wrapper that fails with [`std::io::ErrorKind::FileTooLarge`]
-/// once more than `cap` bytes are produced. Silently truncating (what
-/// `Read::take` alone did) surfaced as a misleading decode error; the
-/// distinct kind lets the HTTP layer answer 413. Exactly-cap-sized
-/// sources are fine: the post-cap probe read distinguishes EOF from
-/// more data.
-#[cfg(feature = "server")]
-struct CappedReader<R> {
-    inner: R,
-    remaining: u64,
-}
-
-#[cfg(feature = "server")]
-impl<R: std::io::Read> std::io::Read for CappedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.remaining == 0 {
-            let mut probe = [0u8; 1];
-            return match self.inner.read(&mut probe)? {
-                0 => Ok(0),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::FileTooLarge,
-                    "source exceeds OXIMG_MAX_SOURCE_BYTES",
-                )),
-            };
-        }
-        let want = buf
-            .len()
-            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
-        let n = self.inner.read(&mut buf[..want])?;
-        self.remaining -= n as u64;
-        Ok(n)
-    }
-}
-
 /// The shared async HTTP client — one client, and therefore one
 /// connection pool, for the async server paths and the sync embedder
 /// wrappers alike. reqwest over rustls with h2 enabled: against an
@@ -648,7 +573,7 @@ impl<R: std::io::Read> std::io::Read for CappedReader<R> {
 /// multiplexes over a single connection, which retires the
 /// connection-churn cost the permit-lab churn cell measured; against
 /// HTTP/1.1 origins the pool keeps idle connections per host without
-/// ureq 3.3's 3-per-host ceiling (whose idle-age check was also a
+/// ureq 3.3's 3-per-host ceiling (whose idle-age check was also a no-op).
 /// no-op: `age()` computed `now - now`).
 #[cfg(feature = "server")]
 fn fetch_client() -> &'static reqwest::Client {
@@ -838,16 +763,22 @@ pub fn process_url(url: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Erro
 }
 
 /// GCS-source variant (`gs://` mode): fetch `key` from `bucket` with
-/// GCP-attached credentials and stream it into the decoder, same
+/// GCP-attached credentials into a bounded buffer, then decode — same
 /// contract as [`process_url`]. `key` must already be percent-encoded
 /// segment-wise. Requires the `server` feature.
 #[cfg(feature = "server")]
 pub fn process_gcs(bucket: &str, key: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
-    let inner = || -> Result<(Vec<u8>, ImageFormat)> {
-        let resp = gcs::fetch(bucket, key)?;
-        process_response(resp, p)
-    };
-    inner().map_err(|e| Error::classify(e, true))
+    let bytes = fetch_gcs(bucket, key)?;
+    process(&bytes, p)
+}
+
+/// Async buffered GCS fetch: [`fetch_gcs`] for callers already inside
+/// a runtime — the server awaits this directly. Requires the `server`
+/// feature.
+#[cfg(feature = "server")]
+pub async fn fetch_gcs_async(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let inner = async { buffer_body_async(gcs::fetch(bucket, key).await?).await };
+    inner.await.map_err(|e| Error::classify(e, true))
 }
 
 /// Startup credential probe for the `gs://` mode — the server calls
@@ -878,78 +809,16 @@ pub fn fetch_url(url: &str) -> Result<Vec<u8>, Error> {
 /// Buffered GCS fetch: [`fetch_url`]'s contract for the `gs://` mode —
 /// authenticated via GCP-attached credentials, same caps and
 /// classification as [`process_gcs`]. `key` must already be
-/// percent-encoded segment-wise. Requires the `server` feature.
+/// percent-encoded segment-wise. Sync bridge over
+/// [`fetch_gcs_async`]. Requires the `server` feature.
 #[cfg(feature = "server")]
 pub fn fetch_gcs(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
-    let inner = || buffer_response(gcs::fetch(bucket, key)?);
-    inner().map_err(|e| Error::classify(e, true))
-}
-
-/// The streaming tail of a remote fetch: size caps, the no-redirect
-/// rule, and the streaming hand-off into the decoder.
-#[cfg(feature = "server")]
-fn process_response(
-    resp: ureq::http::Response<ureq::Body>,
-    p: &Params,
-) -> Result<(Vec<u8>, ImageFormat)> {
-    let cap = max_source_bytes();
-    precheck_response(&resp, cap)?;
-    let reader = CappedReader {
-        inner: resp.into_body().into_reader(),
-        remaining: cap,
-    };
-    process_reader(reader, p, 0)
-}
-
-/// The buffered tail: same caps and redirect rule, but the body lands
-/// whole in a `Vec` instead of streaming into a decoder. Mid-body
-/// failures keep their I/O shape (reset, EOF, the capped reader's
-/// FileTooLarge, ureq's boxed timeout) so `Error::classify` sees them
-/// exactly as it did on the streaming path.
-#[cfg(feature = "server")]
-fn buffer_response(resp: ureq::http::Response<ureq::Body>) -> Result<Vec<u8>> {
-    let cap = max_source_bytes();
-    let declared = precheck_response(&resp, cap)?;
-    let mut reader = CappedReader {
-        inner: resp.into_body().into_reader(),
-        remaining: cap,
-    };
-    // The declared size is already checked against the cap, so a
-    // well-behaved origin costs one allocation; chunked origins grow.
-    let mut buf = Vec::with_capacity(usize::try_from(declared.unwrap_or(0)).unwrap_or(0));
-    std::io::Read::read_to_end(&mut reader, &mut buf).context("read source body")?;
-    Ok(buf)
-}
-
-/// Refusals available before reading a body byte, shared by both
-/// tails: an over-cap Content-Length (the capped reader backstops
-/// chunked or lying origins; streaming decoders may translate that
-/// mid-read error into their own decode failure, but the buffered
-/// tail surfaces it precisely), and any redirect. Returns the declared
-/// length, when there is one, as an allocation hint.
-#[cfg(feature = "server")]
-fn precheck_response(resp: &ureq::http::Response<ureq::Body>, cap: u64) -> Result<Option<u64>> {
-    let declared = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if let Some(len) = declared
-        && len > cap
-    {
-        return Err(anyhow::Error::new(std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            format!("source is {len} bytes, over the {cap}-byte limit"),
-        )));
-    }
-    if resp.status().is_redirection() {
-        return Err(anyhow::anyhow!(
-            "origin answered {} (redirects are not followed)",
-            resp.status()
-        )
-        .context(UpstreamFault));
-    }
-    Ok(declared)
+    clear_fetch_time();
+    let t0 = std::time::Instant::now();
+    let (bucket, key) = (bucket.to_string(), key.to_string());
+    let result = block_on_fetch(async move { fetch_gcs_async(&bucket, &key).await });
+    record_fetch_time(t0.elapsed().as_secs_f64());
+    result
 }
 
 thread_local! {
