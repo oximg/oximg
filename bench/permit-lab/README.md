@@ -186,6 +186,42 @@ against a 60 ms RTT; at W=2 (8 slots) one wave, ~65 ms. `fetch/process`
 above 100% is therefore expected, not an accounting bug: the wait still
 happens, it just no longer holds a permit.
 
+## The connection-churn cell (2026-08-05)
+
+With fetches off-permit, the next fixed cost was connection churn:
+one host, `OXIMG_FETCH_CONCURRENCY`-wide bursts, and a client pool
+smaller than the burst. `churn.sh` measures it — the origin charges
+`SETUP_MS` once per NEW connection (a stated model of
+TCP+TLS-over-RTT, invisible on loopback) and counts data connections;
+conns/req is ground truth for how often the cost was paid.
+
+At 30ms RTT, 20ms setup, burst=8, fetch slots=8 (same window,
+interleaved):
+
+```
+ureq 3.3 (0.9.0)   conns/req=0.62   srv_fetch=44.2ms   (every gap: 0/5/20s)
+ureq + pool POC    conns/req=0.00   srv_fetch=33.1ms
+reqwest (migrated) conns/req=0.00   srv_fetch=34.3ms
+```
+
+Three findings worth keeping:
+
+- 0.62 = 5/8 exactly: ureq keeps 3 idle connections per host, so an
+  8-wide burst re-establishes 5, every time. The srv_fetch delta
+  (11-12ms) matches conns/req x SETUP_MS to within a millisecond —
+  the metric sees precisely what the model predicts.
+- The gap dimension did nothing because ureq 3.3's idle-age check is
+  a no-op: `Connection::age()` computes `now.duration_since(now)`,
+  always zero (fixed on upstream main, unreleased). Client-side
+  expiry never fires; only the per-host cap and the server side
+  close connections.
+- Same-region gs:// gains little from fixing this (~2-6ms of a ~75ms
+  fetch head — GCS TTFB dominates); high-RTT https:// origins gain a
+  lot (a churned connection costs ~2 RTT). The fix landed as the
+  reqwest migration (h2 multiplexes one connection; the pool POC was
+  the interim proof), verified in this cell at conns/req=0.00 and in
+  the production-equivalent cell at an unchanged 14.8-14.9 rps.
+
 ## What follows from this
 
 1. ~~`OXIMG_WORKERS` above the CPU count is *correct* for remote-source
