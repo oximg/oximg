@@ -596,8 +596,8 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
     // Mirrors the pipeline's own choice: these fixtures are CMYK, the
     // buffered arm, which keeps shrink-on-load by default because
     // there it is buying memory rather than costing quality.
-    let margin = dct_margin().or(Some(BUFFERED_DCT_MARGIN));
-    dec.scale(dct_scale_num(src_w, src_h, w, h, margin));
+    let margin = dct_margin().unwrap_or(BUFFERED_DCT_MARGIN);
+    dec.scale(dct_scale_num(src_w, src_h, w, h, Some(margin)));
     let mut started = dec.to_colorspace(ColorSpace::JCS_CMYK).unwrap();
     let (dec_w, dec_h) = (started.width(), started.height());
     let planes: Vec<u8> = started.read_scanlines().unwrap();
