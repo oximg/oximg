@@ -32,11 +32,11 @@ pub(crate) struct Config {
     /// Shrink-on-load is a **speed** knob, not a quality one: it was
     /// the default at 1.7 until measurement showed it only ever costs
     /// quality. libjpeg's reduced IDCT is erratic per scale — 3/8
-    /// measured 15.7 SSIMULACRA2 points below full decode on a 5.3x
+    /// measured 13.4 SSIMULACRA2 points below full decode on a 5.3x
     /// downscale, for the same output size and the same bytes, and no
     /// single margin avoids the bad scales at every ratio (see
-    /// bench/quality/dct_sweep.py). Set it to buy throughput back on
-    /// large sources, knowing what it spends.
+    /// bench/quality/dct_sweep.py, 12 photographs per group). Set it to
+    /// buy throughput back on large sources, knowing what it spends.
     pub dct_margin: Option<f64>,
     /// OXIMG_JPEG_PROGRESSIVE ("0" selects baseline jpegli).
     pub jpegli_progressive: bool,

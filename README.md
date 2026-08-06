@@ -43,9 +43,9 @@ while resizing in linear light at measurably higher output quality
   across the resample — the properties behind the SSIMULACRA2 scores in
   [Benchmarks](#benchmarks). Shrink-on-load is available
   (`OXIMG_DCT_MARGIN`) and off by default: it buys decode time with
-  quality, and libjpeg's reduced IDCT charges erratically for it — up
-  to 13 SSIMULACRA2 points on a 5x downscale, for the same output size
-  and the same bytes.
+  quality, and libjpeg's reduced IDCT charges erratically for it — 13.4
+  SSIMULACRA2 points on a 5.3x downscale, for the same output size and
+  the same bytes.
 - **Performance as architecture, not flags**: per-arch row-streaming
   SIMD resize kernels (AVX2 on x86-64, NEON on aarch64, both verified
   against an f64 reference), JPEG decode fused with resize+encode on a

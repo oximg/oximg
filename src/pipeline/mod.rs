@@ -250,8 +250,8 @@ fn fit_dims(src_w: usize, src_h: usize, max_w: u32, max_h: u32) -> (usize, usize
 /// let Lanczos recover what the DCT truncation dropped; a sweep of
 /// every reachable numerator over the quality corpus
 /// (bench/quality/dct_sweep.py) says otherwise. Full decode is the best
-/// cell or within 0.08 of it at every ratio measured, the penalty is
-/// erratic rather than graded — 3/8 measured 15.7 SSIMULACRA2 points
+/// cell or within 0.04 of it at every ratio measured, the penalty is
+/// erratic rather than graded — 3/8 measured 13.4 SSIMULACRA2 points
 /// below full decode at 5.3x while 5/8 on the same image was optimal —
 /// and no single margin dodges the bad scales everywhere: 3.0 fixes
 /// 5.3x and is worse than 1.7 at 4x. ImageMagick reproduces the same
