@@ -167,7 +167,19 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
         (fit_w, fit_h)
     };
 
-    dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()));
+    // Shrink-on-load defaults off (see `dct_scale_num`: it only ever
+    // costs quality) — but that holds for the streaming arm, where the
+    // decode size never materializes and the shrink was buying CPU
+    // alone. CMYK and YCCK stage the whole frame, so there it is
+    // buying memory, and keeps its old default. An explicit knob
+    // overrides both. The colorspace is known from the header, before
+    // any scanline is read, so this costs nothing to ask.
+    let buffered = matches!(
+        dec.color_space(),
+        ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
+    );
+    let margin = dct_margin().or_else(|| buffered.then_some(BUFFERED_DCT_MARGIN));
+    dec.scale(dct_scale_num(src_w, src_h, dst_w, dst_h, margin));
 
     // The decoded-bytes estimate. Two things field validation caught
     // here (issue #17 follow-up), both worth naming:
@@ -186,13 +198,12 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     //    arms (CMYK/YCCK) do materialize a frame, and progressive
     //    sources add coefficient arrays no output size reduces.
     {
-        let num = dct_scale_num(src_w, src_h, dst_w, dst_h, dct_margin()) as usize;
+        // The same `margin` the scale was chosen with, not a second
+        // read of the knob: the estimate has to describe the decode
+        // that is actually about to happen.
+        let num = dct_scale_num(src_w, src_h, dst_w, dst_h, margin) as usize;
         let (dec_w, dec_h) = ((src_w * num).div_ceil(8), (src_h * num).div_ceil(8));
         let comps = dec.components().len().max(1) as u64;
-        let buffered = matches!(
-            dec.color_space(),
-            ColorSpace::JCS_CMYK | ColorSpace::JCS_YCCK
-        );
         let channels = if buffered { 4 } else { 3 };
         let mut cost = if buffered {
             // Staged whole (4-channel CMYK) and fed to the full-frame

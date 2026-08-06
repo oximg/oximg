@@ -337,7 +337,13 @@ fn orientation_edge_paths() {
     let (out, _) = pipeline::process(&webp_src, &p).unwrap();
     // 134 not 133: WebP re-fits from the decode-scaler's intermediate
     // dims (pre-existing ±1 rounding drift, orientation-independent);
-    // the stored-frame fit would have produced ~100x75 rotated.
+    // the stored-frame fit would have produced ~100x75 rotated. The
+    // drift is a property of decoding at an intermediate size, so it
+    // is exactly what turning the scaler off removes — the PNG
+    // assertion below is the same box with no scaler and lands on 133.
+    // WebP keeps its shrink by default (it is the memory it buys, not
+    // the CPU), so this stays 134; `OXIMG_DCT_MARGIN` unset on the
+    // *streaming* JPEG arm is what changed.
     assert_eq!(
         dims_of(&out),
         (134, 100),

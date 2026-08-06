@@ -24,8 +24,20 @@ pub(crate) struct Config {
     pub auto_rotate: bool,
     /// OXIMG_ICC ("0" strips profiles instead of passing them through).
     pub icc_passthrough: bool,
-    /// OXIMG_DCT_MARGIN: decode-size headroom over the target.
-    pub dct_margin: f64,
+    /// OXIMG_DCT_MARGIN: decode-size headroom over the target, and the
+    /// switch that turns shrink-on-load on at all. `None` (the default)
+    /// decodes at full size and hands the whole reduction to the
+    /// resampler.
+    ///
+    /// Shrink-on-load is a **speed** knob, not a quality one: it was
+    /// the default at 1.7 until measurement showed it only ever costs
+    /// quality. libjpeg's reduced IDCT is erratic per scale — 3/8
+    /// measured 15.7 SSIMULACRA2 points below full decode on a 5.3x
+    /// downscale, for the same output size and the same bytes, and no
+    /// single margin avoids the bad scales at every ratio (see
+    /// bench/quality/dct_sweep.py). Set it to buy throughput back on
+    /// large sources, knowing what it spends.
+    pub dct_margin: Option<f64>,
     /// OXIMG_JPEG_PROGRESSIVE ("0" selects baseline jpegli).
     pub jpegli_progressive: bool,
     /// OXIMG_FLATTEN_BG: alpha→JPEG flatten background, RRGGBB hex.
@@ -210,7 +222,7 @@ pub(crate) fn config() -> &'static Config {
         fir_backend: std::env::var("OXIMG_RESIZE_BACKEND").as_deref() == Ok("fir"),
         auto_rotate: std::env::var("OXIMG_AUTO_ROTATE").as_deref() != Ok("0"),
         icc_passthrough: std::env::var("OXIMG_ICC").as_deref() != Ok("0"),
-        dct_margin: parsed("OXIMG_DCT_MARGIN").unwrap_or(1.7),
+        dct_margin: parsed("OXIMG_DCT_MARGIN"),
         jpegli_progressive: std::env::var("OXIMG_JPEG_PROGRESSIVE").as_deref() != Ok("0"),
         flatten_bg: std::env::var("OXIMG_FLATTEN_BG")
             .ok()

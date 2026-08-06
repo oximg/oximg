@@ -593,7 +593,11 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
 
     let mut dec = Decompress::new_mem(jpeg).unwrap();
     let (src_w, src_h) = dec.size();
-    dec.scale(dct_scale_num(src_w, src_h, w, h, dct_margin()));
+    // Mirrors the pipeline's own choice: these fixtures are CMYK, the
+    // buffered arm, which keeps shrink-on-load by default because
+    // there it is buying memory rather than costing quality.
+    let margin = dct_margin().or(Some(BUFFERED_DCT_MARGIN));
+    dec.scale(dct_scale_num(src_w, src_h, w, h, margin));
     let mut started = dec.to_colorspace(ColorSpace::JCS_CMYK).unwrap();
     let (dec_w, dec_h) = (started.width(), started.height());
     let planes: Vec<u8> = started.read_scanlines().unwrap();
@@ -624,9 +628,14 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
 /// compaction, and the resize join at scaled dims.
 #[test]
 fn cmyk_dct_scaled_decode_matches_reference() {
-    // 256x192 in a 64x64 box → fit 64x48; the 1.7 margin wants
-    // ≥109x82 → num=4, a 128x96 scaled decode ahead of the resize.
-    assert_eq!(dct_scale_num(256, 192, 64, 48, 1.7), 4);
+    // 256x192 in a 64x64 box → fit 64x48; the buffered arm's 1.7
+    // margin wants ≥109x82 → num=4, a 128x96 scaled decode ahead of
+    // the resize. CMYK is that arm, so this is the default path here
+    // even though the streaming arm no longer shrinks at all.
+    assert_eq!(
+        dct_scale_num(256, 192, 64, 48, Some(BUFFERED_DCT_MARGIN)),
+        4
+    );
     assert_cmyk_matches_reference(&make_cmyk_jpeg(256, 192, true), 64, 1);
 }
 
@@ -645,11 +654,22 @@ fn cmyk_band_parallel_matches_reference() {
 #[test]
 fn dct_scale_picks_smallest_sufficient() {
     // 7360 * 1/8 = 920 >= 500 -> num = 1
-    assert_eq!(dct_scale_num(7360, 4912, 500, 334, 1.0), 1);
+    assert_eq!(dct_scale_num(7360, 4912, 500, 334, Some(1.0)), 1);
     // 1000 * 4/8 = 500 >= 500, 667*4/8=334 >= 334 -> num = 4
-    assert_eq!(dct_scale_num(1000, 667, 500, 334, 1.0), 4);
+    assert_eq!(dct_scale_num(1000, 667, 500, 334, Some(1.0)), 4);
     // already at target size -> no scaling
-    assert_eq!(dct_scale_num(500, 334, 500, 334, 1.0), 8);
+    assert_eq!(dct_scale_num(500, 334, 500, 334, Some(1.0)), 8);
+}
+
+/// The default: no margin means no shrink-on-load, whatever the
+/// reduction. Shrink only ever costs quality (bench/quality/
+/// dct_sweep.py), so it is opt-in — and the ratio that used to select
+/// the worst scale of all, 5.3x, is the one this pins.
+#[test]
+fn no_margin_decodes_at_full_size() {
+    assert_eq!(dct_scale_num(4000, 2667, 750, 500, None), 8);
+    assert_eq!(dct_scale_num(7360, 4912, 500, 334, None), 8);
+    assert_eq!(dct_scale_num(500, 334, 500, 334, None), 8);
 }
 
 /// Issue #14: the output format's dimension ceiling is one more
@@ -737,7 +757,11 @@ fn decode_cost_separates_what_pixel_counts_cannot() {
     // Progressive CMYK 4:4:4, ~150 MP at width=1920: four-channel
     // staging at the shrink-on-load size, plus coefficient arrays no
     // output size reduces. Measured peak 1231 MiB.
-    let num = dct_scale_num(12247, 12247, 1920, 1920, 1.7) as usize;
+    // Explicitly at the margin this case was *measured* under, not at
+    // the current default: the 1231 MiB figure below came off a run
+    // with shrink-on-load engaged, and the estimator is what is being
+    // checked here, not the default.
+    let num = dct_scale_num(12247, 12247, 1920, 1920, Some(1.7)) as usize;
     let (dw, dh) = ((12247 * num).div_ceil(8), (12247 * num).div_ceil(8));
     let prog = DecodeCost::full_frame(dw, dh, 4, p)
         .with_output(1920, 1920, 4)

@@ -396,7 +396,16 @@ pub(super) fn webp_decode_into_chunk8(
         } else {
             (fit_w, fit_h)
         };
-        let need_w = ((dst_w as f64) * dct_margin()).ceil() as usize;
+        // Unlike the streaming JPEG arm, this one keeps its shrink by
+        // default: libwebp stages the whole frame, so the decode size
+        // is the resident set. Full decode does score better — 69.27
+        // against 64.15 on 4000x2667 sources into 750x500, monotonic
+        // rather than the JPEG path's erratic dips, because libwebp
+        // rescales properly instead of truncating DCT coefficients —
+        // but it costs 133.9 MB against 21.7. Five points is not worth
+        // six times the memory here. The knob still overrides.
+        let margin = dct_margin().unwrap_or(BUFFERED_DCT_MARGIN);
+        let need_w = ((dst_w as f64) * margin).ceil() as usize;
         let (dec_w, dec_h) = if need_w < src_w {
             let scale = need_w as f64 / src_w as f64;
             (
