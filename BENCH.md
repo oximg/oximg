@@ -558,6 +558,117 @@ req/s, oximg vs imgproxy:
   *relative* metadata cost, which is what a real deployment's
   phone-photo / design-asset traffic pays.
 
+## Ruby: as a library, against the image-processing gems
+
+Everything above measures oximg as a server, against servers. This
+section measures it as a **library**, through the [`oximg`
+gem](rubygem/oximg), against what a Rails app would otherwise call:
+`ruby-vips` (ActiveStorage's variant processor since Rails 7),
+`image_processing` (the layer ActiveStorage actually calls, on both its
+backends), and `mini_magick` (366M downloads, the older default).
+
+Task: the canonical ActiveStorage variant — fit within 750x750, never
+enlarging, re-encoded as JPEG at quality 80 — each gem at its own
+defaults, because defaults are what an app gets. Best of 3 per image,
+averaged across the group. oximg 0.10.1, ruby-vips 2.3.0,
+image_processing 1.14.0, mini_magick 5.3.3, pinned by one
+`Gemfile.lock` on all three machines. Harness:
+[bench/ruby/bench.rb](bench/ruby/bench.rb).
+
+Peak RSS is why each (group, gem) pair runs in its own subprocess under
+`/usr/bin/time`: a single Ruby VM that has loaded libvips, loaded
+ImageMagick and spawned oximg reports the high-water mark of whichever
+ran worst.
+
+### Large source: 4000x2667 JPEG → 750x500 (n=3)
+
+wall ms / CPU s / peak RSS:
+
+| Gem | Apple M2 Max | AMD Ryzen 7 8745HS | Intel i7-1360P |
+|---|---|---|---|
+| **oximg** | 73.4 / **0.83** / **37.5 MB** | 76.6 / 0.84 / **41.1 MB** | 76.2 / **0.84** / **41.0 MB** |
+| ruby-vips | 74.0 / 0.91 / 373.3 MB | **71.7** / **0.83** / 419.3 MB | 78.5 / 0.88 / 424.4 MB |
+| image_processing/vips | **73.1** / 0.95 / 156.5 MB | 72.9 / 0.92 / 365.1 MB | **76.0** / 0.97 / 317.1 MB |
+| image_processing/magick | 317.9 / 2.97 / 181.2 MB | 235.9 / 2.96 / 169.9 MB | 244.7 / 3.14 / 169.9 MB |
+| mini_magick | 316.3 / 2.97 / 182.2 MB | 235.9 / 2.96 / 170.0 MB | 240.0 / 3.10 / 169.9 MB |
+
+### Smaller sources, wall ms (M2 Max / Ryzen / Intel)
+
+| Gem | 2000x1334 (n=3) | 768x512 (n=8) |
+|---|---|---|
+| oximg | 23.0 / 20.6 / 21.0 | 12.8 / 12.0 / 15.8 |
+| ruby-vips | **18.5** / **18.4** / **21.6** | **6.3** / **5.7** / **9.8** |
+| image_processing/vips | 20.3 / 21.6 / 25.6 | 7.7 / 7.8 / 11.7 |
+| image_processing/magick | 79.7 / 69.8 / 67.8 | 27.2 / 26.5 / 26.1 |
+| mini_magick | 79.8 / 68.9 / 67.5 | 27.2 / 26.7 / 26.7 |
+
+Peak RSS on those groups, range across the three CPUs: oximg
+**22.3-30.0 MB** / **22.5-31.5 MB**, ruby-vips 94.0-145.9 / 76.4-93.7,
+image_processing/vips 84.7-149.7 / 70.8-94.5, mini_magick 51.8-62.2 /
+28.8-34.5.
+
+### Baseline: gem loaded, nothing processed
+
+| Gem | M2 Max | Ryzen | Intel |
+|---|---|---|---|
+| oximg | **28.7 MB** | **22.2 MB** | **23.5 MB** |
+| mini_magick | 30.0 MB | 23.8 MB | 25.3 MB |
+| ruby-vips | 47.3 MB | 51.8 MB | 52.3 MB |
+| image_processing/vips | 48.5 MB | 56.9 MB | 57.3 MB |
+
+Requiring libvips costs 25-35 MB resident in *every* process that loads
+it, before an image is touched — multiplied by the worker count. The
+oximg gem keeps the codecs in a subprocess, so the web process carries
+almost nothing.
+
+### Output size and quality
+
+Output bytes were identical on all three machines, so this table is
+per-group. SSIMULACRA2 is from the macOS run (the Linux boxes have no
+`ssimulacra2` package), scored against a linear-light Lanczos reference
+at the same dimensions, per
+[bench/quality/QUALITY.md](bench/quality/QUALITY.md):
+
+| Gem | large KB / ssim2 | medium KB / ssim2 | kodak KB / ssim2 |
+|---|---|---|---|
+| oximg | **84.4** / 59.90 | **84.6** / 70.67 | **73.1** / 78.07 |
+| ruby-vips | 86.6 / 62.06 | 87.5 / 66.40 | 78.1 / 75.82 |
+| image_processing/vips | 97.9 / 67.34 | 99.0 / 70.07 | 86.8 / 70.57 |
+| mini_magick | 86.4 / 64.11 | 86.5 / 67.09 | 89.7 / 78.64 |
+
+**The ssim2 column is not a verdict.** At one quality setting the
+contenders write different numbers of bytes — image_processing/vips
+writes 16% more than oximg on the large group — so a single point
+cannot separate encoder quality from encoder size. Ranking these
+encoders needs the iso-byte sweep that QUALITY.md runs for the server;
+what this table does establish is that oximg writes the smallest output
+in every group.
+
+### What the numbers say
+
+- **Memory is the difference, and it holds on all three CPUs.** On
+  4000x2667 sources oximg peaks at 37-41 MB against ruby-vips'
+  373-424 MB — about 10x — while `image_processing/vips` lands anywhere
+  between 157 and 365 MB depending on the platform. For a deployment
+  with a container memory limit, that spread is its own problem: oximg's
+  own figure varies ±5% across the three.
+- **Time is a tie with libvips.** Every oximg/ruby-vips pair on the
+  large group is within 6%, and oximg's CPU seconds are equal or lower.
+- **ImageMagick burns 3.5-4x the CPU** everywhere, and is 3-4x slower in
+  wall time. It is also the one path that is markedly worse on Apple
+  silicon (318 ms vs 235-245 ms on x86).
+- **Small sources are oximg's weak spot**: one process spawn per image
+  costs a median 4.2 ms, which dominates a 6 ms job. That is a property
+  of driving a CLI, not of the pipeline, and an in-process native
+  extension would recover it without changing the gem's API.
+
+Caveats: within a machine the comparison is exact — every contender ran
+the same way, from the same lockfile. Across machines it carries the
+system Ruby patch level (3.4.1 / 3.4.10 / 3.4.8) and each
+distribution's own libvips and ImageMagick builds. Laptop numbers are
+only valid on a charged battery: the Intel box measured 28-38% slow at
+1% battery even on AC.
+
 ## Notes
 
 - Measurement provenance: the official-harness tables (local Ryzen and
@@ -603,6 +714,9 @@ IMGPROXY_BIND=:8082 IMGPROXY_LOCAL_FILESYSTEM_ROOT=$PWD/images IMGPROXY_QUALITY=
 bench/coldstart.sh
 # connection-capacity ramp (needs the harness dataset and k6's image):
 DATASET=~/benchmark/dataset bench/stress.sh
+# Ruby gems (needs the quality corpus, libvips and ImageMagick; the
+# oximg gem resolves target/debug/oximg, or one on PATH):
+cd bench/ruby && bundle install && bundle exec ruby bench.rb 3
 ```
 
 Docker (Linux): build with the repo `Dockerfile`; run competitors from
