@@ -3,16 +3,16 @@
 
 `OXIMG_DCT_MARGIN` decides how much of a downscale is handed to
 libjpeg's scaled decode and how much is left to the resampler. The
-default (1.7) turned out to select the 3/8 scale for a 5.3x downscale,
-which measured 16 SSIMULACRA2 points below decoding at 5/8 — for the
-same output size and the same bytes. ImageMagick reproduces the same
-dip through its own `jpeg:size` hint, so the effect is libjpeg's
-reduced IDCT and not this pipeline's.
+old default (1.7) selected the 3/8 scale for a 5.3x downscale, which
+measured 13.4 SSIMULACRA2 points below a full decode — for the same
+output size and the same bytes. ImageMagick reproduces the same dip
+through its own `jpeg:size` hint, so the effect is libjpeg's reduced
+IDCT and not this pipeline's.
 
-Three photographs at one ratio are not enough to move a default that
-shapes every user's output. This sweeps every reachable numerator over
-the whole quality corpus and several ratios, so the question "is a
-larger margin ever worse?" has an answer with a corpus behind it.
+Three photographs at one ratio were not enough to move a default that
+shapes every user's output, which is what this exists for: every
+reachable numerator, over the whole quality corpus (24 Kodak plus 12
+photographs per size group), at several ratios.
 
 Each cell: oximg decodes at k/8, resizes to the target, encodes at q80.
 Scored with SSIMULACRA2 against a linear-light Lanczos downscale at the
@@ -24,6 +24,7 @@ same dimensions — QUALITY.md's ref_lin, built the same way.
 import argparse
 import json
 import math
+import os
 import pathlib
 import subprocess
 import statistics
@@ -40,6 +41,21 @@ GROUPS = [
     ("medium 2000x1334", "medium/*.jpg", [750, 500]),
     ("large 4000x2667", "large/*.jpg", [750, 500]),
 ]
+
+
+def sweep_env(margin):
+    """The caller's environment, plus this sweep's margin.
+
+    Inherited rather than replaced: a stripped-down env breaks anything
+    that needs a dynamic-linker path, a locale, or a toolchain prefix,
+    and this harness is meant to run on machines it was not written on.
+    Every *other* OXIMG_* knob is dropped, though — a shell that
+    happens to export OXIMG_RESIZE=srgb would otherwise change what the
+    sweep measures without saying so.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OXIMG_")}
+    env["OXIMG_DCT_MARGIN"] = f"{margin:.6f}"
+    return env
 
 
 def sh(*cmd, env=None):
@@ -96,9 +112,8 @@ def main():
                     scores, sizes = [], []
                     for src in sources:
                         out = tmp / f"{label[:3]}-{target}-{k}-{src.name}"
-                        env = {"PATH": "/usr/bin:/bin", "OXIMG_DCT_MARGIN": f"{m:.6f}"}
                         sh(args.bin, "resize", src, target, 0, out,
-                           "-q", args.quality, env=env)
+                           "-q", args.quality, env=sweep_env(m))
                         w, h = dims(out)
                         ref = tmp / f"ref-{src.stem}-{w}x{h}.png"
                         if not ref.exists():
@@ -131,7 +146,7 @@ def main():
             print(f"  {k}   {c['decoded_px']:>6}px  {c['margin']:>7.2f}  "
                   f"{c['kb']:>6.1f}  {c['ssim2']:>6.2f}{mark}")
         # The knob picks the smallest k reaching its margin.
-        for default, name in ((1.7, "1.7 (current default)"), (3.0, "3.0")):
+        for default, name in ((1.7, "1.7 (the old default)"), (3.0, "3.0")):
             picked = next((k for k in ks if row["by_k"][k]["margin"] >= default), ks[-1])
             c = row["by_k"][picked]
             print(f"  margin {name}: k={picked}, ssim2 {c['ssim2']:.2f} "
