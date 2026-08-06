@@ -4,3 +4,6 @@ bench/quality/node_modules/
 bench/quality/corpus/
 bench/quality/package*.json
 .env
+rubygem/*/Gemfile.lock
+rubygem/*/*.gem
+rubygem/oximg/exe/

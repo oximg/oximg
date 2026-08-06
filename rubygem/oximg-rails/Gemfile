@@ -1,0 +1,11 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec
+
+# Unreleased sibling: the two gems move together in this repo.
+gem "oximg", path: "../oximg"
+
+gem "minitest", "~> 5.0"
+gem "rake", "~> 13.0"
