@@ -17,9 +17,15 @@ Two test groups:
   (`magick -colorspace RGB -filter Lanczos -resize ... -colorspace sRGB`).
 
 Corpus: the 24 Kodak images (converted to q97 4:4:4 JPEG as the common
-source, 768x512), 3 real photographs at 4000x2667 (pinned picsum IDs),
-and 2000px versions of the same 3. All fit into 500x500. Quality sweep:
-60/70/75/80/85/90.
+source, 768x512), 12 real photographs at 4000x2667 (pinned picsum IDs),
+and 2000px versions of the same 12 (`magick large -resize 2000x1334
+-quality 95`). All fit into 500x500. Quality sweep: 60/70/75/80/85/90.
+
+The photograph groups were 3 images each until 2026-08, and the medium
+group was not walked by `run.py` at all — its published row could not
+be reproduced by the harness that claimed it. Both are fixed, so the
+numbers below differ from earlier revisions for that reason as well as
+the decode-scale change described under Group B.
 
 Contenders: oximg (this repo), imgproxy (Homebrew 4.0.9 and Docker
 v4.0.11 produce identical scores) with per-URL `quality:N`, imagor
@@ -33,10 +39,10 @@ relative to plain libjpeg-turbo:
 
 | Encoder | S=70 | S=80 |
 |---|---|---|
-| oximg default (jpegli, progressive) | **-11.0%** | **-12.4%** |
-| oximg `PRESET=small` (mozjpeg trellis+progressive) | -12.7% | -10.0% |
-| sharp `mozjpeg:true` | -12.8% | -10.1% |
-| oximg `PRESET=fast` (mozjpeg fastest + optimized Huffman) | +0.1% | ~0% |
+| oximg default (jpegli, progressive) | **-10.0%** | **-12.5%** |
+| oximg `PRESET=small` (mozjpeg trellis+progressive) | -11.9% | -9.7% |
+| sharp `mozjpeg:true` | -11.9% | -9.8% |
+| oximg `PRESET=fast` (mozjpeg fastest + optimized Huffman) | -0.8% | -2.0% |
 | sharp default | -0.8% | -2.0% |
 | libjpeg-turbo (imgproxy's encoder) | baseline | baseline |
 
@@ -45,14 +51,30 @@ CPU of the mozjpeg trellis path (`PRESET=small`).
 
 ## Group B — end-to-end (q80, scored vs linear-light reference)
 
-| Source | oximg (defaults, jpegli) | oximg `PRESET=fast` | imgproxy default | imgproxy linear* | imagor 1.9.2 |
+| Source | oximg (defaults, jpegli) | oximg `PRESET=fast` | imgproxy default | sharp default | imagor 1.9.2* |
 |---|---|---|---|---|---|
-| Kodak 768px | **77.5** | 75.9 | 71.2 | 72.4 | 71.2 |
-| medium 2000px | **72.2** | 72.6 | 60.1 | 69.4 | 60.1 |
-| large 4000px | **67.5** | 68.3 | 49.7 | 49.7* | 51.6 |
+| Kodak 768px (n=24) | **77.5** | 76.0 | 71.2 | 71.2 | 71.2 |
+| medium 2000px (n=12) | **77.5** | 76.4 | 65.8 | 65.8 | 60.1 |
+| large 4000px (n=12) | **77.3** | 76.1 | 56.2 | 58.0 | 51.6 |
 
-\* imgproxy with `IMGPROXY_USE_LINEAR_COLORSPACE=1`. On the large-source
-group its output was byte-identical to the default configuration.
+\* imagor is not driven by `run.py`; its column is carried over from the
+earlier 3-image run and is on the old corpus.
+
+**Shrink-on-load was the ceiling here, not the encoder.** These rows
+were 77.5 / 74.7 / 71.4 until 2026-08, when JPEG shrink-on-load stopped
+being the default (see the `OXIMG_DCT_MARGIN` row in the README):
+decoding at full size and handing the whole reduction to the resampler
+is worth +2.8 points on the medium group and +5.9 on the large one, for
+the same bytes. Measured by running this harness twice over the same
+corpus, once with `OXIMG_DCT_MARGIN=1.7` — every competitor's score is
+identical across the two runs, which is the control that makes the
+oximg delta attributable.
+
+Note what the shape of the new column says: oximg now scores ~77.4 on
+all three groups, where before it fell away as sources got larger. The
+resize is no longer measurably lossy against the linear-light ground
+truth at any ratio in the corpus, so what is left is the encoder — the
+Group A number.
 
 At q80 oximg produces 33.9 KB (Kodak group mean, jpegli default);
 imgproxy reaches a lower score (76.0) at q90 with 63.8 KB.
@@ -61,13 +83,17 @@ The speed profile (`OXIMG_JPEG_PROGRESSIVE=0`, see BENCH.md) scores
 **identically to the default on all 30 corpus images** — baseline and
 progressive jpegli encode the same quantized coefficients, differing
 only in entropy layout — at +9-11% bytes (Kodak group: 37.2 KB vs
-34.0 KB; imgproxy produces 35.0 KB at 71.2). Re-measured 2026-07 at
-HEAD (streamed SIMD resize on both architectures): 77.5 / 72.1 / 67.3
-for the three groups, matching the table above.
+34.0 KB; imgproxy produces 35.0 KB at 71.2). That comparison was made
+on the 30-image corpus and at the old decode default; the property it
+rests on (identical coefficients, different entropy layout) is not one
+the decode scale can touch, but the byte figures are from that run.
 
 Scores with oximg's quality-reducing knobs (`OXIMG_RESIZE=srgb
 OXIMG_DCT_MARGIN=1.0`) are ~60 on the medium group — the same level as
-imgproxy's and imagor's defaults. Throughput for all profiles is in
+imgproxy's and imagor's defaults. Both are explicit settings, so that
+figure is unaffected by the default change; it is now the *distance*
+from the default that grew, since the default no longer shrinks on
+load. Throughput for all profiles is in
 [../../BENCH.md](../../BENCH.md).
 
 ## PNG and WebP (same-format in/out, fit 500x500)
