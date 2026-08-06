@@ -43,7 +43,12 @@ def sh(*cmd):
 
 def sources():
     out = []
-    for sub in ("src", "large"):
+    # `medium` was measured for QUALITY.md's Group B table but never
+    # walked here, so the harness could not reproduce its own published
+    # row. It is the most interesting ratio for the decode-scale
+    # question (2000px into 500 is where the old shrink default landed
+    # on a middling numerator), so it belongs in the sweep.
+    for sub in ("src", "medium", "large"):
         for p in sorted((CORPUS / sub).glob("*.jpg")):
             out.append((f"{sub}/{p.name}", p))
     return out
@@ -72,7 +77,10 @@ def gen_outputs(ctx):
     d, rows, sharp_jobs = ctx["dir"], [], []
     for q in QUALITIES:
         # --- group A: encoder isolation (from master pixels) ---
-        for svc, preset in (("oximg-fast", "fast"), ("oximg-small", "small")):
+        # jpegli is the shipped default and the row QUALITY.md publishes;
+        # it was measured by hand before and so could drift from the
+        # harness. from_preset maps anything not fast/small to it.
+        for svc, preset in (("oximg-jpegli", "jpegli"), ("oximg-fast", "fast"), ("oximg-small", "small")):
             out = d / f"A_{svc}_q{q}.jpg"
             sh(QCLI, "encode", ctx["master_ppm"], q, preset, out)
             rows.append(("A", svc, q, out))
@@ -85,7 +93,7 @@ def gen_outputs(ctx):
                                    out=str(out), quality=q, mozjpeg=moz))
             rows.append(("A", svc, q, out))
         # --- group B: end-to-end (from JPEG source) ---
-        for svc, preset in (("oximg-fast", "fast"), ("oximg-small", "small")):
+        for svc, preset in (("oximg-jpegli", "jpegli"), ("oximg-fast", "fast"), ("oximg-small", "small")):
             out = d / f"B_{svc}_q{q}.jpg"
             sh(QCLI, "resize", ctx["src"], MAXW, MAXH, q, preset, out)
             rows.append(("B", svc, q, out))

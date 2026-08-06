@@ -151,7 +151,7 @@ mod tests {
             fir_backend: false,
             auto_rotate: true,
             icc_passthrough: true,
-            dct_margin: 1.7,
+            dct_margin: None,
             jpegli_progressive: true,
             flatten_bg: [255, 255, 255],
             png_compression: None,

@@ -243,12 +243,44 @@ fn fit_dims(src_w: usize, src_h: usize, max_w: u32, max_h: u32) -> (usize, usize
 
 /// Pick the smallest num (num/8 DCT scaling) whose decoded size stays at
 /// or above target size x margin. libjpeg's scaled size is
-/// ceil(dim * num / 8).
-/// margin=1.0 is fastest (greedy), but DCT truncation destroys the
-/// high-frequency headroom Lanczos needs and end-to-end quality drops
-/// visibly; around margin 2.0 the remaining shrink is done by SIMD
-/// Lanczos and quality approaches a full decode.
-fn dct_scale_num(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, margin: f64) -> u8 {
+/// ceil(dim * num / 8). `None` — the default — decodes at full size.
+///
+/// Shrink-on-load only ever costs quality, so it is off unless asked
+/// for. The old default (1.7) was chosen believing that ~2x of headroom
+/// let Lanczos recover what the DCT truncation dropped; a sweep of
+/// every reachable numerator over the quality corpus
+/// (bench/quality/dct_sweep.py) says otherwise. Full decode is the best
+/// cell or within 0.04 of it at every ratio measured, the penalty is
+/// erratic rather than graded — 3/8 measured 13.4 SSIMULACRA2 points
+/// below full decode at 5.3x while 5/8 on the same image was optimal —
+/// and no single margin dodges the bad scales everywhere: 3.0 fixes
+/// 5.3x and is worse than 1.7 at 4x. ImageMagick reproduces the same
+/// dips through its own jpeg:size hint, so this is libjpeg's reduced
+/// IDCT rather than anything here.
+/// The margin the *buffered* decode paths keep when the knob is unset.
+///
+/// Where a whole frame is staged at the decode size — CMYK/YCCK JPEG,
+/// and WebP — shrink-on-load is not paying for quality, it is paying
+/// for memory, and the exchange rate is nothing like the streaming
+/// arm's. Measured on a 4000x2667 source into 750px: CMYK peaks at
+/// 23.7 MB with this margin against 111.5 MB decoding full size, and
+/// WebP at 21.7 MB against 133.9 MB. The quality those buy back (5.1
+/// SSIMULACRA2 points for WebP) is not worth 6x the resident set in a
+/// service whose whole point is fitting in a small container. The
+/// streaming arm, where the decode size never materializes, pays no
+/// such price and so defaults to no shrink at all.
+pub(crate) const BUFFERED_DCT_MARGIN: f64 = 1.7;
+
+fn dct_scale_num(
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    margin: Option<f64>,
+) -> u8 {
+    let Some(margin) = margin else {
+        return 8;
+    };
     let (need_w, need_h) = (
         (dst_w as f64 * margin).ceil() as usize,
         (dst_h as f64 * margin).ceil() as usize,
@@ -263,7 +295,7 @@ fn dct_scale_num(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize, margin:
     8
 }
 
-fn dct_margin() -> f64 {
+fn dct_margin() -> Option<f64> {
     crate::config::config().dct_margin
 }
 

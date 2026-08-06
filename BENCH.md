@@ -669,8 +669,65 @@ distribution's own libvips and ImageMagick builds. Laptop numbers are
 only valid on a charged battery: the Intel box measured 28-38% slow at
 1% battery even on AC.
 
+These rows ran against the released `oximg` gem 0.10.1, which bundles a
+binary from before the decode-scale change — so the oximg row is what
+`gem install oximg` gives you today, and the next release will move it
+along the frontier above: slower on the large group, and scoring where
+QUALITY.md's new numbers put it. The memory column is unaffected, which
+is the column this comparison turns on.
+
+## Decode scale: the throughput/quality frontier (2026-08)
+
+Every throughput table above was measured while JPEG shrink-on-load was
+the default. It no longer is (see the `OXIMG_DCT_MARGIN` row in the
+README): it only ever cost quality, and the more of the reduction it
+did, the more it cost. That moves the large-source cells, and the
+honest way to show it is not one number but the frontier — because the
+old default's throughput was bought at a quality nobody would choose on
+purpose.
+
+Same box (Apple M2 Max), 7360x4912 → 500x500, `ab -n 300 -c 8`, three
+interleaved rounds. The quality column is the same reduction (14.7x) on
+real photographs — SSIMULACRA2 against a linear-light Lanczos reference,
+6 sources, q80 — since plasma fractals say nothing about quality:
+
+| Decode | `OXIMG_DCT_MARGIN` | req/s | SSIMULACRA2 |
+|---|---|---|---|
+| full size (**default**) | unset | 41.3 | **76.9** |
+| DCT does ≤ 2x | ~7 | 48.4 | 75.7 |
+| DCT does ≤ 4x | ~3.5 | **62.7** | 71.5 |
+| DCT does the lot (old default) | 1.7 | **71.4** | 59.4 |
+| *imgproxy 4.0.9, for reference* | — | *60.7* | *~56* |
+
+Read the last two rows together: the 71.7 req/s this document used to
+lead with on large sources was a 59.4-point output, 17.5 points below
+what the same pipeline produces from a full decode. The default now
+sits at the top of the quality column and pays 42% of the throughput
+for it.
+
+Deployments that would rather have the throughput can buy it back by
+the rung, and the middle rung is the interesting one: at
+`OXIMG_DCT_MARGIN=3.5` oximg does 62.7 req/s at 71.5, which is ahead of
+imgproxy on **both** axes at once. That is a better claim than the old
+one, and it is the one the numbers actually support.
+
+What this does *not* change: the peak-RSS rows. Shrink-on-load never
+bought memory on the streaming JPEG path — nothing full-frame is
+resident there — and the buffered paths (CMYK/YCCK JPEG, WebP) keep
+their 1.7 margin precisely because it is memory they buy. Measured
+across the change: CMYK 23.7 MB both ways, WebP 21.8 → 21.4 MB.
+
 ## Notes
 
+- **Every throughput table below this line predates the decode-scale
+  change** and was measured with shrink-on-load on, i.e. at the bottom
+  row of the frontier above. The oximg cells for large sources are the
+  ones that move; small-source cells (where no shrink was selected
+  anyway) do not, and no competitor cell does. Sized on the one cell
+  that could be re-run locally: 71.4 → 41.3 req/s at 7360x4912 → 500,
+  614.97 → 513.08 at 2000x1333 → 500. The AWS grids cannot be re-run
+  from here, so they are left as measured and labelled rather than
+  quietly adjusted.
 - Measurement provenance: the official-harness tables (local Ryzen and
   AWS) were measured at the 0.3.0 cross-format + fused-overlap state
   (2026-07-05). The metadata work since (0.4.x: EXIF/AVIF orientation,
