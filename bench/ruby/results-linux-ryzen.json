@@ -1,0 +1,137 @@
+[
+  {
+    "group": "large 4000x2667",
+    "gem": "oximg",
+    "ms": 76.60045067314059,
+    "bytes": 86402,
+    "cpu": 0.840118,
+    "rss_mb": 41.07421875,
+    "dims": "750x500"
+  },
+  {
+    "group": "large 4000x2667",
+    "gem": "ruby-vips",
+    "ms": 71.67158469868203,
+    "bytes": 88656,
+    "cpu": 0.831758,
+    "rss_mb": 419.28515625,
+    "dims": "750x500"
+  },
+  {
+    "group": "large 4000x2667",
+    "gem": "image_processing/vips",
+    "ms": 72.93477068499972,
+    "bytes": 100257,
+    "cpu": 0.924839,
+    "rss_mb": 365.0859375,
+    "dims": "750x500"
+  },
+  {
+    "group": "large 4000x2667",
+    "gem": "image_processing/magick",
+    "ms": 235.92696164269,
+    "bytes": 88486,
+    "cpu": 2.9646090000000003,
+    "rss_mb": 169.89453125,
+    "dims": "750x500"
+  },
+  {
+    "group": "large 4000x2667",
+    "gem": "mini_magick",
+    "ms": 235.87803499928364,
+    "bytes": 88486,
+    "cpu": 2.964211,
+    "rss_mb": 170.046875,
+    "dims": "750x500"
+  },
+  {
+    "group": "medium 2000x1334",
+    "gem": "oximg",
+    "ms": 20.63556298768769,
+    "bytes": 86603,
+    "cpu": 0.34425,
+    "rss_mb": 22.3125,
+    "dims": "750x500"
+  },
+  {
+    "group": "medium 2000x1334",
+    "gem": "ruby-vips",
+    "ms": 18.411220361789066,
+    "bytes": 89560,
+    "cpu": 0.353116,
+    "rss_mb": 141.00390625,
+    "dims": "750x500"
+  },
+  {
+    "group": "medium 2000x1334",
+    "gem": "image_processing/vips",
+    "ms": 21.56206771420936,
+    "bytes": 101389,
+    "cpu": 0.47672699999999996,
+    "rss_mb": 149.71875,
+    "dims": "750x500"
+  },
+  {
+    "group": "medium 2000x1334",
+    "gem": "image_processing/magick",
+    "ms": 69.79016303860892,
+    "bytes": 88600,
+    "cpu": 0.9687520000000001,
+    "rss_mb": 62.12109375,
+    "dims": "750x500"
+  },
+  {
+    "group": "medium 2000x1334",
+    "gem": "mini_magick",
+    "ms": 68.90648731496185,
+    "bytes": 88600,
+    "cpu": 0.9660879999999998,
+    "rss_mb": 62.14453125,
+    "dims": "750x500"
+  },
+  {
+    "group": "kodak 768x512",
+    "gem": "oximg",
+    "ms": 11.993794643785805,
+    "bytes": 74897,
+    "cpu": 0.447759,
+    "rss_mb": 22.51171875,
+    "dims": "750x500"
+  },
+  {
+    "group": "kodak 768x512",
+    "gem": "ruby-vips",
+    "ms": 5.6771624949760735,
+    "bytes": 79969,
+    "cpu": 0.36299200000000004,
+    "rss_mb": 89.140625,
+    "dims": "750x500"
+  },
+  {
+    "group": "kodak 768x512",
+    "gem": "image_processing/vips",
+    "ms": 7.7773623779648915,
+    "bytes": 88899,
+    "cpu": 0.5730649999999999,
+    "rss_mb": 90.53515625,
+    "dims": "750x500"
+  },
+  {
+    "group": "kodak 768x512",
+    "gem": "image_processing/magick",
+    "ms": 26.475975784705952,
+    "bytes": 91840,
+    "cpu": 0.963384,
+    "rss_mb": 28.87109375,
+    "dims": "750x500"
+  },
+  {
+    "group": "kodak 768x512",
+    "gem": "mini_magick",
+    "ms": 26.70709212543443,
+    "bytes": 91840,
+    "cpu": 0.976919,
+    "rss_mb": 28.859375,
+    "dims": "750x500"
+  }
+]

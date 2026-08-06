@@ -1,0 +1,71 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    ffi (1.17.4)
+    ffi (1.17.4-aarch64-linux-gnu)
+    ffi (1.17.4-aarch64-linux-musl)
+    ffi (1.17.4-arm-linux-gnu)
+    ffi (1.17.4-arm-linux-musl)
+    ffi (1.17.4-arm64-darwin)
+    ffi (1.17.4-x86-linux-gnu)
+    ffi (1.17.4-x86-linux-musl)
+    ffi (1.17.4-x86_64-darwin)
+    ffi (1.17.4-x86_64-linux-gnu)
+    ffi (1.17.4-x86_64-linux-musl)
+    image_processing (1.14.0)
+      mini_magick (>= 4.9.5, < 6)
+      ruby-vips (>= 2.0.17, < 3)
+    logger (1.7.0)
+    mini_magick (5.3.3)
+      logger
+    oximg (0.10.1)
+    oximg (0.10.1-aarch64-linux-gnu)
+    oximg (0.10.1-arm64-darwin)
+    oximg (0.10.1-x86_64-linux-gnu)
+    ruby-vips (2.3.0)
+      ffi (~> 1.12)
+      logger
+
+PLATFORMS
+  aarch64-linux-gnu
+  aarch64-linux-musl
+  arm-linux-gnu
+  arm-linux-musl
+  arm64-darwin
+  ruby
+  x86-linux-gnu
+  x86-linux-musl
+  x86_64-darwin
+  x86_64-linux-gnu
+  x86_64-linux-musl
+
+DEPENDENCIES
+  image_processing (~> 1.13)
+  mini_magick (~> 5.3)
+  oximg (~> 0.10)
+  ruby-vips (~> 2.3)
+
+CHECKSUMS
+  bundler (4.0.14) sha256=d09a0a965cf772266a7e49e83610be7c2f4e49e61134c42a56804bb383cc24b8
+  ffi (1.17.4) sha256=bcd1642e06f0d16fc9e09ac6d49c3a7298b9789bcb58127302f934e437d60acf
+  ffi (1.17.4-aarch64-linux-gnu) sha256=b208f06f91ffd8f5e1193da3cae3d2ccfc27fc36fba577baf698d26d91c080df
+  ffi (1.17.4-aarch64-linux-musl) sha256=9286b7a615f2676245283aef0a0a3b475ae3aae2bb5448baace630bb77b91f39
+  ffi (1.17.4-arm-linux-gnu) sha256=d6dbddf7cb77bf955411af5f187a65b8cd378cb003c15c05697f5feee1cb1564
+  ffi (1.17.4-arm-linux-musl) sha256=9d4838ded0465bef6e2426935f6bcc93134b6616785a84ffd2a3d82bc3cf6f95
+  ffi (1.17.4-arm64-darwin) sha256=19071aaf1419251b0a46852abf960e77330a3b334d13a4ab51d58b31a937001b
+  ffi (1.17.4-x86-linux-gnu) sha256=38e150df5f4ca555e25beca4090823ae09657bceded154e3c52f8631c1ed72cf
+  ffi (1.17.4-x86-linux-musl) sha256=fbeec0fc7c795bcf86f623bb18d31ea1820f7bd580e1703a3d3740d527437809
+  ffi (1.17.4-x86_64-darwin) sha256=aa70390523cf3235096cf64962b709b4cfbd5c082a2cb2ae714eb0fe2ccda496
+  ffi (1.17.4-x86_64-linux-gnu) sha256=9d3db14c2eae074b382fa9c083fe95aec6e0a1451da249eab096c34002bc752d
+  ffi (1.17.4-x86_64-linux-musl) sha256=3fdf9888483de005f8ef8d1cf2d3b20d86626af206cbf780f6a6a12439a9c49e
+  image_processing (1.14.0) sha256=754cc169c9c262980889bec6bfd325ed1dafad34f85242b5a07b60af004742fb
+  logger (1.7.0) sha256=196edec7cc44b66cfb40f9755ce11b392f21f7967696af15d274dde7edff0203
+  mini_magick (5.3.3) sha256=b3beed8a8cef36bd03666365f14b89cd344da0ecd373af53e617c71bfd426aab
+  oximg (0.10.1) sha256=ad73977f46d913489a22bcad30d060d50424253b42ddc7fc0d1860a49cef74e2
+  oximg (0.10.1-aarch64-linux-gnu) sha256=67cc8f697095781e91bdc568491d78d59177a98e070db097fa3a298f6b80b73a
+  oximg (0.10.1-arm64-darwin) sha256=fd88e95e9493d5486658ab4f9d61ac4a6d013d2866603f5a5549cf2f924dbef1
+  oximg (0.10.1-x86_64-linux-gnu) sha256=ccc9217954c22b560a29df3e98c22ee7b8f69862adfbaed74994d823a178ed55
+  ruby-vips (2.3.0) sha256=e685ec02c13969912debbd98019e50492e12989282da5f37d05f5471442f5374
+
+BUNDLED WITH
+  4.0.14

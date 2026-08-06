@@ -1,0 +1,10 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+# The contenders. oximg comes from rubygems.org like anyone else would
+# install it — the platform gem, binary bundled.
+gem "oximg", "~> 0.10"
+gem "ruby-vips", "~> 2.3"          # ActiveStorage default since Rails 7
+gem "image_processing", "~> 1.13"  # the layer ActiveStorage actually calls
+gem "mini_magick", "~> 5.3"        # the other ActiveStorage processor
