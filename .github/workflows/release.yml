@@ -157,3 +157,110 @@ jobs:
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The `oximg` gem, published as one plain-Ruby gem plus a platform gem
+  # per released binary. The platform gems bundle the executable the
+  # `binaries` job just uploaded, which is the whole point: `bundle
+  # install` and a Rails app has image processing, with no libvips or
+  # ImageMagick on the box. Platforms with no build (Intel macOS, musl)
+  # fall back to the plain gem, which resolves a binary from OXIMG_BIN
+  # or PATH.
+  #
+  # 0.10.1 was pushed by hand, so both gem names already exist: what this
+  # job needs is a trusted publisher on each gem's settings page
+  # (repository, this workflow file, the `release` environment). Without
+  # it the OIDC exchange has nothing to match and the push 403s.
+  rubygem:
+    needs: binaries
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write # OIDC token exchange for RubyGems Trusted Publishing
+      contents: read # gh release download
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: Tag matches the gem version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          gem_version=$(grep -m1 'VERSION = ' rubygem/oximg/lib/oximg/version.rb | cut -d'"' -f2)
+          test "$tag" = "$gem_version" || { echo "::error::tag $tag != gem $gem_version"; exit 1; }
+      # The suite CI runs against a real binary; here it runs without
+      # one (the integration cases skip themselves), which is still
+      # enough to catch a gem that cannot even load.
+      - name: Test
+        working-directory: rubygem/oximg
+        run: |
+          bundle install --jobs 4
+          bundle exec rake test
+      - name: Download the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'oximg-*.tar.gz' --dir dist
+      - name: Build the gems
+        working-directory: rubygem/oximg
+        run: |
+          set -euo pipefail
+          dist="$GITHUB_WORKSPACE/dist"
+          mkdir -p exe && rm -f exe/oximg
+          # Plain-Ruby gem first, while exe/ is still empty.
+          gem build oximg.gemspec -o "$dist/oximg-ruby.gem"
+          for pair in x86_64-unknown-linux-gnu:x86_64-linux-gnu \
+                      aarch64-unknown-linux-gnu:aarch64-linux-gnu \
+                      aarch64-apple-darwin:arm64-darwin; do
+            target="${pair%%:*}"
+            platform="${pair##*:}"
+            name="oximg-${GITHUB_REF_NAME}-${target}"
+            tar xzf "$dist/$name.tar.gz" -C "$dist"
+            install -m 0755 "$dist/$name/oximg" exe/oximg
+            OXIMG_GEM_PLATFORM="$platform" gem build oximg.gemspec -o "$dist/oximg-$platform.gem"
+          done
+          rm -f exe/oximg
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
+      - name: Publish
+        run: |
+          set -euo pipefail
+          for gem in "$GITHUB_WORKSPACE"/dist/oximg-*.gem; do
+            gem push "$gem"
+          done
+
+  # Separate job, not a second push in the one above: a trusted
+  # publisher's credentials are scoped to the gem they were configured
+  # for, so each gem name exchanges its own OIDC token. Ordered after
+  # `oximg` because oximg-rails depends on it.
+  rubygem-rails:
+    needs: rubygem
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: Tag matches the gem version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          gem_version=$(grep -m1 'VERSION = ' rubygem/oximg-rails/lib/oximg/rails/version.rb | cut -d'"' -f2)
+          test "$tag" = "$gem_version" || { echo "::error::tag $tag != gem $gem_version"; exit 1; }
+      - name: Test
+        working-directory: rubygem/oximg-rails
+        run: |
+          bundle install --jobs 4
+          bundle exec rake test
+      - name: Build
+        working-directory: rubygem/oximg-rails
+        run: gem build oximg-rails.gemspec -o oximg-rails.gem
+      - uses: rubygems/configure-rubygems-credentials@v2.1.0
+      - name: Publish
+        run: gem push rubygem/oximg-rails/oximg-rails.gem

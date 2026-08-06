@@ -151,3 +151,41 @@ jobs:
       # while making a silent slide into the 70s a red build.
       - name: Coverage summary
         run: cargo llvm-cov --release --features avif --summary-only --fail-under-lines 80
+
+  # The Ruby gems: `oximg` drives the binary, `oximg-rails` builds URLs
+  # for the server. Both suites run against a real oximg build rather
+  # than a stub — the CLI grammar and the signing scheme are the
+  # contracts between the two languages, and a stub would agree with
+  # whatever the gem believes.
+  rubygem:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor we declare and the current release: Ruby 3.4 moved
+        # base64 out of the default gems, which is why the signer packs
+        # its own.
+        ruby: ["3.1", "3.4"]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Debug, not release: this job asks whether the CLI still answers
+      # what the gem says, not how fast it does it.
+      - name: Build the oximg binary
+        run: cargo build
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Test oximg
+        working-directory: rubygem/oximg
+        run: |
+          bundle install --jobs 4
+          bundle exec rake test
+      - name: Test oximg-rails
+        working-directory: rubygem/oximg-rails
+        run: |
+          bundle install --jobs 4
+          bundle exec rake test
