@@ -8,6 +8,108 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
+## [0.11.0] - 2026-08-07
+
+A minor, not a patch: the default JPEG output changes. Sources that
+were being downscaled score materially higher and take materially
+longer, and no re-encode of an existing URL is byte-identical to the
+0.10.x one. Also the release where oximg becomes installable from Ruby.
+
+### Changed
+
+- **JPEG shrink-on-load is off by default** — the pipeline decodes at
+  full size and hands the whole reduction to the resampler. It had been
+  on at a 1.7x margin and described in the README as quality-first
+  processing; measurement says the opposite. libjpeg's reduced IDCT is
+  erratic per scale rather than graded: on a 5.3x downscale the 1.7
+  default selected the 3/8 scale, which measured **13.4 SSIMULACRA2
+  points below a full decode for the same output size and the same
+  bytes**, while 5/8 on the same image was optimal. ImageMagick
+  reproduces the same dips through its own `jpeg:size` hint, so this is
+  libjpeg's behaviour and not this pipeline's. No single margin avoids
+  the bad scales at every ratio — 3.0 fixes 5.3x and is *worse* than
+  1.7 at 4x — so the fix is to stop asking for one. Over the quality
+  corpus at six ratios, full decode is the best cell or within 0.04 of
+  it every time (`bench/quality/dct_sweep.py`).
+
+  What it costs: **42% of the throughput on the extreme cell** (7360x4912
+  into 500x500, 71.4 -> 41.3 req/s). What the old number bought is the
+  part worth stating — that 71.4 req/s was a 59.4-point output, 17.5
+  points below what the same pipeline produces from a full decode.
+  BENCH.md now publishes the frontier instead of one cell, and
+  `OXIMG_DCT_MARGIN` buys the throughput back by the rung: at 3.5 oximg
+  does 62.7 req/s at 71.5, ahead of imgproxy on both axes at once.
+
+  Published Group B scores (q80, vs the linear-light reference), same
+  corpus, measured with and without the change so competitors act as
+  the control: Kodak 768px 77.5 -> 77.5, medium 2000px 74.7 -> **77.5**,
+  large 4000px 71.4 -> **77.3**. oximg now sits at ~77.4 on all three
+  groups instead of falling away as sources grow.
+
+- **The buffered decode paths keep the 1.7 margin**, because there the
+  shrink is buying memory rather than costing throughput: decoding full
+  size takes CMYK/YCCK JPEG from 23.7 MB to 111.5 MB and WebP from
+  21.7 MB to 133.9 MB, against 37.0 -> 37.5 MB (noise) on the streaming
+  JPEG arm where nothing full-frame is resident. WebP does score 5.1
+  points better full-size, monotonically — libwebp rescales properly
+  instead of truncating coefficients — but five points is not worth six
+  times the resident set here. `OXIMG_DCT_MARGIN` still overrides
+  every path.
+
+- `OXIMG_DCT_MARGIN` is now documented as the speed knob it is, and
+  defaults to unset rather than 1.7.
+
+### Added
+
+- **Two Ruby gems.** `oximg` drives the executable from Ruby
+  (`Oximg.resize`, `Oximg.probe`) so a Rails app can compress and
+  resize with no libvips and no ImageMagick on the box — platform gems
+  bundle the binary, so `bundle install` is the installation.
+  `oximg-rails` owns the remote half: `Oximg::Server` builds and
+  HMAC-signs URLs for a server, against the same vectors the Rust
+  integration suite serves 200s for. The ActiveStorage glue is not
+  written yet and the README says so.
+
+- **musl builds**, for Alpine — the base image most Ruby containers
+  use, and the one platform a glibc binary cannot serve at all. Built
+  natively inside an Alpine container rather than cross-compiled (the
+  C++ codec stack was the reason this was called future work; it turns
+  out not to need cross-compiling), and static-pie linked, so unlike
+  the gnu builds they carry no minimum-glibc caveat. Released as
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`
+  binaries and as `x86_64-linux-musl` / `aarch64-linux-musl` platform
+  gems.
+
+- **A quality-per-byte benchmark for the Ruby image-processing gems**
+  (`bench/ruby/`), measuring wall time, CPU seconds and peak RSS across
+  three CPUs. On 4000x2667 sources oximg peaks at 37-41 MB against
+  ruby-vips' 373-424 MB while matching it on wall time to within 6%;
+  ImageMagick burns 3.5-4x the CPU. Each pair runs in its own
+  subprocess under `/usr/bin/time`, because one Ruby VM that has loaded
+  libvips, loaded ImageMagick and spawned oximg reports the high-water
+  mark of whichever ran worst.
+
+- **`bench/quality/dct_sweep.py`**, which measures quality as a
+  function of the decode scale over the whole corpus at several ratios
+  — the evidence the default change rests on.
+
+### Fixed
+
+- The quality harness now walks the `medium` corpus and runs the jpegli
+  preset. QUALITY.md published a medium row and a jpegli column that
+  `run.py` could not produce, which is how a table drifts from the tool
+  that is supposed to defend it.
+- `Cargo.toml`'s feature comment listed `ureq` — a dev-dependency,
+  never in a normal build — as something `--no-default-features` drops,
+  and omitted `reqwest` and `serde_json`, which the `server` feature
+  does pull in. Verified against `cargo tree` rather than re-read.
+
+### Corpus
+
+The photograph groups in the quality corpus go from 3 images to 12 (and
+their 2000px derivatives with them), so the numbers above are measured
+rather than inferred from the 24-image Kodak group.
+
 ## [0.10.1] - 2026-08-05
 
 Internal only, and a patch because the output is byte-identical: 3,372

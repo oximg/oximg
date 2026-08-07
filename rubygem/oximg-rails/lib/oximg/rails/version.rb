@@ -7,6 +7,6 @@ module Oximg
   module Rails
     # Tracks the oximg release whose URL grammar the client speaks, the
     # same convention as the oximg gem and the npm package.
-    VERSION = "0.10.1"
+    VERSION = "0.11.0"
   end
 end
