@@ -26,12 +26,20 @@ resolve a binary from `OXIMG_BIN` or PATH.
 |---|---|---|
 | `x86_64-linux-gnu` | `x86_64-unknown-linux-gnu` | glibc; spelled `-gnu` so it never installs on musl |
 | `aarch64-linux-gnu` | `aarch64-unknown-linux-gnu` | glibc |
+| `x86_64-linux-musl` | `x86_64-unknown-linux-musl` | Alpine. Built natively in an Alpine container, static-pie linked — no libc to match at all |
+| `aarch64-linux-musl` | `aarch64-unknown-linux-musl` | Alpine on arm64 |
 | `arm64-darwin` | `aarch64-apple-darwin` | Apple silicon |
-| (plain Ruby) | — | Intel macOS, Alpine/musl, anything else: needs a binary on PATH |
+| (plain Ruby) | — | Intel macOS, anything else: needs a binary on PATH |
 
-Filling the musl and Intel-macOS gaps means adding those targets to the
-`binaries` job first; the gem side is one more line in the platform
-loop.
+Alpine is the one platform where "it works on Linux" is not an answer —
+a glibc binary does not run there — so CI proves it end to end on every
+push (`rubygem-musl`): build in Alpine, run both suites there, then
+build the platform gem, install it into an empty `GEM_HOME` with only
+`ruby` present, and resize a real image through it. If that needs a
+build toolchain, the gem is not self-contained and the premise of
+shipping one has failed.
+
+Intel macOS is the remaining gap and falls back to the plain gem.
 
 ## Testing
 

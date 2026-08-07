@@ -98,10 +98,9 @@ jobs:
   # smoke-tested as artifacts, then attached to the release with
   # checksums. Default features (server + CLI, no AVIF) to match
   # crates.io and Homebrew; the Docker images stay the AVIF-included
-  # channel. Linux binaries are glibc builds (Ubuntu 24.04, so glibc
-  # >= 2.39 — fine for the CI-runner audience); a musl build would
-  # need the C++ codec stack (jpegli) cross-compiled and is future
-  # work.
+  # channel. These are the glibc builds (Ubuntu 24.04, so glibc >=
+  # 2.39 — fine for the CI-runner audience); musl has its own job
+  # below.
   binaries:
     needs: github-release
     if: github.ref_type == 'tag'
@@ -158,20 +157,76 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
+  # musl builds, for Alpine — the base image most Ruby containers use,
+  # and where a glibc binary simply does not run. The build is native
+  # inside an Alpine container rather than a cross-compile, because the
+  # hard part was never Rust: jpegli is C++, and pointing a
+  # cross-toolchain at it is a different job from letting Alpine's own
+  # gcc build it. `docker run` rather than a job-level `container:`,
+  # since actions/checkout ships a glibc node and cannot run on Alpine.
+  #
+  # The output is static-pie linked — no interpreter, no libc to match —
+  # so unlike the gnu builds it carries no minimum-glibc caveat.
+  binaries-musl:
+    needs: github-release
+    if: github.ref_type == 'tag'
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      # rust:alpine is multi-arch, so each runner pulls its own
+      # architecture and builds natively — no QEMU in the loop.
+      - name: Build in Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
+            apk add --no-cache build-base cmake nasm >/dev/null &&
+            cargo build --release --locked &&
+            strip target/release/oximg'
+      - name: Smoke test the artifact
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD":/src -w /src alpine:latest sh -c '
+            set -e
+            ./target/release/oximg --version
+            ./target/release/oximg resize tests/fixtures/photo.jpg 100 100 /tmp/smoke.webp
+            ./target/release/oximg probe /tmp/smoke.webp | grep -q image/webp'
+          echo "ok: runs on bare Alpine, no runtime dependencies"
+      - name: Package and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="oximg-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          sudo chown "$(id -u):$(id -g)" target/release/oximg
+          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
   # The `oximg` gem, published as one plain-Ruby gem plus a platform gem
   # per released binary. The platform gems bundle the executable the
-  # `binaries` job just uploaded, which is the whole point: `bundle
+  # `binaries` jobs just uploaded, which is the whole point: `bundle
   # install` and a Rails app has image processing, with no libvips or
-  # ImageMagick on the box. Platforms with no build (Intel macOS, musl)
-  # fall back to the plain gem, which resolves a binary from OXIMG_BIN
-  # or PATH.
+  # ImageMagick on the box. Platforms with no build (Intel macOS) fall
+  # back to the plain gem, which resolves a binary from OXIMG_BIN or
+  # PATH.
   #
   # 0.10.1 was pushed by hand, so both gem names already exist: what this
   # job needs is a trusted publisher on each gem's settings page
   # (repository, this workflow file, the `release` environment). Without
   # it the OIDC exchange has nothing to match and the push 403s.
   rubygem:
-    needs: binaries
+    needs: [binaries, binaries-musl]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     environment: release
@@ -212,8 +267,15 @@ jobs:
           mkdir -p exe && rm -f exe/oximg
           # Plain-Ruby gem first, while exe/ is still empty.
           gem build oximg.gemspec -o "$dist/oximg-ruby.gem"
+          # The Linux platforms are spelled out per libc: an
+          # unqualified `x86_64-linux` gem installs on musl too, where a
+          # glibc binary cannot run. RubyGems reports `x86_64-linux-musl`
+          # as the local platform on Alpine, so these are the names
+          # bundler matches against.
           for pair in x86_64-unknown-linux-gnu:x86_64-linux-gnu \
                       aarch64-unknown-linux-gnu:aarch64-linux-gnu \
+                      x86_64-unknown-linux-musl:x86_64-linux-musl \
+                      aarch64-unknown-linux-musl:aarch64-linux-musl \
                       aarch64-apple-darwin:arm64-darwin; do
             target="${pair%%:*}"
             platform="${pair##*:}"
