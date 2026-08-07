@@ -56,7 +56,10 @@ pic-scale = "0.7"
 # The `oximg` binary needs `server`; it is on by default so `cargo
 # build`/`cargo install` produce it. Library users who only want the
 # `pipeline` API build with `--no-default-features` to drop the whole
-# HTTP stack (axum, tokio, ureq, hmac, sha2).
+# HTTP stack — the `server` list below, i.e. axum, tokio, reqwest,
+# hmac, sha2 and serde_json. (ureq is a dev-dependency: the
+# integration suites' client, never in a normal build, so there is
+# nothing for a feature flag to drop.)
 default = ["server"]
 server = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:hmac", "dep:sha2", "dep:serde_json"]
 avif = ["dep:avif-serialize", "dep:avif-parse", "dep:dav1d-sys"]
