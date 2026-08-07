@@ -205,6 +205,10 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
             apk add --no-cache build-base cmake nasm >/dev/null &&
             cargo build --release --locked'
+          # Root inside the container is root on the mount too, so the
+          # build output lands root-owned on the runner. Give it back
+          # here rather than discovering it in a later step.
+          sudo chown -R "$(id -u):$(id -g)" target
       # Only `ruby` and `ruby-bundler` — no build toolchain. If this
       # needs anything else, the platform gem is not self-contained and
       # the whole premise of shipping one has failed.
@@ -221,6 +225,8 @@ jobs:
               bundle install --jobs 4 >/dev/null
               bundle exec rake test
             done'
+          # bundler wrote vendor/bundle and lockfiles as root.
+          sudo chown -R "$(id -u):$(id -g)" rubygem
       # Proves the shipped artifact, not just the source tree: build the
       # platform gem, install it into an empty GEM_HOME, resize a real
       # image through it.
@@ -245,3 +251,4 @@ jobs:
             rm -f exe/oximg
             GEM_HOME=/tmp/gh gem install /tmp/musl.gem --no-document >/dev/null
             env -u OXIMG_BIN PATH=/usr/bin:/bin GEM_HOME=/tmp/gh ruby /smoke.rb'
+          sudo chown -R "$(id -u):$(id -g)" rubygem target

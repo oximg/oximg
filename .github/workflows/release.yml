@@ -190,6 +190,10 @@ jobs:
             apk add --no-cache build-base cmake nasm >/dev/null &&
             cargo build --release --locked &&
             strip target/release/oximg'
+          # The container builds as root into the mounted workspace, so
+          # every artifact it leaves behind is root-owned. Hand the
+          # whole tree back before any host-side step touches it.
+          sudo chown -R "$(id -u):$(id -g)" target
       - name: Smoke test the artifact
         run: |
           set -euo pipefail
@@ -206,7 +210,6 @@ jobs:
           set -euo pipefail
           name="oximg-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          sudo chown "$(id -u):$(id -g)" target/release/oximg
           cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
