@@ -189,3 +189,66 @@ jobs:
         run: |
           bundle install --jobs 4
           bundle exec rake test
+
+  # The same two suites on Alpine, against a musl build. Alpine is the
+  # base image most Ruby containers use, and it is the one platform
+  # where "it works on Linux" is not an answer: a glibc binary does not
+  # run there at all. Everything happens inside `docker run` rather than
+  # a job-level `container:`, because actions/checkout ships a
+  # glibc-linked node and cannot run on Alpine itself.
+  rubygem-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the musl binary in Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
+            apk add --no-cache build-base cmake nasm >/dev/null &&
+            cargo build --release --locked'
+          # Root inside the container is root on the mount too, so the
+          # build output lands root-owned on the runner. Give it back
+          # here rather than discovering it in a later step.
+          sudo chown -R "$(id -u):$(id -g)" target
+      # Only `ruby` and `ruby-bundler` — no build toolchain. If this
+      # needs anything else, the platform gem is not self-contained and
+      # the whole premise of shipping one has failed.
+      - name: Test both gems on Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:latest sh -c '
+            set -e
+            apk add --no-cache ruby ruby-bundler >/dev/null
+            test "$(ruby -e "puts Gem::Platform.local")" = "x86_64-linux-musl"
+            export BUNDLE_SILENCE_ROOT_WARNING=1
+            for gem in oximg oximg-rails; do
+              cd "/src/rubygem/$gem"
+              bundle config set --local path vendor/bundle >/dev/null
+              bundle install --jobs 4 >/dev/null
+              bundle exec rake test
+            done'
+          # bundler wrote vendor/bundle and lockfiles as root.
+          sudo chown -R "$(id -u):$(id -g)" rubygem
+      # Proves the shipped artifact, not just the source tree: build the
+      # platform gem, install it into an empty GEM_HOME, resize a real
+      # image through it.
+      - name: Install the musl platform gem and use it
+        run: |
+          # A file, not `ruby -e`: this string would otherwise cross a
+          # YAML block, a shell, `docker run`, and another shell, and
+          # each layer wants its own quoting.
+          cat > /tmp/smoke.rb <<'RUBY'
+          require "oximg"
+          puts "executable: #{Oximg.executable}"
+          Oximg.resize("/src/tests/fixtures/photo.jpg", "/tmp/o.webp", width: 120)
+          raise "unexpected output" unless Oximg.probe("/tmp/o.webp") == {content_type: "image/webp", format: :webp, width: 120, height: 90}
+          puts "ok: the platform gem resized on bare Alpine"
+          RUBY
+          docker run --rm -v "$PWD":/src -v /tmp/smoke.rb:/smoke.rb -w /src alpine:latest sh -c '
+            set -e
+            apk add --no-cache ruby >/dev/null
+            cd /src/rubygem/oximg
+            mkdir -p exe && install -m 0755 /src/target/release/oximg exe/oximg
+            OXIMG_GEM_PLATFORM=x86_64-linux-musl gem build oximg.gemspec -o /tmp/musl.gem >/dev/null
+            rm -f exe/oximg
+            GEM_HOME=/tmp/gh gem install /tmp/musl.gem --no-document >/dev/null
+            env -u OXIMG_BIN PATH=/usr/bin:/bin GEM_HOME=/tmp/gh ruby /smoke.rb'
+          sudo chown -R "$(id -u):$(id -g)" rubygem target
