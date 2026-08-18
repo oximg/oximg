@@ -293,6 +293,7 @@ mod tests {
             include_str!("pipeline/jpeg.rs"),
             include_str!("pipeline/fuse.rs"),
             include_str!("pipeline/formats.rs"),
+            include_str!("pipeline/gif.rs"),
             include_str!("pipeline/resolved.rs"),
             #[cfg(feature = "server")]
             include_str!("pipeline/gcs.rs"),

@@ -503,6 +503,26 @@ fn content_types_match_formats() {
     assert_eq!(ImageFormat::Png.content_type(), "image/png");
     assert_eq!(ImageFormat::Webp.content_type(), "image/webp");
     assert_eq!(ImageFormat::Avif.content_type(), "image/avif");
+    assert_eq!(ImageFormat::Gif.content_type(), "image/gif");
+}
+
+/// GIF decodes but never encodes, so it must not be reachable as an
+/// output format: no token names it, and asking for one is a client
+/// error rather than a silent substitution (`@gif` is rejected in
+/// `split_format`, `format=gif` in `options`).
+#[test]
+fn gif_is_not_an_output_format() {
+    assert_eq!(ImageFormat::from_token("gif"), None);
+    assert_eq!(default_target(ImageFormat::Gif), ImageFormat::Webp);
+    for f in [
+        ImageFormat::Jpeg,
+        ImageFormat::Png,
+        ImageFormat::Webp,
+        ImageFormat::Avif,
+    ] {
+        assert_eq!(default_target(f), f, "encodable formats keep themselves");
+    }
+    assert!(!target_supports_icc(ImageFormat::Gif));
 }
 
 #[test]
@@ -517,7 +537,17 @@ fn sniff_detects_formats_by_magic_bytes() {
         ImageFormat::sniff(b"\x00\x00\x00\x1cftypavif"),
         Some(ImageFormat::Avif)
     );
-    assert_eq!(ImageFormat::sniff(b"GIF89a\x00\x00\x00\x00\x00\x00"), None);
+    // Both signatures: GIF87a is still out there, and a decoder that
+    // only knew GIF89a would reject a decade of files.
+    assert_eq!(
+        ImageFormat::sniff(b"GIF89a\x00\x00\x00\x00\x00\x00"),
+        Some(ImageFormat::Gif)
+    );
+    assert_eq!(
+        ImageFormat::sniff(b"GIF87a\x00\x00\x00\x00\x00\x00"),
+        Some(ImageFormat::Gif)
+    );
+    assert_eq!(ImageFormat::sniff(b"GIF88a\x00\x00\x00\x00\x00\x00"), None);
 }
 
 /// Deterministic 4-component JPEG source: plain CMYK (Adobe APP14

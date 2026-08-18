@@ -205,6 +205,10 @@ impl Default for Params {
 fn format_max_dimension(format: ImageFormat) -> Option<u32> {
     match format {
         ImageFormat::Webp => Some(16383),
+        // GIF's logical screen fields are u16. Inert while GIF is
+        // input-only (a source can never exceed it), and correct the
+        // moment it isn't.
+        ImageFormat::Gif => Some(65535),
         _ => None,
     }
 }
@@ -305,6 +309,11 @@ pub enum ImageFormat {
     Png,
     Webp,
     Avif,
+    /// Decode-only. No GIF encoder ships here — a GIF source with no
+    /// requested output becomes WebP (see [`default_target`]) — but the
+    /// variant is a real format everywhere else: `sniff` returns it,
+    /// `probe` reports it, and `content_type` names it.
+    Gif,
 }
 
 impl ImageFormat {
@@ -314,6 +323,7 @@ impl ImageFormat {
             ImageFormat::Png => "image/png",
             ImageFormat::Webp => "image/webp",
             ImageFormat::Avif => "image/avif",
+            ImageFormat::Gif => "image/gif",
         }
     }
 
@@ -322,6 +332,12 @@ impl ImageFormat {
     /// never trusted — these name the *requested* output format.
     /// Returns Avif even in non-avif builds; availability is the
     /// caller's check (HTTP rejects before spending a CPU slot).
+    ///
+    /// Deliberately no `"gif"`: there is no GIF encoder here, so every
+    /// caller that turns a token into an output format — `@{fmt}`,
+    /// `format=`, OXIMG_AUTO_FORMAT, the CLI's output extension — is
+    /// better served by rejecting it than by silently emitting
+    /// something else under a `.gif` name.
     pub fn from_token(token: &str) -> Option<ImageFormat> {
         match token {
             "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
@@ -340,6 +356,8 @@ impl ImageFormat {
             Some(ImageFormat::Png)
         } else if &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
             Some(ImageFormat::Webp)
+        } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+            Some(ImageFormat::Gif)
         } else if &header[4..8] == b"ftyp"
             && (&header[8..12] == b"avif" || &header[8..12] == b"avis")
         {
@@ -347,6 +365,22 @@ impl ImageFormat {
         } else {
             None
         }
+    }
+}
+
+/// What a source becomes when the request names no output format.
+/// Normally the source's own format — the pipeline is a resizer first
+/// and a transcoder second — except for the decode-only ones, which
+/// have to land somewhere they can actually be encoded. GIF goes to
+/// WebP: it is the only target that can carry both an animation and an
+/// alpha channel, and at matched visual scores it measured ~3x smaller
+/// than the best GIF-to-GIF variant on a real-world corpus — where
+/// gifsicle `-O3` saved nothing at all on 9 of 15 files
+/// (docs/gif-evaluation.md §3).
+fn default_target(format: ImageFormat) -> ImageFormat {
+    match format {
+        ImageFormat::Gif => ImageFormat::Webp,
+        other => other,
     }
 }
 
@@ -417,6 +451,10 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
             );
             Ok((format, features.width as usize, features.height as usize))
         },
+        ImageFormat::Gif => {
+            let (w, h) = probe_gif(bytes)?;
+            Ok((format, w, h))
+        }
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
             let (w, h) = crate::avif::probe_avif(bytes)?;
@@ -480,7 +518,7 @@ fn process_reader<R: std::io::Read>(
     let mut header = [0u8; 12];
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
-    let target = p.output.unwrap_or(format);
+    let target = p.output.unwrap_or_else(|| default_target(format));
     // Every knob resolves here, once (override > env > default); the
     // stages below read plain data and never consult the environment.
     // The output format's own dimension ceiling is one more constraint
@@ -496,6 +534,14 @@ fn process_reader<R: std::io::Read>(
     anyhow::ensure!(
         target != ImageFormat::Avif,
         "AVIF support is not enabled in this build"
+    );
+    // Same treatment for the format that decodes but never encodes:
+    // `ImageFormat::Gif` is public, so a library caller can name it as
+    // an output even though no URL token can. Refusing here makes it a
+    // clean 422 instead of a 500 from the encoder's backstop arm.
+    anyhow::ensure!(
+        target != ImageFormat::Gif,
+        "GIF output is not supported (GIF is a decode-only format here)"
     );
     let reader = std::io::BufReader::new(std::io::Read::chain(&header[..], reader));
 
@@ -514,6 +560,7 @@ fn process_reader<R: std::io::Read>(
             })??,
             ImageFormat::Png => process_png(s, reader, target, p)?,
             ImageFormat::Webp => process_webp(s, reader, target, p)?,
+            ImageFormat::Gif => process_gif(s, reader, target, p)?,
             #[cfg(feature = "avif")]
             ImageFormat::Avif => process_avif(s, reader, target, p)?,
             #[cfg(not(feature = "avif"))]
@@ -1132,6 +1179,9 @@ pub fn bench_resolve(p: &Params) -> impl Sized {
 fn target_supports_icc(target: ImageFormat) -> bool {
     match target {
         ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Webp => true,
+        // Never a target (no encoder), and GIF's palette has nowhere to
+        // put a profile anyway.
+        ImageFormat::Gif => false,
         #[cfg(feature = "avif")]
         ImageFormat::Avif => true,
         #[cfg(not(feature = "avif"))]
@@ -1434,6 +1484,7 @@ mod formats;
 mod fuse;
 #[cfg(feature = "server")]
 mod gcs;
+mod gif;
 mod jpeg;
 mod resolved;
 #[cfg(test)]
@@ -1445,6 +1496,9 @@ use encode::*;
 pub use error::{Error, ErrorKind};
 use formats::*;
 use fuse::*;
+// This module, not the `gif` crate — a `mod gif` shadows the extern
+// prelude here. gif.rs reaches the crate as `::gif`.
+use gif::*;
 pub use jpeg::decode_and_resize;
 #[cfg_attr(not(test), allow(unused_imports))] // tests.rs reaches these via super::*
 use jpeg::*;

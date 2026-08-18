@@ -360,6 +360,11 @@ fn encode_output_inner(
         }
         #[cfg(not(feature = "avif"))]
         ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
+        // Unreachable through any request: `from_token` has no "gif", so
+        // nothing can ask for it, and `default_target` sends GIF sources
+        // to WebP. A hard error rather than a quiet fallback, so a
+        // future encoder cannot slip through as mislabeled bytes.
+        ImageFormat::Gif => anyhow::bail!("GIF output is not supported"),
     }
 }
 

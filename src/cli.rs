@@ -24,7 +24,8 @@ pub fn print_help() {
              re-encode it. 0 leaves an axis unconstrained: `750 0` is\n          \
              width-only, `0 0` re-encodes at the source's own size.\n          \
              Output format: --format, else the <out> file\n          \
-             extension, else the source's own format.\n          \
+             extension, else the source's own format (GIF sources,\n          \
+             which have no encoder here, become WebP).\n          \
              -q, --quality N    JPEG quality, 1-100 (default 80)\n          \
              -f, --format FMT   jpg | png | webp | avif\n          \
              --preset P         jpegli (default) | fast | small\n  \
@@ -161,7 +162,10 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
 
 /// Map an output filename's extension to a format the same way the
 /// server maps `@{fmt}` tokens; unknown extensions keep the source
-/// format (the summary line makes the actual format visible).
+/// format (the summary line makes the actual format visible). `.gif` is
+/// among the unknowns on purpose — nothing here encodes GIF, so a GIF
+/// source resolves to WebP whatever the output file is called, and the
+/// summary line is what says so.
 fn format_from_ext(path: &str) -> Option<ImageFormat> {
     let ext = std::path::Path::new(path)
         .extension()?

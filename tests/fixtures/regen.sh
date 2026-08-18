@@ -154,6 +154,14 @@ docker run --rm -v "$work":/work alpine:3.20 sh -c '
   avifenc -s 10 --fps 2 f1.png f2.png f3.png anim.avif >/dev/null
   avifenc -s 10 --fps 2 --icc fake.icc --irot 1 f1.png f2.png f3.png anim_meta.avif >/dev/null
 
+  # --- GIF family: a third-party writer for the decode-only format.
+  # Frame-level structure (sub-rectangles, disposal, out-of-bounds
+  # rects) is built byte-exactly in tests/formats_gif.rs instead; these
+  # three pin that a real encoder-s output decodes at all.
+  magick corner.png still.gif
+  magick corner.png -transparent "rgb(128,128,128)" alpha.gif
+  magick -delay 50 -loop 0 f1.png f2.png f3.png anim.gif
+
   # --- CMYK family (see README.md "CMYK/YCCK fixtures") ---
   magick corner64.png -colorspace CMYK -quality 95 cmyk_ycck.jpg
   vips copy cmyk_ycck.jpg "cmyk_t0.jpg[Q=95,strip]"
@@ -186,10 +194,11 @@ docker run --rm -v "$work":/work alpine:3.20 sh -c '
 '
 
 cp "$work"/icc.avif "$work"/orient_*.avif "$work"/anim.avif "$work"/anim_meta.avif .
+cp "$work"/still.gif "$work"/alpha.gif "$work"/anim.gif .
 cp "$work"/cmyk_ycck.jpg "$work"/cmyk_t0.jpg "$work"/cmyk_prog.jpg \
    "$work"/cmyk_noadobe.jpg "$work"/cmyk_sub.jpg "$work"/cmyk_icc.jpg \
    "$work"/cmyk_ycck.ppm "$work"/cmyk_t0.ppm "$work"/cmyk_sub.ppm \
    "$work"/cmyk_icc.ppm .
-echo "regenerated: icc.avif orient_*.avif anim.avif anim_meta.avif cmyk_*.jpg cmyk_*.ppm"
+echo "regenerated: icc.avif orient_*.avif anim.avif anim_meta.avif cmyk_*.jpg cmyk_*.ppm still.gif alpha.gif anim.gif"
 echo "note: icc.avif was originally encoded from a decoded oximg output"
 echo "frame rather than corner.png; only its ICC payload is pinned."

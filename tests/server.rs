@@ -463,8 +463,28 @@ fn format_token_error_mapping() {
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@bogus"), 404);
     // Reserved for a future encoder: clear 400 instead of a silent 404.
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@jxl"), 400);
+    // Reserved permanently: GIF decodes here but never encodes, so the
+    // request cannot be honored under the name the client asked for.
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg@gif"), 400);
+    assert_eq!(s.status_of("/resize/100/100/still.gif@gif"), 400);
     #[cfg(not(feature = "avif"))]
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@avif"), 400);
+}
+
+/// A GIF source is served like any other, except that its default output
+/// is WebP — including the `Content-Type`, which must describe the bytes
+/// actually sent and not the source's extension.
+#[test]
+fn gif_sources_are_served_as_webp() {
+    let s = Server::start(&[]);
+    let (status, ct, body) = s.get("/resize/100/100/still.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    let (fmt, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+    assert_eq!((w, h), (100, 75), "still.gif is 240x180");
+    // An explicit token still wins, as for any other source.
+    let (status, ct, _) = s.get("/resize/100/100/still.gif@png").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/png"));
 }
 
 #[test]

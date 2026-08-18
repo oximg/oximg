@@ -7,12 +7,13 @@
 
 High-performance image compression in Rust: a library, a CLI, and a
 self-hostable HTTP server (PoC). JPEG, PNG, WebP — and AVIF with the
-`avif` feature — in and out; sources are format-sniffed by magic bytes
-and re-encoded in their own format. On imgproxy's official benchmark
-harness, run on the same AWS instance types as their published
-results, oximg leads every format cell on both x86-64 and Graviton
-while resizing in linear light at measurably higher output quality
-(see [Benchmarks](#benchmarks)).
+`avif` feature — in and out, plus GIF in; sources are format-sniffed by
+magic bytes and re-encoded in their own format (GIF, having no encoder
+here, becomes WebP). On imgproxy's official benchmark harness, run on
+the same AWS instance types as their published results, oximg leads
+every format cell on both x86-64 and Graviton while resizing in linear
+light at measurably higher output quality (see
+[Benchmarks](#benchmarks)).
 
 ## Features
 
@@ -75,13 +76,25 @@ combines with any encode column:
 | PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A); opt-in palette quantization (`OXIMG_PNG_QUANTIZE`) |
 | WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha; output is scaled to fit WebP's 16383 px limit |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
+| GIF | GIF87a/89a, first frame composited onto the logical screen (frame sub-rectangle, transparent index) | none — see below |
+
+GIF is the one decode-only format, so it is also the one source whose
+output format is not its own: with no `@{fmt}` and no negotiation, a GIF
+becomes **WebP**. That is a deliberate choice, not a missing encoder —
+on a 15-file real-world corpus, lossless GIF→GIF saved *nothing* on 9 of
+them (median 100% of the source bytes, which is also what imgproxy's
+GIF→GIF measured), and at native size the smallest GIF variant measured
+still landed at 80.7% where WebP reached 25.2% at the same visual score.
+`@gif` and `format=gif` are rejected with a 400 instead of quietly
+answering with different bytes under the name the client asked for. See
+[`docs/gif-evaluation.md`](docs/gif-evaluation.md) for the measurements.
 
 **Cross-format output**: append an imgproxy-style `@{fmt}` token to the
 filename — `/resize/300/200/photo.jpg@webp` (`jpg`/`jpeg`, `png`,
-`webp`, `avif`; `jxl` is reserved). Only exact tokens count, so
-`photo@2x.jpg` is still a filename. Precedence: explicit `@{fmt}` >
-`Accept` negotiation > source format. Negotiation is opt-in: set
-`OXIMG_AUTO_FORMAT` to a preference list (e.g. `avif,webp`) and
+`webp`, `avif`; `jxl` is reserved, `gif` permanently so). Only exact
+tokens count, so `photo@2x.jpg` is still a filename. Precedence:
+explicit `@{fmt}` > `Accept` negotiation > source format. Negotiation is
+opt-in: set `OXIMG_AUTO_FORMAT` to a preference list (e.g. `avif,webp`) and
 bare-URL responses follow the request's `Accept` header; every response
 then carries `Vary: Accept` (make sure your CDN honors it or normalizes
 `Accept` into the cache key — explicit `@{fmt}` URLs avoid the issue
@@ -147,6 +160,7 @@ source bytes (local file or HTTP origin)
       PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
       WebP: libwebp
       AVIF: dav1d (8/10/12-bit, all subsamplings, alpha, bilinear chroma upsampling)
+      GIF:  gif crate, first frame composited onto the logical screen
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 → sRGB u8
       (alpha is premultiplied before resampling, unpremultiplied after;
        JPEG rows stream through in-tree ring-scheduled f32 row kernels —
@@ -154,7 +168,7 @@ source bytes (local file or HTTP origin)
        reference — optionally fused with the decode on a second thread;
        other formats resize full-frame: pic-scale on x86-64, the same
        in-tree kernel on aarch64)
-  → encode in the source format
+  → encode in the source format (GIF sources: WebP, the default target)
       JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
 ```
@@ -533,8 +547,10 @@ drain.
   is tracked in [#11](https://github.com/oximg/oximg/issues/11) and
   fails at boot with a pointer rather than misbehaving)
 - JXL output (the `@jxl` token is reserved and returns a clear error)
-- Animated output (animated AVIF and WebP *sources* render their
+- Animated output (animated GIF, AVIF and WebP *sources* render their
   first frame, like other image proxies)
+- GIF output (GIF is decode-only; `@gif` returns a clear error and GIF
+  sources default to WebP)
 - Response caching
 
 ## Roadmap

@@ -32,6 +32,13 @@ jpegli = "0.1.0"
 # the gs:// source path can parse token responses without hand-rolling JSON.
 serde_json = { version = "1", optional = true }
 png = "0.18.1"
+# GIF decoder: safe Rust (`#![forbid(unsafe_code)]`, LZW included), one
+# dependency, and a settable decoder-level memory limit. `color_quant`
+# is its encoder-side quantizer, which we never use — GIF is an
+# input-only format here (docs/gif-evaluation.md §4). `raii_no_panic` is
+# kept because the tests write GIFs to build their own sources, and
+# without it the encoder's Drop unwraps.
+gif = { version = "0.14.2", default-features = false, features = ["std", "raii_no_panic"] }
 libwebp-sys = { version = "0.14", features = ["neon"] }
 hmac = { version = "0.13.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
