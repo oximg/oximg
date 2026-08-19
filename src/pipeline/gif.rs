@@ -311,6 +311,16 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     if check_src_pixels(cw, ch).is_err() {
         return Ok(None);
     }
+    // libwebp's frame timestamps are `i32` milliseconds. A duration that
+    // does not fit cannot be spelled: the saturating adds below would
+    // hand equal start times to the tail frames, silently collapsing
+    // their durations, and the flush would report a duration the source
+    // never had. Only reachable with OXIMG_MAX_ANIM_FRAMES raised far
+    // past its default, since one frame is at most 655_350 ms — but a
+    // knob is not a promise, so check rather than assume.
+    if scan.duration_ms > i32::MAX as u64 {
+        return Ok(None);
+    }
     let (out_w, out_h) = fit_dims(cw, ch, p.max_width, p.max_height);
     let work = (encoded as u64).saturating_mul((out_w as u64).saturating_mul(out_h as u64));
     if work > cfg.max_anim_work {

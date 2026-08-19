@@ -645,6 +645,50 @@ fn oversized_frames_are_priced_against_the_frame_not_the_screen() {
     }
 }
 
+/// A temp IMAGES_DIR holding GIFs whose frames declare the maximum delay
+/// (65535 cs = 655,350 ms), which is how a test reaches a duration
+/// libwebp's `i32` timestamps cannot represent without a huge file.
+fn max_delay_gif_dir(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-slowest-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    for (name, frames) in [("short.gif", 100usize), ("long.gif", 3300)] {
+        let mut out = Vec::new();
+        let mut enc = gif::Encoder::new(&mut out, 4, 4, pal).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for i in 0..frames {
+            let mut f = gif::Frame::from_indexed_pixels(4, 4, vec![(i % 3) as u8; 16], None);
+            f.delay = u16::MAX;
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        std::fs::write(dir.join(name), out).unwrap();
+    }
+    dir.to_str().unwrap().to_string()
+}
+
+/// libwebp's frame timestamps are `i32` milliseconds and a GIF frame can
+/// ask for 655,350 ms, so enough frames describe a duration WebP cannot
+/// spell — reachable only with `OXIMG_MAX_ANIM_FRAMES` raised far past its
+/// default, which is exactly why the code checks instead of assuming. It
+/// degrades like every other budget rather than emitting collapsed
+/// timestamps.
+#[test]
+fn a_duration_webp_cannot_represent_degrades_to_a_still() {
+    let s = Server::start(&[
+        ("IMAGES_DIR", max_delay_gif_dir("i32")),
+        ("OXIMG_MAX_ANIM_FRAMES", "5000".into()),
+    ]);
+    // 100 x 655,350 ms = 65.5e6 ms, comfortably inside an i32.
+    let (status, _, body) = s.get("/resize/8/8/short.gif").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(frames_of(&body), Some(100), "a long but representable one");
+    // 3300 x 655,350 ms = 2.16e9 ms, past i32::MAX (2.147e9).
+    let (status, ct, body) = s.get("/resize/8/8/long.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), None, "unrepresentable, so a still");
+}
+
 /// Frame decimation: every Nth frame is encoded and the total play time
 /// is preserved, so what it costs is smoothness, not fidelity.
 #[test]
