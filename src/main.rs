@@ -758,7 +758,8 @@ async fn handle_metrics(State(app): State<App>) -> impl IntoResponse {
 /// filename. Only exact known tokens count — any other suffix is part
 /// of the filename (`photo@2x.jpg` keeps working; a file literally
 /// named `x.jpg@webp` becomes unreachable, a documented trade). "jxl"
-/// is reserved so the future encoder slots in with a clear error today.
+/// is reserved so the future encoder slots in with a clear error today,
+/// and "gif" so a decode-only format cannot be asked for as output.
 /// Only the last path segment is considered: a `@` in a directory name
 /// is never a token by design, not just because its "token" would
 /// contain `/`.
@@ -780,6 +781,14 @@ fn split_format(file: &str) -> Result<(&str, Option<ImageFormat>), (StatusCode, 
         None if token == "jxl" => Err((
             StatusCode::BAD_REQUEST,
             "jxl output is not supported in this build".into(),
+        )),
+        // Reserved for the same reason, but permanently: GIF decodes
+        // here and never encodes, so `@gif` is a request that cannot be
+        // honored — better said out loud than answered with WebP bytes
+        // under the name the client picked.
+        None if token == "gif" => Err((
+            StatusCode::BAD_REQUEST,
+            "gif output is not supported (gif sources are decoded to webp)".into(),
         )),
         None => Ok((file, None)),
     }
@@ -1445,11 +1454,15 @@ mod tests {
                 "@{token}"
             );
         }
-        // reserved: jxl errors clearly instead of 404ing as a filename
-        assert_eq!(
-            split_format("photo.jpg@jxl").unwrap_err().0,
-            StatusCode::BAD_REQUEST
-        );
+        // reserved: jxl errors clearly instead of 404ing as a filename,
+        // and gif does the same permanently (it decodes, never encodes)
+        for token in ["jxl", "gif"] {
+            assert_eq!(
+                split_format(&format!("photo.jpg@{token}")).unwrap_err().0,
+                StatusCode::BAD_REQUEST,
+                "@{token}"
+            );
+        }
         #[cfg(feature = "avif")]
         assert_eq!(
             split_format("photo.jpg@avif"),

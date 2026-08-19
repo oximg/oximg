@@ -58,6 +58,36 @@ fn resize_format_precedence() {
     assert_eq!(ct, "image/jpeg");
 }
 
+/// `.gif` is the one output extension refused rather than ignored —
+/// nothing here encodes GIF, and a WebP written under a `.gif` name is the
+/// mislabeled output the server rejects `@gif` for. An explicit `-f` still
+/// wins, since then the extension is never consulted at all.
+#[test]
+fn a_gif_output_extension_is_refused_before_anything_is_written() {
+    let out = tmp("refused.gif");
+    std::fs::remove_file(&out).ok();
+    let output = bin()
+        .args(["resize", &fixture("anim.gif"), "100", "100"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("gif output is not supported"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !out.exists(),
+        "nothing may be written under the refused name"
+    );
+
+    // The escape hatch: the caller who names both format and file gets
+    // both, as the documented precedence says.
+    let (ct, ..) = resize_ok(&out, &["-f", "webp"]);
+    assert_eq!(ct, "image/webp");
+}
+
 /// The quality flag must actually steer the encoder.
 #[test]
 fn resize_quality_flag_changes_output_size() {
@@ -128,6 +158,10 @@ fn usage_errors_exit_2() {
         &["resize", "in.jpg", "-1", "100", "out.jpg"][..],
         &["resize", "in.jpg", "wide", "100", "out.jpg"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-f", "gif"][..],
+        // Nothing encodes GIF, so a `.gif` output name is refused rather
+        // than ignored — writing WebP bytes under it would mislabel the
+        // file, which is what the server rejects `@gif` for.
+        &["resize", "in.jpg", "100", "100", "out.gif"][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "-q", "0"][..],
         &[
             "resize", "in.jpg", "100", "100", "out.jpg", "--preset", "bogus",

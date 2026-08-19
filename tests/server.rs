@@ -371,6 +371,11 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_FETCH_CONCURRENCY", "many"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
+        ("OXIMG_GIF_ANIMATION", "off"),
+        ("OXIMG_MAX_ANIM_FRAMES", "0"),
+        ("OXIMG_MAX_ANIM_WORK", "none"),
+        ("OXIMG_ANIM_FRAME_STEP", "0"),
+        ("OXIMG_ANIM_FRAME_STEP", "100"),
         ("QUALITY", "eighty"),
     ] {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
@@ -463,8 +468,246 @@ fn format_token_error_mapping() {
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@bogus"), 404);
     // Reserved for a future encoder: clear 400 instead of a silent 404.
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@jxl"), 400);
+    // Reserved permanently: GIF decodes here but never encodes, so the
+    // request cannot be honored under the name the client asked for.
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg@gif"), 400);
+    assert_eq!(s.status_of("/resize/100/100/still.gif@gif"), 400);
     #[cfg(not(feature = "avif"))]
     assert_eq!(s.status_of("/resize/100/100/photo.jpg@avif"), 400);
+}
+
+/// A GIF source is served like any other, except that its default output
+/// is WebP — including the `Content-Type`, which must describe the bytes
+/// actually sent and not the source's extension.
+#[test]
+fn gif_sources_are_served_as_webp() {
+    let s = Server::start(&[]);
+    let (status, ct, body) = s.get("/resize/100/100/still.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    let (fmt, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!(fmt, oximg::pipeline::ImageFormat::Webp);
+    assert_eq!((w, h), (100, 75), "still.gif is 240x180");
+    // An explicit token still wins, as for any other source.
+    let (status, ct, _) = s.get("/resize/100/100/still.gif@png").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/png"));
+}
+
+/// Frame count of a response body, or `None` when it is a still — the
+/// one thing every animation budget is asserted through.
+fn frames_of(body: &[u8]) -> Option<usize> {
+    oximg::pipeline::probe_animation(body)
+        .unwrap()
+        .map(|a| a.frames)
+}
+
+/// A temp IMAGES_DIR holding one hand-built animated GIF: `frames`
+/// full-screen frames at 10cs each, which is how a test buys an
+/// arbitrary frame count and canvas size without committing a fixture
+/// for every budget. The color cycles through three, not two, so that
+/// frames stay distinct under `OXIMG_ANIM_FRAME_STEP=2` — every-other
+/// frame of a two-color animation would be a single repeated image, and
+/// libwebp merges those.
+fn animated_images_dir(tag: &str, w: u16, h: u16, frames: usize) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-anim-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut out = Vec::new();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    let mut enc = gif::Encoder::new(&mut out, w, h, pal).unwrap();
+    enc.set_repeat(gif::Repeat::Infinite).unwrap();
+    for i in 0..frames {
+        let px = vec![(i % 3) as u8; w as usize * h as usize];
+        let mut f = gif::Frame::from_indexed_pixels(w, h, px, None);
+        f.delay = 10;
+        enc.write_frame(&f).unwrap();
+    }
+    drop(enc);
+    std::fs::write(dir.join("anim.gif"), out).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
+/// An animated GIF is served as an animated WebP by default. Every knob
+/// that says no serves the still first frame **with a 200** — a
+/// degradation, not an error, because a browser will happily display the
+/// smaller thing and a 413 helps nobody. One server per knob: the config
+/// resolves once per process.
+#[test]
+fn animated_gif_serves_animated_webp_by_default() {
+    let s = Server::start(&[]);
+    let (status, ct, body) = s.get("/resize/120/120/anim.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), Some(3), "anim.gif has three frames");
+
+    // The still fallback is the same bytes an explicit non-animating
+    // target gets, and both are ordinary 200s.
+    let (status, ct, body) = s.get("/resize/120/120/anim.gif@png").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/png"));
+    assert_eq!(frames_of(&body), None);
+}
+
+#[test]
+fn animation_budgets_degrade_to_a_still_instead_of_failing() {
+    for (knob, value) in [
+        ("OXIMG_GIF_ANIMATION", "0"),   // switched off outright
+        ("OXIMG_MAX_ANIM_FRAMES", "2"), // anim.gif carries three
+        ("OXIMG_MAX_ANIM_WORK", "1"),   // one pixel of encode budget
+    ] {
+        let s = Server::start(&[(knob, value.to_string())]);
+        let (status, ct, body) = s.get("/resize/120/120/anim.gif").unwrap();
+        assert_eq!(
+            (status, ct.as_str()),
+            (200, "image/webp"),
+            "{knob}={value} must still serve"
+        );
+        assert_eq!(frames_of(&body), None, "{knob}={value} must serve a still");
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!(
+            (w, h),
+            (120, 90),
+            "{knob}={value}: a still, not a thumbnail"
+        );
+    }
+}
+
+/// The estimated-memory cap degrades too, rather than answering 413 as
+/// it does for a still that cannot fit: at 10 frames of 200x150 the
+/// animation's estimate is over 1 MiB while the same GIF as a still is
+/// comfortably under it, so the cap has a choice — and serving less is
+/// the one that answers the request.
+#[test]
+fn decoded_bytes_cap_degrades_an_animation_it_cannot_afford() {
+    let dir = animated_images_dir("cap", 200, 150, 10);
+    let uncapped = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    let (status, _, body) = uncapped.get("/resize/200/200/anim.gif").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(frames_of(&body), Some(10), "all ten frames without a cap");
+
+    let capped = Server::start(&[
+        ("IMAGES_DIR", dir),
+        ("OXIMG_MAX_DECODED_BYTES", (1024 * 1024).to_string()),
+    ]);
+    let (status, ct, body) = capped.get("/resize/200/200/anim.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), None, "over the cap, a still is served");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (200, 150), "the still is the whole logical screen");
+}
+
+/// A temp IMAGES_DIR holding GIFs whose frame rectangles are far larger
+/// than their logical screen — a shape real writers emit, and the one that
+/// makes the screen the wrong thing to price a decode against: the decoder
+/// expands the frame's own rectangle, and `draw_frame` clips it only
+/// afterwards. `big.gif` is one frame (the still path), `big_anim.gif`
+/// three (the animated path).
+fn oversized_frame_gif_dir(tag: &str, side: u16) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-oversized-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    for (name, frames) in [("big.gif", 1), ("big_anim.gif", 3)] {
+        let mut out = Vec::new();
+        // A 1x1 logical screen; every frame is side x side.
+        let mut enc = gif::Encoder::new(&mut out, 1, 1, pal).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for i in 0..frames {
+            let px = vec![(i % 3) as u8; side as usize * side as usize];
+            let mut f = gif::Frame::from_indexed_pixels(side, side, px, None);
+            f.delay = 10;
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        std::fs::write(dir.join(name), out).unwrap();
+    }
+    dir.to_str().unwrap().to_string()
+}
+
+/// The memory estimate is priced against the frame rectangle, not the
+/// logical screen. Both paths: a 1x1 screen carrying 1200x1200 frames is a
+/// few KB of source that stages 5.8 MB per frame, so pricing the screen
+/// would let a 1x1 header buy an arbitrarily large decode.
+#[test]
+fn oversized_frames_are_priced_against_the_frame_not_the_screen() {
+    let dir = oversized_frame_gif_dir("cost", 1200);
+    let uncapped = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    for path in ["/resize/100/100/big.gif", "/resize/100/100/big_anim.gif"] {
+        assert_eq!(
+            uncapped.status_of(path),
+            200,
+            "{path} decodes without a cap"
+        );
+    }
+
+    // 2 MiB: over the 5.8 MB frame, far under any screen-based estimate.
+    let capped = Server::start(&[
+        ("IMAGES_DIR", dir),
+        ("OXIMG_MAX_DECODED_BYTES", (2 * 1024 * 1024).to_string()),
+    ]);
+    for path in ["/resize/100/100/big.gif", "/resize/100/100/big_anim.gif"] {
+        assert_eq!(capped.status_of(path), 413, "{path} must hit the cap");
+    }
+}
+
+/// A temp IMAGES_DIR holding GIFs whose frames declare the maximum delay
+/// (65535 cs = 655,350 ms), which is how a test reaches a duration
+/// libwebp's `i32` timestamps cannot represent without a huge file.
+fn max_delay_gif_dir(tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-slowest-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    for (name, frames) in [("short.gif", 100usize), ("long.gif", 3300)] {
+        let mut out = Vec::new();
+        let mut enc = gif::Encoder::new(&mut out, 4, 4, pal).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for i in 0..frames {
+            let mut f = gif::Frame::from_indexed_pixels(4, 4, vec![(i % 3) as u8; 16], None);
+            f.delay = u16::MAX;
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        std::fs::write(dir.join(name), out).unwrap();
+    }
+    dir.to_str().unwrap().to_string()
+}
+
+/// libwebp's frame timestamps are `i32` milliseconds and a GIF frame can
+/// ask for 655,350 ms, so enough frames describe a duration WebP cannot
+/// spell — reachable only with `OXIMG_MAX_ANIM_FRAMES` raised far past its
+/// default, which is exactly why the code checks instead of assuming. It
+/// degrades like every other budget rather than emitting collapsed
+/// timestamps.
+#[test]
+fn a_duration_webp_cannot_represent_degrades_to_a_still() {
+    let s = Server::start(&[
+        ("IMAGES_DIR", max_delay_gif_dir("i32")),
+        ("OXIMG_MAX_ANIM_FRAMES", "5000".into()),
+    ]);
+    // 100 x 655,350 ms = 65.5e6 ms, comfortably inside an i32.
+    let (status, _, body) = s.get("/resize/8/8/short.gif").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(frames_of(&body), Some(100), "a long but representable one");
+    // 3300 x 655,350 ms = 2.16e9 ms, past i32::MAX (2.147e9).
+    let (status, ct, body) = s.get("/resize/8/8/long.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), None, "unrepresentable, so a still");
+}
+
+/// Frame decimation: every Nth frame is encoded and the total play time
+/// is preserved, so what it costs is smoothness, not fidelity.
+#[test]
+fn anim_frame_step_decimates_but_keeps_the_duration() {
+    let dir = animated_images_dir("step", 60, 40, 8);
+    let full = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    let (_, _, body) = full.get("/resize/60/60/anim.gif").unwrap();
+    let all = oximg::pipeline::probe_animation(&body).unwrap().unwrap();
+    assert_eq!(all.frames, 8);
+
+    let stepped = Server::start(&[("IMAGES_DIR", dir), ("OXIMG_ANIM_FRAME_STEP", "2".into())]);
+    let (status, _, body) = stepped.get("/resize/60/60/anim.gif").unwrap();
+    assert_eq!(status, 200);
+    let half = oximg::pipeline::probe_animation(&body).unwrap().unwrap();
+    assert_eq!(half.frames, 4, "every other frame");
+    assert_eq!(
+        half.duration_ms, all.duration_ms,
+        "decimation must not shorten the animation"
+    );
 }
 
 #[test]

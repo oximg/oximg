@@ -9,7 +9,7 @@ This file is generated — do not edit by hand. Regenerate with:
 
 ## Summary
 
-- **Apache License 2.0** — 138 crate(s)
+- **Apache License 2.0** — 140 crate(s)
 - **MIT License** — 35 crate(s)
 - **Unicode License v3** — 19 crate(s)
 - **BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License** — 5 crate(s)
@@ -23,7 +23,7 @@ This file is generated — do not edit by hand. Regenerate with:
 ## Apache License 2.0
 
 Used by:
-- [wide 1.6.0](https://github.com/Lokathor/wide)
+- [wide 1.6.1](https://github.com/Lokathor/wide)
 
 ```
 
@@ -3017,6 +3017,8 @@ limitations under the License.
 
 Used by:
 - [core_affinity 0.8.3](https://github.com/Elzair/core_affinity_rs)
+- [gif 0.14.2](https://github.com/image-rs/image-gif)
+- [weezl 0.1.12](https://github.com/image-rs/weezl)
 
 ```
                               Apache License
@@ -5054,7 +5056,7 @@ DEALINGS IN THE SOFTWARE.
 ## MIT License
 
 Used by:
-- [h2 0.4.15](https://github.com/hyperium/h2)
+- [h2 0.4.16](https://github.com/hyperium/h2)
 
 ```
 Copyright (c) 2017 h2 authors

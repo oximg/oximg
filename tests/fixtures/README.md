@@ -34,6 +34,23 @@ the point: they pin *our* readers against *their* layouts).
 | `anim_meta.avif` | 〃 plus `--irot 1 --icc <blob>` | metadata on animated sources |
 | `list.txt` | plain text | undecodable-input (422) test |
 
+## GIF fixtures (0.12.0 era, reproducible)
+
+GIF is a source format only — oximg never writes one (see
+`docs/gif-evaluation.md`) — so these pin that a real encoder's output
+reads correctly; frame-level structure — sub-rectangles, transparency,
+out-of-bounds rects, disposal, multi-frame composition — is built
+byte-exactly inside `tests/formats_gif.rs`, which is the only way to
+control it precisely. All three `magick` recipes regenerate
+byte-identically across consecutive container runs (verified 2026-08-18,
+ImageMagick 7.1.1-32).
+
+| File | Recipe (see regen.sh) | Layout | Pinned by |
+|---|---|---|---|
+| `still.gif` | `magick corner.png still.gif` | 240×180, one full-canvas frame, 8-color global palette, no transparency | `third_party_gif_sources_decode` |
+| `alpha.gif` | `magick corner.png -transparent 'rgb(128,128,128)' alpha.gif` | 〃 plus a transparent index for the gray field | 〃 (alpha survives to the output) |
+| `anim.gif` | `magick -delay 50 -loop 0 f1.png f2.png f3.png anim.gif` | 120×90, three full-canvas frames (red/blue/green), 50 (=500ms) delays, per-frame local palettes | `animated_gif_renders_first_frame`, `animated_gif_becomes_animated_webp`, `animation_is_only_ever_a_webp_target`, `probe_animation` (doctest) |
+
 ## CMYK/YCCK fixtures (0.5.1 era, reproducible)
 
 64×48 with 16px corner blocks (same TL=R/TR=G/BL=B/BR=W-on-gray

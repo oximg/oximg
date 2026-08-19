@@ -100,6 +100,22 @@ pub(crate) struct Config {
     /// each format's header parse and before any pixel-sized
     /// allocation — compressed-size caps do not bound decoded size.
     pub max_src_pixels: u64,
+    /// OXIMG_GIF_ANIMATION ("0" renders every animated GIF as its still
+    /// first frame instead of animated WebP).
+    pub gif_animation: bool,
+    /// OXIMG_MAX_ANIM_FRAMES: source frames an animation may carry
+    /// before it degrades to a still. Bounds the decode+composite half
+    /// of the work, which no output size reduces.
+    pub max_anim_frames: usize,
+    /// OXIMG_MAX_ANIM_WORK: encoded frames x post-resize frame area, in
+    /// pixels — the product that predicts encode time, which is what
+    /// dominates an animation (docs/gif-evaluation.md §5). Over it, the
+    /// request degrades to a still rather than failing.
+    pub max_anim_work: u64,
+    /// OXIMG_ANIM_FRAME_STEP: encode every Nth frame (1 = all of them).
+    /// Total duration is preserved, so decimation costs smoothness, not
+    /// fidelity — off by default for that reason.
+    pub anim_frame_step: usize,
 }
 
 /// The knob inventory, pinned to the README by `knobs_are_documented`.
@@ -125,6 +141,10 @@ const KNOBS: &[&str] = &[
     "OXIMG_AVIF_DECODE_THREADS",
     "OXIMG_MAX_SOURCE_BYTES",
     "OXIMG_MAX_SRC_PIXELS",
+    "OXIMG_GIF_ANIMATION",
+    "OXIMG_MAX_ANIM_FRAMES",
+    "OXIMG_MAX_ANIM_WORK",
+    "OXIMG_ANIM_FRAME_STEP",
     "OXIMG_MAX_DECODED_BYTES",
     "OXIMG_LOG_DECODED_BYTES_ABOVE",
     "OXIMG_UPSTREAM_CONNECT_TIMEOUT",
@@ -178,6 +198,7 @@ pub(crate) fn validate() -> Result<(), String> {
         "OXIMG_JPEG_PROGRESSIVE",
         "OXIMG_WEBP_DECODE_THREADS",
         "OXIMG_PNG_QUANTIZE",
+        "OXIMG_GIF_ANIMATION",
     ] {
         one_of(b, &["0", "1"])?;
     }
@@ -197,6 +218,11 @@ pub(crate) fn validate() -> Result<(), String> {
     num("OXIMG_AVIF_DECODE_THREADS", 1i64, 64)?;
     num("OXIMG_MAX_SOURCE_BYTES", 1u64, u64::MAX)?;
     num("OXIMG_MAX_SRC_PIXELS", 1u64, u64::MAX)?;
+    num("OXIMG_MAX_ANIM_FRAMES", 1u64, u64::MAX)?;
+    num("OXIMG_MAX_ANIM_WORK", 1u64, u64::MAX)?;
+    // A step above the frame cap could only ever emit one frame, which
+    // is a still with extra steps; 64 is far past any useful decimation.
+    num("OXIMG_ANIM_FRAME_STEP", 1u64, 64)?;
     // A cap under a mebibyte cannot admit any real image; treating it
     // as a typo is friendlier than 413ing every request.
     num("OXIMG_MAX_DECODED_BYTES", 1u64 << 20, u64::MAX)?;
@@ -266,6 +292,17 @@ pub(crate) fn config() -> &'static Config {
             .unwrap_or(if cfg!(target_arch = "x86_64") { 2 } else { 1 }),
         max_source_bytes: parsed("OXIMG_MAX_SOURCE_BYTES").unwrap_or(64 * 1024 * 1024),
         max_src_pixels: parsed("OXIMG_MAX_SRC_PIXELS").unwrap_or(64_000_000),
+        gif_animation: std::env::var("OXIMG_GIF_ANIMATION").as_deref() != Ok("0"),
+        max_anim_frames: parsed("OXIMG_MAX_ANIM_FRAMES").unwrap_or(200),
+        // 8 Mpx of post-resize frame area: the corpus in
+        // docs/gif-evaluation.md §5 puts its worst in-budget file
+        // (hd_1280x720_mars, 26 frames into a 512 box, ~6.8 Mpx) at
+        // 517 ms, and its worst file overall (web_480x270_docu, ~34 Mpx)
+        // at 3.2 s — which this refuses, serving a still instead.
+        max_anim_work: parsed("OXIMG_MAX_ANIM_WORK").unwrap_or(8_000_000),
+        anim_frame_step: parsed::<usize>("OXIMG_ANIM_FRAME_STEP")
+            .filter(|s| *s >= 1)
+            .unwrap_or(1),
         max_decoded_bytes: parsed("OXIMG_MAX_DECODED_BYTES").filter(|b| *b >= (1 << 20)),
         log_decoded_bytes_above: parsed("OXIMG_LOG_DECODED_BYTES_ABOVE").filter(|b| *b >= 1),
         upstream_connect_timeout: parsed("OXIMG_UPSTREAM_CONNECT_TIMEOUT").unwrap_or(5),
@@ -293,6 +330,7 @@ mod tests {
             include_str!("pipeline/jpeg.rs"),
             include_str!("pipeline/fuse.rs"),
             include_str!("pipeline/formats.rs"),
+            include_str!("pipeline/gif.rs"),
             include_str!("pipeline/resolved.rs"),
             #[cfg(feature = "server")]
             include_str!("pipeline/gcs.rs"),

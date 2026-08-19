@@ -88,7 +88,10 @@ fn animated_webp_renders_first_frame() {
 
 #[test]
 fn garbage_and_truncation_error_instead_of_panicking() {
-    assert!(pipeline::process(b"GIF89a not supported here", &params(100)).is_err());
+    // A signature no decoder here claims (BMP), and empty input. GIF used
+    // to stand in for the first case; it decodes now, so its malformed and
+    // truncated sources live in tests/formats_gif.rs instead.
+    assert!(pipeline::process(b"BM not supported here", &params(100)).is_err());
     assert!(pipeline::process(b"", &params(100)).is_err());
     for name in ["photo.jpg", "rgb.png", "photo.webp"] {
         let full = fixture(name);

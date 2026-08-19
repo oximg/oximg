@@ -205,6 +205,10 @@ impl Default for Params {
 fn format_max_dimension(format: ImageFormat) -> Option<u32> {
     match format {
         ImageFormat::Webp => Some(16383),
+        // GIF's logical screen fields are u16. Inert while GIF is
+        // input-only (a source can never exceed it), and correct the
+        // moment it isn't.
+        ImageFormat::Gif => Some(65535),
         _ => None,
     }
 }
@@ -305,6 +309,11 @@ pub enum ImageFormat {
     Png,
     Webp,
     Avif,
+    /// Decode-only. No GIF encoder ships here — a GIF source with no
+    /// requested output becomes WebP (see [`default_target`]) — but the
+    /// variant is a real format everywhere else: `sniff` returns it,
+    /// `probe` reports it, and `content_type` names it.
+    Gif,
 }
 
 impl ImageFormat {
@@ -314,6 +323,7 @@ impl ImageFormat {
             ImageFormat::Png => "image/png",
             ImageFormat::Webp => "image/webp",
             ImageFormat::Avif => "image/avif",
+            ImageFormat::Gif => "image/gif",
         }
     }
 
@@ -322,6 +332,12 @@ impl ImageFormat {
     /// never trusted — these name the *requested* output format.
     /// Returns Avif even in non-avif builds; availability is the
     /// caller's check (HTTP rejects before spending a CPU slot).
+    ///
+    /// Deliberately no `"gif"`: there is no GIF encoder here, so every
+    /// caller that turns a token into an output format — `@{fmt}`,
+    /// `format=`, OXIMG_AUTO_FORMAT, the CLI's output extension — is
+    /// better served by rejecting it than by silently emitting
+    /// something else under a `.gif` name.
     pub fn from_token(token: &str) -> Option<ImageFormat> {
         match token {
             "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
@@ -340,6 +356,8 @@ impl ImageFormat {
             Some(ImageFormat::Png)
         } else if &header[0..4] == b"RIFF" && &header[8..12] == b"WEBP" {
             Some(ImageFormat::Webp)
+        } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+            Some(ImageFormat::Gif)
         } else if &header[4..8] == b"ftyp"
             && (&header[8..12] == b"avif" || &header[8..12] == b"avis")
         {
@@ -347,6 +365,22 @@ impl ImageFormat {
         } else {
             None
         }
+    }
+}
+
+/// What a source becomes when the request names no output format.
+/// Normally the source's own format — the pipeline is a resizer first
+/// and a transcoder second — except for the decode-only ones, which
+/// have to land somewhere they can actually be encoded. GIF goes to
+/// WebP: it is the only target that can carry both an animation and an
+/// alpha channel, and at matched visual scores it measured ~3x smaller
+/// than the best GIF-to-GIF variant on a real-world corpus — where
+/// gifsicle `-O3` saved nothing at all on 9 of 15 files
+/// (docs/gif-evaluation.md §3).
+fn default_target(format: ImageFormat) -> ImageFormat {
+    match format {
+        ImageFormat::Gif => ImageFormat::Webp,
+        other => other,
     }
 }
 
@@ -417,6 +451,10 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
             );
             Ok((format, features.width as usize, features.height as usize))
         },
+        ImageFormat::Gif => {
+            let (w, h) = probe_gif(bytes)?;
+            Ok((format, w, h))
+        }
         #[cfg(feature = "avif")]
         ImageFormat::Avif => {
             let (w, h) = crate::avif::probe_avif(bytes)?;
@@ -424,6 +462,73 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
         }
         #[cfg(not(feature = "avif"))]
         ImageFormat::Avif => anyhow::bail!("AVIF support is not enabled in this build"),
+    }
+}
+
+/// What a source's animation is, for the formats that have one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Animation {
+    /// Frames the container declares.
+    pub frames: usize,
+    /// Total play time in milliseconds. For GIF this is the duration
+    /// oximg would *emit*, not a verbatim sum: delays of 0 or 1
+    /// centisecond are normalized (see `pipeline/gif.rs`).
+    pub duration_ms: u64,
+    /// Plays before stopping; 0 means forever. GIF counts the *repeats*
+    /// after the first play instead, so this — like `duration_ms` — is
+    /// what oximg would emit: a GIF asking for 3 repeats reports 4.
+    pub loop_count: u32,
+}
+
+/// Animation summary from headers alone, the companion to [`probe`]:
+/// the frame count and duration that the `OXIMG_MAX_ANIM_*` budgets are
+/// spent against, so what a request will cost is inspectable before it
+/// is served.
+///
+/// `None` means "no animation here": a GIF with a single frame, a WebP
+/// with no `ANIM` chunk, or any other format — including an AVIF image
+/// sequence, which this build decodes as a still and so does not report.
+///
+/// # Examples
+///
+/// ```
+/// use oximg::pipeline;
+///
+/// let bytes = std::fs::read(concat!(
+///     env!("CARGO_MANIFEST_DIR"),
+///     "/tests/fixtures/anim.gif"
+/// ))?;
+/// let anim = pipeline::probe_animation(&bytes)?.expect("three frames");
+/// assert_eq!((anim.frames, anim.duration_ms), (3, 1500));
+/// assert_eq!(anim.loop_count, 0, "loops forever");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn probe_animation(bytes: &[u8]) -> Result<Option<Animation>, Error> {
+    probe_animation_inner(bytes).map_err(|e| Error::classify(e, false))
+}
+
+fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
+    let mut header = [0u8; 12];
+    anyhow::ensure!(bytes.len() >= 12, "source too short");
+    header.copy_from_slice(&bytes[..12]);
+    let format = ImageFormat::sniff(&header).context("unsupported image format")?;
+    match format {
+        ImageFormat::Gif => {
+            let scan = scan_gif(bytes)?;
+            Ok((scan.frames > 1).then_some(Animation {
+                frames: scan.frames,
+                duration_ms: scan.duration_ms,
+                loop_count: scan.loop_count,
+            }))
+        }
+        ImageFormat::Webp => Ok(
+            webp_animation(bytes).map(|(frames, duration_ms, loop_count)| Animation {
+                frames,
+                duration_ms,
+                loop_count,
+            }),
+        ),
+        _ => Ok(None),
     }
 }
 
@@ -480,7 +585,7 @@ fn process_reader<R: std::io::Read>(
     let mut header = [0u8; 12];
     std::io::Read::read_exact(&mut reader, &mut header).context("source too short")?;
     let format = ImageFormat::sniff(&header).context("unsupported image format")?;
-    let target = p.output.unwrap_or(format);
+    let target = p.output.unwrap_or_else(|| default_target(format));
     // Every knob resolves here, once (override > env > default); the
     // stages below read plain data and never consult the environment.
     // The output format's own dimension ceiling is one more constraint
@@ -496,6 +601,14 @@ fn process_reader<R: std::io::Read>(
     anyhow::ensure!(
         target != ImageFormat::Avif,
         "AVIF support is not enabled in this build"
+    );
+    // Same treatment for the format that decodes but never encodes:
+    // `ImageFormat::Gif` is public, so a library caller can name it as
+    // an output even though no URL token can. Refusing here makes it a
+    // clean 422 instead of a 500 from the encoder's backstop arm.
+    anyhow::ensure!(
+        target != ImageFormat::Gif,
+        "GIF output is not supported (GIF is a decode-only format here)"
     );
     let reader = std::io::BufReader::new(std::io::Read::chain(&header[..], reader));
 
@@ -514,6 +627,7 @@ fn process_reader<R: std::io::Read>(
             })??,
             ImageFormat::Png => process_png(s, reader, target, p)?,
             ImageFormat::Webp => process_webp(s, reader, target, p)?,
+            ImageFormat::Gif => process_gif(s, reader, target, p)?,
             #[cfg(feature = "avif")]
             ImageFormat::Avif => process_avif(s, reader, target, p)?,
             #[cfg(not(feature = "avif"))]
@@ -879,6 +993,10 @@ struct Scratch {
     // buffer (png's Seek bound, libwebp's one-shot API). JPEG never uses
     // this: it streams.
     srcbuf: Vec<u8>,
+    // Canvas snapshot for GIF's "restore to previous" disposal: the one
+    // disposal method that needs a second canvas, so it stays empty
+    // until a source actually asks for it.
+    anim_prev: Vec<u8>,
     // Final RGB pixels also live in scratch: output sizes vary per request
     // (every distinct target width is a distinct allocation size), and that
     // churn is what the allocator retains across thread heaps.
@@ -1132,6 +1250,9 @@ pub fn bench_resolve(p: &Params) -> impl Sized {
 fn target_supports_icc(target: ImageFormat) -> bool {
     match target {
         ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::Webp => true,
+        // Never a target (no encoder), and GIF's palette has nowhere to
+        // put a profile anyway.
+        ImageFormat::Gif => false,
         #[cfg(feature = "avif")]
         ImageFormat::Avif => true,
         #[cfg(not(feature = "avif"))]
@@ -1434,6 +1555,7 @@ mod formats;
 mod fuse;
 #[cfg(feature = "server")]
 mod gcs;
+mod gif;
 mod jpeg;
 mod resolved;
 #[cfg(test)]
@@ -1445,6 +1567,9 @@ use encode::*;
 pub use error::{Error, ErrorKind};
 use formats::*;
 use fuse::*;
+// This module, not the `gif` crate — a `mod gif` shadows the extern
+// prelude here. gif.rs reaches the crate as `::gif`.
+use gif::*;
 pub use jpeg::decode_and_resize;
 #[cfg_attr(not(test), allow(unused_imports))] // tests.rs reaches these via super::*
 use jpeg::*;
