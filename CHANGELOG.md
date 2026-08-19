@@ -8,6 +8,101 @@ and this project adheres to
 experimental PoC: until 1.0.0, minor versions may change APIs and the
 HTTP interface without notice.
 
+## [Unreleased]
+
+GIF becomes a source format, and the first one that can leave as an
+animation. Minor rather than patch when released: a source that used to
+be a 422 now serves bytes, and one CLI edge changes its exit code.
+
+### Added
+
+- **GIF is a source format** — the fifth, and the first decode-only
+  one. Sniffed by GIF87a/89a, probed for its logical screen, and
+  rendered by compositing a frame onto that screen with the frame
+  rectangle and the transparent palette index both honored, since a
+  first frame is not necessarily the whole image. Frame rectangles that
+  hang off the screen are clipped rather than refused, matching browsers
+  and imgproxy; opaque sources — most GIFs — drop to 3 channels before
+  the resize.
+
+  A GIF has to leave as something else, because no GIF encoder ships:
+  with no `@{fmt}` and no negotiation it becomes WebP. That is the
+  measured choice, not a shortcut — lossless GIF-to-GIF saved nothing on
+  9 of the 15 corpus files, while WebP reached **25.2% of the source
+  bytes** at the same visual score (SSIMULACRA2 ~71) against 80.7% for
+  the best GIF-to-GIF variant. Asking for GIF *output* is refused rather
+  than silently substituted, at every layer that can be reached: `@gif`
+  and `format=gif` are 400s, `Params.output = Gif` is a 422 from the
+  pipeline entry, and the encoder keeps a `bail!` backstop so a future
+  encoder cannot slip in as mislabeled bytes.
+
+  Memory is bounded before the first pixel: `check_src_pixels` on the
+  logical screen, a `DecodeCost` that counts the canvas *and* the
+  decoder's own staged frame — priced at the frame's own rectangle,
+  which a writer may make larger than the screen — plus the `gif`
+  crate's per-frame memory limit.
+
+- **Animated GIF becomes animated WebP**, through libwebp's
+  `WebPAnimEncoder` (already in `libwebp-sys`, so no new dependency).
+  Every frame is composited onto the logical screen — sub-rectangle,
+  transparent index, all four disposal methods — resized like any other
+  output, then encoded. Loop counts are translated rather than copied
+  (GIF counts the repeats *after* the first play, WebP counts total
+  plays, so `min(n + 1, 65535)` — what `gif2webp` does by default), and
+  the canvas background is declared transparent so the container agrees
+  with the pixels the compositor builds.
+
+  One animated request costs roughly 643 still ones, so four knobs bound
+  the work: `OXIMG_GIF_ANIMATION` (`1`), `OXIMG_MAX_ANIM_FRAMES`
+  (`200`), `OXIMG_MAX_ANIM_WORK` (`8,000,000` — encoded frames x
+  post-resize frame area, the product that predicts encode time) and
+  `OXIMG_ANIM_FRAME_STEP` (`1`). Exceeding a budget is deliberately not
+  an error: the request degrades to the still first frame, the way
+  animated WebP and animated AVIF sources already do. So does
+  `OXIMG_MAX_DECODED_BYTES`, and so does a play time WebP's i32
+  timestamps cannot represent. `OXIMG_GIF_ANIMATION=0` restores 0.11.0
+  behavior exactly.
+
+  Resizing before encoding is what makes this affordable (2040ms ->
+  517ms into a 512 box on the corpus). Staging is a function of the
+  canvas — at most three canvases, whatever arrives — but
+  `WebPAnimEncoder` retains every frame it has compressed until
+  `Assemble`, so peak memory does grow with the animation, and
+  `OXIMG_MAX_ANIM_WORK` is what bounds that term. Verified against
+  libwebp's own demuxer rather than only our reader: canvas size, loop
+  count, per-frame end timestamps, composited pixels, and the `ANIM`
+  chunk's background.
+
+  Measured against the release binary at a 512 box: 11 of the 15 corpus
+  files serve animated (4–30% of the source bytes, worst case 467ms) and
+  4 degrade to a still because they exceed a budget — exactly the
+  intended line. One case runs the other way and is worth knowing
+  before enabling this: `Animhorse.gif`, a 25 KB 8-frame cartoon at
+  native size, comes back **41 KB**, because a flat palette is what LZW
+  compresses best.
+
+- **`pipeline::probe_animation`**, and frame count, duration and loop
+  count on `oximg probe`, so an operator can price a source against the
+  budgets before serving it. Both report what oximg would emit rather
+  than the source's literal numbers.
+
+- **`docs/gif-evaluation.md`**: the measurements behind all of the
+  above — four compression strategies over a 15-file corpus, the memory
+  and CPU accounting, and an imgproxy comparison.
+
+### Changed
+
+- **`oximg resize` refuses a `.gif` output extension** — exit 2, before
+  anything is read or written — instead of ignoring it. It used to fall
+  through to the source format, so `oximg resize photo.jpg 100 100
+  out.gif` wrote JPEG bytes under a `.gif` name. Nothing here encodes
+  GIF, so honoring the name is impossible and ignoring it mislabels the
+  file: the same case the server answers 400 for on `@gif`, and worse
+  on the CLI, because the file is already on disk by the time the
+  summary line could mention it. An explicit `-f` still wins with the
+  extension unread, per the documented precedence — `-f webp out.gif`
+  is a name the caller chose on purpose.
+
 ## [0.11.0] - 2026-08-07
 
 A minor, not a patch: the default JPEG output changes. Sources that
@@ -1325,7 +1420,7 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.5.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.11.0...HEAD
 [0.5.0]: https://github.com/oximg/oximg/compare/v0.4.5...v0.5.0
 [0.4.5]: https://github.com/oximg/oximg/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/oximg/oximg/compare/v0.4.3...v0.4.4
