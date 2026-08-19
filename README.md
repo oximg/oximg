@@ -534,6 +534,14 @@ an image a browser will happily display.
 | `OXIMG_MAX_ANIM_WORK` | `8,000,000` | Encoded frames x **post-resize** frame area, in pixels — the product that predicts encode time, which is what dominates an animation (3018 ms of a 3213 ms worst case). The default admits the measured corpus' worst in-budget file (26 frames of 1280x720 into a 512 box, ~6.8 Mpx, 517 ms) and refuses its worst overall (~34 Mpx, 3.2 s). Because it is measured *after* the resize, a small output box is what buys an expensive source back: the same source that is refused at native size fits into a thumbnail |
 | `OXIMG_ANIM_FRAME_STEP` | `1` | Encode every Nth frame. Total play time is preserved (a skipped frame extends the previous frame's duration), so this costs smoothness, not fidelity — which is why it is off by default. `2` roughly halves encode cost |
 
+One caveat on bytes: animated WebP wins hugely on photographic and
+video-like GIFs (4–30% of the source across the corpus) but can *lose*
+on small flat-graphics ones, where GIF's tiny palette is exactly what
+LZW compresses best — a measured 25 KB, 8-frame cartoon comes back at
+41 KB. oximg re-encodes whatever it is asked to, in every format; if
+a caller has such sources, serving them at their own size gains nothing
+and `OXIMG_GIF_ANIMATION=0` is the cheaper answer.
+
 The estimated-memory cap (`OXIMG_MAX_DECODED_BYTES`) applies here too,
 and degrades rather than refusing for the same reason: a still of the
 same GIF fits under any cap that admits one frame. Frames are
