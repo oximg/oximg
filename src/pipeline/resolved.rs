@@ -174,6 +174,10 @@ mod tests {
             max_decoded_bytes: None,
             log_decoded_bytes_above: None,
             max_src_pixels: 64_000_000,
+            gif_animation: true,
+            max_anim_frames: 200,
+            max_anim_work: 8_000_000,
+            anim_frame_step: 1,
         }
     }
 

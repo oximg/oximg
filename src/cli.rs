@@ -31,7 +31,8 @@ pub fn print_help() {
              --preset P         jpegli (default) | fast | small\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \
-             pixel decode).\n  \
+             pixel decode), plus frame count, duration and loop count\n          \
+             when the source is animated.\n  \
            oximg --version | --help",
         env!("CARGO_PKG_VERSION")
     );
@@ -152,8 +153,24 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
     }
     let bytes = std::fs::read(input).with_context(|| format!("read {input}"))?;
     let (format, w, h) = pipeline::probe(&bytes)?;
+    // Frame count and duration are what the animation budgets
+    // (OXIMG_MAX_ANIM_FRAMES / OXIMG_MAX_ANIM_WORK) are spent against,
+    // so an operator can price a source here before serving it.
+    let anim = match pipeline::probe_animation(&bytes)? {
+        Some(a) => format!(
+            ", {} frames, {}ms, {}",
+            a.frames,
+            a.duration_ms,
+            match a.loop_count {
+                0 => "looping forever".to_string(),
+                1 => "playing once".to_string(),
+                n => format!("playing {n} times"),
+            }
+        ),
+        None => String::new(),
+    };
     println!(
-        "{input}: {} {w}x{h} ({} stored pixels)",
+        "{input}: {} {w}x{h} ({} stored pixels){anim}",
         format.content_type(),
         w as u64 * h as u64
     );

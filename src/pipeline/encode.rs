@@ -198,6 +198,197 @@ pub(super) fn wrap_webp_icc(webp: &[u8], icc: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+/// `WEBP_FF_FORMAT_FLAGS` bit that says the container carries an `ANIM`
+/// chunk, i.e. a frame sequence rather than a single still.
+const ANIMATION_FLAG: u32 = 0x02;
+
+/// One animation's worth of libwebp `WebPAnimEncoder`: the handle, the
+/// per-frame encoder config, and the canvas size every frame must match,
+/// freed on drop. The GIF path streams frames through this, so nothing
+/// larger than one frame is ever staged on our side (the encoder itself
+/// retains the frames it has already compressed — priced into the
+/// `DecodeCost` at the call site).
+///
+/// Timestamps must be non-decreasing, because libwebp derives a frame's
+/// duration from the *next* frame's timestamp. That is also why
+/// [`AnimEncoder::finish`] takes the animation's total duration: the
+/// documented final `Add(NULL, ts)` exists to give the last real frame
+/// its own.
+pub(super) struct AnimEncoder {
+    enc: *mut libwebp_sys::WebPAnimEncoder,
+    config: libwebp_sys::WebPConfig,
+    w: usize,
+    h: usize,
+}
+
+impl AnimEncoder {
+    /// `loop_count` is WebP's spelling: 0 = forever.
+    // SAFETY: both Internal entry points are called with WEBP_MUX_ABI_VERSION and
+    // their return values checked, so the zeroed options/config structs are only
+    // read after libwebp itself initialized them. On the config-init failure path
+    // the already-created encoder is deleted before returning, and on every other
+    // path it is owned by the returned value and freed exactly once in `drop`.
+    pub(super) fn new(w: usize, h: usize, loop_count: u32, p: &Resolved) -> Result<Self> {
+        use libwebp_sys as wp;
+        unsafe {
+            let mut opts: wp::WebPAnimEncoderOptions = std::mem::zeroed();
+            anyhow::ensure!(
+                wp::WebPAnimEncoderOptionsInitInternal(&mut opts, wp::WEBP_MUX_ABI_VERSION as _)
+                    != 0,
+                "libwebp mux ABI mismatch"
+            );
+            opts.anim_params.loop_count = loop_count as std::os::raw::c_int;
+            // Both of these buy bytes with encoder passes, and CPU is
+            // this path's binding constraint (docs/gif-evaluation.md
+            // §5): minimize_size re-encodes to search key-frame
+            // placement, allow_mixed encodes every frame twice to pick
+            // lossy or lossless per frame. Off, explicitly.
+            opts.minimize_size = 0;
+            opts.allow_mixed = 0;
+            let enc = wp::WebPAnimEncoderNewInternal(
+                w as i32,
+                h as i32,
+                &opts,
+                wp::WEBP_MUX_ABI_VERSION as _,
+            );
+            anyhow::ensure!(!enc.is_null(), "webp animation encoder");
+            let mut config: wp::WebPConfig = std::mem::zeroed();
+            if !wp::WebPInitConfig(&mut config) {
+                wp::WebPAnimEncoderDelete(enc);
+                anyhow::bail!("libwebp ABI mismatch");
+            }
+            // The same quality and effort knobs as a still WebP: an
+            // animation is not a different product, just more frames.
+            config.quality = p.webp_quality;
+            config.method = webp_effort().clamp(0, 6);
+            Ok(AnimEncoder { enc, config, w, h })
+        }
+    }
+
+    /// Add one full-canvas RGBA frame, starting at `ts_ms`.
+    // SAFETY: a zeroed WebPPicture is libwebp's documented pre-init state and the
+    // Init ABI check is enforced. The import reads exactly h rows of w*4 bytes,
+    // which the length assertion pins to the caller's slice; `pic` is freed on
+    // both the import-failure and the normal path, exactly once. `self.enc` is
+    // non-null for the lifetime of `self`, and the config is only read by Add.
+    pub(super) fn add(&mut self, rgba: &[u8], ts_ms: i32) -> Result<()> {
+        use libwebp_sys as wp;
+        assert_eq!(rgba.len(), self.w * self.h * 4, "frame is not the canvas");
+        unsafe {
+            let mut pic: wp::WebPPicture = std::mem::zeroed();
+            anyhow::ensure!(wp::WebPPictureInit(&mut pic), "libwebp ABI mismatch");
+            pic.width = self.w as i32;
+            pic.height = self.h as i32;
+            // ARGB rather than the default YUV import: the encoder diffs
+            // each frame against its canvas in ARGB, and converts a YUV
+            // frame back with a loss its own header calls out.
+            pic.use_argb = 1;
+            let imported = wp::WebPPictureImportRGBA(&mut pic, rgba.as_ptr(), (self.w * 4) as i32);
+            if imported == 0 {
+                wp::WebPPictureFree(&mut pic);
+                anyhow::bail!("webp picture import");
+            }
+            let ok = wp::WebPAnimEncoderAdd(self.enc, &mut pic, ts_ms, &self.config);
+            wp::WebPPictureFree(&mut pic);
+            anyhow::ensure!(ok != 0, "webp animation frame: {}", self.error());
+            Ok(())
+        }
+    }
+
+    /// Close the animation at `total_ms` — the last frame's end — and
+    /// assemble the container.
+    // SAFETY: the NULL frame is the documented terminator, not a missing argument.
+    // A zeroed WebPData is a valid out-param; on success data.bytes[..size] is
+    // libwebp-allocated and copied out before the single WebPDataClear frees it,
+    // and Clear on the zeroed/failed struct is a no-op. `self` is dropped (and the
+    // encoder deleted) on every path out of here.
+    pub(super) fn finish(self, total_ms: i32) -> Result<Vec<u8>> {
+        use libwebp_sys as wp;
+        unsafe {
+            anyhow::ensure!(
+                wp::WebPAnimEncoderAdd(self.enc, std::ptr::null_mut(), total_ms, std::ptr::null())
+                    != 0,
+                "webp animation flush: {}",
+                self.error()
+            );
+            let mut data: wp::WebPData = std::mem::zeroed();
+            if wp::WebPAnimEncoderAssemble(self.enc, &mut data) == 0 {
+                wp::WebPDataClear(&mut data);
+                anyhow::bail!("webp animation assemble: {}", self.error());
+            }
+            let out = std::slice::from_raw_parts(data.bytes, data.size).to_vec();
+            wp::WebPDataClear(&mut data);
+            Ok(out)
+        }
+    }
+
+    /// libwebp's own message for the last failure, which is the only
+    /// place it says *why* (the return codes are plain booleans).
+    // SAFETY: GetError returns either NULL or a NUL-terminated string owned by
+    // the encoder, valid as long as `self` is; it is copied into a String here.
+    fn error(&self) -> String {
+        unsafe {
+            let msg = libwebp_sys::WebPAnimEncoderGetError(self.enc);
+            if msg.is_null() {
+                "unknown error".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+            }
+        }
+    }
+}
+
+impl Drop for AnimEncoder {
+    // SAFETY: `enc` came from WebPAnimEncoderNewInternal, was null-checked, is
+    // never handed out or copied, and this is the only place it is deleted.
+    fn drop(&mut self) {
+        unsafe { libwebp_sys::WebPAnimEncoderDelete(self.enc) }
+    }
+}
+
+/// Animation summary of a WebP container: (frames, total duration in ms,
+/// loop count) — demux only, no frame is decoded. `None` when the file
+/// carries no `ANIM` chunk (or does not parse).
+// SAFETY: the demuxer borrows `srcbuf` (copy_data=0) and is deleted exactly once,
+// after every read of it. A zeroed WebPIterator is the documented pre-GetFrame
+// state, and each successfully fetched iterator is released before the next.
+pub(super) fn webp_animation(srcbuf: &[u8]) -> Option<(usize, u64, u32)> {
+    use libwebp_sys as wp;
+    unsafe {
+        let data = wp::WebPData {
+            bytes: srcbuf.as_ptr(),
+            size: srcbuf.len(),
+        };
+        let dmux = wp::WebPDemuxInternal(
+            &data,
+            0,
+            std::ptr::null_mut(),
+            wp::WEBP_DEMUX_ABI_VERSION as _,
+        );
+        if dmux.is_null() {
+            return None;
+        }
+        let flags = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FORMAT_FLAGS);
+        let out = (flags & ANIMATION_FLAG != 0).then(|| {
+            let frames = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FRAME_COUNT);
+            let loops = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_LOOP_COUNT);
+            // Durations live per frame, so the total is a walk over the
+            // frame table — still no pixel work.
+            let mut duration = 0u64;
+            for i in 1..=frames {
+                let mut iter: wp::WebPIterator = std::mem::zeroed();
+                if wp::WebPDemuxGetFrame(dmux, i as i32, &mut iter) != 0 {
+                    duration += iter.duration.max(0) as u64;
+                    wp::WebPDemuxReleaseIterator(&mut iter);
+                }
+            }
+            (frames as usize, duration, loops)
+        });
+        wp::WebPDemuxDelete(dmux);
+        out
+    }
+}
+
 /// First frame of an animated WebP as a standalone-decodable
 /// bitstream — only when it covers the full canvas at zero offset
 /// (true of virtually every real file; a partial first frame would
@@ -224,7 +415,6 @@ pub(super) fn webp_first_frame(srcbuf: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         let flags = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FORMAT_FLAGS);
-        const ANIMATION_FLAG: u32 = 0x02;
         if flags & ANIMATION_FLAG == 0 {
             wp::WebPDemuxDelete(dmux);
             return None;

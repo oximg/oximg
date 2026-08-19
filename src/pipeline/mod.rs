@@ -465,6 +465,71 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
     }
 }
 
+/// What a source's animation is, for the formats that have one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Animation {
+    /// Frames the container declares.
+    pub frames: usize,
+    /// Total play time in milliseconds. For GIF this is the duration
+    /// oximg would *emit*, not a verbatim sum: delays of 0 or 1
+    /// centisecond are normalized (see `pipeline/gif.rs`).
+    pub duration_ms: u64,
+    /// Plays before stopping; 0 means forever.
+    pub loop_count: u32,
+}
+
+/// Animation summary from headers alone, the companion to [`probe`]:
+/// the frame count and duration that the `OXIMG_MAX_ANIM_*` budgets are
+/// spent against, so what a request will cost is inspectable before it
+/// is served.
+///
+/// `None` means "no animation here": a GIF with a single frame, a WebP
+/// with no `ANIM` chunk, or any other format — including an AVIF image
+/// sequence, which this build decodes as a still and so does not report.
+///
+/// # Examples
+///
+/// ```
+/// use oximg::pipeline;
+///
+/// let bytes = std::fs::read(concat!(
+///     env!("CARGO_MANIFEST_DIR"),
+///     "/tests/fixtures/anim.gif"
+/// ))?;
+/// let anim = pipeline::probe_animation(&bytes)?.expect("three frames");
+/// assert_eq!((anim.frames, anim.duration_ms), (3, 1500));
+/// assert_eq!(anim.loop_count, 0, "loops forever");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn probe_animation(bytes: &[u8]) -> Result<Option<Animation>, Error> {
+    probe_animation_inner(bytes).map_err(|e| Error::classify(e, false))
+}
+
+fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
+    let mut header = [0u8; 12];
+    anyhow::ensure!(bytes.len() >= 12, "source too short");
+    header.copy_from_slice(&bytes[..12]);
+    let format = ImageFormat::sniff(&header).context("unsupported image format")?;
+    match format {
+        ImageFormat::Gif => {
+            let scan = scan_gif(bytes)?;
+            Ok((scan.frames > 1).then_some(Animation {
+                frames: scan.frames,
+                duration_ms: scan.duration_ms,
+                loop_count: scan.loop_count,
+            }))
+        }
+        ImageFormat::Webp => Ok(
+            webp_animation(bytes).map(|(frames, duration_ms, loop_count)| Animation {
+                frames,
+                duration_ms,
+                loop_count,
+            }),
+        ),
+        _ => Ok(None),
+    }
+}
+
 /// Resize + re-encode a source held in memory: sniff the format by
 /// magic bytes, fit within the [`Params`] box (never enlarging), and
 /// encode in `p.output` (defaulting to the source's own format).
@@ -926,6 +991,10 @@ struct Scratch {
     // buffer (png's Seek bound, libwebp's one-shot API). JPEG never uses
     // this: it streams.
     srcbuf: Vec<u8>,
+    // Canvas snapshot for GIF's "restore to previous" disposal: the one
+    // disposal method that needs a second canvas, so it stays empty
+    // until a source actually asks for it.
+    anim_prev: Vec<u8>,
     // Final RGB pixels also live in scratch: output sizes vary per request
     // (every distinct target width is a distinct allocation size), and that
     // churn is what the allocator retains across thread heaps.

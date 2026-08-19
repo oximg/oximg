@@ -371,6 +371,11 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_FETCH_CONCURRENCY", "many"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
+        ("OXIMG_GIF_ANIMATION", "off"),
+        ("OXIMG_MAX_ANIM_FRAMES", "0"),
+        ("OXIMG_MAX_ANIM_WORK", "none"),
+        ("OXIMG_ANIM_FRAME_STEP", "0"),
+        ("OXIMG_ANIM_FRAME_STEP", "100"),
         ("QUALITY", "eighty"),
     ] {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
@@ -485,6 +490,127 @@ fn gif_sources_are_served_as_webp() {
     // An explicit token still wins, as for any other source.
     let (status, ct, _) = s.get("/resize/100/100/still.gif@png").unwrap();
     assert_eq!((status, ct.as_str()), (200, "image/png"));
+}
+
+/// Frame count of a response body, or `None` when it is a still — the
+/// one thing every animation budget is asserted through.
+fn frames_of(body: &[u8]) -> Option<usize> {
+    oximg::pipeline::probe_animation(body)
+        .unwrap()
+        .map(|a| a.frames)
+}
+
+/// A temp IMAGES_DIR holding one hand-built animated GIF: `frames`
+/// full-screen frames at 10cs each, which is how a test buys an
+/// arbitrary frame count and canvas size without committing a fixture
+/// for every budget. The color cycles through three, not two, so that
+/// frames stay distinct under `OXIMG_ANIM_FRAME_STEP=2` — every-other
+/// frame of a two-color animation would be a single repeated image, and
+/// libwebp merges those.
+fn animated_images_dir(tag: &str, w: u16, h: u16, frames: usize) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-anim-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut out = Vec::new();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    let mut enc = gif::Encoder::new(&mut out, w, h, pal).unwrap();
+    enc.set_repeat(gif::Repeat::Infinite).unwrap();
+    for i in 0..frames {
+        let px = vec![(i % 3) as u8; w as usize * h as usize];
+        let mut f = gif::Frame::from_indexed_pixels(w, h, px, None);
+        f.delay = 10;
+        enc.write_frame(&f).unwrap();
+    }
+    drop(enc);
+    std::fs::write(dir.join("anim.gif"), out).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
+/// An animated GIF is served as an animated WebP by default. Every knob
+/// that says no serves the still first frame **with a 200** — a
+/// degradation, not an error, because a browser will happily display the
+/// smaller thing and a 413 helps nobody. One server per knob: the config
+/// resolves once per process.
+#[test]
+fn animated_gif_serves_animated_webp_by_default() {
+    let s = Server::start(&[]);
+    let (status, ct, body) = s.get("/resize/120/120/anim.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), Some(3), "anim.gif has three frames");
+
+    // The still fallback is the same bytes an explicit non-animating
+    // target gets, and both are ordinary 200s.
+    let (status, ct, body) = s.get("/resize/120/120/anim.gif@png").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/png"));
+    assert_eq!(frames_of(&body), None);
+}
+
+#[test]
+fn animation_budgets_degrade_to_a_still_instead_of_failing() {
+    for (knob, value) in [
+        ("OXIMG_GIF_ANIMATION", "0"),   // switched off outright
+        ("OXIMG_MAX_ANIM_FRAMES", "2"), // anim.gif carries three
+        ("OXIMG_MAX_ANIM_WORK", "1"),   // one pixel of encode budget
+    ] {
+        let s = Server::start(&[(knob, value.to_string())]);
+        let (status, ct, body) = s.get("/resize/120/120/anim.gif").unwrap();
+        assert_eq!(
+            (status, ct.as_str()),
+            (200, "image/webp"),
+            "{knob}={value} must still serve"
+        );
+        assert_eq!(frames_of(&body), None, "{knob}={value} must serve a still");
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        assert_eq!(
+            (w, h),
+            (120, 90),
+            "{knob}={value}: a still, not a thumbnail"
+        );
+    }
+}
+
+/// The estimated-memory cap degrades too, rather than answering 413 as
+/// it does for a still that cannot fit: at 10 frames of 200x150 the
+/// animation's estimate is over 1 MiB while the same GIF as a still is
+/// comfortably under it, so the cap has a choice — and serving less is
+/// the one that answers the request.
+#[test]
+fn decoded_bytes_cap_degrades_an_animation_it_cannot_afford() {
+    let dir = animated_images_dir("cap", 200, 150, 10);
+    let uncapped = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    let (status, _, body) = uncapped.get("/resize/200/200/anim.gif").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(frames_of(&body), Some(10), "all ten frames without a cap");
+
+    let capped = Server::start(&[
+        ("IMAGES_DIR", dir),
+        ("OXIMG_MAX_DECODED_BYTES", (1024 * 1024).to_string()),
+    ]);
+    let (status, ct, body) = capped.get("/resize/200/200/anim.gif").unwrap();
+    assert_eq!((status, ct.as_str()), (200, "image/webp"));
+    assert_eq!(frames_of(&body), None, "over the cap, a still is served");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (200, 150), "the still is the whole logical screen");
+}
+
+/// Frame decimation: every Nth frame is encoded and the total play time
+/// is preserved, so what it costs is smoothness, not fidelity.
+#[test]
+fn anim_frame_step_decimates_but_keeps_the_duration() {
+    let dir = animated_images_dir("step", 60, 40, 8);
+    let full = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    let (_, _, body) = full.get("/resize/60/60/anim.gif").unwrap();
+    let all = oximg::pipeline::probe_animation(&body).unwrap().unwrap();
+    assert_eq!(all.frames, 8);
+
+    let stepped = Server::start(&[("IMAGES_DIR", dir), ("OXIMG_ANIM_FRAME_STEP", "2".into())]);
+    let (status, _, body) = stepped.get("/resize/60/60/anim.gif").unwrap();
+    assert_eq!(status, 200);
+    let half = oximg::pipeline::probe_animation(&body).unwrap().unwrap();
+    assert_eq!(half.frames, 4, "every other frame");
+    assert_eq!(
+        half.duration_ms, all.duration_ms,
+        "decimation must not shorten the animation"
+    );
 }
 
 #[test]

@@ -7,9 +7,10 @@
 
 High-performance image compression in Rust: a library, a CLI, and a
 self-hostable HTTP server (PoC). JPEG, PNG, WebP — and AVIF with the
-`avif` feature — in and out, plus GIF in; sources are format-sniffed by
-magic bytes and re-encoded in their own format (GIF, having no encoder
-here, becomes WebP). On imgproxy's official benchmark harness, run on
+`avif` feature — in and out, plus GIF in (animated GIF included, as
+animated WebP); sources are format-sniffed by magic bytes and re-encoded
+in their own format (GIF, having no encoder here, becomes WebP). On
+imgproxy's official benchmark harness, run on
 the same AWS instance types as their published results, oximg leads
 every format cell on both x86-64 and Graviton while resizing in linear
 light at measurably higher output quality (see
@@ -76,11 +77,13 @@ combines with any encode column:
 | PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A); opt-in palette quantization (`OXIMG_PNG_QUANTIZE`) |
 | WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha; output is scaled to fit WebP's 16383 px limit |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
-| GIF | GIF87a/89a, first frame composited onto the logical screen (frame sub-rectangle, transparent index) | none — see below |
+| GIF | GIF87a/89a, every frame composited onto the logical screen (frame sub-rectangle, transparent index, all four disposal methods) | none — see below |
 
 GIF is the one decode-only format, so it is also the one source whose
 output format is not its own: with no `@{fmt}` and no negotiation, a GIF
-becomes **WebP**. That is a deliberate choice, not a missing encoder —
+becomes **WebP**, and an *animated* GIF becomes an **animated WebP**
+(see [Animation](#animation) for the budgets that decides under). That
+is a deliberate choice, not a missing encoder —
 on a 15-file real-world corpus, lossless GIF→GIF saved *nothing* on 9 of
 them (median 100% of the source bytes, which is also what imgproxy's
 GIF→GIF measured), and at native size the smallest GIF variant measured
@@ -160,7 +163,8 @@ source bytes (local file or HTTP origin)
       PNG:  png crate (palette/gray/16-bit normalized to RGB(A)8)
       WebP: libwebp
       AVIF: dav1d (8/10/12-bit, all subsamplings, alpha, bilinear chroma upsampling)
-      GIF:  gif crate, first frame composited onto the logical screen
+      GIF:  gif crate, frames composited onto the logical screen (every
+            frame for an animated GIF into a WebP target, else the first)
   → linear-light resize: sRGB u8 → linear u16 → Lanczos3 → sRGB u8
       (alpha is premultiplied before resampling, unpremultiplied after;
        JPEG rows stream through in-tree ring-scheduled f32 row kernels —
@@ -171,6 +175,8 @@ source bytes (local file or HTTP origin)
   → encode in the source format (GIF sources: WebP, the default target)
       JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
+      animated GIF: each frame composited, resized and streamed into
+            libwebp's animation encoder (one canvas in memory, not N)
 ```
 
 Concurrent identical requests are coalesced and share one result.
@@ -370,6 +376,7 @@ oximg resize photo.jpg 800 800 out.jpg -q 70  # JPEG quality 70 (--preset fast|s
 oximg resize photo.jpg 750 0 out.jpg          # width-only: height follows the aspect ratio
 oximg resize photo.jpg 0 0 out.webp           # 0 0 = re-encode at the source's own size
 oximg probe photo.webp                        # format + stored dimensions, header-only
+oximg probe loop.gif                           # animated sources also print frames, duration and loop count
 ```
 
 The output format is `-f/--format`, else the `<out>` extension, else
@@ -381,7 +388,9 @@ the same way. Usage errors exit 2; processing failures exit 1.
 
 The `oximg::pipeline` module is usable without the HTTP server —
 `process`/`process_path` take a `Params` and return the re-encoded
-bytes plus their format, `probe` reads just the header. Depend on it
+bytes plus their format, `probe` reads just the header, and
+`probe_animation` reports frame count, play time and loop count for an
+animated source (GIF and WebP) without decoding pixels. Depend on it
 with `default-features = false` to drop the entire HTTP stack (axum,
 tokio, reqwest, hmac, sha2, serde_json); add `features = ["avif"]`
 for AVIF. The remote-source functions need the `server` feature:
@@ -505,6 +514,33 @@ Three consequences that catch people out:
   [the Cloud Run guide](docs/deploy-cloud-run.md), where pinning it
   down measured *slower*).
 
+### Animation
+
+An animated GIF into a WebP target is served as an animated WebP; every
+other target renders its first frame. The knobs below bound what one
+such request may cost — and unlike the source caps above, **exceeding
+one is not an error**: the request degrades to the still first frame and
+still answers 200. That is the point. An animation is not one image but
+N, so a single request can cost hundreds of still requests' CPU
+(measured: 3.2 s for the worst file in a 15-file corpus, against 5 ms
+for a still — [docs/gif-evaluation.md](docs/gif-evaluation.md) §5), and
+a service that answers a *smaller* thing beats one that answers 413 to
+an image a browser will happily display.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OXIMG_GIF_ANIMATION` | `1` | `0` renders every animated GIF as its still first frame, i.e. 0.11.0 behaviour |
+| `OXIMG_MAX_ANIM_FRAMES` | `200` | Source frames an animation may carry before it degrades to a still. Bounds the decode+composite half of the work, which shrinking the output does not touch |
+| `OXIMG_MAX_ANIM_WORK` | `8,000,000` | Encoded frames x **post-resize** frame area, in pixels — the product that predicts encode time, which is what dominates an animation (3018 ms of a 3213 ms worst case). The default admits the measured corpus' worst in-budget file (26 frames of 1280x720 into a 512 box, ~6.8 Mpx, 517 ms) and refuses its worst overall (~34 Mpx, 3.2 s). Because it is measured *after* the resize, a small output box is what buys an expensive source back: the same source that is refused at native size fits into a thumbnail |
+| `OXIMG_ANIM_FRAME_STEP` | `1` | Encode every Nth frame. Total play time is preserved (a skipped frame extends the previous frame's duration), so this costs smoothness, not fidelity — which is why it is off by default. `2` roughly halves encode cost |
+
+The estimated-memory cap (`OXIMG_MAX_DECODED_BYTES`) applies here too,
+and degrades rather than refusing for the same reason: a still of the
+same GIF fits under any cap that admits one frame. Frames are
+composited, resized and handed to the encoder one at a time, so peak
+memory is a function of the canvas and the output size, not of the frame
+count.
+
 ### Pixel pipeline
 
 | Variable | Default | Meaning |
@@ -547,8 +583,9 @@ drain.
   is tracked in [#11](https://github.com/oximg/oximg/issues/11) and
   fails at boot with a pointer rather than misbehaving)
 - JXL output (the `@jxl` token is reserved and returns a clear error)
-- Animated output (animated GIF, AVIF and WebP *sources* render their
-  first frame, like other image proxies)
+- Animated output from an animated **AVIF or WebP** source (those render
+  their first frame; animated GIF sources do animate — see
+  [Animation](#animation))
 - GIF output (GIF is decode-only; `@gif` returns a clear error and GIF
   sources default to WebP)
 - Response caching
