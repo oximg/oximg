@@ -265,11 +265,16 @@ Three findings:
    `Muybridge` 13.6% (ffmpeg 14%), `Rotating_earth` 20.7% (21%),
    `web_480x270_docu` 20.2% (20%). Whatever `gif2webp` does, oximg can
    do in-process.
-2. **Memory is O(canvas), not O(frames).** Peak RSS is 7–60 MB across
-   the corpus — the 265-frame source peaks at 36 MB, *less* than the
-   26-frame 1280x720 one at 60 MB. `WebPAnimEncoder` is incremental and
-   the compositor holds at most three canvases (current, previous,
-   resized). Frame count does not enter the memory budget.
+2. **Canvas size dominated memory on this corpus, not frame count.**
+   Peak RSS is 7–60 MB — the 265-frame source peaks at 36 MB, *less* than
+   the 26-frame 1280x720 one at 60 MB. The compositor is genuinely
+   O(canvas): at most three canvases (current, previous, resized).
+   `WebPAnimEncoder` is incremental but not free of the frame count — it
+   retains every frame it has compressed until `Assemble`, so encoder
+   memory scales with the *encoded output*, which on these files stayed
+   small (0.11 B/px, §5). Read this as "canvas dominates in practice",
+   not "frames are asymptotically free"; the shipped cost model prices
+   the retained frames explicitly.
 3. **The in-tree GIF encoder is not competitive.** Engineering it
    properly helped a lot — a global palette with no dithering and
    changed-rectangle diffs took the screencast from 137,813 bytes
@@ -377,10 +382,14 @@ No GIF *encoder* dependency is needed, per §4 finding 3.
 ### Memory accounting
 
 `DecodeCost` / `check_decoded_bytes` / `check_src_pixels` are all
-O(one frame) today, and §4 finding 2 says that is still the right shape:
-the compositor and `WebPAnimEncoder` are both O(canvas). What animation
-adds is a **CPU** axis, `frames × pixels`, which no existing budget
-covers. That is the new term to add — a work budget, checked after
+O(one frame) today, and §4 finding 2 says the compositor keeps that
+shape: at most three canvases, whatever the frame count. `WebPAnimEncoder`
+does not — it holds its compressed frames until assembly — so animation
+adds a memory term proportional to the encoded output as well (what
+shipped models it at one byte per encoded pixel). The larger new axis is
+**CPU**, `frames × pixels`, which no existing budget covers, and which
+the same product bounds. That is the term to add — a work budget, checked
+after
 `probe()` yields the frame count and before any frame is composited, so
 an oversized animation is rejected or degraded to Tier 0 *before* it
 consumes anything.

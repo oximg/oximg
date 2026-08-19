@@ -280,8 +280,13 @@ fn delay_ms(delay_cs: u16) -> u32 {
 /// place a broken GIF is reported and there is one message per failure
 /// mode rather than two.
 ///
-/// Memory stays O(canvas) however many frames arrive: frames are
-/// composited, resized and handed to the encoder one at a time.
+/// *Staging* memory stays O(canvas) however many frames arrive: frames
+/// are composited, resized and handed to the encoder one at a time, so no
+/// buffer here grows with the frame count. The encoder is the other half
+/// of the story — `WebPAnimEncoder` retains every frame it has compressed
+/// until `Assemble`, so peak memory does grow with the animation. That
+/// part is estimated below (one byte per encoded pixel) and bounded by
+/// `OXIMG_MAX_ANIM_WORK`, not by the canvas.
 fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<u8>>> {
     let cfg = crate::config::config();
     if !cfg.gif_animation {

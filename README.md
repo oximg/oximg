@@ -545,9 +545,13 @@ and `OXIMG_GIF_ANIMATION=0` is the cheaper answer.
 The estimated-memory cap (`OXIMG_MAX_DECODED_BYTES`) applies here too,
 and degrades rather than refusing for the same reason: a still of the
 same GIF fits under any cap that admits one frame. Frames are
-composited, resized and handed to the encoder one at a time, so peak
-memory is a function of the canvas and the output size, not of the frame
-count.
+composited, resized and handed to the encoder one at a time, so *our*
+staging is a function of the canvas alone — but libwebp's animation
+encoder retains every frame it has compressed until the container is
+assembled, so peak memory does grow with the animation. The estimate
+prices that retained output at one byte per encoded pixel (~9x the
+0.11 B/px measured across the corpus, i.e. deliberately pessimistic),
+which makes it `OXIMG_MAX_ANIM_WORK`, not the canvas, that bounds it.
 
 ### Pixel pipeline
 
