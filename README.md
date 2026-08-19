@@ -82,7 +82,8 @@ combines with any encode column:
 GIF is the one decode-only format, so it is also the one source whose
 output format is not its own: with no `@{fmt}` and no negotiation, a GIF
 becomes **WebP**, and an *animated* GIF becomes an **animated WebP**
-(see [Animation](#animation) for the budgets that decides under). That
+(see [Animation](#animation) for the budgets that decide whether the
+animation is kept). That
 is a deliberate choice, not a missing encoder —
 on a 15-file real-world corpus, lossless GIF→GIF saved *nothing* on 9 of
 them (median 100% of the source bytes, which is also what imgproxy's

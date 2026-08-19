@@ -157,7 +157,7 @@ docker run --rm -v "$work":/work alpine:3.20 sh -c '
   # --- GIF family: a third-party writer for the decode-only format.
   # Frame-level structure (sub-rectangles, disposal, out-of-bounds
   # rects) is built byte-exactly in tests/formats_gif.rs instead; these
-  # three pin that a real encoder-s output decodes at all.
+  # three pin that a real encoder's output decodes at all.
   magick corner.png still.gif
   magick corner.png -transparent "rgb(128,128,128)" alpha.gif
   magick -delay 50 -loop 0 f1.png f2.png f3.png anim.gif
