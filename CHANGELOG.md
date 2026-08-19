@@ -73,12 +73,17 @@ be a 422 now serves bytes, and one CLI edge changes its exit code.
   count, per-frame end timestamps, composited pixels, and the `ANIM`
   chunk's background.
 
-  Measured against the release binary at a 512 box: 11 of the 15 corpus
-  files serve animated (4–30% of the source bytes, worst case 467ms) and
-  4 degrade to a still because they exceed a budget — exactly the
-  intended line. One case runs the other way and is worth knowing
-  before enabling this: `Animhorse.gif`, a 25 KB 8-frame cartoon at
-  native size, comes back **41 KB**, because a flat palette is what LZW
+  Measured against the release binary at a 512 box (warm, best of
+  three): 10 of the 15 corpus files serve animated, 4 degrade to a still
+  — three at 9, 14 and 15 Mpx of post-resize work against
+  `OXIMG_MAX_ANIM_WORK`'s 8, one at 265 frames against
+  `OXIMG_MAX_ANIM_FRAMES`' 200 — and 1 was a still GIF to begin with.
+  Worst animated request 449ms, for 26 frames of 1280x720 into the box.
+  On the seven photographic or video-like files the animated WebP is
+  **4–30% of the source bytes**. The other three run the other way and
+  are worth knowing before enabling this: flat graphics land at 84% and
+  104%, and `Animhorse.gif` — a 25 KB 8-frame cartoon at native size —
+  comes back **41 KB (162%)**, because a flat palette is what LZW
   compresses best.
 
 - **`pipeline::probe_animation`**, and frame count, duration and loop
