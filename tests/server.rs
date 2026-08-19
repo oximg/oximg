@@ -592,6 +592,59 @@ fn decoded_bytes_cap_degrades_an_animation_it_cannot_afford() {
     assert_eq!((w, h), (200, 150), "the still is the whole logical screen");
 }
 
+/// A temp IMAGES_DIR holding GIFs whose frame rectangles are far larger
+/// than their logical screen — a shape real writers emit, and the one that
+/// makes the screen the wrong thing to price a decode against: the decoder
+/// expands the frame's own rectangle, and `draw_frame` clips it only
+/// afterwards. `big.gif` is one frame (the still path), `big_anim.gif`
+/// three (the animated path).
+fn oversized_frame_gif_dir(tag: &str, side: u16) -> String {
+    let dir = std::env::temp_dir().join(format!("oximg-oversized-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pal: &[u8] = &[255, 0, 0, 0, 255, 0, 0, 0, 255];
+    for (name, frames) in [("big.gif", 1), ("big_anim.gif", 3)] {
+        let mut out = Vec::new();
+        // A 1x1 logical screen; every frame is side x side.
+        let mut enc = gif::Encoder::new(&mut out, 1, 1, pal).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for i in 0..frames {
+            let px = vec![(i % 3) as u8; side as usize * side as usize];
+            let mut f = gif::Frame::from_indexed_pixels(side, side, px, None);
+            f.delay = 10;
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        std::fs::write(dir.join(name), out).unwrap();
+    }
+    dir.to_str().unwrap().to_string()
+}
+
+/// The memory estimate is priced against the frame rectangle, not the
+/// logical screen. Both paths: a 1x1 screen carrying 1200x1200 frames is a
+/// few KB of source that stages 5.8 MB per frame, so pricing the screen
+/// would let a 1x1 header buy an arbitrarily large decode.
+#[test]
+fn oversized_frames_are_priced_against_the_frame_not_the_screen() {
+    let dir = oversized_frame_gif_dir("cost", 1200);
+    let uncapped = Server::start(&[("IMAGES_DIR", dir.clone())]);
+    for path in ["/resize/100/100/big.gif", "/resize/100/100/big_anim.gif"] {
+        assert_eq!(
+            uncapped.status_of(path),
+            200,
+            "{path} decodes without a cap"
+        );
+    }
+
+    // 2 MiB: over the 5.8 MB frame, far under any screen-based estimate.
+    let capped = Server::start(&[
+        ("IMAGES_DIR", dir),
+        ("OXIMG_MAX_DECODED_BYTES", (2 * 1024 * 1024).to_string()),
+    ]);
+    for path in ["/resize/100/100/big.gif", "/resize/100/100/big_anim.gif"] {
+        assert_eq!(capped.status_of(path), 413, "{path} must hit the cap");
+    }
+}
+
 /// Frame decimation: every Nth frame is encoded and the total play time
 /// is preserved, so what it costs is smoothness, not fidelity.
 #[test]

@@ -118,10 +118,13 @@ fn first_frame_into_chunk8(
     let (out_w, out_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
     let mut cost = DecodeCost::full_frame(src_w, src_h, 4, p);
     // Two frame-sized buffers, not one: the decoder stages its own RGBA
-    // frame next to the canvas that frame composites onto. Counted at
-    // the screen size for both, which over-states the staged frame
-    // whenever it is a sub-rectangle — the safe direction.
-    cost.staged_bytes = cost.staged_bytes.saturating_mul(2);
+    // frame next to the canvas that frame composites onto. The canvas is
+    // the screen; the staged frame is the frame's own rectangle, which a
+    // writer may make larger than the screen — priced from the header so
+    // that shape cannot slip past the cap (see `first_frame_px`).
+    let canvas_bytes = cost.staged_bytes;
+    cost.staged_bytes =
+        canvas_bytes.saturating_add(first_frame_px(src).saturating_mul(4).max(canvas_bytes));
     check_decoded_bytes(
         cost.with_output(out_w, out_h, 4)
             .with_compressed(src.len() + s.held_source_bytes),
@@ -147,6 +150,31 @@ fn first_frame_into_chunk8(
     ))
 }
 
+/// The first frame's rectangle, in pixels, read from headers alone.
+///
+/// The still path decodes exactly one frame, and the decoder expands that
+/// frame's own rectangle — which a writer may make *larger* than the
+/// logical screen, since [`draw_frame`] clips only afterwards and
+/// `check_frame_consistency` is off. Pricing the staged buffer at the
+/// screen area would therefore under-count exactly the shape an attacker
+/// picks: a 1x1 screen carrying one 8000x8000 frame.
+///
+/// One extra `skip_frame_decoding` parse, which allocates nothing
+/// pixel-sized. Zero on a header that cannot be read at all — the real
+/// decode is a few lines later and is where that error gets reported.
+fn first_frame_px(src: &[u8]) -> u64 {
+    let mut opts = DecodeOptions::new();
+    opts.skip_frame_decoding(true);
+    opts.check_frame_consistency(false);
+    let Ok(mut dec) = opts.read_info(std::io::Cursor::new(src)) else {
+        return 0;
+    };
+    match dec.next_frame_info() {
+        Ok(Some(f)) => u64::from(f.width) * u64::from(f.height),
+        _ => 0,
+    }
+}
+
 /// Header-only summary of a GIF's animation: everything needed to price
 /// the animated path, and to answer `probe_animation`, without decoding
 /// a pixel.
@@ -165,6 +193,12 @@ pub(super) struct GifScan {
     /// Whether any frame asks for [`DisposalMethod::Previous`], the one
     /// disposal that needs a second canvas.
     pub needs_previous: bool,
+    /// The largest frame *rectangle* seen, in pixels. Not redundant with
+    /// the screen: a writer may emit a frame bigger than the logical
+    /// screen, and while [`draw_frame`] clips it, the decoder has
+    /// already expanded the whole thing — so this, not the screen area,
+    /// is what the staged frame buffer costs.
+    pub max_frame_px: u64,
     /// Total plays, in WebP's spelling: 0 = forever. Converted from
     /// GIF's own counting — see [`scan_gif`].
     pub loop_count: u32,
@@ -181,6 +215,11 @@ pub(super) struct GifScan {
 pub(super) fn scan_gif(src: &[u8]) -> Result<GifScan> {
     let mut opts = DecodeOptions::new();
     opts.skip_frame_decoding(true);
+    // The same tolerance as `decoder`, and for a harder reason than
+    // taste: if the scan stopped at the first out-of-bounds rectangle
+    // while the decode below drew it, the budgets would be priced
+    // against fewer frames than actually get encoded.
+    opts.check_frame_consistency(false);
     let mut dec = opts
         .read_info(std::io::Cursor::new(src))
         .context("parse GIF")?;
@@ -193,6 +232,9 @@ pub(super) fn scan_gif(src: &[u8]) -> Result<GifScan> {
         scan.frames += 1;
         scan.duration_ms += u64::from(delay_ms(f.delay));
         scan.needs_previous |= f.dispose == DisposalMethod::Previous;
+        scan.max_frame_px = scan
+            .max_frame_px
+            .max(u64::from(f.width) * u64::from(f.height));
     }
     // Read after the walk, not before: the loop-count extension is an
     // application block that may sit anywhere, and by now the whole file
@@ -278,11 +320,16 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     let mut cost = DecodeCost::full_frame(cw, ch, 4, p);
     // The canvas, the decoder's staged frame, and — only when a source
     // asks for it — the snapshot the Previous disposal restores from.
-    // Counted at the screen size each, which over-states any frame that
-    // is a sub-rectangle: the safe direction.
-    cost.staged_bytes = cost
-        .staged_bytes
-        .saturating_mul(if scan.needs_previous { 3 } else { 2 });
+    // The canvas and the snapshot are the screen; the staged frame is
+    // whatever the *largest frame rectangle* is, which a writer may make
+    // bigger than the screen. Pricing that one at the screen area would
+    // under-count precisely the shape an attacker would choose: a 1x1
+    // screen carrying 8000x8000 frames reads as 28 bytes while the
+    // decoder expands 256 MB.
+    let canvas_bytes = cost.staged_bytes;
+    cost.staged_bytes = canvas_bytes
+        .saturating_add(scan.max_frame_px.saturating_mul(4).max(canvas_bytes))
+        .saturating_add(if scan.needs_previous { canvas_bytes } else { 0 });
     let mut cost = cost
         .with_output(out_w, out_h, 4)
         .with_compressed(src.len() + s.held_source_bytes);
