@@ -179,14 +179,23 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
 
 /// Map an output filename's extension to a format the same way the
 /// server maps `@{fmt}` tokens; unknown extensions keep the source
-/// format (the summary line makes the actual format visible). `.gif` is
-/// among the unknowns on purpose — nothing here encodes GIF, so a GIF
-/// source resolves to WebP whatever the output file is called, and the
-/// summary line is what says so.
+/// format (the summary line makes the actual format visible).
+///
+/// `.gif` is the one extension refused outright rather than ignored.
+/// Nothing here encodes GIF, so honoring it is impossible and ignoring it
+/// would write some other codec's bytes under a `.gif` name — the same
+/// mislabeled output the server rejects `@gif` for (`src/main.rs`), and
+/// worse here, because the file is on disk by the time the summary line
+/// could mention it. An explicit `-f` still wins, extension unread, as the
+/// documented precedence says: `-f webp out.gif` is a name the caller
+/// chose on purpose, not a format request oximg cannot meet.
 fn format_from_ext(path: &str) -> Option<ImageFormat> {
     let ext = std::path::Path::new(path)
         .extension()?
         .to_str()?
         .to_ascii_lowercase();
+    if ext == "gif" {
+        usage_error("gif output is not supported (gif sources are decoded to webp)");
+    }
     ImageFormat::from_token(&ext)
 }
