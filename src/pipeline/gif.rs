@@ -165,7 +165,8 @@ pub(super) struct GifScan {
     /// Whether any frame asks for [`DisposalMethod::Previous`], the one
     /// disposal that needs a second canvas.
     pub needs_previous: bool,
-    /// Plays before stopping, in WebP's spelling: 0 = forever.
+    /// Total plays, in WebP's spelling: 0 = forever. Converted from
+    /// GIF's own counting — see [`scan_gif`].
     pub loop_count: u32,
 }
 
@@ -198,10 +199,18 @@ pub(super) fn scan_gif(src: &[u8]) -> Result<GifScan> {
     // has been parsed.
     scan.loop_count = match dec.repeat() {
         Repeat::Infinite => 0,
-        // GIF's count is plays, and a file with no loop extension
-        // reports Finite(0) — meaning "show it once", which in WebP is
-        // 1, since 0 there means forever.
-        Repeat::Finite(n) => u32::from(n).max(1),
+        // A file with no loop extension reports Finite(0), which means
+        // "show it once" — 1 in WebP, where 0 means forever.
+        Repeat::Finite(0) => 1,
+        // The two formats count differently: GIF's Netscape value is the
+        // repeats *after* the first play, WebP's is the total number of
+        // plays. So a finite count gains the initial play — the same
+        // conversion libwebp's own gif2webp applies by default
+        // (`loop_count += 1` for 0 < n < 65535; its
+        // `-loop_compatibility` flag is what *skips* the adjustment, for
+        // Chrome M62 and older). Clamped at WebP's 16-bit ceiling,
+        // which libwebp likewise leaves alone.
+        Repeat::Finite(n) => u32::from(n).saturating_add(1).min(65535),
     };
     Ok(scan)
 }

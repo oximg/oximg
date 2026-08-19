@@ -474,7 +474,9 @@ pub struct Animation {
     /// oximg would *emit*, not a verbatim sum: delays of 0 or 1
     /// centisecond are normalized (see `pipeline/gif.rs`).
     pub duration_ms: u64,
-    /// Plays before stopping; 0 means forever.
+    /// Plays before stopping; 0 means forever. GIF counts the *repeats*
+    /// after the first play instead, so this — like `duration_ms` — is
+    /// what oximg would emit: a GIF asking for 3 repeats reports 4.
     pub loop_count: u32,
 }
 

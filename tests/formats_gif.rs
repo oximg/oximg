@@ -482,11 +482,13 @@ fn implausible_delays_are_normalized() {
     );
 }
 
-/// A GIF that plays a fixed number of times keeps that count, and the
-/// two formats' spellings of "forever" differ (GIF's Netscape 0 against
-/// WebP's loop_count 0), so the translation is worth pinning.
+/// The two formats count plays differently, so this is a translation, not
+/// a copy: GIF's Netscape value is the repeats *after* the first play,
+/// WebP's `loop_count` is the total number of plays, and only "forever"
+/// happens to be 0 in both. A finite count therefore gains one — the same
+/// conversion libwebp's own `gif2webp` performs by default.
 #[test]
-fn loop_counts_survive_the_transcode() {
+fn loop_counts_are_translated_not_copied() {
     let keep = gif::DisposalMethod::Keep;
     let two = || {
         vec![
@@ -495,8 +497,9 @@ fn loop_counts_survive_the_transcode() {
         ]
     };
     for (repeat, want) in [
-        (gif::Repeat::Finite(3), 3),
-        (gif::Repeat::Finite(1), 1),
+        // "repeat 3 times" = 4 plays.
+        (gif::Repeat::Finite(3), 4),
+        (gif::Repeat::Finite(1), 2),
         (gif::Repeat::Infinite, 0),
     ] {
         let src = build_gif_repeat(4, 4, repeat, two());
