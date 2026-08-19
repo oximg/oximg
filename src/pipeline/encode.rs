@@ -238,6 +238,13 @@ impl AnimEncoder {
                 "libwebp mux ABI mismatch"
             );
             opts.anim_params.loop_count = loop_count as std::os::raw::c_int;
+            // libwebp defaults this to 0xffffffff — opaque white — which
+            // would contradict the transparent canvas the GIF compositor
+            // builds: anything no frame covers, and anything a Background
+            // disposal clears, is transparent for us, and a player that
+            // honors the ANIM background would paint white there instead.
+            // Fully transparent, to say the same thing twice.
+            opts.anim_params.bgcolor = 0;
             // Both of these buy bytes with encoder passes, and CPU is
             // this path's binding constraint (docs/gif-evaluation.md
             // §5): minimize_size re-encodes to search key-frame

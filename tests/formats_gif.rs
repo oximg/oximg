@@ -162,6 +162,29 @@ fn webp_frames(bytes: &[u8]) -> (u32, u32, u32, Vec<(i32, Vec<u8>)>) {
     }
 }
 
+/// The `ANIM` chunk's canvas background color, as libwebp's own demuxer
+/// reports it: `(A << 24) | (R << 16) | (G << 8) | B`, so 0 is fully
+/// transparent and libwebp's encoder default (`0xffffffff`) is white.
+fn webp_anim_bgcolor(bytes: &[u8]) -> u32 {
+    // SAFETY: as `webp_frames` — `data` borrows `bytes`, which outlives
+    // the decoder created and deleted here, and the info struct is only
+    // read after GetInfo reports success.
+    unsafe {
+        let data = libwebp_sys::WebPData {
+            bytes: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        let mut opts = std::mem::zeroed::<libwebp_sys::WebPAnimDecoderOptions>();
+        assert_eq!(libwebp_sys::WebPAnimDecoderOptionsInit(&mut opts), 1);
+        let dec = libwebp_sys::WebPAnimDecoderNew(&data, &opts);
+        assert!(!dec.is_null(), "not a decodable WebP animation");
+        let mut info = libwebp_sys::WebPAnimInfo::default();
+        assert_eq!(libwebp_sys::WebPAnimDecoderGetInfo(dec, &mut info), 1);
+        libwebp_sys::WebPAnimDecoderDelete(dec);
+        info.bgcolor
+    }
+}
+
 /// Params for the hand-built animations: WebP quality pinned high so a
 /// 4x4 canvas of hard-edged flat blocks — the worst case for a lossy
 /// codec, and nothing like the photographs the default 75 is tuned for —
@@ -479,6 +502,36 @@ fn implausible_delays_are_normalized() {
     assert_eq!(
         frames.iter().map(|f| f.0).collect::<Vec<_>>(),
         vec![100, 200]
+    );
+}
+
+/// libwebp defaults the animation canvas background to `0xffffffff` —
+/// opaque white — which would contradict the transparent canvas this
+/// compositor builds: a first frame smaller than the screen, and every
+/// `Background` disposal, leave pixels no frame covers, and a player that
+/// honors the `ANIM` background would paint those white instead of
+/// letting the page through. Only the container can be asserted on:
+/// libwebp's own decoder composites onto transparent black and ignores
+/// the field, so the decoded pixels look right either way.
+#[test]
+fn the_animation_canvas_background_is_transparent() {
+    let mut first = frame(0, 0, 2, 2, &[1; 4], None);
+    first.delay = 10;
+    let src = build_gif(
+        4,
+        4,
+        vec![
+            first,
+            anim_frame(4, 4, &[2; 16], 10, gif::DisposalMethod::Keep),
+        ],
+    );
+    let (out, _) = pipeline::process(&src, &anim_params(4)).unwrap();
+    let (_, _, _, frames) = webp_frames(&out);
+    assert_near(at(&frames[0].1, 4, 3, 3), CLEAR, "uncovered by frame 0");
+    assert_eq!(
+        webp_anim_bgcolor(&out),
+        0,
+        "the ANIM chunk must say transparent, not libwebp's white default"
     );
 }
 
