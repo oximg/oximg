@@ -1,13 +1,22 @@
 # GIF support: evaluation and recommendation
 
-oximg does not accept GIF today — `ImageFormat::sniff` deliberately
-returns `None` for `GIF89a` (asserted in `src/pipeline/tests.rs:520`).
-This document evaluates how to change that: what the mainstream GIF
+This document evaluates how to accept GIF — what the mainstream GIF
 optimization techniques are, which of them fit this codebase, and what
-each costs. Every number below was measured on **starship** (AMD Ryzen 7
-8745HS, Arch Linux) on 2026-08-18 with a purpose-built POC that links
-oximg's own crate graph. Nothing here is quoted from an encoder's
-documentation.
+each costs. It was written when `ImageFormat::sniff` deliberately
+returned `None` for `GIF89a`. Every number below was measured on
+**starship** (AMD Ryzen 7 8745HS, Arch Linux) on 2026-08-18 with a
+purpose-built POC that links oximg's own crate graph. Nothing here is
+quoted from an encoder's documentation.
+
+**Status (2026-08-18): Tiers 0 and 1 are shipped**, so the sections
+below are the reasoning behind the code, not a plan. One deliberate
+divergence from imgproxy (§8): `OXIMG_GIF_ANIMATION` defaults to **on**.
+The budgets are what bound the cost here, and every one of them degrades
+to the still first frame rather than failing, so animation does not need
+to be opt-in to stay safe — an operator who wants imgproxy's still-only
+default sets the knob to `0`. See the
+[Animation](../README.md#animation) section for the shipped knobs and
+their defaults. Tier 2 was not built and Tier 3 remains deferred.
 
 ## Recommendation
 
