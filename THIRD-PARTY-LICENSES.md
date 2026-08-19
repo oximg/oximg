@@ -23,7 +23,7 @@ This file is generated — do not edit by hand. Regenerate with:
 ## Apache License 2.0
 
 Used by:
-- [wide 1.6.0](https://github.com/Lokathor/wide)
+- [wide 1.6.1](https://github.com/Lokathor/wide)
 
 ```
 
@@ -5056,7 +5056,7 @@ DEALINGS IN THE SOFTWARE.
 ## MIT License
 
 Used by:
-- [h2 0.4.15](https://github.com/hyperium/h2)
+- [h2 0.4.16](https://github.com/hyperium/h2)
 
 ```
 Copyright (c) 2017 h2 authors
