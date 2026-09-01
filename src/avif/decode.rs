@@ -411,7 +411,7 @@ pub(super) fn picture_to_rgb(
             yuv::yuv_row_to_rgb(y_row, &cb_row, &cr_row, &csc, row);
             continue;
         }
-        for (x, px) in row.chunks_exact_mut(3).enumerate() {
+        for (x, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let yf = (y_row.at(x) - y_off) * y_mul;
             let (r, g, b) = if monochrome {
                 (yf, yf, yf)

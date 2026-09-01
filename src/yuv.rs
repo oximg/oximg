@@ -180,7 +180,7 @@ fn yuv_row_to_rgb_scalar(y: Row, cb: &[f32], cr: &[f32], c: &Csc, out: &mut [u8]
 
 #[inline(always)]
 fn yuv_px_scalar(ys: impl Iterator<Item = f32>, cb: &[f32], cr: &[f32], c: &Csc, out: &mut [u8]) {
-    for (((yv, &cbv), &crv), px) in ys.zip(cb).zip(cr).zip(out.chunks_exact_mut(3)) {
+    for (((yv, &cbv), &crv), px) in ys.zip(cb).zip(cr).zip(out.as_chunks_mut::<3>().0) {
         let yf = (yv - c.y_off) * c.y_mul;
         let cbf = (cbv - c.center) * c.c_mul;
         let crf = (crv - c.center) * c.c_mul;

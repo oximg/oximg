@@ -537,7 +537,7 @@ fn draw_frame(canvas: &mut [u8], canvas_w: usize, canvas_h: usize, f: &Frame<'_>
     let mut changed = false;
     for (row, line) in f.buffer.chunks_exact(fw * 4).take(rows).enumerate() {
         let dst = ((fy + row) * canvas_w + fx) * 4;
-        for (i, px) in line[..cols * 4].chunks_exact(4).enumerate() {
+        for (i, px) in line[..cols * 4].as_chunks::<4>().0.iter().enumerate() {
             if px[3] == 0 {
                 continue;
             }
@@ -558,7 +558,12 @@ fn draw_frame(canvas: &mut [u8], canvas_w: usize, canvas_h: usize, f: &Frame<'_>
 /// 4i..4i+3 — so it never clobbers unread input, the same trick as
 /// `flatten_alpha_in_out8`.
 fn compact_if_opaque(chunk8: &mut [u8], pixels: usize) -> usize {
-    if chunk8[..pixels * 4].chunks_exact(4).any(|px| px[3] != 255) {
+    if chunk8[..pixels * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|px| px[3] != 255)
+    {
         return 4;
     }
     for i in 0..pixels {

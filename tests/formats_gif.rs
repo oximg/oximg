@@ -99,8 +99,10 @@ fn png_rgba(bytes: &[u8]) -> (usize, usize, png::ColorType, Vec<u8>) {
     let rgba = match color {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
             .collect(),
         other => panic!("unexpected color type {other:?}"),
     };
@@ -290,8 +292,8 @@ fn animated_gif_renders_first_frame() {
     // red, then blue, then green.
     let (w, h, _, px) = render_native(&fixture("anim.gif"), 120);
     assert_eq!((w, h), (120, 90));
-    for (i, chunk) in px.chunks_exact(4).enumerate() {
-        assert_eq!(chunk, RED, "pixel {i} should be the first frame's red");
+    for (i, chunk) in px.as_chunks::<4>().0.iter().enumerate() {
+        assert_eq!(*chunk, RED, "pixel {i} should be the first frame's red");
     }
 }
 
@@ -663,7 +665,7 @@ fn frame_rectangles_outside_the_screen_are_clipped() {
     let src = build_gif(4, 4, vec![frame(10, 10, 2, 2, &[1; 4], Some(0))]);
     let (_, _, _, px) = render_native(&src, 4);
     assert!(
-        px.chunks_exact(4).all(|p| p[3] == 0),
+        px.as_chunks::<4>().0.iter().all(|p| p[3] == 0),
         "an off-screen frame must not paint anything"
     );
 

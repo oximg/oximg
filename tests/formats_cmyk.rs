@@ -136,7 +136,9 @@ fn embedded_cmyk_profile_is_honored() {
     let planes: Vec<u8> = started.read_scanlines().unwrap();
     started.finish().unwrap();
     let naive: Vec<u8> = planes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| {
             let k = px[3] as u32;
             [0, 1, 2].map(|c| ((px[c] as u32 * k + 127) / 255) as u8)
