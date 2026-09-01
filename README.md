@@ -247,8 +247,8 @@ brew install oximg/tap/oximg
 ```
 
 **Cargo** (crates.io; needs `cmake` and `nasm` on the build machine —
-see [Development](#development); add `--features avif` if SVT-AV1 >=
-4.1 and dav1d are installed and visible to pkg-config):
+see [Development](#development); add `--features avif` if `pkg-config`
+is installed and can see SVT-AV1 >= 4.1 and dav1d):
 
 ```sh
 cargo install oximg
@@ -275,8 +275,8 @@ reservation that points here.
 Building a checkout needs a C/C++ toolchain plus **cmake** and
 **nasm** with the *default* features — `jpegli-sys` compiles the
 jpegli C++ encoder from source and `mozjpeg-sys` assembles its SIMD —
-not just for AVIF (which additionally wants SVT-AV1 >= 4.1 and dav1d
-visible to pkg-config):
+not just for AVIF (which additionally wants `pkg-config` itself, plus
+SVT-AV1 >= 4.1 and dav1d visible to it):
 
 ```sh
 sudo apt-get install cmake nasm     # or: brew install cmake nasm

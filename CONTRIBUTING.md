@@ -16,8 +16,9 @@ So `cargo build --release` fails without them even with AVIF off.
 Debian/Ubuntu: `sudo apt-get install cmake nasm`. macOS:
 `brew install cmake nasm`.
 
-The `avif` feature additionally needs SVT-AV1 >= 4.1 and dav1d, both
-visible to pkg-config (Debian/Ubuntu ships `libdav1d-dev`; SVT-AV1
+The `avif` feature additionally needs `pkg-config` itself, plus
+SVT-AV1 >= 4.1 and dav1d visible to it (Debian/Ubuntu:
+`sudo apt-get install pkg-config libdav1d-dev`; SVT-AV1
 4.1 is usually too new to be packaged, so CI and the Dockerfile build
 a pinned post-4.1 revision from source — the `SVT_AV1_REV` in
 [.github/workflows/ci.yml](.github/workflows/ci.yml); build that
