@@ -246,14 +246,16 @@ link glibc >= 2.39 with libstdc++ static.
 brew install oximg/tap/oximg
 ```
 
-**Cargo** (crates.io; add `--features avif` if SVT-AV1 >= 4.1 and
-dav1d are installed and visible to pkg-config):
+**Cargo** (crates.io; needs `cmake` and `nasm` on the build machine —
+see [Development](#development); add `--features avif` if `pkg-config`
+is installed and can see SVT-AV1 >= 4.1 and dav1d):
 
 ```sh
 cargo install oximg
 ```
 
-**From source** (the Docker build needs no system dependencies — it
+**From source** (build prerequisites under
+[Development](#development); the Docker build is self-contained — it
 compiles a pinned SVT-AV1 itself):
 
 ```sh
@@ -267,6 +269,26 @@ last tagged release, while the Docker images rebuild on every `main`
 push. The npm package
 [`@oximg/oximg`](https://www.npmjs.com/package/@oximg/oximg) is a name
 reservation that points here.
+
+## Development
+
+Building a checkout needs a C/C++ toolchain plus **cmake** and
+**nasm** with the *default* features — `jpegli-sys` compiles the
+jpegli C++ encoder from source and `mozjpeg-sys` assembles its SIMD —
+not just for AVIF (which additionally wants `pkg-config` itself, plus
+SVT-AV1 >= 4.1 and dav1d visible to it):
+
+```sh
+sudo apt-get install cmake nasm     # or: brew install cmake nasm
+cargo build --release
+cargo test --release                # hermetic: no network, fixtures committed
+```
+
+CI merges nothing that fails `cargo fmt --check`, clippy with
+`-D warnings`, or the test suite with and without `--features avif`.
+The full pre-merge checklist — the feature matrix, MSRV, the coverage
+gate, the Ruby gems, license compliance, fuzzing — is in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Serving
 
