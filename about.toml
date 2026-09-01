@@ -44,3 +44,68 @@ license = "BSD-3-Clause"
 path = "LICENSE"
 license = "BSD-3-Clause"
 checksum = "2fbf612cf8db413c570f11b875cf96d89266c275b4712902e76d7375a1902624"
+
+# mozjpeg-sys vendors the libjpeg-turbo tree without its LICENSE.md,
+# so harvesting finds the three license texts only as source-file
+# headers and (under 0.9.2) renders the whole files — config headers
+# and all — into the bundle. Pin one clean source of truth per
+# component: the crate's own LICENSE for IJG, and start/end-extracted
+# headers from the two files whose notices libjpeg-turbo's LICENSE.md
+# itself points at (turbojpeg.h for BSD-3-Clause, the nasm SIMD
+# extensions for Zlib).
+[mozjpeg-sys.clarify]
+license = "IJG AND Zlib AND BSD-3-Clause"
+
+[[mozjpeg-sys.clarify.files]]
+path = "LICENSE"
+license = "IJG"
+checksum = "59c9ef25a8178687f4cc220c4bd7ad8f746f612485d04e9335ebae24c0271b8d"
+
+# Note: with start/end, the checksum covers the extracted substring
+# (markers included), not the whole file.
+[[mozjpeg-sys.clarify.files]]
+path = "vendor/turbojpeg.h"
+license = "BSD-3-Clause"
+checksum = "0eefb2fb15e8617fcdb88c5335651e521c138b174dabfd0380afc867d85b10ae"
+start = "Copyright (C)2009"
+end = "POSSIBILITY OF SUCH DAMAGE."
+
+[[mozjpeg-sys.clarify.files]]
+path = "vendor/simd/nasm/jsimdext.inc"
+license = "Zlib"
+checksum = "247ac1a50bb23bf53188b51a48a92afff7ac83b8098963e2c0629ca143c00831"
+start = "; This software is provided 'as-is'"
+end = "; 3. This notice may not be removed or altered from any source distribution."
+
+# ring 0.17 splits its licensing into LICENSE-BoringSSL (Apache-2.0,
+# followed by test-suite-only notices that never ship) and
+# LICENSE-other-bits (ISC); the root LICENSE is just a pointer.
+# cargo-about's built-in `workarounds = ["ring"]` still expects the
+# pre-0.17 single concatenated LICENSE, so its checksums never match
+# and it silently does nothing — without this clarify, harvesting
+# renders whole C headers (struct definitions included) into the
+# bundle under short ISC headers.
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+end = "limitations under the License."
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+# Our own crate: the scan otherwise counts every Apache-2.0 text in
+# the repo (LICENSE, plus the copies inside this very bundle) and
+# lists oximg once per hit. One LICENSE, one entry.
+[oximg.clarify]
+license = "Apache-2.0"
+
+[[oximg.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
