@@ -377,17 +377,20 @@ fn orient_pixels<const C: usize>(src: &[u8], w: usize, h: usize, o: Orientation,
                 .chunks_exact_mut(w * C)
                 .zip(src[..w * h * C].chunks_exact(w * C))
             {
-                for (d, s) in drow.chunks_exact_mut(C).zip(srow.chunks_exact(C).rev()) {
-                    d.copy_from_slice(s);
+                let (drow, srow) = (drow.as_chunks_mut::<C>().0, srow.as_chunks::<C>().0);
+                for (d, s) in drow.iter_mut().zip(srow.iter().rev()) {
+                    *d = *s;
                 }
             }
         }
         3 => {
             for (d, s) in dst
-                .chunks_exact_mut(C)
-                .zip(src[..w * h * C].chunks_exact(C).rev())
+                .as_chunks_mut::<C>()
+                .0
+                .iter_mut()
+                .zip(src[..w * h * C].as_chunks::<C>().0.iter().rev())
             {
-                d.copy_from_slice(s);
+                *d = *s;
             }
         }
         4 => {
@@ -429,7 +432,7 @@ fn orient_tiles<const C: usize>(
             let x_end = (tx + B).min(dw);
             for y in ty..y_end {
                 let row = &mut dst[(y * dw + tx) * C..(y * dw + x_end) * C];
-                for (px, x) in row.chunks_exact_mut(C).zip(tx..x_end) {
+                for (px, x) in row.as_chunks_mut::<C>().0.iter_mut().zip(tx..x_end) {
                     let (sx, sy) = f(x, y, w, h);
                     let s = (sy * w + sx) * C;
                     px.copy_from_slice(&src[s..s + C]);

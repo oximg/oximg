@@ -488,15 +488,22 @@ fn rgba_roundtrip_preserves_color_and_alpha() {
     let (decoded, dw, dh, channels) = decode_avif(&encoded).unwrap();
     assert_eq!((dw, dh, channels), (w, h, 4));
     let a_se: f64 = rgba
-        .chunks_exact(4)
-        .zip(decoded.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(decoded.as_chunks::<4>().0)
         .map(|(s, d)| ((s[3] as f64) - (d[3] as f64)).powi(2))
         .sum();
     let a_rmse = (a_se / (w * h) as f64).sqrt();
     assert!(a_rmse < 3.0, "alpha rmse too high: {a_rmse:.2}");
     // Color must survive where alpha is meaningful.
     let (mut c_se, mut n) = (0f64, 0u32);
-    for (s, d) in rgba.chunks_exact(4).zip(decoded.chunks_exact(4)) {
+    for (s, d) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(decoded.as_chunks::<4>().0)
+    {
         if s[3] > 128 {
             for c in 0..3 {
                 c_se += ((s[c] as f64) - (d[c] as f64)).powi(2);

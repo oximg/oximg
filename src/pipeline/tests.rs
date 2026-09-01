@@ -603,7 +603,9 @@ fn cmyk_and_ycck_sources_decode_to_naive_rgb() {
         let planes: Vec<u8> = started.read_scanlines().unwrap();
         started.finish().unwrap();
         let want: Vec<u8> = planes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|px| {
                 let k = px[3] as u32;
                 [0, 1, 2].map(|c| ((px[c] as u32 * k + 127) / 255) as u8)
@@ -634,7 +636,12 @@ fn assert_cmyk_matches_reference(jpeg: &[u8], box_px: u32, parallel: usize) {
     started.finish().unwrap();
     let mut s = Scratch::default();
     let chunk = scratch_u8(&mut s.chunk8, dec_w * dec_h * 3);
-    for (d, px) in chunk.chunks_exact_mut(3).zip(planes.chunks_exact(4)) {
+    for (d, px) in chunk
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(planes.as_chunks::<4>().0)
+    {
         let k = px[3] as u32;
         for (c, &v) in px[..3].iter().enumerate() {
             d[c] = ((v as u32 * k + 127) / 255) as u8;

@@ -69,10 +69,17 @@ pub fn encode_avif(
     // pixel aborts it), so alpha-bearing images pay ~nothing and opaque
     // RGBA drops to the 3-channel output — byte-identical to encoding
     // the same pixels as RGB, since the color path ignores px[3].
-    let has_alpha = channels == 4 && pixels[..w * h * 4].chunks_exact(4).any(|px| px[3] != 255);
+    let has_alpha = channels == 4
+        && pixels[..w * h * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] != 255);
     let alpha = if has_alpha {
         let a_plane: Vec<u16> = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|px| ((px[3] as u32 * 1023 + 128) / 255) as u16)
             .collect();
         // One zeroed buffer serves as both placeholder chroma planes.

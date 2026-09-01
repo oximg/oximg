@@ -14,9 +14,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # cargo-about is pinned: its output must match the committed
+      # THIRD-PARTY-LICENSES.md byte-for-byte, and 0.9.2 re-picked
+      # license files across the tree, turning a tool update into a
+      # red build with no repo change. Bump it together with a
+      # regeneration. cargo-deny deliberately floats — hearing about
+      # new advisories is its job.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-about
+          tool: cargo-deny,cargo-about@0.9.2
       # Policy gate: no copyleft, no known-vulnerable crates, source hygiene.
       - name: cargo deny
         run: cargo deny check

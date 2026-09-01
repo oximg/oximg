@@ -521,8 +521,10 @@ pub(super) fn resize_pixels_to(
         scratch_u16(&mut s.src16, src_len);
         if channels == 4 {
             for (d, src) in s.src16[..src_len]
-                .chunks_exact_mut(4)
-                .zip(s.chunk8[..src_len].chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(s.chunk8[..src_len].as_chunks::<4>().0)
             {
                 let a = src[3] as u32 * 257;
                 for c in 0..3 {
@@ -557,8 +559,10 @@ pub(super) fn resize_pixels_to(
         scratch_u8(&mut s.out8, dst_len);
         if channels == 4 {
             for (d, src) in s.out8[..dst_len]
-                .chunks_exact_mut(4)
-                .zip(s.dst16[..dst_len].chunks_exact(4))
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(s.dst16[..dst_len].as_chunks::<4>().0)
             {
                 let a = src[3] as u32;
                 for (out, &pre) in d[..3].iter_mut().zip(&src[..3]) {
@@ -577,7 +581,7 @@ pub(super) fn resize_pixels_to(
     } else {
         if channels == 4 {
             // Premultiply in place (u8 approximation for speed mode).
-            for px in s.chunk8[..src_len].chunks_exact_mut(4) {
+            for px in s.chunk8[..src_len].as_chunks_mut::<4>().0 {
                 let a = px[3] as u32;
                 for c in px[..3].iter_mut() {
                     *c = ((*c as u32 * a + 127) / 255) as u8;
@@ -603,7 +607,7 @@ pub(super) fn resize_pixels_to(
             &mut s.resizer,
         )?;
         if channels == 4 {
-            for px in s.out8[..dst_len].chunks_exact_mut(4) {
+            for px in s.out8[..dst_len].as_chunks_mut::<4>().0 {
                 let a = px[3] as u32;
                 for c in px[..3].iter_mut() {
                     *c = (*c as u32 * 255).checked_div(a).map_or(0, |v| v.min(255)) as u8;

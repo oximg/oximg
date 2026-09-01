@@ -62,8 +62,10 @@ pub(super) fn encode_png(
 fn quantize_rgb(pixels: &[u8], w: usize, h: usize, colors: u16) -> (Vec<u8>, Vec<u8>) {
     use quantette::deps::palette::Srgb;
     let px: Vec<Srgb<u8>> = pixels
-        .chunks_exact(3)
-        .map(|c| Srgb::new(c[0], c[1], c[2]))
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| Srgb::new(r, g, b))
         .collect();
     let image =
         quantette::ImageBuf::new(w as u32, h as u32, px).expect("pixel count matches dimensions");
