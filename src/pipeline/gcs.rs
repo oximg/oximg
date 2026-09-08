@@ -253,6 +253,6 @@ mod tests {
         assert!(!at(1024));
         assert!(at(1025));
         // Escaped bytes count once, so this 2048-char key is legal.
-        assert!(!(decoded_key_len(&"%20".repeat(341)) > GCS_MAX_KEY_BYTES));
+        assert!(decoded_key_len(&"%20".repeat(341)) <= GCS_MAX_KEY_BYTES);
     }
 }
