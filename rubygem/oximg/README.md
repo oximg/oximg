@@ -22,6 +22,10 @@ Oximg.probe("in.jpg")
 #=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
 ```
 
+A GIF source is read and probed like the others (`format: :gif`), but
+nothing encodes GIF: it leaves as the destination's format, WebP when
+the name does not say, and `:gif` is not a `format:` you can ask for.
+
 ## Resizing
 
 ```ruby

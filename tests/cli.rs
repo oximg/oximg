@@ -149,6 +149,44 @@ fn probe_prints_format_and_dimensions_without_decoding() {
     assert!(stdout.contains("stored pixels"), "stdout: {stdout}");
 }
 
+/// The probe line is a contract with the Ruby gem, which parses it
+/// (`PROBE_LINE` in rubygem/oximg/lib/oximg.rb): the fields the gem
+/// reports come first, the animation summary follows them after a
+/// comma, and a still source prints no summary at all. Pinned exactly,
+/// so a change to the grammar fails here and not only in the gem suite.
+#[test]
+fn probe_prints_the_animation_summary_after_the_fields_the_gem_reads() {
+    let probe = |name: &str| {
+        let output = bin().args(["probe", &fixture(name)]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let expect = |name: &str, rest: &str| format!("{}: {rest}\n", fixture(name));
+
+    assert_eq!(
+        probe("anim.gif"),
+        expect(
+            "anim.gif",
+            "image/gif 120x90 (10800 stored pixels), 3 frames, 1500ms, looping forever"
+        )
+    );
+    assert_eq!(
+        probe("animated.webp"),
+        expect(
+            "animated.webp",
+            "image/webp 64x48 (3072 stored pixels), 2 frames, 200ms, looping forever"
+        )
+    );
+    assert_eq!(
+        probe("still.gif"),
+        expect("still.gif", "image/gif 240x180 (43200 stored pixels)")
+    );
+}
+
 /// Usage errors are exit 2 (distinct from processing failures, exit 1),
 /// with a message on stderr and nothing written.
 #[test]

@@ -108,6 +108,20 @@ be a 422 now serves bytes, and one CLI edge changes its exit code.
   extension unread, per the documented precedence — `-f webp out.gif`
   is a name the caller chose on purpose.
 
+### Fixed
+
+- **The `oximg` gem reads what `oximg probe` now prints.** Its parser
+  stopped at `stored pixels)`, so the animation summary this release
+  adds to that line — for animated WebP as much as animated GIF — made
+  `Oximg.probe` raise `unparsable probe output`, and `image/gif` was
+  missing from its content-type table, so a GIF probed with a `nil`
+  format. The gem now pins the three fields it reports and skips the
+  rest of the line, so the next field the CLI adds does not break it the
+  same way; the summary itself is not exposed yet. GIF stays
+  decode-only: `format: :gif` is still refused by `resize`. A 0.11.0
+  gem driving this release's binary from PATH hits the raise on every
+  animated source, so upgrade the two together.
+
 ## [0.11.0] - 2026-08-07
 
 A minor, not a patch: the default JPEG output changes. Sources that

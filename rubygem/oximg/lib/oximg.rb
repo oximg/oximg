@@ -45,10 +45,25 @@ module Oximg
     "image/jpeg" => :jpeg,
     "image/png" => :png,
     "image/webp" => :webp,
-    "image/avif" => :avif
+    "image/avif" => :avif,
+    "image/gif" => :gif
   }.freeze
 
-  PROBE_LINE = /:\s+(\S+)\s+(\d+)x(\d+)\s+\(\d+\s+stored\s+pixels\)\s*\z/
+  # The line `oximg probe` prints (src/cli.rs):
+  #
+  #   in.gif: image/gif 120x90 (10800 stored pixels), 3 frames, 1500ms, looping forever
+  #
+  # The three fields the gem reports are pinned exactly. Everything after
+  # the comma — the animation summary, printed for an animated source
+  # only — is information the gem does not expose, and is deliberately
+  # left unparsed rather than matched: a pattern that stopped at
+  # `pixels)` is what broke probe when the CLI added that summary, and a
+  # pattern that spelled the summary out would break again on the next
+  # field. What is refused is output that is not exactly that one line:
+  # a field missing, a continuation without the comma, or anything
+  # printed before or after it. stderr is captured separately, so a
+  # warning never lands here.
+  PROBE_LINE = /\A[^\n]*: (\S+) (\d+)x(\d+) \(\d+ stored pixels\)(?:,[^\n]*)?\n?\z/
 
   class << self
     # Absolute path to the executable in use; raises
@@ -96,15 +111,7 @@ module Oximg
     # dimensions are the stored ones (an EXIF rotation is not applied).
     def probe(source)
       out, = Binary.run("probe", expand(source, "source"))
-      match = out.match(PROBE_LINE)
-      raise ProcessingError, "unparsable probe output: #{out.inspect}" unless match
-
-      {
-        content_type: match[1],
-        format: CONTENT_TYPE_FORMATS[match[1]],
-        width: Integer(match[2]),
-        height: Integer(match[3])
-      }
+      parse_probe(out)
     end
 
     # The argv `resize` would run, minus the executable. Public because
@@ -125,6 +132,22 @@ module Oximg
     end
 
     private
+
+    # The hash `probe` builds from the line the CLI printed. Separate
+    # from `probe` so the parser can be tested against every line the
+    # CLI can print — the still form, each loop spelling — without a
+    # binary present; private because nothing outside needs it.
+    def parse_probe(output)
+      match = output.match(PROBE_LINE)
+      raise ProcessingError, "unparsable probe output: #{output.inspect}" unless match
+
+      {
+        content_type: match[1],
+        format: CONTENT_TYPE_FORMATS[match[1]],
+        width: Integer(match[2]),
+        height: Integer(match[3])
+      }
+    end
 
     # Absolute paths throughout: a relative name beginning with "-"
     # would otherwise reach the CLI's argument parser as a flag, and

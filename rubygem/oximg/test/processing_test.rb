@@ -67,6 +67,25 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_operator probed[:height], :>, 0
   end
 
+  # The CLI appends ", 3 frames, 1500ms, looping forever" for an
+  # animated source. This is the line as the binary really prints it;
+  # the other loop spellings, which no fixture reaches, are in
+  # ProbeTest.
+  def test_probe_reads_an_animated_source
+    probed = Oximg.probe(fixture("anim.gif"))
+    assert_equal({content_type: "image/gif", format: :gif, width: 120, height: 90}, probed)
+
+    probed = Oximg.probe(fixture("animated.webp"))
+    assert_equal({content_type: "image/webp", format: :webp, width: 64, height: 48}, probed)
+  end
+
+  # GIF is decode-only, but it is still a content type the CLI emits,
+  # so probe has to name it.
+  def test_probe_names_gif_as_a_format
+    probed = Oximg.probe(fixture("still.gif"))
+    assert_equal({content_type: "image/gif", format: :gif, width: 240, height: 180}, probed)
+  end
+
   # The binary already names what it refused; the gem must surface that
   # rather than a bare exit status.
   def test_surfaces_the_binarys_own_error
