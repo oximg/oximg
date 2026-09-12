@@ -70,7 +70,8 @@ Global:
   --bin PATH                oximg binary (else sibling, OXIMG_BIN, or PATH)
   --images-dir DIR          IMAGES_DIR for a spawned server
                             (default: this crate's tests/fixtures)
-  --env KEY=VAL             Extra env for a spawned server (repeatable)
+  --env KEY=VAL             Extra env for a spawned server (repeatable;
+                            PORT and IMAGES_DIR are reserved)
   --pretty                  Indent JSON
   --dry-run                 Print the plan; do not spawn or write
   --help, --version
@@ -96,7 +97,8 @@ matrix:
   --source FILE             Fixture filename (repeatable; default: a
                             small committed set under tests/fixtures)
   --box WxH                 e.g. 100x100 or 750x0 (repeatable)
-  --format TOKEN            Output token; empty/source = bare URL
+  --format TOKEN            source | jpg | png | webp | avif
+                            (repeatable; default: source and webp)
   --no-negatives            Skip the 400/404 cells
   --base URL                Drive an existing server
 
@@ -258,7 +260,19 @@ fn parse_args(args: &[String]) -> Result<Opts, CtlError> {
                 let (k, val) = v
                     .split_once('=')
                     .ok_or_else(|| CtlError::usage(format!("--env needs KEY=VAL, got {v:?}")))?;
-                env.push((k.to_string(), val.to_string()));
+                match k {
+                    "PORT" => {
+                        return Err(CtlError::usage(
+                            "--env PORT is reserved; use --port (auto-spawn uses PORT=0)",
+                        ));
+                    }
+                    "IMAGES_DIR" => {
+                        return Err(CtlError::usage(
+                            "--env IMAGES_DIR is reserved; use --images-dir",
+                        ));
+                    }
+                    _ => env.push((k.to_string(), val.to_string())),
+                }
                 rest = &rest[2..];
             }
             "--pretty" => {
@@ -529,11 +543,19 @@ fn parse_matrix(args: &[String]) -> Result<Cmd, CtlError> {
                 boxes.push(parse_box(v)?);
             }
             "--format" => {
-                formats.push(
-                    it.next()
-                        .ok_or_else(|| CtlError::usage("--format needs a value"))?
-                        .clone(),
-                );
+                let v = it
+                    .next()
+                    .ok_or_else(|| CtlError::usage("--format needs a value"))?;
+                match v.as_str() {
+                    "" | "source" | "jpg" | "jpeg" | "png" | "webp" | "avif" => {
+                        formats.push(v.clone());
+                    }
+                    other => {
+                        return Err(CtlError::usage(format!(
+                            "unknown --format {other:?} (source|jpg|png|webp|avif)"
+                        )));
+                    }
+                }
             }
             "--no-negatives" => negatives = false,
             "--base" => {
@@ -808,7 +830,11 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
                 "bin": resolve_bin(opts.bin.as_deref())?.display().to_string(),
                 "images_dir": images_dir(opts).display().to_string(),
                 "port": port.unwrap_or(0),
-                "env": opts.env.iter().map(|(k, v)| json!({ (k): v })).collect::<Vec<_>>(),
+                "env": opts
+                    .env
+                    .iter()
+                    .map(|(k, v)| json!({ (k): redact_env_value(k, v) }))
+                    .collect::<Vec<_>>(),
             }),
             opts.pretty,
         );
@@ -961,9 +987,41 @@ fn content_type_matches_token(ct: &str, token: &str) -> bool {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "avif" => "image/avif",
-        _ => return true,
+        _ => return false,
     };
     ct == want || ct.starts_with(&format!("{want};"))
+}
+
+/// Matrix 200 cells must be images that probe. Unlike `image_200_proved`,
+/// a text 200 (e.g. `/health`) is not a pass.
+fn matrix_200_proved(res: &HttpResult, report: &Value) -> bool {
+    if res.status != 200 {
+        return false;
+    }
+    let ct = res
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !ct.starts_with("image/") {
+        return false;
+    }
+    match report.get("probe") {
+        Some(p) => p.get("error").is_none() && p.get("width").is_some(),
+        None => false,
+    }
+}
+
+fn redact_env_value<'a>(key: &str, value: &'a str) -> &'a str {
+    let u = key.to_ascii_uppercase();
+    if ["KEY", "SALT", "SECRET", "TOKEN", "PASSWORD"]
+        .iter()
+        .any(|needle| u.contains(needle))
+    {
+        "<redacted>"
+    } else {
+        value
+    }
 }
 
 fn cmd_get(
@@ -1245,7 +1303,7 @@ fn cmd_sign(
             "ok": true,
             "path": path,
             "signature": signature,
-            "url": format!("/{signature}{path}"),
+            "url": format!("/{signature}{}", percent_encode_path(&path)),
         }),
         opts.pretty,
     );
@@ -1254,6 +1312,11 @@ fn cmd_sign(
 
 fn decode_hex(name: &str, v: &str) -> Result<Vec<u8>, CtlError> {
     let v = v.trim();
+    if v.is_empty() {
+        return Err(CtlError::usage(format!(
+            "{name} must not be empty (unset OXIMG_KEY/OXIMG_SALT means signing off)"
+        )));
+    }
     if !v.len().is_multiple_of(2) {
         return Err(CtlError::usage(format!(
             "{name} is not valid hex (odd length)"
@@ -1303,6 +1366,57 @@ fn hex_digit(c: u8) -> Option<u8> {
         b'A'..=b'F' => Some(c - b'A' + 10),
         _ => None,
     }
+}
+
+/// Encode a decoded path so it can be put back in a URL. HMAC still
+/// covers the decoded form; `%` in a filename must round-trip as `%25`.
+/// `/` stays a separator. Other bytes follow RFC 3986 `pchar`.
+fn percent_encode_path(path: &str) -> String {
+    path.split('/')
+        .map(percent_encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn percent_encode_segment(seg: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::new();
+    for &b in seg.as_bytes() {
+        if is_pchar(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
+}
+
+fn is_pchar(b: u8) -> bool {
+    matches!(
+        b,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+    )
 }
 
 /// The scheme `Signing::verify` in src/main.rs accepts: unpadded
@@ -1490,7 +1604,7 @@ fn cmd_matrix(
                 let mut row = get_report(&res, None)?;
                 let mut pass = res.status == c.expect;
                 if pass && c.expect == 200 {
-                    pass = image_200_proved(&res, &row);
+                    pass = matrix_200_proved(&res, &row);
                     if pass && let Some(token) = c.format.as_deref() {
                         let ct = res
                             .headers

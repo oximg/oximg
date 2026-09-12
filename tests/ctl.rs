@@ -181,6 +181,42 @@ fn sign_rejects_malformed_escapes_and_bad_hex_as_usage() {
     ]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"].as_str().unwrap().contains("hex"), "{v}");
+
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/photo.jpg",
+        "--key",
+        "",
+        "--salt",
+        &salt,
+    ]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("empty"), "{v}");
+}
+
+#[test]
+fn sign_reencodes_percent_in_the_url() {
+    let key = "deadbeef".repeat(8);
+    let salt = "cafebabe".repeat(8);
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/a%25b.jpg",
+        "--key",
+        &key,
+        "--salt",
+        &salt,
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["path"], "/resize/100/100/a%b.jpg");
+    let url = v["url"].as_str().unwrap();
+    assert!(
+        url.ends_with("/resize/100/100/a%25b.jpg"),
+        "decoded % must be re-encoded in the URL: {url}"
+    );
+    assert!(
+        !url.contains("/a%b.jpg"),
+        "raw % in a URL is not sendable: {url}"
+    );
 }
 
 #[test]
@@ -333,4 +369,46 @@ fn serve_dry_run_reports_env_under_the_real_key() {
     assert_eq!(env.len(), 1, "{v}");
     assert_eq!(env[0]["OXIMG_LOG"], "request", "{v}");
     assert!(env[0].get("k").is_none(), "json! ident trap: {v}");
+}
+
+#[test]
+fn serve_dry_run_redacts_signing_secrets() {
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_KEY=deadbeef",
+        "--env",
+        "OXIMG_SALT=cafebabe",
+        "--env",
+        "OXIMG_LOG=request",
+        "--dry-run",
+        "serve",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let env = v["env"].as_array().expect("env array");
+    let find = |k: &str| {
+        env.iter()
+            .find_map(|o| o.get(k).and_then(|x| x.as_str()))
+            .unwrap_or_else(|| panic!("missing {k} in {v}"))
+    };
+    assert_eq!(find("OXIMG_KEY"), "<redacted>");
+    assert_eq!(find("OXIMG_SALT"), "<redacted>");
+    assert_eq!(find("OXIMG_LOG"), "request");
+}
+
+#[test]
+fn env_cannot_override_managed_spawn_keys() {
+    let (code, v) = run(&["--env", "PORT=8081", "--dry-run", "serve"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("PORT"), "{v}");
+
+    let (code, v) = run(&["--env", "IMAGES_DIR=/tmp", "--dry-run", "serve"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("IMAGES_DIR"), "{v}");
+}
+
+#[test]
+fn matrix_rejects_unknown_format_tokens() {
+    let (code, v) = run(&["--dry-run", "matrix", "--format", "bogus"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("--format"), "{v}");
 }
