@@ -32,7 +32,7 @@ pic-scale and enforced by the CI `msrv` job).
 
 | Build | What it is |
 |---|---|
-| default (= `server`) | The `oximg` binary and the full HTTP stack |
+| default (= `server`) | The `oximg` binary, `oximg-ctl`, and the full HTTP stack |
 | `--no-default-features` | Library only — the `pipeline` API without axum/tokio/reqwest |
 | `--features avif` | AVIF encode (SVT-AV1) and decode (dav1d) |
 | `--features bench-internals` | Re-exposes internals for the bench tools under `bench/tools/` (compiled as examples; not public API) |
@@ -51,7 +51,8 @@ What the suites assume — and deliberately don't:
   reaches the internet.
 - The server suites spawn the compiled binary on an OS-assigned port
   (`PORT=0`), so `cargo test` builds the binary as a side effect and
-  never collides on a fixed port.
+  never collides on a fixed port. `oximg-ctl` does the same, and
+  `tests/ctl.rs` drives it as an agent would (JSON on stdout).
 - All fixtures are committed under `tests/fixtures/` — no downloads,
   no generation step.
 - Library-level tests share one process-wide config (a `OnceLock`),
@@ -93,6 +94,19 @@ The short local loop that catches most of it:
 cargo fmt --check
 cargo clippy --release --all-targets -- -D warnings
 cargo test --release
+```
+
+## Control CLI
+
+`oximg-ctl` is the JSON control plane over the real `oximg` binary:
+spawn the server, GET a path, probe, resize, sign, or walk a fixture
+matrix. stdout is one JSON object (except `--help`). Docker images
+still copy only `oximg`.
+
+```sh
+cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg
+cargo run --release --bin oximg-ctl -- matrix --source photo.jpg --box 100x100
+cargo test --release --test ctl
 ```
 
 ## The Ruby gems

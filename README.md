@@ -284,6 +284,16 @@ cargo build --release
 cargo test --release                # hermetic: no network, fixtures committed
 ```
 
+`oximg-ctl` is the JSON control plane for that binary: it spawns the
+real server (`PORT=0`), drives HTTP/CLI/probe/sign, and prints one
+JSON object per command so an agent can close the loop without
+hand-rolling curl. Docker images still ship only `oximg`.
+
+```sh
+cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg
+cargo run --release --bin oximg-ctl -- matrix --box 100x100 --source photo.jpg
+```
+
 CI merges nothing that fails `cargo fmt --check`, clippy with
 `-D warnings`, or the test suite with and without `--features avif`.
 The full pre-merge checklist — the feature matrix, MSRV, the coverage
