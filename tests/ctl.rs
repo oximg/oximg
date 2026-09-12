@@ -8,7 +8,11 @@ fn ctl() -> Command {
     // Hyphenated extra bins don't always get CARGO_BIN_EXE_* in the
     // integration-test crate; they do land next to `oximg`.
     let oximg = std::path::Path::new(env!("CARGO_BIN_EXE_oximg"));
-    let ctl = oximg.with_file_name("oximg-ctl");
+    let ctl = oximg.with_file_name(if cfg!(windows) {
+        "oximg-ctl.exe"
+    } else {
+        "oximg-ctl"
+    });
     let mut c = Command::new(&ctl);
     c.arg("--bin").arg(oximg);
     c
@@ -56,6 +60,17 @@ fn unknown_command_is_usage_json() {
         "{v}"
     );
     assert_eq!(v["hint"], "oximg-ctl --help");
+}
+
+#[test]
+fn pretty_indents_usage_json() {
+    let output = ctl().args(["--pretty", "nope"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('\n') && stdout.contains("\"ok\": false"),
+        "expected indented JSON, got {stdout:?}"
+    );
 }
 
 #[test]
@@ -120,6 +135,52 @@ fn sign_matches_the_server_vector() {
         v["signature"],
         "XQ8C3eYRVAkFAnUczGBsuXMOu-J6vMoYi3W8_4-sT6Q"
     );
+
+    // Percent-decoded form is what the server verifies.
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/albums%2F2026%2Fphoto.jpg",
+        "--key",
+        &key,
+        "--salt",
+        &salt,
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["path"], "/resize/100/100/albums/2026/photo.jpg");
+    assert_eq!(
+        v["signature"],
+        "i1gy8Dm1yo32_9FMzrRj8MDG_c0F0kJDV22jAgvUCow"
+    );
+}
+
+#[test]
+fn sign_rejects_malformed_escapes_and_bad_hex_as_usage() {
+    let key = "deadbeef".repeat(8);
+    let salt = "cafebabe".repeat(8);
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/photo%.jpg",
+        "--key",
+        &key,
+        "--salt",
+        &salt,
+    ]);
+    assert_eq!(code, 2, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("percent-escape"),
+        "{v}"
+    );
+
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/photo.jpg",
+        "--key",
+        "not-hex",
+        "--salt",
+        &salt,
+    ]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("hex"), "{v}");
 }
 
 #[test]
@@ -190,6 +251,23 @@ fn resize_shells_out_to_the_cli() {
 }
 
 #[test]
+fn resize_usage_errors_exit_2() {
+    let out = std::env::temp_dir().join(format!("oximg-ctl-usage-{}.jpg", std::process::id()));
+    let (code, v) = run(&[
+        "resize",
+        &fixture("photo.jpg"),
+        "80",
+        "80",
+        "--out",
+        out.to_str().unwrap(),
+        "-q",
+        "0",
+    ]);
+    assert_eq!(code, 2, "{v}");
+    assert_eq!(v["ok"], false);
+}
+
+#[test]
 fn matrix_dry_run_is_the_plan() {
     let (code, v) = run(&[
         "--dry-run",
@@ -245,4 +323,14 @@ fn serve_dry_run_names_the_binary() {
         "bin={}",
         v["bin"]
     );
+}
+
+#[test]
+fn serve_dry_run_reports_env_under_the_real_key() {
+    let (code, v) = run(&["--env", "OXIMG_LOG=request", "--dry-run", "serve"]);
+    assert_eq!(code, 0, "{v}");
+    let env = v["env"].as_array().expect("env array");
+    assert_eq!(env.len(), 1, "{v}");
+    assert_eq!(env[0]["OXIMG_LOG"], "request", "{v}");
+    assert!(env[0].get("k").is_none(), "json! ident trap: {v}");
 }

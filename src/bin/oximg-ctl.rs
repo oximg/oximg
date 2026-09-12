@@ -11,7 +11,8 @@
 //!   oximg-ctl matrix
 //!
 //! Exit 0 on success, 1 when a command ran and failed its proof, 2 for
-//! usage errors. stdout is always one JSON value (except `--help`).
+//! usage errors. stdout is always one JSON value (except `--help` and
+//! `--version`).
 
 use hmac::Mac;
 use hmac::digest::KeyInit;
@@ -22,7 +23,10 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -34,13 +38,14 @@ fn main() {
         println!("oximg-ctl {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    let pretty = args.iter().any(|a| a == "--pretty");
     match parse_args(&args) {
         Ok(opts) => {
             if let Err(e) = run(opts) {
-                e.exit();
+                e.with_pretty(pretty).exit();
             }
         }
-        Err(e) => e.exit(),
+        Err(e) => e.with_pretty(pretty).exit(),
     }
 }
 
@@ -97,7 +102,9 @@ matrix:
 
 Spawned servers use PORT=0 and, unless already set, OXIMG_WORKERS=1
 so a control-plane loop does not size itself to the host. stderr from
-oximg is forwarded; stdout of oximg-ctl is one JSON object.
+oximg is forwarded. stdout is one JSON object (`--help` and `--version`
+are plain text). `serve` prints the ready record then waits; a later
+child failure is a stderr line and exit 1, not a second JSON object.
 
 Examples:
   oximg-ctl get /resize/100/100/photo.jpg
@@ -117,6 +124,7 @@ Examples:
 struct CtlError {
     exit: i32,
     json: Value,
+    pretty: bool,
 }
 
 impl CtlError {
@@ -129,6 +137,7 @@ impl CtlError {
                 "error": msg,
                 "hint": "oximg-ctl --help",
             }),
+            pretty: false,
         }
     }
 
@@ -137,15 +146,28 @@ impl CtlError {
         if let Some(h) = hint {
             v["hint"] = json!(h);
         }
-        Self { exit: 1, json: v }
+        Self {
+            exit: 1,
+            json: v,
+            pretty: false,
+        }
     }
 
     fn from_value(exit: i32, json: Value) -> Self {
-        Self { exit, json }
+        Self {
+            exit,
+            json,
+            pretty: false,
+        }
+    }
+
+    fn with_pretty(mut self, pretty: bool) -> Self {
+        self.pretty = pretty;
+        self
     }
 
     fn exit(self) -> ! {
-        emit(&self.json, false);
+        emit(&self.json, self.pretty);
         std::process::exit(self.exit);
     }
 }
@@ -683,6 +705,7 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
+    let deadline = Instant::now() + SPAWN_TIMEOUT;
     let mut child = cmd.spawn().map_err(|e| {
         CtlError::fail(
             format!("spawn {}: {e}", bin.display()),
@@ -690,29 +713,44 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
         )
     })?;
     let stderr = child.stderr.take().expect("stderr piped");
-    let mut reader = BufReader::new(stderr);
-    let mut port_found = None;
-    let mut line = String::new();
-    let mut boot = String::new();
-    for _ in 0..100 {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                boot.push_str(&line);
-                if let Some(rest) = line.strip_prefix("oximg listening on :") {
-                    port_found = rest.split_whitespace().next().and_then(|p| p.parse().ok());
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut stderr = std::io::stderr();
-        let mut r = reader;
-        let _ = std::io::copy(&mut r, &mut stderr);
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let mut boot = String::new();
+        let mut port = None;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    boot.push_str(&line);
+                    if let Some(rest) = line.strip_prefix("oximg listening on :") {
+                        port = rest.split_whitespace().next().and_then(|p| p.parse().ok());
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        std::thread::spawn(move || {
+            let mut sink = std::io::stderr();
+            let _ = std::io::copy(&mut reader, &mut sink);
+        });
+        let _ = tx.send((port, boot));
     });
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (port_found, boot) = match rx.recv_timeout(remaining) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CtlError::fail(
+                "server did not print a listening line within 15s",
+                Some("check --bin points at oximg, and that cmake/nasm are installed"),
+            ));
+        }
+    };
     let Some(port) = port_found else {
         let status = child.wait().ok();
         let hint = if boot.is_empty() {
@@ -736,14 +774,12 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
         images_dir,
         kill_on_drop: true,
     };
-    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if http_get(
+        if let Ok(res) = http_get(
             &format!("http://127.0.0.1:{port}/health"),
             None,
             Duration::from_secs(2),
-        )
-        .is_ok()
+        ) && res.status == 200
         {
             return Ok(spawned);
         }
@@ -756,7 +792,7 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
         if Instant::now() > deadline {
             return Err(CtlError::fail(
                 "server did not become healthy within 15s",
-                Some("the listening line was printed but /health did not answer"),
+                Some("the listening line was printed but /health did not answer 200"),
             ));
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -772,7 +808,7 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
                 "bin": resolve_bin(opts.bin.as_deref())?.display().to_string(),
                 "images_dir": images_dir(opts).display().to_string(),
                 "port": port.unwrap_or(0),
-                "env": opts.env.iter().map(|(k,v)| json!({k: v})).collect::<Vec<_>>(),
+                "env": opts.env.iter().map(|(k, v)| json!({ (k): v })).collect::<Vec<_>>(),
             }),
             opts.pretty,
         );
@@ -792,14 +828,18 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
     );
     let _ = std::io::stdout().flush();
     spawned.kill_on_drop = false;
-    let status = spawned
-        .child
-        .wait()
-        .map_err(|e| CtlError::fail(format!("wait on server: {e}"), None))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(CtlError::fail(format!("server exited {status}"), None))
+    // The ready record is already on stdout. A later child failure must
+    // not emit a second JSON object — parsers take the first value.
+    match spawned.child.wait() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            eprintln!("oximg-ctl: server exited {status}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("oximg-ctl: wait on server: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -895,6 +935,37 @@ fn get_report(res: &HttpResult, write: Option<&Path>) -> Result<Value, CtlError>
     Ok(v)
 }
 
+/// A 200 image response is proved only when the body probes. Non-image
+/// 200s (e.g. `/health`) and non-200s are observations, not image proofs.
+fn image_200_proved(res: &HttpResult, report: &Value) -> bool {
+    if res.status != 200 {
+        return true;
+    }
+    let ct = res
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    if !ct.starts_with("image/") {
+        return true;
+    }
+    match report.get("probe") {
+        Some(p) => p.get("error").is_none() && p.get("width").is_some(),
+        None => false,
+    }
+}
+
+fn content_type_matches_token(ct: &str, token: &str) -> bool {
+    let want = match token {
+        "webp" => "image/webp",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "avif" => "image/avif",
+        _ => return true,
+    };
+    ct == want || ct.starts_with(&format!("{want};"))
+}
+
 fn cmd_get(
     opts: &Opts,
     path: &str,
@@ -935,14 +1006,18 @@ fn cmd_get(
             Some("is the server up? pass --base or let get auto-spawn"),
         )
     })?;
-    let report = get_report(&res, write)?;
+    let mut report = get_report(&res, write)?;
     if let Some(want) = expect
         && res.status != want
     {
-        let mut v = report;
-        v["ok"] = json!(false);
-        v["error"] = json!(format!("expected status {want}, got {}", res.status));
-        return Err(CtlError::from_value(1, v));
+        report["ok"] = json!(false);
+        report["error"] = json!(format!("expected status {want}, got {}", res.status));
+        return Err(CtlError::from_value(1, report));
+    }
+    if !image_200_proved(&res, &report) {
+        report["ok"] = json!(false);
+        report["error"] = json!("response body did not probe as an image");
+        return Err(CtlError::from_value(1, report));
     }
     emit(&report, opts.pretty);
     Ok(())
@@ -1079,13 +1154,13 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
-        return Err(CtlError::fail(
-            format!(
-                "oximg resize exited {}: {stderr}",
-                output.status.code().unwrap_or(1)
-            ),
-            None,
-        ));
+        let code = output.status.code().unwrap_or(1);
+        let msg = format!("oximg resize exited {code}: {stderr}");
+        return Err(if code == 2 {
+            CtlError::usage(msg)
+        } else {
+            CtlError::fail(msg, None)
+        });
     }
     let bytes = std::fs::read(out_path)
         .map_err(|e| CtlError::fail(format!("read {}: {e}", out_path.display()), None))?;
@@ -1142,7 +1217,7 @@ fn cmd_sign(
     key: Option<&str>,
     salt: Option<&str>,
 ) -> Result<(), CtlError> {
-    let path = normalize_path(path);
+    let path = percent_decode_path(&normalize_path(path))?;
     let key_hex = key
         .map(str::to_string)
         .or_else(|| std::env::var("OXIMG_KEY").ok())
@@ -1180,18 +1255,54 @@ fn cmd_sign(
 fn decode_hex(name: &str, v: &str) -> Result<Vec<u8>, CtlError> {
     let v = v.trim();
     if !v.len().is_multiple_of(2) {
-        return Err(CtlError::fail(
-            format!("{name} is not valid hex (odd length)"),
-            None,
-        ));
+        return Err(CtlError::usage(format!(
+            "{name} is not valid hex (odd length)"
+        )));
     }
     (0..v.len())
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&v[i..i + 2], 16)
-                .map_err(|_| CtlError::fail(format!("{name} is not valid hex"), None))
+                .map_err(|_| CtlError::usage(format!("{name} is not valid hex")))
         })
         .collect()
+}
+
+/// Percent-decode a URL path the way the server's `Path` extractor does
+/// before HMAC verify. `+` is a literal (this is a path, not a query).
+fn percent_decode_path(path: &str) -> Result<String, CtlError> {
+    let b = path.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() {
+                return Err(CtlError::usage(format!(
+                    "malformed percent-escape in {path:?}"
+                )));
+            }
+            let hi = hex_digit(b[i + 1])
+                .ok_or_else(|| CtlError::usage(format!("malformed percent-escape in {path:?}")))?;
+            let lo = hex_digit(b[i + 2])
+                .ok_or_else(|| CtlError::usage(format!("malformed percent-escape in {path:?}")))?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| CtlError::usage(format!("percent-decoded path is not valid UTF-8: {path:?}")))
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The scheme `Signing::verify` in src/main.rs accepts: unpadded
@@ -1299,19 +1410,24 @@ fn cmd_matrix(
         path: String,
         expect: u16,
         kind: &'static str,
+        format: Option<String>,
     }
     let mut plan: Vec<Cell> = Vec::new();
     for src in &sources {
         for (w, h) in &boxes {
             for fmt in &formats {
-                let path = match fmt.as_str() {
-                    "" | "source" => format!("/resize/{w}/{h}/{src}"),
-                    token => format!("/resize/{w}/{h}/{src}@{token}"),
+                let (path, format) = match fmt.as_str() {
+                    "" | "source" => (format!("/resize/{w}/{h}/{src}"), None),
+                    token => (
+                        format!("/resize/{w}/{h}/{src}@{token}"),
+                        Some(token.to_string()),
+                    ),
                 };
                 plan.push(Cell {
                     path,
                     expect: 200,
                     kind: "cell",
+                    format,
                 });
             }
         }
@@ -1321,16 +1437,19 @@ fn cmd_matrix(
             path: "/resize/0/0/photo.jpg".into(),
             expect: 400,
             kind: "negative",
+            format: None,
         });
         plan.push(Cell {
             path: "/resize/100/100/missing.jpg".into(),
             expect: 404,
             kind: "negative",
+            format: None,
         });
         plan.push(Cell {
             path: "/resize/100/100/photo.jpg@gif".into(),
             expect: 400,
             kind: "negative",
+            format: None,
         });
     }
 
@@ -1368,11 +1487,22 @@ fn cmd_matrix(
         let url = format!("{base}{}", c.path);
         match http_get(&url, None, timeout) {
             Ok(res) => {
-                let pass = res.status == c.expect;
+                let mut row = get_report(&res, None)?;
+                let mut pass = res.status == c.expect;
+                if pass && c.expect == 200 {
+                    pass = image_200_proved(&res, &row);
+                    if pass && let Some(token) = c.format.as_deref() {
+                        let ct = res
+                            .headers
+                            .get("content-type")
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        pass = content_type_matches_token(ct, token);
+                    }
+                }
                 if !pass {
                     failed += 1;
                 }
-                let mut row = get_report(&res, None)?;
                 row["path"] = json!(c.path);
                 row["expect"] = json!(c.expect);
                 row["kind"] = json!(c.kind);
