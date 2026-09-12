@@ -10,7 +10,9 @@
   Both axes zero → 400. Each axis 1–8192.
 - Optional `@{fmt}` suffix on the filename (`jpg`/`jpeg`/`png`/`webp`/
   `avif`). Exact token only: `photo@2x.jpg` is a filename. `@gif` and
-  `@jxl` → 400; unknown `@bogus` falls through as a filename → 404.
+  `@jxl` → 400. An unknown `@bogus` is left in the filename — 404 only
+  if that literal file is absent; a file actually named `photo.jpg@bogus`
+  is served.
 - Signed form: `GET /{sig}/resize/{w}/{h}/{*file}` when `OXIMG_KEY` and
   `OXIMG_SALT` are set. Unsigned → 403.
 

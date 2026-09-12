@@ -12,7 +12,7 @@ and turns a crawler into origin load.
 | 204 | `OPTIONS` preflight | empty, `Allow: GET, HEAD, OPTIONS` |
 | 400 | bad dimensions (`0/0`, >8192); path traversal syntax; `@gif`/`@jxl`; `@avif` when the build lacks avif; unknown options-route key; source key the origin will not serve (400/414, over-length) | names the cause when it is the client's grammar |
 | 403 | signing on, missing or wrong signature | |
-| 404 | missing object; path escaping `IMAGES_DIR`; unknown `@bogus` (filename) | `image not found` |
+| 404 | missing object; path escaping `IMAGES_DIR`; unknown `@bogus` kept as a filename (404 only if that file is absent) | `image not found` |
 | 405 | method other than GET/HEAD/OPTIONS | |
 | 413 | `OXIMG_MAX_SOURCE_BYTES` / `OXIMG_MAX_SRC_PIXELS` / `OXIMG_MAX_DECODED_BYTES` | generic; which limit is on stderr |
 | 422 | undecodable bytes | top-level message, safe to echo |
