@@ -6,10 +6,11 @@ ships on; the others are cross-checks.
 ## HTTP (the server)
 
 ```sh
-oximg-ctl get /resize/100/100/photo.jpg
-oximg-ctl get /resize/100/100/photo.jpg@webp --write /tmp/out.webp
-oximg-ctl --env OXIMG_OPTIONS_PREFIX=/image get /image/width=100/photo.jpg
-oximg-ctl matrix --source photo.jpg --box 100x100
+cargo build --release
+./target/release/oximg-ctl get /resize/100/100/photo.jpg
+./target/release/oximg-ctl get /resize/100/100/photo.jpg@webp --write /tmp/out.webp
+./target/release/oximg-ctl --env OXIMG_OPTIONS_PREFIX=/image get /image/width=100/photo.jpg
+./target/release/oximg-ctl matrix --source photo.jpg --box 100x100
 ```
 
 Auto-spawns `oximg` on `PORT=0` with `IMAGES_DIR=tests/fixtures`

@@ -2,7 +2,9 @@
 
 Everything is environment, read once at startup. **Fail-closed**: set
 but unparseable or out of range refuses to boot and names the variable.
-Booleans are `0`/`1` only. Long form: [README Configuration](../../README.md#configuration).
+Exception: `OXIMG_AUTO_FORMAT` skips unknown or build-unavailable
+tokens with a warning and still boots, so one config works across
+builds. Booleans are `0`/`1` only. Long form: [README Configuration](../../README.md#configuration).
 Pipeline knobs are pinned to that README by `src/config.rs`
 (`knobs_are_documented`).
 
@@ -17,7 +19,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_OPTIONS_PREFIX` | unset | Mount Cloudflare-style options route |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC; both or neither |
 | `OXIMG_WORKERS` | observed parallelism | CPU permits, 1–512. `oximg-ctl` spawn sets `1` if unset |
-| `OXIMG_FETCH_CONCURRENCY` | `4 × permits`, max 256 | Concurrent origin downloads |
+| `OXIMG_FETCH_CONCURRENCY` | default `min(4 × permits, 256)`; explicit 1–1024 | Concurrent origin downloads |
 | `OXIMG_LOG` | `error` | `request` also logs 200s |
 | `OXIMG_METRICS` | `0` | `1` serves `/metrics` |
 | `OXIMG_SOURCE_BASE_URL` | unset | `https://…` or `gs://bucket[/prefix]` |

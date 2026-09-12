@@ -100,14 +100,15 @@ cargo test --release
 
 `oximg-ctl` is the JSON control plane over the real `oximg` binary:
 spawn the server, GET a path, probe, resize, sign, or walk a fixture
-matrix. stdout is one JSON object (except `--help`). Docker images
-still copy only `oximg`. The compressed feature map (how to reach a
-behavior and what proof looks like) is
+matrix. stdout is one JSON object (except `--help` and `--version`).
+Docker images still copy only `oximg`. The compressed feature map (how
+to reach a behavior and what proof looks like) is
 [`docs/features/`](docs/features/).
 
 ```sh
-cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg
-cargo run --release --bin oximg-ctl -- matrix --source photo.jpg --box 100x100
+cargo build --release                 # both oximg and oximg-ctl
+./target/release/oximg-ctl get /resize/100/100/photo.jpg
+./target/release/oximg-ctl matrix --source photo.jpg --box 100x100
 cargo test --release --test ctl
 ```
 

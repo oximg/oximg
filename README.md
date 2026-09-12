@@ -290,9 +290,14 @@ JSON object per command so an agent can close the loop without
 hand-rolling curl. Docker images still ship only `oximg`.
 
 ```sh
-cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg
-cargo run --release --bin oximg-ctl -- matrix --box 100x100 --source photo.jpg
+cargo build --release                 # both oximg and oximg-ctl
+./target/release/oximg-ctl get /resize/100/100/photo.jpg
+./target/release/oximg-ctl matrix --box 100x100 --source photo.jpg
 ```
+
+`cargo run --bin oximg-ctl` only builds the control binary, so a
+fresh checkout has no sibling `oximg` to spawn. `cargo build --release`
+builds both.
 
 The feature map — routes, format matrix, invariants, knobs, error
 classes, and the three caller paths — is in
