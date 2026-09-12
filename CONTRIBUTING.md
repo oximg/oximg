@@ -28,7 +28,7 @@ with no system libraries.
 The MSRV is **Rust 1.90** (`rust-version` in Cargo.toml, bounded by
 pic-scale and enforced by the CI `msrv` job).
 
-## Feature map
+## Build features
 
 | Build | What it is |
 |---|---|
@@ -101,7 +101,9 @@ cargo test --release
 `oximg-ctl` is the JSON control plane over the real `oximg` binary:
 spawn the server, GET a path, probe, resize, sign, or walk a fixture
 matrix. stdout is one JSON object (except `--help`). Docker images
-still copy only `oximg`.
+still copy only `oximg`. The compressed feature map (how to reach a
+behavior and what proof looks like) is
+[`docs/features/`](docs/features/).
 
 ```sh
 cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg

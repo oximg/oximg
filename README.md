@@ -294,6 +294,10 @@ cargo run --release --bin oximg-ctl -- get /resize/100/100/photo.jpg
 cargo run --release --bin oximg-ctl -- matrix --box 100x100 --source photo.jpg
 ```
 
+The feature map — routes, format matrix, invariants, knobs, error
+classes, and the three caller paths — is in
+[`docs/features/`](docs/features/).
+
 CI merges nothing that fails `cargo fmt --check`, clippy with
 `-D warnings`, or the test suite with and without `--features avif`.
 The full pre-merge checklist — the feature matrix, MSRV, the coverage
