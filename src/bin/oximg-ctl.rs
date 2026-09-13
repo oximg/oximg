@@ -21,10 +21,55 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+/// Unix: forward SIGINT/SIGTERM to the spawned child. `signal(2)`
+/// replaces the default disposition, so the wrapper stays alive to
+/// `wait()` while the server drains. Forced kill is Drop / timeout only.
+#[cfg(unix)]
+mod unix_child {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static CHILD: AtomicI32 = AtomicI32::new(0);
+
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+        fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    }
+
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+
+    extern "C" fn forward(sig: i32) {
+        let pid = CHILD.load(Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                kill(pid, sig);
+            }
+        }
+    }
+
+    pub fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| unsafe {
+            signal(SIGINT, forward);
+            signal(SIGTERM, forward);
+        });
+    }
+
+    pub fn set_pid(pid: u32) {
+        CHILD.store(pid as i32, Ordering::SeqCst);
+    }
+
+    pub fn clear() {
+        CHILD.store(0, Ordering::SeqCst);
+    }
+}
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -270,7 +315,7 @@ fn parse_args(args: &[String]) -> Result<Opts, CtlError> {
                         "--env IMAGES_DIR is reserved; use --images-dir",
                     ));
                 }
-                env.push((k.to_string(), val.to_string()));
+                env.push((canonical_env_key(k), val.to_string()));
                 rest = &rest[2..];
             }
             "--pretty" => {
@@ -682,12 +727,62 @@ fn images_dir(opts: &Opts) -> PathBuf {
 }
 
 fn env_named(opts: &Opts, name: &str) -> bool {
-    opts.env.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    opts.env.iter().any(|(k, _)| k == name)
+}
+
+fn env_value<'a>(opts: &'a Opts, name: &str) -> Option<&'a str> {
+    opts.env
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Unix env keys are case-sensitive. Fold the knobs we ourselves set
+/// so `--env oximg_bind=::1` actually reaches the child.
+fn canonical_env_key(k: &str) -> String {
+    for name in ["OXIMG_BIND", "OXIMG_WORKERS"] {
+        if k.eq_ignore_ascii_case(name) {
+            return name.to_string();
+        }
+    }
+    k.to_string()
+}
+
+fn inherited_unset(name: &str) -> bool {
+    match std::env::var(name) {
+        Err(_) => true,
+        Ok(v) => v.trim().is_empty(),
+    }
+}
+
+fn effective_bind(opts: &Opts, loopback: bool) -> IpAddr {
+    if let Some(v) = env_value(opts, "OXIMG_BIND")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Ok(ip) = v.parse()
+    {
+        return ip;
+    }
+    if loopback {
+        IpAddr::from([127, 0, 0, 1])
+    } else {
+        IpAddr::from([0, 0, 0, 0])
+    }
+}
+
+fn http_host(bind: IpAddr) -> String {
+    match bind {
+        IpAddr::V4(v) if v.is_unspecified() => "127.0.0.1".into(),
+        IpAddr::V6(v) if v.is_unspecified() => "[::1]".into(),
+        IpAddr::V6(v) => format!("[{v}]"),
+        IpAddr::V4(v) => v.to_string(),
+    }
 }
 
 struct Spawned {
     child: Child,
     port: u16,
+    host: String,
     bin: PathBuf,
     images_dir: PathBuf,
     kill_on_drop: bool,
@@ -695,6 +790,8 @@ struct Spawned {
 
 impl Drop for Spawned {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        unix_child::clear();
         if self.kill_on_drop {
             let _ = self.child.kill();
             let _ = self.child.wait();
@@ -724,18 +821,23 @@ fn spawn_server(
     .env("IMAGES_DIR", &images_dir)
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
+    let bind = effective_bind(opts, loopback);
     // A local proof must not publish IMAGES_DIR on every interface.
     if loopback && !env_named(opts, "OXIMG_BIND") {
         cmd.env("OXIMG_BIND", "127.0.0.1");
     }
     // A control-plane loop should not size itself to the host; leave
-    // the operator in charge if they already set a count.
-    if std::env::var("OXIMG_WORKERS").is_err() && !env_named(opts, "OXIMG_WORKERS") {
+    // the operator in charge if they already set a count. Empty inherited
+    // values are unset — the server treats them that way too.
+    if inherited_unset("OXIMG_WORKERS") && !env_named(opts, "OXIMG_WORKERS") {
         cmd.env("OXIMG_WORKERS", "1");
     }
     for (k, v) in &opts.env {
         cmd.env(k, v);
     }
+    let host = http_host(bind);
+    #[cfg(unix)]
+    unix_child::install();
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     let mut child = cmd.spawn().map_err(|e| {
         CtlError::fail(
@@ -743,6 +845,8 @@ fn spawn_server(
             Some("build the binary first: cargo build --release"),
         )
     })?;
+    #[cfg(unix)]
+    unix_child::set_pid(child.id());
     let stderr = child.stderr.take().expect("stderr piped");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -774,6 +878,8 @@ fn spawn_server(
     let (port_found, boot) = match rx.recv_timeout(remaining) {
         Ok(v) => v,
         Err(_) => {
+            #[cfg(unix)]
+            unix_child::clear();
             let _ = child.kill();
             let _ = child.wait();
             return Err(CtlError::fail(
@@ -783,6 +889,8 @@ fn spawn_server(
         }
     };
     let Some(port) = port_found else {
+        #[cfg(unix)]
+        unix_child::clear();
         let status = child.wait().ok();
         let hint = if boot.is_empty() {
             "check --bin points at oximg, and that cmake/nasm are installed"
@@ -804,13 +912,14 @@ fn spawn_server(
     let mut spawned = Spawned {
         child,
         port,
+        host: host.clone(),
         bin,
         images_dir,
         kill_on_drop: true,
     };
     loop {
         if let Ok(res) = http.get(
-            &format!("http://127.0.0.1:{port}/health"),
+            &format!("http://{host}:{port}/health"),
             None,
             Duration::from_secs(2),
         ) && res.status == 200
@@ -859,7 +968,7 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
             "ok": true,
             "pid": spawned.child.id(),
             "port": spawned.port,
-            "base": format!("http://127.0.0.1:{}", spawned.port),
+            "base": format!("http://{}:{}", spawned.host, spawned.port),
             "bin": spawned.bin.display().to_string(),
             "images_dir": spawned.images_dir.display().to_string(),
         }),
@@ -887,37 +996,10 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
 }
 
 fn wait_served_child(spawned: &mut Spawned) -> std::io::Result<ExitStatus> {
-    #[cfg(unix)]
-    {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        rt.block_on(async {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            let mut int =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-            loop {
-                tokio::select! {
-                    _ = term.recv() => {
-                        let _ = spawned.child.kill();
-                    }
-                    _ = int.recv() => {
-                        let _ = spawned.child.kill();
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                        if let Some(st) = spawned.child.try_wait()? {
-                            return Ok(st);
-                        }
-                    }
-                }
-            }
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        spawned.child.wait()
-    }
+    // Unix: SIGINT/SIGTERM are forwarded to the child by unix_child::forward
+    // so oximg can drain. wait() returns when that finishes. Drop still
+    // SIGKILLs if we unwind before then.
+    spawned.child.wait()
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1204,7 @@ fn cmd_get(
     };
     let base = match (base, spawned.as_ref()) {
         (Some(b), _) => b.trim_end_matches('/').to_string(),
-        (None, Some(s)) => format!("http://127.0.0.1:{}", s.port),
+        (None, Some(s)) => format!("http://{}:{}", s.host, s.port),
         (None, None) => unreachable!(),
     };
     let url = format!("{base}{path}");
@@ -1674,7 +1756,7 @@ fn cmd_matrix(
     };
     let base = match (base.as_deref(), spawned.as_ref()) {
         (Some(b), _) => b.trim_end_matches('/').to_string(),
-        (None, Some(s)) => format!("http://127.0.0.1:{}", s.port),
+        (None, Some(s)) => format!("http://{}:{}", s.host, s.port),
         (None, None) => unreachable!(),
     };
 

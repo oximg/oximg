@@ -396,6 +396,28 @@ fn serve_dry_run_redacts_signing_secrets() {
 }
 
 #[test]
+fn env_bind_and_workers_are_canonicalized() {
+    let (code, v) = run(&[
+        "--env",
+        "oximg_workers=2",
+        "--env",
+        "oximg_bind=127.0.0.1",
+        "--dry-run",
+        "serve",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let env = v["env"].as_array().expect("env array");
+    let find = |k: &str| {
+        env.iter()
+            .find_map(|o| o.get(k).and_then(|x| x.as_str()))
+            .unwrap_or_else(|| panic!("missing {k} in {v}"))
+    };
+    assert_eq!(find("OXIMG_WORKERS"), "2");
+    assert_eq!(find("OXIMG_BIND"), "127.0.0.1");
+    assert!(env.iter().all(|o| o.get("oximg_workers").is_none()));
+}
+
+#[test]
 fn env_cannot_override_managed_spawn_keys() {
     let (code, v) = run(&["--env", "PORT=8081", "--dry-run", "serve"]);
     assert_eq!(code, 2, "{v}");
