@@ -2,9 +2,13 @@
 
 Everything is environment, read once at startup. **Fail-closed**: set
 but unparseable or out of range refuses to boot and names the variable.
-Exception: `OXIMG_AUTO_FORMAT` skips unknown or build-unavailable
-tokens with a warning and still boots, so one config works across
-builds. Booleans are `0`/`1` only. Long form: [README Configuration](../../README.md#configuration).
+Lenient exceptions (the process still boots):
+
+- `OXIMG_AUTO_FORMAT` skips unknown or build-unavailable tokens with a warning
+- `PRESET` maps anything other than `fast`/`small` to jpegli
+- `OXIMG_TIMING` is presence-based (any set value enables), not `0`/`1`
+
+Validated booleans are `0`/`1` only. Long form: [README Configuration](../../README.md#configuration).
 Pipeline knobs are pinned to that README by `src/config.rs`
 (`knobs_are_documented`).
 
