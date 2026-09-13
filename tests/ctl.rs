@@ -396,6 +396,41 @@ fn serve_dry_run_redacts_signing_secrets() {
 }
 
 #[test]
+fn env_last_bind_wins() {
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_BIND=0.0.0.0",
+        "--env",
+        "OXIMG_BIND=127.0.0.1",
+        "--dry-run",
+        "serve",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    let env = v["env"].as_array().expect("env array");
+    let binds: Vec<_> = env
+        .iter()
+        .filter_map(|o| o.get("OXIMG_BIND").and_then(|x| x.as_str()))
+        .collect();
+    assert_eq!(binds.last().copied(), Some("127.0.0.1"), "{v}");
+}
+
+#[test]
+fn auto_spawn_ignores_inherited_signing_keys() {
+    let mut c = ctl();
+    c.env("OXIMG_KEY", "deadbeef".repeat(8));
+    c.env("OXIMG_SALT", "cafebabe".repeat(8));
+    let output = c
+        .args(["get", "/resize/100/100/photo.jpg", "--expect", "200"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout not JSON ({e}): {stdout:?}"));
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["status"], 200, "{v}");
+}
+
+#[test]
 fn env_bind_and_workers_are_canonicalized() {
     let (code, v) = run(&[
         "--env",
@@ -466,6 +501,16 @@ fn sign_rejects_non_ascii_hex_without_panicking() {
     ]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"].as_str().unwrap().contains("hex"), "{v}");
+}
+
+#[test]
+fn resize_dry_run_does_not_delete_an_existing_temp() {
+    let tmp = std::env::temp_dir().join(format!("oximg-ctl-{}-80x80.out", std::process::id()));
+    std::fs::write(&tmp, b"keep").unwrap();
+    let (code, v) = run(&["--dry-run", "resize", &fixture("photo.jpg"), "80", "80"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(std::fs::read(&tmp).unwrap(), b"keep");
+    let _ = std::fs::remove_file(&tmp);
 }
 
 #[test]

@@ -731,8 +731,10 @@ fn env_named(opts: &Opts, name: &str) -> bool {
 }
 
 fn env_value<'a>(opts: &'a Opts, name: &str) -> Option<&'a str> {
+    // Last --env wins, matching Command::env overwrite order.
     opts.env
         .iter()
+        .rev()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
 }
@@ -740,7 +742,7 @@ fn env_value<'a>(opts: &'a Opts, name: &str) -> Option<&'a str> {
 /// Unix env keys are case-sensitive. Fold the knobs we ourselves set
 /// so `--env oximg_bind=::1` actually reaches the child.
 fn canonical_env_key(k: &str) -> String {
-    for name in ["OXIMG_BIND", "OXIMG_WORKERS"] {
+    for name in ["OXIMG_BIND", "OXIMG_WORKERS", "OXIMG_KEY", "OXIMG_SALT"] {
         if k.eq_ignore_ascii_case(name) {
             return name.to_string();
         }
@@ -755,19 +757,25 @@ fn inherited_unset(name: &str) -> bool {
     }
 }
 
+fn parse_bind(v: &str) -> Option<IpAddr> {
+    v.trim().parse().ok()
+}
+
 fn effective_bind(opts: &Opts, loopback: bool) -> IpAddr {
-    if let Some(v) = env_value(opts, "OXIMG_BIND")
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && let Ok(ip) = v.parse()
-    {
+    if let Some(ip) = env_value(opts, "OXIMG_BIND").and_then(parse_bind) {
         return ip;
     }
     if loopback {
-        IpAddr::from([127, 0, 0, 1])
-    } else {
-        IpAddr::from([0, 0, 0, 0])
+        return IpAddr::from([127, 0, 0, 1]);
     }
+    if let Some(ip) = std::env::var("OXIMG_BIND")
+        .ok()
+        .as_deref()
+        .and_then(parse_bind)
+    {
+        return ip;
+    }
+    IpAddr::from([0, 0, 0, 0])
 }
 
 fn http_host(bind: IpAddr) -> String {
@@ -831,6 +839,12 @@ fn spawn_server(
     // values are unset — the server treats them that way too.
     if inherited_unset("OXIMG_WORKERS") && !env_named(opts, "OXIMG_WORKERS") {
         cmd.env("OXIMG_WORKERS", "1");
+    }
+    // Fixture get/matrix send unsigned paths. A shell with signing
+    // enabled would otherwise 403 every cell. serve still inherits.
+    if loopback && !env_named(opts, "OXIMG_KEY") && !env_named(opts, "OXIMG_SALT") {
+        cmd.env_remove("OXIMG_KEY");
+        cmd.env_remove("OXIMG_SALT");
     }
     for (k, v) in &opts.env {
         cmd.env(k, v);
@@ -989,6 +1003,9 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
             std::process::exit(1);
         }
         Err(e) => {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            spawned.kill_on_drop = false;
             eprintln!("oximg-ctl: wait on server: {e}");
             std::process::exit(1);
         }
@@ -1345,7 +1362,6 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
             }
         }
     }
-    let _ephemeral = RemoveOnDrop(ephemeral.then(|| out_path.to_path_buf()));
     if opts.dry_run {
         emit(
             &json!({
@@ -1358,6 +1374,7 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
         );
         return Ok(());
     }
+    let _ephemeral = RemoveOnDrop(ephemeral.then(|| out_path.to_path_buf()));
     let argv = resize_argv(input, w, h, out_path, format, quality, preset);
     let t0 = Instant::now();
     let mut cmd = Command::new(&bin);
@@ -1660,6 +1677,21 @@ fn default_formats() -> Vec<String> {
     vec!["".into(), "webp".into()]
 }
 
+/// Bare (no `@{fmt}`) output codec: GIF transcodes to WebP, everything
+/// else keeps the source format.
+fn source_output_token(src: &str) -> Option<String> {
+    let name = src.rsplit('/').next().unwrap_or(src);
+    let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Some("jpeg".into()),
+        "png" => Some("png".into()),
+        "webp" => Some("webp".into()),
+        "gif" => Some("webp".into()),
+        "avif" => Some("avif".into()),
+        _ => None,
+    }
+}
+
 fn cmd_matrix(
     opts: &Opts,
     sources: Vec<String>,
@@ -1697,7 +1729,10 @@ fn cmd_matrix(
         for (w, h) in &boxes {
             for fmt in &formats {
                 let (path, format) = match fmt.as_str() {
-                    "" | "source" => (format!("/resize/{w}/{h}/{src_enc}"), None),
+                    "" | "source" => (
+                        format!("/resize/{w}/{h}/{src_enc}"),
+                        source_output_token(src),
+                    ),
                     token => (
                         format!("/resize/{w}/{h}/{src_enc}@{token}"),
                         Some(token.to_string()),
