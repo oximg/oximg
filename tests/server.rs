@@ -427,6 +427,29 @@ fn invalid_signing_config_refuses_to_boot() {
 }
 
 #[test]
+fn invalid_bind_refuses_to_boot() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+    cmd.env("PORT", "0")
+        .env("OXIMG_BIND", "not-an-ip")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().expect("spawn oximg");
+    let mut status = None;
+    for _ in 0..200 {
+        if let Ok(Some(s)) = child.try_wait() {
+            status = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let Some(status) = status else {
+        let _ = child.kill();
+        panic!("server kept running with an undecodable OXIMG_BIND");
+    };
+    assert!(!status.success(), "exit must be non-zero, got {status}");
+}
+
+#[test]
 fn signing_gate() {
     let key = "deadbeef".repeat(8);
     let salt = "cafebabe".repeat(8);

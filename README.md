@@ -284,6 +284,25 @@ cargo build --release
 cargo test --release                # hermetic: no network, fixtures committed
 ```
 
+`oximg-ctl` is the JSON control plane for that binary: it spawns the
+real server (`PORT=0`), drives HTTP/CLI/probe/sign, and prints one
+JSON object per command so an agent can close the loop without
+hand-rolling curl. Docker images still ship only `oximg`.
+
+```sh
+cargo build --release                 # both oximg and oximg-ctl
+./target/release/oximg-ctl get /resize/100/100/photo.jpg
+./target/release/oximg-ctl matrix --box 100x100 --source photo.jpg
+```
+
+`cargo run --bin oximg-ctl` only builds the control binary, so a
+fresh checkout has no sibling `oximg` to spawn. `cargo build --release`
+builds both.
+
+The feature map — routes, format matrix, invariants, knobs, error
+classes, and the three caller paths — is in
+[`docs/features/`](docs/features/).
+
 CI merges nothing that fails `cargo fmt --check`, clippy with
 `-D warnings`, or the test suite with and without `--features avif`.
 The full pre-merge checklist — the feature matrix, MSRV, the coverage
@@ -453,6 +472,7 @@ never silently falls back to a default.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8081` | Listen port (`0` = OS-assigned, printed on stderr) |
+| `OXIMG_BIND` | `0.0.0.0` | Listen address. `oximg-ctl` auto-spawn sets `127.0.0.1` so a local proof does not publish `IMAGES_DIR` on every interface |
 | `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |

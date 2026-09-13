@@ -367,6 +367,7 @@ mod tests {
                     "OXIMG_OPTIONS_PREFIX",
                     "OXIMG_WORKERS",
                     "OXIMG_FETCH_CONCURRENCY",
+                    "OXIMG_BIND",
                 ];
                 assert!(
                     KNOBS.contains(&name) || startup.contains(&name),

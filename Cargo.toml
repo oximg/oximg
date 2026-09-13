@@ -49,6 +49,8 @@ quantette = { version = "0.6", default-features = false }
 # The integration suites' own HTTP client — deliberately not the one
 # the server uses, so a client bug cannot cancel itself out of a test.
 ureq = "3.3.0"
+# oximg-ctl prints one JSON object per command; the ctl suite parses it.
+serde_json = "1"
 
 [profile.release]
 lto = true
@@ -76,6 +78,15 @@ bench-internals = []
 
 [[bin]]
 name = "oximg"
+required-features = ["server"]
+
+# Agent/operator control plane: spawn the real server, drive HTTP/CLI,
+# print JSON. Not the user-facing product (`oximg resize` / the HTTP
+# routes are); Docker copies only `oximg`. Required-features matches
+# the server binary so `cargo test` builds both together.
+[[bin]]
+name = "oximg-ctl"
+path = "src/bin/oximg-ctl.rs"
 required-features = ["server"]
 
 # Benchmark/dev tools live under bench/tools/ (kept out of examples/,
