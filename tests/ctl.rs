@@ -401,6 +401,10 @@ fn env_cannot_override_managed_spawn_keys() {
     assert_eq!(code, 2, "{v}");
     assert!(v["error"].as_str().unwrap().contains("PORT"), "{v}");
 
+    let (code, v) = run(&["--env", "port=8081", "--dry-run", "serve"]);
+    assert_eq!(code, 2, "Windows-style case fold: {v}");
+    assert!(v["error"].as_str().unwrap().contains("PORT"), "{v}");
+
     let (code, v) = run(&["--env", "IMAGES_DIR=/tmp", "--dry-run", "serve"]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"].as_str().unwrap().contains("IMAGES_DIR"), "{v}");
@@ -411,4 +415,44 @@ fn matrix_rejects_unknown_format_tokens() {
     let (code, v) = run(&["--dry-run", "matrix", "--format", "bogus"]);
     assert_eq!(code, 2, "{v}");
     assert!(v["error"].as_str().unwrap().contains("--format"), "{v}");
+}
+
+#[test]
+fn matrix_encodes_percent_in_source_names() {
+    let (code, v) = run(&[
+        "--dry-run",
+        "matrix",
+        "--source",
+        "a%b.jpg",
+        "--format",
+        "source",
+        "--no-negatives",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["cells"][0]["path"], "/resize/100/100/a%25b.jpg");
+}
+
+#[test]
+fn sign_rejects_non_ascii_hex_without_panicking() {
+    let (code, v) = run(&[
+        "sign",
+        "/resize/100/100/photo.jpg",
+        "--key",
+        "€a",
+        "--salt",
+        "cafebabe",
+    ]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("hex"), "{v}");
+}
+
+#[test]
+fn resize_without_out_does_not_leave_a_temp_file() {
+    let (code, v) = run(&["resize", &fixture("photo.jpg"), "80", "80"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        v.get("out").is_none(),
+        "ephemeral output must not linger: {v}"
+    );
+    assert_eq!(v["probe"]["width"], 80);
 }

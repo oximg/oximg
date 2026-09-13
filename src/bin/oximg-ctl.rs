@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -260,19 +260,17 @@ fn parse_args(args: &[String]) -> Result<Opts, CtlError> {
                 let (k, val) = v
                     .split_once('=')
                     .ok_or_else(|| CtlError::usage(format!("--env needs KEY=VAL, got {v:?}")))?;
-                match k {
-                    "PORT" => {
-                        return Err(CtlError::usage(
-                            "--env PORT is reserved; use --port (auto-spawn uses PORT=0)",
-                        ));
-                    }
-                    "IMAGES_DIR" => {
-                        return Err(CtlError::usage(
-                            "--env IMAGES_DIR is reserved; use --images-dir",
-                        ));
-                    }
-                    _ => env.push((k.to_string(), val.to_string())),
+                if k.eq_ignore_ascii_case("PORT") {
+                    return Err(CtlError::usage(
+                        "--env PORT is reserved; use --port (auto-spawn uses PORT=0)",
+                    ));
                 }
+                if k.eq_ignore_ascii_case("IMAGES_DIR") {
+                    return Err(CtlError::usage(
+                        "--env IMAGES_DIR is reserved; use --images-dir",
+                    ));
+                }
+                env.push((k.to_string(), val.to_string()));
                 rest = &rest[2..];
             }
             "--pretty" => {
@@ -683,6 +681,10 @@ fn images_dir(opts: &Opts) -> PathBuf {
     opts.images_dir.clone().unwrap_or_else(default_images_dir)
 }
 
+fn env_named(opts: &Opts, name: &str) -> bool {
+    opts.env.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+}
+
 struct Spawned {
     child: Child,
     port: u16,
@@ -700,7 +702,12 @@ impl Drop for Spawned {
     }
 }
 
-fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
+fn spawn_server(
+    opts: &Opts,
+    port: Option<u16>,
+    loopback: bool,
+    http: &Http,
+) -> Result<Spawned, CtlError> {
     let bin = resolve_bin(opts.bin.as_deref())?;
     let images_dir = images_dir(opts);
     if !images_dir.is_dir() {
@@ -717,11 +724,13 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
     .env("IMAGES_DIR", &images_dir)
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
+    // A local proof must not publish IMAGES_DIR on every interface.
+    if loopback && !env_named(opts, "OXIMG_BIND") {
+        cmd.env("OXIMG_BIND", "127.0.0.1");
+    }
     // A control-plane loop should not size itself to the host; leave
     // the operator in charge if they already set a count.
-    if std::env::var("OXIMG_WORKERS").is_err()
-        && !opts.env.iter().any(|(k, _)| k == "OXIMG_WORKERS")
-    {
+    if std::env::var("OXIMG_WORKERS").is_err() && !env_named(opts, "OXIMG_WORKERS") {
         cmd.env("OXIMG_WORKERS", "1");
     }
     for (k, v) in &opts.env {
@@ -789,6 +798,9 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
         }
         return Err(err);
     };
+    // The copy thread only sees lines after the listening line; keep
+    // the promised "stderr is forwarded" contract for boot warnings.
+    eprint!("{boot}");
     let mut spawned = Spawned {
         child,
         port,
@@ -797,7 +809,7 @@ fn spawn_server(opts: &Opts, port: Option<u16>) -> Result<Spawned, CtlError> {
         kill_on_drop: true,
     };
     loop {
-        if let Ok(res) = http_get(
+        if let Ok(res) = http.get(
             &format!("http://127.0.0.1:{port}/health"),
             None,
             Duration::from_secs(2),
@@ -840,7 +852,8 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
         );
         return Ok(());
     }
-    let mut spawned = spawn_server(opts, port)?;
+    let http = Http::new().map_err(|e| CtlError::fail(e, None))?;
+    let mut spawned = spawn_server(opts, port, false, &http)?;
     emit(
         &json!({
             "ok": true,
@@ -853,12 +866,16 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
         opts.pretty,
     );
     let _ = std::io::stdout().flush();
-    spawned.kill_on_drop = false;
-    // The ready record is already on stdout. A later child failure must
-    // not emit a second JSON object — parsers take the first value.
-    match spawned.child.wait() {
-        Ok(status) if status.success() => Ok(()),
+    // Ready record is already on stdout. A later child failure must not
+    // emit a second JSON object. Keep kill_on_drop until the child is
+    // reaped so SIGINT/SIGTERM cannot leave an orphan listener.
+    match wait_served_child(&mut spawned) {
+        Ok(status) if status.success() => {
+            spawned.kill_on_drop = false;
+            Ok(())
+        }
         Ok(status) => {
+            spawned.kill_on_drop = false;
             eprintln!("oximg-ctl: server exited {status}");
             std::process::exit(1);
         }
@@ -866,6 +883,40 @@ fn cmd_serve(opts: &Opts, port: Option<u16>) -> Result<(), CtlError> {
             eprintln!("oximg-ctl: wait on server: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+fn wait_served_child(spawned: &mut Spawned) -> std::io::Result<ExitStatus> {
+    #[cfg(unix)]
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let mut int =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            loop {
+                tokio::select! {
+                    _ = term.recv() => {
+                        let _ = spawned.child.kill();
+                    }
+                    _ = int.recv() => {
+                        let _ = spawned.child.kill();
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if let Some(st) = spawned.child.try_wait()? {
+                            return Ok(st);
+                        }
+                    }
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        spawned.child.wait()
     }
 }
 
@@ -881,42 +932,58 @@ struct HttpResult {
     url: String,
 }
 
-fn http_get(url: &str, accept: Option<&str>, timeout: Duration) -> Result<HttpResult, String> {
-    let t0 = Instant::now();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("tokio runtime: {e}"))?;
-    rt.block_on(async {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
-        let mut req = client.get(url);
-        if let Some(a) = accept {
-            req = req.header("accept", a);
-        }
-        let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
-        let status = resp.status().as_u16();
-        let mut headers = HashMap::new();
-        for (k, v) in resp.headers() {
-            if let Ok(val) = v.to_str() {
-                headers.insert(k.as_str().to_ascii_lowercase(), val.to_string());
-            }
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("read body: {e}"))?
-            .to_vec();
-        Ok(HttpResult {
-            status,
-            headers,
-            body,
-            ms: t0.elapsed().as_secs_f64() * 1e3,
-            url: url.to_string(),
+struct Http {
+    rt: tokio::runtime::Runtime,
+    client: reqwest::Client,
+}
+
+impl Http {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            rt: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("tokio runtime: {e}"))?,
+            client: reqwest::Client::builder()
+                .build()
+                .map_err(|e| format!("http client: {e}"))?,
         })
-    })
+    }
+
+    fn get(
+        &self,
+        url: &str,
+        accept: Option<&str>,
+        timeout: Duration,
+    ) -> Result<HttpResult, String> {
+        let t0 = Instant::now();
+        self.rt.block_on(async {
+            let mut req = self.client.get(url).timeout(timeout);
+            if let Some(a) = accept {
+                req = req.header("accept", a);
+            }
+            let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+            let status = resp.status().as_u16();
+            let mut headers = HashMap::new();
+            for (k, v) in resp.headers() {
+                if let Ok(val) = v.to_str() {
+                    headers.insert(k.as_str().to_ascii_lowercase(), val.to_string());
+                }
+            }
+            let body = resp
+                .bytes()
+                .await
+                .map_err(|e| format!("read body: {e}"))?
+                .to_vec();
+            Ok(HttpResult {
+                status,
+                headers,
+                body,
+                ms: t0.elapsed().as_secs_f64() * 1e3,
+                url: url.to_string(),
+            })
+        })
+    }
 }
 
 fn normalize_path(path: &str) -> String {
@@ -1048,9 +1115,10 @@ fn cmd_get(
         );
         return Ok(());
     }
+    let http = Http::new().map_err(|e| CtlError::fail(e, None))?;
     let spawned = match base {
         Some(_) => None,
-        None => Some(spawn_server(opts, None)?),
+        None => Some(spawn_server(opts, None, true, &http)?),
     };
     let base = match (base, spawned.as_ref()) {
         (Some(b), _) => b.trim_end_matches('/').to_string(),
@@ -1058,12 +1126,14 @@ fn cmd_get(
         (None, None) => unreachable!(),
     };
     let url = format!("{base}{path}");
-    let res = http_get(&url, accept, Duration::from_secs(timeout_secs)).map_err(|e| {
-        CtlError::fail(
-            e,
-            Some("is the server up? pass --base or let get auto-spawn"),
-        )
-    })?;
+    let res = http
+        .get(&url, accept, Duration::from_secs(timeout_secs))
+        .map_err(|e| {
+            CtlError::fail(
+                e,
+                Some("is the server up? pass --base or let get auto-spawn"),
+            )
+        })?;
     let mut report = get_report(&res, write)?;
     if let Some(want) = expect
         && res.status != want
@@ -1171,6 +1241,7 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
     let quality = quality.as_deref();
     let preset = preset.as_deref();
     let bin = resolve_bin(opts.bin.as_deref())?;
+    let ephemeral = out.is_none();
     let tmp;
     let out_path: &Path = match out {
         Some(p) => p,
@@ -1184,6 +1255,15 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
             &tmp
         }
     };
+    struct RemoveOnDrop(Option<PathBuf>);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let _ephemeral = RemoveOnDrop(ephemeral.then(|| out_path.to_path_buf()));
     if opts.dry_run {
         emit(
             &json!({
@@ -1222,18 +1302,18 @@ fn cmd_resize(opts: &Opts) -> Result<(), CtlError> {
     }
     let bytes = std::fs::read(out_path)
         .map_err(|e| CtlError::fail(format!("read {}: {e}", out_path.display()), None))?;
-    emit(
-        &json!({
-            "ok": true,
-            "out": out_path.display().to_string(),
-            "bytes": bytes.len(),
-            "sha256": sha256_hex(&bytes),
-            "ms": (ms * 10.0).round() / 10.0,
-            "probe": probe_value(&bytes),
-            "stderr": stderr,
-        }),
-        opts.pretty,
-    );
+    let mut report = json!({
+        "ok": true,
+        "bytes": bytes.len(),
+        "sha256": sha256_hex(&bytes),
+        "ms": (ms * 10.0).round() / 10.0,
+        "probe": probe_value(&bytes),
+        "stderr": stderr,
+    });
+    if !ephemeral {
+        report["out"] = json!(out_path.display().to_string());
+    }
+    emit(&report, opts.pretty);
     Ok(())
 }
 
@@ -1317,15 +1397,18 @@ fn decode_hex(name: &str, v: &str) -> Result<Vec<u8>, CtlError> {
             "{name} must not be empty (unset OXIMG_KEY/OXIMG_SALT means signing off)"
         )));
     }
-    if !v.len().is_multiple_of(2) {
+    let raw = v.as_bytes();
+    if !raw.len().is_multiple_of(2) {
         return Err(CtlError::usage(format!(
             "{name} is not valid hex (odd length)"
         )));
     }
-    (0..v.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&v[i..i + 2], 16)
+    if !raw.iter().all(u8::is_ascii_hexdigit) {
+        return Err(CtlError::usage(format!("{name} is not valid hex")));
+    }
+    raw.chunks(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).expect("ascii hex"), 16)
                 .map_err(|_| CtlError::usage(format!("{name} is not valid hex")))
         })
         .collect()
@@ -1528,12 +1611,13 @@ fn cmd_matrix(
     }
     let mut plan: Vec<Cell> = Vec::new();
     for src in &sources {
+        let src_enc = percent_encode_path(src);
         for (w, h) in &boxes {
             for fmt in &formats {
                 let (path, format) = match fmt.as_str() {
-                    "" | "source" => (format!("/resize/{w}/{h}/{src}"), None),
+                    "" | "source" => (format!("/resize/{w}/{h}/{src_enc}"), None),
                     token => (
-                        format!("/resize/{w}/{h}/{src}@{token}"),
+                        format!("/resize/{w}/{h}/{src_enc}@{token}"),
                         Some(token.to_string()),
                     ),
                 };
@@ -1583,9 +1667,10 @@ fn cmd_matrix(
         return Ok(());
     }
 
+    let http = Http::new().map_err(|e| CtlError::fail(e, None))?;
     let spawned = match base.as_deref() {
         Some(_) => None,
-        None => Some(spawn_server(opts, None)?),
+        None => Some(spawn_server(opts, None, true, &http)?),
     };
     let base = match (base.as_deref(), spawned.as_ref()) {
         (Some(b), _) => b.trim_end_matches('/').to_string(),
@@ -1599,7 +1684,7 @@ fn cmd_matrix(
     let mut failed = 0u32;
     for c in &plan {
         let url = format!("{base}{}", c.path);
-        match http_get(&url, None, timeout) {
+        match http.get(&url, None, timeout) {
             Ok(res) => {
                 let mut row = get_report(&res, None)?;
                 let mut pass = res.status == c.expect;
