@@ -433,7 +433,8 @@ async fn async_main(workers: usize, fetch_limit: usize) -> anyhow::Result<()> {
     }
     let router = router.with_state(app);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let bind: std::net::IpAddr = env_or("OXIMG_BIND", std::net::Ipv4Addr::UNSPECIFIED.into());
+    let listener = tokio::net::TcpListener::bind((bind, port)).await?;
     // Install the signal handlers BEFORE announcing readiness: the
     // listening line is the "safe to manage this process" signal, and
     // a SIGTERM racing in after it must drain, never hit the default

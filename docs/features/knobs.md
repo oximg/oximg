@@ -15,6 +15,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | Variable | Default | One line |
 |---|---|---|
 | `PORT` | `8081` | `0` = OS-assigned; printed on stderr |
+| `OXIMG_BIND` | `0.0.0.0` | Listen address; ctl auto-spawn sets `127.0.0.1` |
 | `IMAGES_DIR` | `./images` | Local sources when no source URL |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mount Cloudflare-style options route |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC; both or neither |

@@ -472,6 +472,7 @@ never silently falls back to a default.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8081` | Listen port (`0` = OS-assigned, printed on stderr) |
+| `OXIMG_BIND` | `0.0.0.0` | Listen address. `oximg-ctl` auto-spawn sets `127.0.0.1` so a local proof does not publish `IMAGES_DIR` on every interface |
 | `IMAGES_DIR` | `./images` | Local source directory (when no source URL is set) |
 | `OXIMG_OPTIONS_PREFIX` | unset | Mounts the Cloudflare-style options route at this prefix (e.g. `/image`, `/cdn-cgi/image`) |
 | `OXIMG_KEY` / `OXIMG_SALT` | unset | Hex HMAC key/salt; setting both requires signed URLs |

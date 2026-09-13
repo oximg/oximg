@@ -16,6 +16,9 @@ be a 422 now serves bytes, and one CLI edge changes its exit code.
 
 ### Added
 
+- **`OXIMG_BIND`** — listen address, default `0.0.0.0`. Invalid values
+  refuse to boot. `oximg-ctl` auto-spawn sets `127.0.0.1`.
+
 - **`oximg-ctl`** — a JSON control plane over the real `oximg` binary:
   spawn the server, `get` a path (auto-spawn unless `--base`), `probe`,
   `resize`, `sign` (the same HMAC scheme `tests/server.rs` pins), and
