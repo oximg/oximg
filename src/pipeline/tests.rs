@@ -943,3 +943,121 @@ fn larger_fit_covers_the_swapped_orientation() {
         (300, 200)
     );
 }
+
+/// One-pixel black and white lines, downscaled exactly 2:1, have a
+/// known correct answer and need no reference image. Each output pixel
+/// averages one black and one white pixel, so the result is linear
+/// 0.5, which is `1.055 * 0.5^(1/2.4) - 0.055` in sRGB, or about 188.
+/// Averaging the encoded values gives 128 instead. One source per
+/// decode path, since each checks the flag on its own (issue #7).
+#[test]
+fn two_to_one_downscale_averages_in_linear_light() {
+    // 64x64 keeps the source cheap while leaving plenty of interior
+    // rows to average.
+    const W: usize = 64;
+    const H: usize = 64;
+    // RGB and RGBA carry the same pattern; the channel count is what
+    // sends them down different decode paths. PNG is lossless, so the
+    // one-pixel lines reach the resize intact. JPEG at quality 100 is
+    // close enough to land on the same numbers.
+    let png_src = black_white_lines_png(W, H, 3);
+    let rgba_src = black_white_lines_png(W, H, 4);
+    let jpeg_src = {
+        let mut c = Compress::new(ColorSpace::JCS_RGB);
+        c.set_size(W, H);
+        c.set_quality(100.0);
+        let mut c = c.start_compress(Vec::new()).unwrap();
+        c.write_scanlines(&black_white_lines(W, H, 3)).unwrap();
+        c.finish().unwrap()
+    };
+
+    for (label, src) in [("png", &png_src), ("jpeg", &jpeg_src), ("rgba", &rgba_src)] {
+        for (linear, want) in [(true, 188.0), (false, 128.0)] {
+            let (out, _) = process(
+                src,
+                &Params {
+                    max_width: (W / 2) as u32,
+                    max_height: (H / 2) as u32,
+                    output: Some(ImageFormat::Png),
+                    linear_light: Some(linear),
+                    ..Params::default()
+                },
+            )
+            .unwrap();
+            let mean = interior_mean(&out);
+            assert!(
+                (mean - want).abs() <= 2.0,
+                "{label} source, linear_light={linear}: want ~{want}, got {mean:.1} \
+                 (188 is the linear-light average, 128 the gamma-space one)"
+            );
+        }
+    }
+}
+
+/// Rows of alternating black and white, one pixel tall, so a 2:1
+/// shrink pairs one of each. `channels` is 3 for RGB or 4 for RGBA,
+/// where alpha is fully opaque and premultiplying is a no-op.
+fn black_white_lines(w: usize, h: usize, channels: usize) -> Vec<u8> {
+    let mut px = Vec::with_capacity(w * h * channels);
+    for y in 0..h {
+        let v = if y % 2 == 0 { 0u8 } else { 255u8 };
+        for _ in 0..w {
+            px.extend_from_slice(&[v, v, v]);
+            if channels == 4 {
+                px.push(255);
+            }
+        }
+    }
+    px
+}
+
+/// [`black_white_lines`] encoded as a lossless PNG.
+fn black_white_lines_png(w: usize, h: usize, channels: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+    enc.set_color(if channels == 4 {
+        png::ColorType::Rgba
+    } else {
+        png::ColorType::Rgb
+    });
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()
+        .unwrap()
+        .write_image_data(&black_white_lines(w, h, channels))
+        .unwrap();
+    out
+}
+
+/// Mean of the red channel over the interior rows of a PNG.
+///
+/// The first and last two rows are excluded. A Lanczos window at the
+/// edge falls partly outside the image, so those rows do not average
+/// one black and one white pixel. On this fixture the edge rows read
+/// 173/191 and 184/201 while every interior row reads exactly 188, so
+/// the skew reaches two rows at each end.
+fn interior_mean(png_bytes: &[u8]) -> f64 {
+    let mut r = png::Decoder::new(std::io::Cursor::new(png_bytes))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0u8; r.output_buffer_size().unwrap()];
+    let info = r.next_frame(&mut buf).unwrap();
+    assert_eq!((info.width, info.height), (32, 32));
+    // RGB or RGBA only: the loop below reads one byte per pixel as a
+    // channel value. In an indexed PNG that byte is not a color.
+    use png::ColorType::{Rgb, Rgba};
+    assert!(
+        matches!(info.color_type, Rgb | Rgba),
+        "interior_mean needs RGB or RGBA, got {:?}",
+        info.color_type
+    );
+    let stride = info.line_size;
+    let channels = stride / info.width as usize;
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in 2..(info.height as usize - 2) {
+        for x in 0..info.width as usize {
+            sum += buf[y * stride + x * channels] as u64;
+            n += 1;
+        }
+    }
+    sum as f64 / n as f64
+}
