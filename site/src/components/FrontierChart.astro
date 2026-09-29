@@ -1,0 +1,155 @@
+---
+// Throughput against quality for each decode scale, drawn at build time
+// as static SVG. The shaded corner is everything that beats imgproxy on
+// both axes at once.
+import { frontier } from "../data/bench";
+
+const W = 640;
+const H = 380;
+const pad = { top: 24, right: 24, bottom: 48, left: 52 };
+const x0 = 30, x1 = 80; // req/s
+const y0 = 50, y1 = 85; // SSIMULACRA2; headroom keeps the top labels clear
+const sx = (v: number) => pad.left + ((v - x0) / (x1 - x0)) * (W - pad.left - pad.right);
+const sy = (v: number) => H - pad.bottom - ((v - y0) / (y1 - y0)) * (H - pad.top - pad.bottom);
+
+const ours = frontier.points.filter((p) => p.ours);
+const theirs = frontier.points.find((p) => !p.ours)!;
+const line = ours.map((p, i) => `${i ? "L" : "M"}${sx(p.rps)},${sy(p.ssim2)}`).join(" ");
+const xTicks = [30, 40, 50, 60, 70, 80];
+const yTicks = [50, 60, 70, 80];
+
+// Label placement per point, so none collide with the line.
+const anchor: Record<string, { dx: number; dy: number; end?: boolean }> = {
+  "full size": { dx: -6, dy: -16 },
+  "DCT ≤ 2×": { dx: 6, dy: 24, end: true },
+  "DCT ≤ 4×": { dx: 12, dy: -8 },
+  "DCT does the lot": { dx: 60, dy: 22, end: true },
+  "imgproxy 4.0.9": { dx: -12, dy: 22, end: true },
+};
+---
+
+<figure class="frontier card">
+  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-labelledby="frontier-title frontier-desc">
+    <title id="frontier-title">Throughput against output quality by JPEG decode scale</title>
+    <desc id="frontier-desc">
+      {
+        frontier.points
+          .map((p) => `${p.label}: ${p.rps} req/s at SSIMULACRA2 ${p.approx ? "about " : ""}${p.ssim2}`)
+          .join("; ")
+      }
+    </desc>
+
+    <rect
+      class="wins"
+      x={sx(theirs.rps)}
+      y={sy(y1)}
+      width={sx(x1) - sx(theirs.rps)}
+      height={sy(theirs.ssim2) - sy(y1)}
+    />
+    <text class="wins-label" x={sx(x1) - 8} y={sy(y1) + 16} text-anchor="end">
+      ahead of imgproxy on both axes
+    </text>
+
+    {
+      yTicks.map((t) => (
+        <>
+          <line class="grid" x1={pad.left} x2={W - pad.right} y1={sy(t)} y2={sy(t)} />
+          <text class="tick" x={pad.left - 10} y={sy(t) + 4} text-anchor="end">{t}</text>
+        </>
+      ))
+    }
+    {
+      xTicks.map((t) => (
+        <text class="tick" x={sx(t)} y={H - pad.bottom + 20} text-anchor="middle">{t}</text>
+      ))
+    }
+    <text class="axis" x={W - pad.right} y={H - 6} text-anchor="end">req/s →</text>
+    <text class="axis" x={pad.left - 10} y={pad.top - 8} text-anchor="end">SSIM2 ↑</text>
+
+    <path class="line" d={line} />
+    {
+      frontier.points.map((p) => {
+        const a = anchor[p.label];
+        return (
+          <g class:list={["pt", { ours: p.ours, default: p.isDefault }]}>
+            <circle cx={sx(p.rps)} cy={sy(p.ssim2)} r={p.isDefault ? 7 : 5} />
+            <text
+              x={sx(p.rps) + a.dx}
+              y={sy(p.ssim2) + a.dy}
+              text-anchor={a.end ? "end" : "start"}
+            >
+              {p.label}
+              {p.isDefault ? " (default)" : ""} · {p.rps} / {p.approx ? "~" : ""}{p.ssim2}
+            </text>
+          </g>
+        );
+      })
+    }
+  </svg>
+  <figcaption class="mono">
+    {frontier.machine} · {frontier.workload} · SSIMULACRA2 on 6 real photographs at the same
+    14.7× reduction, q80 · measured {frontier.measured} ·{" "}
+    <a href={frontier.source}>source table ↗</a>
+  </figcaption>
+</figure>
+
+<style>
+  .frontier {
+    margin: 0;
+    padding: var(--space-6);
+    min-width: 0;
+  }
+  svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  .grid {
+    stroke: var(--line);
+  }
+  .tick,
+  .axis {
+    fill: var(--text-faint);
+  }
+  .wins {
+    fill: var(--patina-900);
+    stroke: var(--patina-700);
+    stroke-dasharray: 4 4;
+  }
+  .wins-label {
+    fill: var(--patina-300);
+    font-size: 11px;
+  }
+  .line {
+    fill: none;
+    stroke: var(--rust-600);
+    stroke-width: 2;
+  }
+  .pt circle {
+    fill: var(--series-theirs-1);
+  }
+  .pt text {
+    fill: var(--text-faint);
+  }
+  .pt.ours circle {
+    fill: var(--series-ours);
+  }
+  .pt.ours text {
+    fill: var(--text-muted);
+  }
+  .pt.default circle {
+    stroke: var(--rust-300);
+    stroke-width: 2;
+  }
+  .pt.default text {
+    fill: var(--text);
+    font-weight: 600;
+  }
+  figcaption {
+    margin-top: var(--space-4);
+    font-size: 0.75rem;
+    color: var(--text-faint);
+  }
+</style>

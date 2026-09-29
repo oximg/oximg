@@ -1,9 +1,15 @@
 ---
 // Grouped bars per format, one panel per instance. The instance switch
-// is two radio inputs and CSS — the chart ships no JavaScript.
-import { FORMATS, harness } from "../data/bench";
+// is radio inputs and CSS — the chart ships no JavaScript. Up to four
+// runs; `name` keeps two charts on one page out of one radio group.
+import { FORMATS, harness, measuredBefore, type HarnessRun } from "../data/bench";
 
-const runs = harness.runs;
+interface Props {
+  runs?: HarnessRun[];
+  name?: string;
+  source?: string;
+}
+const { runs = harness.runs, name = "bench-run", source = harness.source } = Astro.props;
 ---
 
 <div class="chart">
@@ -11,8 +17,8 @@ const runs = harness.runs;
     {
       runs.map((r, i) => (
         <>
-          <input type="radio" name="bench-run" id={`run-${r.id}`} value={r.id} checked={i === 0} />
-          <label for={`run-${r.id}`}>
+          <input type="radio" name={name} id={`${name}-${r.id}`} value={r.id} checked={i === 0} />
+          <label for={`${name}-${r.id}`}>
             {r.instance}
             <span>{r.arch}</span>
           </label>
@@ -21,6 +27,7 @@ const runs = harness.runs;
     }
   </div>
 
+  <div class="panels">
   {
     runs.map((r) => (
       <div class="panel" data-run={r.id}>
@@ -51,16 +58,23 @@ const runs = harness.runs;
         </div>
         <p class="meta mono">
           req/s (higher is better) · p95 latency · {harness.workload} · measured {r.measured} ·{" "}
-          <a href={harness.source}>source table ↗</a>
+          <a href={source}>source table ↗</a>
+        </p>
+        <p class="meta mono stale">
+          Measured before {measuredBefore.version} {measuredBefore.change}. That lowers oximg's
+          JPEG-source cells ({measuredBefore.example}); no competitor cell moves.{" "}
+          <a href="/benchmarks/#current-default">The current default →</a>
         </p>
       </div>
     ))
   }
+  </div>
 </div>
 
 <style>
   .switch {
     display: inline-flex;
+    flex-wrap: wrap;
     padding: var(--space-1);
     margin-bottom: var(--space-6);
     background: var(--bg-sunken);
@@ -96,8 +110,11 @@ const runs = harness.runs;
   .panel {
     display: none;
   }
-  .chart:has(#run-c7i:checked) .panel[data-run="c7i"],
-  .chart:has(#run-c7g:checked) .panel[data-run="c7g"] {
+  /* The nth radio shows the nth panel. */
+  .chart:has(.switch input:nth-of-type(1):checked) .panel:nth-child(1),
+  .chart:has(.switch input:nth-of-type(2):checked) .panel:nth-child(2),
+  .chart:has(.switch input:nth-of-type(3):checked) .panel:nth-child(3),
+  .chart:has(.switch input:nth-of-type(4):checked) .panel:nth-child(4) {
     display: block;
   }
 
@@ -168,6 +185,10 @@ const runs = harness.runs;
     margin-top: var(--space-4);
     font-size: 0.75rem;
     color: var(--text-faint);
+  }
+  .stale {
+    margin-top: var(--space-2);
+    color: var(--amber-400);
   }
 
   /* Bars grow to their value as the chart scrolls into view, where the

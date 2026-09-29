@@ -1,0 +1,705 @@
+---
+import Base from "../layouts/Base.astro";
+import BenchChart from "../components/BenchChart.astro";
+import FrontierChart from "../components/FrontierChart.astro";
+import CodeCard from "../components/CodeCard.astro";
+import {
+  harness,
+  nextGen,
+  nextGenSource,
+  measuredBefore,
+  frontier,
+  crossFormat,
+  capacity,
+  coldStart,
+  metadata,
+  ruby,
+} from "../data/bench";
+
+const GH = "https://github.com/oximg/oximg/blob/main";
+const runs = [...harness.runs, ...nextGen];
+const ratio = (a: number, b: number) => a / b;
+const pct = (a: number, b: number) => {
+  const d = Math.round((a / b - 1) * 1000) / 10;
+  return `${d > 0 ? "+" : ""}${d}%`;
+};
+const mean = (xs: number[]) => xs.reduce((s, x) => s + x, 0) / xs.length;
+const maxRss = Math.max(...ruby.rows.map((r) => r.rss));
+const maxLead = Math.max(...metadata.rows.map((r) => r.lead));
+
+const toc = [
+  { id: "harness", label: "Official harness" },
+  { id: "cross-format", label: "Cross-format" },
+  { id: "current-default", label: "Current default" },
+  { id: "overload", label: "Overload" },
+  { id: "cold-start", label: "Cold start" },
+  { id: "metadata", label: "Metadata sources" },
+  { id: "library", label: "As a library" },
+  { id: "losses", label: "Where we don't lead" },
+  { id: "reproduce", label: "Reproduce" },
+];
+
+// Each of these is stated in BENCH.md or README.md, with the numbers.
+const losses = [
+  {
+    title: "The default gives up throughput on large JPEG sources",
+    body: "At full-size decode, a 7360×4912 source does 41.3 req/s against imgproxy's 60.7 — for 76.9 SSIMULACRA2 against ~56. OXIMG_DCT_MARGIN buys the throughput back by the rung.",
+    href: frontier.source,
+  },
+  {
+    title: "JPEG → AVIF on c7i.large is a tie",
+    body: "44.6 req/s against imgproxy's 44.9 at the default SVT preset. OXIMG_AVIF_SPEED=9 turns it into 53.3 for −0.6 SSIMULACRA2.",
+    href: crossFormat.source,
+  },
+  {
+    title: "One synthetic shape favors imgproxy",
+    body: "A Huffman-heavy 2000×1333 synthetic plasma to 500×333: the default does 583 / 740 req/s at c=8 / 16 against imgproxy's 614 / 784. The baseline-jpegli speed profile leads it at 659 / 810.",
+    href: `${GH}/BENCH.md#medium-2000x1333-09mb--500x500-re-measured-on-linuxzen4`,
+  },
+  {
+    title: "Small images are slower through the Ruby gem",
+    body: "768×512 takes 12.8 ms against ruby-vips' 6.3 ms on the M2 Max: the gem spawns one process per image, a median 4.2 ms.",
+    href: ruby.source,
+  },
+  {
+    title: "AVIF defaults target fidelity, not bytes",
+    body: "On photographic sources AVIF output measures 10–28% larger than WebP at default settings.",
+    href: `${GH}/README.md#supported-formats`,
+  },
+  {
+    title: "Request coalescing is per-process",
+    body: "Scaled out behind round-robin, identical requests rarely meet: 0 followers across 6 Cloud Run instances in the field. Put a CDN in front.",
+    href: `${GH}/BENCH.md#same-url-matrix-c8--c16-peak-rss-via-cgroup-memorypeak`,
+  },
+];
+
+// Verbatim from BENCH.md's Reproduce section.
+const reproduce = `
+# cold start (needs target/release/oximg + the two Docker images):
+bench/coldstart.sh
+# connection-capacity ramp (needs the harness dataset and k6's image):
+DATASET=~/benchmark/dataset bench/stress.sh
+# Ruby gems (needs the quality corpus, libvips and ImageMagick):
+cd bench/ruby && bundle install && bundle exec ruby bench.rb 3
+`;
+---
+
+<Base
+  title="Benchmarks — oximg"
+  description="oximg against imgproxy, imagor and thumbor on imgproxy's own harness and AWS instance types, plus overload, cold start, metadata and library measurements."
+>
+  <header class="page-head">
+    <div class="container">
+      <p class="eyebrow">benchmarks</p>
+      <h1>Every number, with where it came from.</h1>
+      <p class="lede">
+        Throughput, latency and memory against imgproxy, imagor and thumbor — on imgproxy's own
+        harness where one exists. Each figure below links to the table in
+        <a href={`${GH}/BENCH.md`}>BENCH.md</a> it was copied from; the losses are on this page too.
+      </p>
+      <aside class="notice">
+        <p class="mono">! which default these were measured at</p>
+        <p>
+          Every throughput table here except the frontier was measured before{" "}
+          {measuredBefore.version} {measuredBefore.change}. That lowers oximg's JPEG-source cells
+          ({measuredBefore.example}); no competitor cell moves. The AWS grids could not be re-run, so
+          they are shown as measured and labelled. <a href="#current-default">What the current
+          default does</a> is measured separately.
+        </p>
+      </aside>
+      <nav class="toc mono" aria-label="On this page">
+        {toc.map((t) => <a href={`#${t.id}`}>{t.label}</a>)}
+      </nav>
+    </div>
+  </header>
+
+  <section class="section" id="harness">
+    <div class="container">
+      <header class="section-head">
+        <p class="eyebrow">official harness</p>
+        <h2>Their benchmark, on their instance types.</h2>
+        <p>
+          <a href="https://github.com/imgproxy/image-servers-benchmark">imgproxy's harness</a>: 100
+          DIV2K photographs over nginx, fit into 512×512, k6 with 2 VUs for 5 minutes, every server at
+          its defaults, 100% successful checks. oximg is added with a compose service and a URL case.
+          The c7 instances are the ones imgproxy publishes on; c8i and c9g are the newest generations
+          in us-east-1.
+        </p>
+      </header>
+      <BenchChart runs={runs} name="harness" />
+      <p class="note">
+        c7 cells from one wholesale run with all four servers on fresh instances; the
+        <a href={harness.source}>c7 tables</a> and the <a href={nextGenSource}>c8i / c9g tables</a> are
+        in BENCH.md.
+      </p>
+    </div>
+  </section>
+
+  <section class="section" id="cross-format">
+    <div class="container">
+      <header class="section-head">
+        <p class="eyebrow">cross-format</p>
+        <h2>JPEG in, WebP or AVIF out.</h2>
+        <p>
+          The upstream harness only measures same-format cells. Our patch adds an output-format
+          override for every contender, in each server's own syntax, at the harness's own quality
+          mapping (WebP q75, AVIF q65). These cells were run oximg against imgproxy.
+        </p>
+      </header>
+      <div class="table-wrap card">
+        <table>
+          <thead>
+            <tr>
+              <th>instance</th>
+              <th>JPEG → WebP</th>
+              <th>imgproxy</th>
+              <th></th>
+              <th>JPEG → AVIF</th>
+              <th>imgproxy</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              crossFormat.cells.map((c) => (
+                <tr>
+                  <th class="mono">{c.instance}</th>
+                  <td class="num ours">{c.webp.ours.rps} <span>({c.webp.ours.p95ms} ms)</span></td>
+                  <td class="num">{c.webp.theirs.rps} <span>({c.webp.theirs.p95ms} ms)</span></td>
+                  <td class="num delta">{ratio(c.webp.ours.rps, c.webp.theirs.rps).toFixed(2)}×</td>
+                  <td class="num ours">{c.avif.ours.rps} <span>({c.avif.ours.p95ms} ms)</span></td>
+                  <td class="num">{c.avif.theirs.rps} <span>({c.avif.theirs.p95ms} ms)</span></td>
+                  <td
+                    class:list={[
+                      "num delta",
+                      { tie: Math.abs(c.avif.ours.rps / c.avif.theirs.rps - 1) < 0.03 },
+                    ]}
+                  >
+                    {pct(c.avif.ours.rps, c.avif.theirs.rps)}
+                  </td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        req/s (p95). Within 3% is marked as a tie — it is inside the instance-to-instance variance the
+        same-run anchors bound. On c7i the AVIF cell is encode-bound at the default SVT preset 8;
+        <code>OXIMG_AVIF_SPEED=9</code> measured {crossFormat.avifSpeed9.tuned.rps} req/s against
+        imgproxy's {crossFormat.avifSpeed9.imgproxy.rps} in the same run, for −0.6 SSIMULACRA2 at
+        unchanged bytes. The default stays at 8. <a href={crossFormat.source}>Source ↗</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="section" id="current-default">
+    <div class="container split">
+      <header class="section-head">
+        <p class="eyebrow">current default</p>
+        <h2>Throughput is a dial. Quality is the default.</h2>
+        <p>
+          Since {measuredBefore.version}, JPEG sources decode at full size and the resampler does the
+          whole reduction. Shrink-on-load only ever cost quality, so it is now an opt-in speed knob,
+          <code>OXIMG_DCT_MARGIN</code>, and the honest way to show it is the whole frontier.
+        </p>
+        <p>
+          The old default's 71.4 req/s was a 59.4-point image. The default now pays 42% of that
+          throughput for 76.9. The middle rung, <code>OXIMG_DCT_MARGIN=3.5</code>, is ahead of imgproxy
+          on both axes at once.
+        </p>
+      </header>
+      <FrontierChart />
+    </div>
+  </section>
+
+  <section class="section" id="overload">
+    <div class="container">
+      <header class="section-head">
+        <p class="eyebrow">overload</p>
+        <h2>Degrades by latency, not by failures.</h2>
+        <p>
+          Constant open connections, each on its own URL so coalescing never serves a duplicate.
+          oximg accepts every connection and queues work behind a fair CPU semaphore; imgproxy holds
+          to its default 2048-client ceiling and then starts starving connections.
+        </p>
+      </header>
+      <div class="table-wrap card">
+        <table>
+          <thead>
+            <tr>
+              <th>open conns</th>
+              <th>oximg req/s</th>
+              <th>latency</th>
+              <th>failed</th>
+              <th>peak mem</th>
+              <th>imgproxy req/s</th>
+              <th>latency</th>
+              <th>failed</th>
+              <th>peak mem</th>
+            </tr>
+          </thead>
+          <tbody>
+            {
+              capacity.rows.map((r) => (
+                <tr class:list={{ coalesced: r.coalesced }}>
+                  <th class="num">{r.c.toLocaleString("en-US")}{r.coalesced ? "*" : ""}</th>
+                  <td class="num ours">{r.ours.rps ?? "—"}</td>
+                  <td class="num">{r.ours.p50 === "—" ? "—" : `${r.ours.p50} · ${r.ours.tail}`}</td>
+                  <td class="num ours">{r.ours.fail}</td>
+                  <td class="num">{r.ours.mem} MB</td>
+                  <td class="num">{r.theirs.rps ?? "—"}</td>
+                  <td class:list={["num", { bad: r.theirs.fail !== "0%" }]}>
+                    {r.theirs.p50 === "—" ? "—" : `${r.theirs.p50} · ${r.theirs.tail}`}
+                  </td>
+                  <td class:list={["num", { bad: r.theirs.fail !== "0%" }]}>{r.theirs.fail}</td>
+                  <td class="num">{r.theirs.mem} MB</td>
+                </tr>
+              ))
+            }
+          </tbody>
+        </table>
+      </div>
+      <p class="note">
+        {capacity.machine}; {capacity.workload}; latency is p50 · tail. * 8192 connections exceed the
+        4100 distinct URLs, so oximg's coalescing engages and throughput is no longer comparable; the
+        failure and memory columns still are. Neither server sheds load by default — put a queue-depth
+        limit in front if you want that. <a href={capacity.source}>Source ↗</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="section" id="cold-start">
+    <div class="container split">
+      <header class="section-head">
+        <p class="eyebrow">cold start</p>
+        <h2>Ready in 6 ms. The container is the floor.</h2>
+        <p>
+          Container platforms bill the whole cold-start chain. Measured as distributions from process
+          start to a 200 on <code>/health</code> and to the first real resize. Under Docker both servers
+          sit on the ~120 ms runtime floor; the native row is oximg's own init.
+        </p>
+      </header>
+      <div class="stack">
+        <div class="table-wrap card">
+          <table>
+            <thead>
+              <tr>
+                <th></th>
+                <th>ready p50 / p95</th>
+                <th>first resize p50 / p95</th>
+              </tr>
+            </thead>
+            <tbody>
+              {
+                coldStart.rows.map((r) => (
+                  <tr>
+                    <th class:list={{ ours: r.ours }}>{r.what}</th>
+                    <td class:list={["num", { ours: r.ours }]}>{r.ready}</td>
+                    <td class:list={["num", { ours: r.ours }]}>{r.firstWork}</td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+        <ul class="stats">
+          {
+            coldStart.footprint.map((f) => (
+              <li class="card">
+                <p class="mono label">{f.what}</p>
+                <p class="num big">{f.ours}</p>
+                <p class="mono vs">imgproxy {f.theirs}</p>
+              </li>
+            ))
+          }
+        </ul>
+        <p class="note">{coldStart.machine}. <a href={coldStart.source}>Source ↗</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="metadata">
+    <div class="container split">
+      <header class="section-head">
+        <p class="eyebrow">metadata sources</p>
+        <h2>Phone photos and ICC profiles cost nothing extra.</h2>
+        <p>
+          The harness dataset carries no orientation tags or ICC profiles; real traffic does. These
+          cells splice an orientation-6 EXIF tag or a real sRGB profile into each source, byte for byte.
+          oximg rotates the small output frame and passes the profile through; imgproxy converts to sRGB
+          and strips it, which costs it ~20% on JPEG and clips out-of-gamut colors.
+        </p>
+      </header>
+      <div class="stack">
+        <ul class="leads card">
+          {
+            metadata.rows.map((r) => (
+              <li>
+                <span class="cell">{r.cell}</span>
+                <span class="track">
+                  <span class="bar" style={`--w:${(r.lead / maxLead) * 100}%`} />
+                </span>
+                <span class="num lead">+{r.lead}%</span>
+                <span class="num raw">
+                  {mean(r.ours).toFixed(1)} vs {mean(r.theirs).toFixed(1)}
+                </span>
+              </li>
+            ))
+          }
+        </ul>
+        <p class="note">
+          oximg's lead over imgproxy, req/s as the mean of two interleaved rounds. {metadata.machine};
+          single-box relative cost, not the AWS grid. <a href={metadata.source}>Source ↗</a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="library">
+    <div class="container split">
+      <header class="section-head">
+        <p class="eyebrow">as a library</p>
+        <h2>A tenth of libvips' memory, from Ruby.</h2>
+        <p>
+          The <code>oximg</code> gem against what an ActiveStorage app would otherwise call, on the
+          canonical variant. Time is a tie with libvips; memory is the difference, and it holds on all
+          three CPUs measured: 37–41 MB against ruby-vips' 373–424 MB.
+        </p>
+      </header>
+      <div class="stack">
+        <div class="table-wrap card">
+          <table>
+            <thead>
+              <tr>
+                <th>gem</th>
+                <th>wall ms</th>
+                <th>CPU s</th>
+                <th class="wide">peak RSS</th>
+              </tr>
+            </thead>
+            <tbody>
+              {
+                ruby.rows.map((r) => (
+                  <tr>
+                    <th class:list={["mono", { ours: r.ours }]}>{r.gem}</th>
+                    <td class="num">{r.ms}</td>
+                    <td class="num">{r.cpu.toFixed(2)}</td>
+                    <td class:list={["rss", { ours: r.ours }]}>
+                      <span class="track">
+                        <span class="bar" style={`--w:${(r.rss / maxRss) * 100}%`} />
+                      </span>
+                      <span class="num">{r.rss} MB</span>
+                    </td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+        <p class="note">
+          {ruby.machine}; {ruby.workload}; {ruby.versions}. Each gem runs in its own subprocess so peak
+          RSS is its own. <a href={ruby.source}>Source ↗</a>
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="losses">
+    <div class="container">
+      <header class="section-head">
+        <p class="eyebrow">where we don't lead</p>
+        <h2>The cells that don't go our way.</h2>
+        <p>Kept on the same page as the wins, with the same sourcing.</p>
+      </header>
+      <ul class="losses">
+        {
+          losses.map((l) => (
+            <li class="card">
+              <strong>{l.title}</strong>
+              <p>{l.body}</p>
+              <a class="mono" href={l.href}>source ↗</a>
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+  </section>
+
+  <section class="section" id="reproduce">
+    <div class="container split">
+      <header class="section-head">
+        <p class="eyebrow">reproduce</p>
+        <h2>Run it yourself.</h2>
+        <p>
+          The scripts are in <a href={`${GH}/bench`}>bench/</a>, and
+          <a href={`${GH}/bench/METHODOLOGY.md`}>METHODOLOGY.md</a> lists the rules they encode —
+          interleaved same-window A/B, a URL space at least as large as the virtual users so the
+          coalescer never flatters the result, pinned cpusets, and never concluding from one round.
+        </p>
+      </header>
+      <CodeCard code={reproduce} lang="sh" caption="from the oximg repo root" />
+    </div>
+  </section>
+</Base>
+
+<style>
+  .page-head {
+    padding-block: var(--space-24) var(--space-12);
+  }
+  h1 {
+    margin-top: var(--space-3);
+    font-size: var(--step-4);
+    max-width: 20ch;
+  }
+  .lede {
+    margin-top: var(--space-6);
+    max-width: 44rem;
+    font-size: var(--step-1);
+    color: var(--text-muted);
+  }
+  .notice {
+    margin-top: var(--space-8);
+    max-width: 44rem;
+    padding: var(--space-4) var(--space-6);
+    border: 1px dashed var(--line-strong);
+    border-left: 2px solid var(--amber-400);
+    border-radius: var(--radius);
+    font-size: var(--step--1);
+    color: var(--text-muted);
+  }
+  .notice .mono {
+    color: var(--amber-400);
+    margin-bottom: var(--space-1);
+  }
+  .toc {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2) var(--space-4);
+    margin-top: var(--space-8);
+    font-size: var(--step--1);
+  }
+  .toc a {
+    color: var(--text-faint);
+    text-decoration: none;
+  }
+  .toc a:hover {
+    color: var(--text);
+  }
+
+  .split {
+    display: grid;
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    gap: var(--space-12);
+    align-items: start;
+  }
+  .split .section-head {
+    margin-bottom: 0;
+  }
+  .split .section-head p + p {
+    margin-top: var(--space-2);
+  }
+  .stack {
+    display: grid;
+    gap: var(--space-4);
+    min-width: 0;
+  }
+  @media (max-width: 960px) {
+    .split {
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-8);
+    }
+  }
+
+  .note {
+    margin-top: var(--space-4);
+    max-width: 60rem;
+    font-size: var(--step--1);
+    color: var(--text-faint);
+  }
+  .stack .note {
+    margin-top: 0;
+  }
+  code {
+    font-size: 0.9em;
+    color: var(--brand-strong);
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--step--1);
+    white-space: nowrap;
+  }
+  th,
+  td {
+    padding: var(--space-3) var(--space-4);
+    text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  tbody tr:last-child > * {
+    border-bottom: 0;
+  }
+  thead th {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  tbody th {
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+  td {
+    color: var(--text-faint);
+  }
+  td span {
+    color: var(--text-faint);
+    font-size: 0.85em;
+  }
+  .ours {
+    color: var(--text);
+    font-weight: 600;
+  }
+  td.ours {
+    color: var(--brand-strong);
+  }
+  .delta {
+    color: var(--accent-strong);
+  }
+  .delta.tie {
+    color: var(--amber-400);
+  }
+  .bad {
+    color: var(--red-400);
+  }
+  tr.coalesced th,
+  tr.coalesced td {
+    opacity: 0.75;
+  }
+
+  .track {
+    display: block;
+    height: 8px;
+    background: var(--bg-sunken);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar {
+    display: block;
+    height: 100%;
+    width: var(--w);
+    background: var(--series-theirs-2);
+    border-radius: 2px;
+  }
+  .ours .bar,
+  .leads .bar {
+    background: linear-gradient(90deg, var(--rust-600), var(--series-ours));
+  }
+  .rss {
+    display: grid;
+    grid-template-columns: minmax(6rem, 1fr) 5.5rem;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .rss .num {
+    text-align: right;
+    font-size: 1em;
+  }
+  th.wide {
+    min-width: 14rem;
+  }
+
+  .stats {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+  .stats li {
+    padding: var(--space-6);
+    display: grid;
+    gap: var(--space-1);
+  }
+  .stats .label,
+  .stats .vs {
+    font-size: 0.75rem;
+    color: var(--text-faint);
+  }
+  .big {
+    font-size: var(--step-3);
+    font-weight: 650;
+    color: var(--brand-strong);
+  }
+
+  .leads {
+    list-style: none;
+    margin: 0;
+    padding: var(--space-6);
+    display: grid;
+    gap: var(--space-4);
+  }
+  .leads li {
+    display: grid;
+    grid-template-columns: 11rem minmax(0, 1fr) 3.5rem 8.5rem;
+    align-items: center;
+    gap: var(--space-3);
+    font-size: var(--step--1);
+  }
+  .leads .lead {
+    text-align: right;
+    color: var(--brand-strong);
+    font-weight: 600;
+  }
+  .leads .raw {
+    text-align: right;
+    color: var(--text-faint);
+  }
+  @media (max-width: 560px) {
+    .leads li {
+      grid-template-columns: minmax(0, 1fr) 3.5rem;
+    }
+    .leads .track,
+    .leads .raw {
+      display: none;
+    }
+  }
+
+  .losses {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-4);
+  }
+  .losses li {
+    display: grid;
+    align-content: start;
+    gap: var(--space-2);
+    padding: var(--space-6);
+    border-style: dashed;
+  }
+  .losses strong {
+    font-weight: 600;
+  }
+  .losses p {
+    color: var(--text-muted);
+    font-size: var(--step--1);
+  }
+  .losses a {
+    font-size: 0.75rem;
+  }
+  @media (max-width: 960px) {
+    .losses {
+      grid-template-columns: minmax(0, 1fr);
+    }
+  }
+</style>

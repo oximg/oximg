@@ -113,7 +113,7 @@ const PAGES = [
 
 // README headings that no page holds, and where a link to them goes.
 const README_ANCHOR_FALLBACK = {
-  benchmarks: "/#benchmarks",
+  benchmarks: "/benchmarks/",
   deployment: "/docs/deploy/docker/",
 };
 

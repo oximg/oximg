@@ -1,8 +1,12 @@
 # oximg.dev
 
 The project website: a static [Astro](https://astro.build) site with
-the home page and `/docs`. Benchmark, quality and migration pages are
-planned.
+the home page, `/docs` and `/benchmarks`. Quality and migration pages
+are planned.
+
+Every figure on `/benchmarks` lives in `src/data/bench.ts`, copied from
+BENCH.md, README.md or QUALITY.md with a link back to its table. Update
+the markdown first, then the data file.
 
 ```sh
 npm install

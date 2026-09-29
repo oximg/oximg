@@ -6,6 +6,10 @@ export default defineConfig({
   site: "https://oximg.dev",
   // Everything is static; islands opt in to JS individually.
   output: "static",
+  // Astro's compressor drops the line break between text and an inline
+  // element that starts the next source line ("in<a>BENCH.md</a>"),
+  // which runs words together all over the prose.
+  compressHTML: false,
   build: {
     inlineStylesheets: "always",
   },
