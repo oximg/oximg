@@ -2,7 +2,7 @@
 // Grouped bars per format, one panel per instance. The instance switch
 // is radio inputs and CSS — the chart ships no JavaScript. Up to four
 // runs; `name` keeps two charts on one page out of one radio group.
-import { FORMATS, harness, measuredBefore, type HarnessRun } from "../data/bench";
+import { FORMATS, harness, decodeControl, type HarnessRun } from "../data/bench";
 
 interface Props {
   runs?: HarnessRun[];
@@ -10,6 +10,7 @@ interface Props {
   source?: string;
 }
 const { runs = harness.runs, name = "bench-run", source = harness.source } = Astro.props;
+const control = (instance: string) => decodeControl.cells.find((c) => c.instance === instance);
 ---
 
 <div class="chart">
@@ -60,11 +61,15 @@ const { runs = harness.runs, name = "bench-run", source = harness.source } = Ast
           req/s (higher is better) · p95 latency · {harness.workload} · measured {r.measured} ·{" "}
           <a href={source}>source table ↗</a>
         </p>
-        <p class="meta mono stale">
-          Measured before {measuredBefore.version} {measuredBefore.change}. That lowers oximg's
-          JPEG-source cells ({measuredBefore.example}); no competitor cell moves.{" "}
-          <a href="/benchmarks/#current-default">The current default →</a>
-        </p>
+        {control(r.instance) && (
+          <p class="meta mono caveat">
+            JPEG is decoded at full size by default; imgproxy shrinks on load. With the old
+            shrink-on-load default (<code>OXIMG_DCT_MARGIN=1.7</code>) the same run measured{" "}
+            {control(r.instance)!.margin17.rps} req/s against imgproxy's{" "}
+            {control(r.instance)!.imgproxy.rps}.{" "}
+            <a href="/benchmarks/#current-default">The current default →</a>
+          </p>
+        )}
       </div>
     ))
   }
@@ -186,7 +191,7 @@ const { runs = harness.runs, name = "bench-run", source = harness.source } = Ast
     font-size: 0.75rem;
     color: var(--text-faint);
   }
-  .stale {
+  .caveat {
     margin-top: var(--space-2);
     color: var(--amber-400);
   }

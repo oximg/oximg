@@ -35,46 +35,46 @@ export const harness = {
       id: "c7i",
       instance: "c7i.large",
       arch: "x86-64 · 2 vCPU",
-      measured: "2026-07-05",
+      measured: "2026-09-29",
       rows: [
         {
           server: "oximg",
           ours: true,
           cells: {
-            JPEG: { rps: 78.7, p95ms: 33 },
-            PNG: { rps: 32.8, p95ms: 79 },
-            WebP: { rps: 30.9, p95ms: 92 },
-            AVIF: { rps: 15.6, p95ms: 181 },
+            JPEG: { rps: 62.8, p95ms: 41 },
+            PNG: { rps: 37.3, p95ms: 69 },
+            WebP: { rps: 35.6, p95ms: 80 },
+            AVIF: { rps: 17.8, p95ms: 159 },
           },
         },
         {
           server: "imgproxy",
           ours: false,
           cells: {
-            JPEG: { rps: 67.0, p95ms: 40 },
-            PNG: { rps: 14.3, p95ms: 187 },
-            WebP: { rps: 20.3, p95ms: 136 },
-            AVIF: { rps: 15.2, p95ms: 190 },
+            JPEG: { rps: 74.4, p95ms: 37 },
+            PNG: { rps: 16.6, p95ms: 162 },
+            WebP: { rps: 23.1, p95ms: 120 },
+            AVIF: { rps: 17.4, p95ms: 167 },
           },
         },
         {
-          server: "imagor 1.9.2",
+          server: "imagor 1.9.6",
           ours: false,
           cells: {
-            JPEG: { rps: 58.7, p95ms: 44 },
-            PNG: { rps: 15.5, p95ms: 174 },
-            WebP: { rps: 17.7, p95ms: 152 },
-            AVIF: { rps: 10.1, p95ms: 283 },
+            JPEG: { rps: 67.0, p95ms: 39 },
+            PNG: { rps: 17.6, p95ms: 153 },
+            WebP: { rps: 19.0, p95ms: 140 },
+            AVIF: { rps: 11.4, p95ms: 252 },
           },
         },
         {
-          server: "thumbor 7.x",
+          server: "thumbor 7.8.0",
           ours: false,
           cells: {
-            JPEG: { rps: 50.0, p95ms: 50 },
-            PNG: { rps: 8.7, p95ms: 304 },
-            WebP: { rps: 14.0, p95ms: 187 },
-            AVIF: { rps: 12.1, p95ms: 225 },
+            JPEG: { rps: 55.5, p95ms: 45 },
+            PNG: { rps: 9.8, p95ms: 271 },
+            WebP: { rps: 15.6, p95ms: 166 },
+            AVIF: { rps: 13.1, p95ms: 208 },
           },
         },
       ],
@@ -83,46 +83,46 @@ export const harness = {
       id: "c7g",
       instance: "c7g.large",
       arch: "Graviton3 · 2 cores",
-      measured: "2026-07-05",
+      measured: "2026-09-29",
       rows: [
         {
           server: "oximg",
           ours: true,
           cells: {
-            JPEG: { rps: 91.2, p95ms: 28 },
-            PNG: { rps: 39.0, p95ms: 66 },
-            WebP: { rps: 41.5, p95ms: 70 },
-            AVIF: { rps: 23.4, p95ms: 124 },
+            JPEG: { rps: 64.7, p95ms: 38 },
+            PNG: { rps: 39.9, p95ms: 65 },
+            WebP: { rps: 41.4, p95ms: 69 },
+            AVIF: { rps: 24.5, p95ms: 120 },
           },
         },
         {
           server: "imgproxy",
           ours: false,
           cells: {
-            JPEG: { rps: 68.0, p95ms: 39 },
-            PNG: { rps: 21.0, p95ms: 123 },
-            WebP: { rps: 25.4, p95ms: 110 },
-            AVIF: { rps: 20.3, p95ms: 139 },
+            JPEG: { rps: 67.3, p95ms: 40 },
+            PNG: { rps: 21.3, p95ms: 123 },
+            WebP: { rps: 25.6, p95ms: 110 },
+            AVIF: { rps: 20.3, p95ms: 140 },
           },
         },
         {
-          server: "imagor 1.9.2",
+          server: "imagor 1.9.6",
           ours: false,
           cells: {
             JPEG: { rps: 57.5, p95ms: 44 },
-            PNG: { rps: 22.1, p95ms: 115 },
-            WebP: { rps: 19.7, p95ms: 133 },
-            AVIF: { rps: 13.7, p95ms: 204 },
+            PNG: { rps: 22.2, p95ms: 115 },
+            WebP: { rps: 19.5, p95ms: 132 },
+            AVIF: { rps: 13.6, p95ms: 208 },
           },
         },
         {
-          server: "thumbor 7.x",
+          server: "thumbor 7.8.0",
           ours: false,
           cells: {
-            JPEG: { rps: 63.2, p95ms: 41 },
-            PNG: { rps: 12.5, p95ms: 210 },
-            WebP: { rps: 20.2, p95ms: 129 },
-            AVIF: { rps: 14.7, p95ms: 196 },
+            JPEG: { rps: 60.6, p95ms: 42 },
+            PNG: { rps: 12.3, p95ms: 213 },
+            WebP: { rps: 20.1, p95ms: 130 },
+            AVIF: { rps: 14.7, p95ms: 198 },
           },
         },
       ],
@@ -144,18 +144,18 @@ export interface Proof {
 // same-URL one, because request coalescing flatters the latter.
 export const proofs: Proof[] = [
   {
-    value: "91.2",
+    value: "39.9",
     unit: "req/s",
-    label: "JPEG throughput",
-    versus: "imgproxy 68.0",
+    label: "PNG throughput",
+    versus: "imgproxy 21.3",
     context: "c7g.large, official harness",
     source: harness.source,
   },
   {
-    value: "2.1",
+    value: "1.6",
     unit: "×",
     label: "JPEG → WebP",
-    versus: "79.3 vs 37.0 req/s",
+    versus: "58.2 vs 37.2 req/s",
     context: "c7g.large, cross-format cell",
     source: `${REPO}/README.md#benchmarks`,
   },
@@ -207,8 +207,11 @@ export const quality: QualityPair[] = [
 const BENCH = `${REPO}/BENCH.md`;
 
 // Which build the throughput tables were measured on. BENCH.md's Notes:
-// every throughput table predates the 2026-08 decode-scale change
-// (shipped in 0.11.0), after which JPEG sources decode at full size.
+// the AWS harness grids were re-measured on 0.12.0; every other
+// throughput table predates the 2026-08 decode-scale change (shipped in
+// 0.11.0), after which JPEG sources decode at full size.
+export const awsMeasuredOn = { version: "0.12.0", date: "2026-09-29" };
+
 export const measuredBefore = {
   version: "0.11.0",
   change: "made full-size JPEG decode the default",
@@ -221,46 +224,46 @@ export const nextGen: HarnessRun[] = [
     id: "c8i",
     instance: "c8i.large",
     arch: "Granite Rapids · 2 vCPU",
-    measured: "2026-07",
+    measured: "2026-09-29",
     rows: [
       {
         server: "oximg",
         ours: true,
         cells: {
-          JPEG: { rps: 110.3, p95ms: 24 },
-          PNG: { rps: 44.7, p95ms: 58 },
-          WebP: { rps: 40.7, p95ms: 70 },
-          AVIF: { rps: 21.5, p95ms: 134 },
+          JPEG: { rps: 73.7, p95ms: 34 },
+          PNG: { rps: 43.3, p95ms: 59 },
+          WebP: { rps: 40.7, p95ms: 71 },
+          AVIF: { rps: 20.7, p95ms: 139 },
         },
       },
       {
         server: "imgproxy",
         ours: false,
         cells: {
-          JPEG: { rps: 90.3, p95ms: 31 },
-          PNG: { rps: 19.0, p95ms: 142 },
-          WebP: { rps: 27.0, p95ms: 104 },
-          AVIF: { rps: 20.8, p95ms: 140 },
+          JPEG: { rps: 88.2, p95ms: 31 },
+          PNG: { rps: 18.6, p95ms: 145 },
+          WebP: { rps: 26.6, p95ms: 105 },
+          AVIF: { rps: 20.0, p95ms: 146 },
         },
       },
       {
-        server: "imagor 1.9.2",
+        server: "imagor 1.9.6",
         ours: false,
         cells: {
-          JPEG: { rps: 76.9, p95ms: 34 },
-          PNG: { rps: 20.8, p95ms: 130 },
-          WebP: { rps: 24.5, p95ms: 110 },
-          AVIF: { rps: 14.5, p95ms: 199 },
+          JPEG: { rps: 75.5, p95ms: 34 },
+          PNG: { rps: 20.0, p95ms: 135 },
+          WebP: { rps: 23.2, p95ms: 115 },
+          AVIF: { rps: 13.9, p95ms: 206 },
         },
       },
       {
-        server: "thumbor 7.x",
+        server: "thumbor 7.8.0",
         ours: false,
         cells: {
-          JPEG: { rps: 66.4, p95ms: 38 },
-          PNG: { rps: 11.2, p95ms: 235 },
-          WebP: { rps: 18.6, p95ms: 139 },
-          AVIF: { rps: 16.0, p95ms: 171 },
+          JPEG: { rps: 65.5, p95ms: 38 },
+          PNG: { rps: 11.0, p95ms: 239 },
+          WebP: { rps: 17.6, p95ms: 145 },
+          AVIF: { rps: 15.1, p95ms: 181 },
         },
       },
     ],
@@ -269,46 +272,46 @@ export const nextGen: HarnessRun[] = [
     id: "c9g",
     instance: "c9g.large",
     arch: "next-gen Graviton · 2 cores",
-    measured: "2026-07",
+    measured: "2026-09-29",
     rows: [
       {
         server: "oximg",
         ours: true,
         cells: {
-          JPEG: { rps: 135.6, p95ms: 19 },
-          PNG: { rps: 53.9, p95ms: 48 },
-          WebP: { rps: 58.9, p95ms: 51 },
-          AVIF: { rps: 36.2, p95ms: 82 },
+          JPEG: { rps: 98.0, p95ms: 26 },
+          PNG: { rps: 55.4, p95ms: 46 },
+          WebP: { rps: 59.2, p95ms: 50 },
+          AVIF: { rps: 37.4, p95ms: 80 },
         },
       },
       {
         server: "imgproxy",
         ours: false,
         cells: {
-          JPEG: { rps: 112.8, p95ms: 25 },
-          PNG: { rps: 32.8, p95ms: 80 },
-          WebP: { rps: 36.3, p95ms: 79 },
+          JPEG: { rps: 112.6, p95ms: 25 },
+          PNG: { rps: 33.1, p95ms: 78 },
+          WebP: { rps: 36.9, p95ms: 78 },
           AVIF: { rps: 32.4, p95ms: 90 },
         },
       },
       {
-        server: "imagor 1.9.2",
+        server: "imagor 1.9.6",
         ours: false,
         cells: {
-          JPEG: { rps: 100.6, p95ms: 26 },
-          PNG: { rps: 34.5, p95ms: 75 },
-          WebP: { rps: 29.7, p95ms: 88 },
-          AVIF: { rps: 22.3, p95ms: 129 },
+          JPEG: { rps: 100.2, p95ms: 26 },
+          PNG: { rps: 34.9, p95ms: 74 },
+          WebP: { rps: 30.3, p95ms: 87 },
+          AVIF: { rps: 22.5, p95ms: 129 },
         },
       },
       {
-        server: "thumbor 7.x",
+        server: "thumbor 7.8.0",
         ours: false,
         cells: {
-          JPEG: { rps: 100.4, p95ms: 26 },
-          PNG: { rps: 18.7, p95ms: 140 },
-          WebP: { rps: 30.6, p95ms: 86 },
-          AVIF: { rps: 22.1, p95ms: 135 },
+          JPEG: { rps: 98.1, p95ms: 26 },
+          PNG: { rps: 18.5, p95ms: 141 },
+          WebP: { rps: 30.5, p95ms: 87 },
+          AVIF: { rps: 22.0, p95ms: 133 },
         },
       },
     ],
@@ -329,31 +332,45 @@ export const crossFormat = {
   cells: [
     {
       instance: "c7i.large",
-      webp: { ours: { rps: 65.3, p95ms: 41 }, theirs: { rps: 35.3, p95ms: 73 } },
-      avif: { ours: { rps: 44.6, p95ms: 57 }, theirs: { rps: 44.9, p95ms: 59 } },
+      webp: { ours: { rps: 55.4, p95ms: 47 }, theirs: { rps: 38.1, p95ms: 68 } },
+      avif: { ours: { rps: 40.3, p95ms: 63 }, theirs: { rps: 47.4, p95ms: 56 } },
     },
     {
       instance: "c7g.large",
-      webp: { ours: { rps: 79.3, p95ms: 33 }, theirs: { rps: 37.0, p95ms: 69 } },
-      avif: { ours: { rps: 56.5, p95ms: 46 }, theirs: { rps: 52.7, p95ms: 50 } },
+      webp: { ours: { rps: 58.2, p95ms: 44 }, theirs: { rps: 37.2, p95ms: 69 } },
+      avif: { ours: { rps: 47.7, p95ms: 53 }, theirs: { rps: 52.2, p95ms: 51 } },
     },
     {
       instance: "c8i.large",
-      webp: { ours: { rps: 89.6, p95ms: 30 }, theirs: { rps: 46.7, p95ms: 55 } },
-      avif: { ours: { rps: 64.8, p95ms: 40 }, theirs: { rps: 63.4, p95ms: 43 } },
+      webp: { ours: { rps: 64.3, p95ms: 40 }, theirs: { rps: 46.6, p95ms: 56 } },
+      avif: { ours: { rps: 50.4, p95ms: 51 }, theirs: { rps: 62.0, p95ms: 44 } },
     },
     {
       instance: "c9g.large",
-      webp: { ours: { rps: 116.6, p95ms: 23 }, theirs: { rps: 56.8, p95ms: 46 } },
-      avif: { ours: { rps: 96.9, p95ms: 27 }, theirs: { rps: 87.6, p95ms: 33 } },
+      webp: { ours: { rps: 86.0, p95ms: 30 }, theirs: { rps: 57.3, p95ms: 45 } },
+      avif: { ours: { rps: 76.6, p95ms: 33 }, theirs: { rps: 88.5, p95ms: 33 } },
     },
   ] satisfies CrossCell[],
-  // c7i.large JPEG→AVIF, interleaved official cells.
-  avifSpeed9: {
-    tuned: { rps: 53.3, p95ms: 48 },
-    imgproxy: { rps: 45.8, p95ms: 58 },
-    default: { rps: 44.8, p95ms: 57 },
-  },
+};
+
+export interface ControlCell {
+  instance: string;
+  /** Pre-0.11.0 decode default, `OXIMG_DCT_MARGIN=1.7`. */
+  margin17: Cell;
+  /** imgproxy, the control round's same-run anchor. */
+  imgproxy: Cell;
+}
+
+// The harness JPEG cell at the old shrink-on-load default, measured after
+// each instance's grid in the same run.
+export const decodeControl = {
+  source: `${BENCH}#decode-default-control-cells`,
+  cells: [
+    { instance: "c7i.large", margin17: { rps: 89.3, p95ms: 30 }, imgproxy: { rps: 76.2, p95ms: 36 } },
+    { instance: "c7g.large", margin17: { rps: 97.2, p95ms: 27 }, imgproxy: { rps: 67.6, p95ms: 39 } },
+    { instance: "c8i.large", margin17: { rps: 109.5, p95ms: 24 }, imgproxy: { rps: 87.8, p95ms: 31 } },
+    { instance: "c9g.large", margin17: { rps: 146.8, p95ms: 18 }, imgproxy: { rps: 113.6, p95ms: 25 } },
+  ] satisfies ControlCell[],
 };
 
 export interface FrontierPoint {

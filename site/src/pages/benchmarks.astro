@@ -8,6 +8,8 @@ import {
   nextGen,
   nextGenSource,
   measuredBefore,
+  awsMeasuredOn,
+  decodeControl,
   frontier,
   crossFormat,
   capacity,
@@ -47,8 +49,13 @@ const losses = [
     href: frontier.source,
   },
   {
-    title: "JPEG → AVIF on c7i.large is a tie",
-    body: "44.6 req/s against imgproxy's 44.9 at the default SVT preset. OXIMG_AVIF_SPEED=9 turns it into 53.3 for −0.6 SSIMULACRA2.",
+    title: "The harness JPEG cell trails imgproxy at the default",
+    body: "62.8 / 64.7 req/s against imgproxy's 74.4 / 67.3 on c7i / c7g: the full-size decode does 4× the pixel work of imgproxy's shrink-on-load. OXIMG_DCT_MARGIN=1.7 measured 89.3 / 97.2 in the same run.",
+    href: decodeControl.source,
+  },
+  {
+    title: "JPEG → AVIF trails imgproxy at the default",
+    body: "40.3 / 47.7 req/s against imgproxy's 47.4 / 52.2 on c7i / c7g, for the same reason. OXIMG_DCT_MARGIN=1.7 measured 51.1 / 63.1.",
     href: crossFormat.source,
   },
   {
@@ -100,11 +107,11 @@ cd bench/ruby && bundle install && bundle exec ruby bench.rb 3
       <aside class="notice">
         <p class="mono">! which default these were measured at</p>
         <p>
-          Every throughput table here except the frontier was measured before{" "}
-          {measuredBefore.version} {measuredBefore.change}. That lowers oximg's JPEG-source cells
-          ({measuredBefore.example}); no competitor cell moves. The AWS grids could not be re-run, so
-          they are shown as measured and labelled. <a href="#current-default">What the current
-          default does</a> is measured separately.
+          The AWS harness grids were re-measured on {awsMeasuredOn.version} ({awsMeasuredOn.date}),
+          at the current default. The other throughput tables here, except the frontier, were measured
+          before {measuredBefore.version} {measuredBefore.change}. That lowers oximg's JPEG-source
+          cells ({measuredBefore.example}); no competitor cell moves.{" "}
+          <a href="#current-default">What the current default does</a> is measured separately.
         </p>
       </aside>
       <nav class="toc mono" aria-label="On this page">
@@ -128,7 +135,8 @@ cd bench/ruby && bundle install && bundle exec ruby bench.rb 3
       </header>
       <BenchChart runs={runs} name="harness" />
       <p class="note">
-        c7 cells from one wholesale run with all four servers on fresh instances; the
+        One wholesale run per instance with all four servers on fresh instances, each from its
+        published image ({awsMeasuredOn.date}); the
         <a href={harness.source}>c7 tables</a> and the <a href={nextGenSource}>c8i / c9g tables</a> are
         in BENCH.md.
       </p>
@@ -185,10 +193,9 @@ cd bench/ruby && bundle install && bundle exec ruby bench.rb 3
       </div>
       <p class="note">
         req/s (p95). Within 3% is marked as a tie — it is inside the instance-to-instance variance the
-        same-run anchors bound. On c7i the AVIF cell is encode-bound at the default SVT preset 8;
-        <code>OXIMG_AVIF_SPEED=9</code> measured {crossFormat.avifSpeed9.tuned.rps} req/s against
-        imgproxy's {crossFormat.avifSpeed9.imgproxy.rps} in the same run, for −0.6 SSIMULACRA2 at
-        unchanged bytes. The default stays at 8. <a href={crossFormat.source}>Source ↗</a>
+        same-run anchors bound. JPEG → AVIF pays the full-size JPEG decode on top of an encode that
+        imgproxy's shrink-on-load keeps cheaper; with <code>OXIMG_DCT_MARGIN=1.7</code> the same runs
+        tie it on c8i and lead it on the other three instances. <a href={crossFormat.source}>Source ↗</a>
       </p>
     </div>
   </section>
