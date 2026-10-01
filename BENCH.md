@@ -227,9 +227,10 @@ cells above. Example: `FORMAT=jpg OUT_FORMAT=avif` measures
 JPEG-source → AVIF-output across all four servers.
 
 Converting from JPEG sources swaps the expensive source decode for
-oximg's cheapest one (streaming mozjpeg with DCT shrink-on-load), so
-JPEG→WebP runs ~2x the WebP→WebP cell and JPEG→AVIF ~3x the AVIF→AVIF
-cell.
+oximg's cheapest one (streaming mozjpeg), so JPEG→WebP runs ~1.5x the
+WebP→WebP cell and JPEG→AVIF ~2x the AVIF→AVIF cell at the current
+full-size decode default (~2x and ~3x with the pre-0.11.0 DCT
+shrink-on-load, `OXIMG_DCT_MARGIN=1.7`).
 
 Local Ryzen harness, measured 2026-07-04 on the pre-fused-YUV build
 (same cpuset 0-1 environment as the table above; req/s, p95 in
@@ -240,29 +241,33 @@ parentheses):
 | JPEG→WebP | **158.8** (17 ms) | 81.5 (34 ms) |
 | JPEG→AVIF | **115.0** (23 ms) | 102.2 (28 ms) |
 
-AWS reference instances, measured 2026-07-05 in the wholesale re-run
-(fresh instances, current build, same run as the tables in the next
-section):
+AWS reference instances, re-measured 2026-09-29 on oximg 0.12.0 (same
+run as the tables in the next section; the `OXIMG_DCT_MARGIN=1.7`
+column is the pre-0.11.0 decode default, from the control cells there):
 
-| c7i.large (x86-64) | oximg | imgproxy |
-|---|---|---|
-| JPEG→WebP | **65.3** (41 ms) | 35.3 (73 ms) |
-| JPEG→AVIF | 44.6 (57 ms) | 44.9 (59 ms) |
+| c7i.large (x86-64) | oximg | oximg, margin 1.7 | imgproxy |
+|---|---|---|---|
+| JPEG→WebP | **55.4** (47 ms) | 75.1 (36 ms) | 38.1 (68 ms) |
+| JPEG→AVIF | 40.3 (63 ms) | 51.1 (51 ms) | **47.4** (56 ms) |
 
-| c7g.large (Graviton3) | oximg | imgproxy |
-|---|---|---|
-| JPEG→WebP | **79.3** (33 ms) | 37.0 (69 ms) |
-| JPEG→AVIF | **56.5** (46 ms) | 52.7 (50 ms) |
+| c7g.large (Graviton3) | oximg | oximg, margin 1.7 | imgproxy |
+|---|---|---|---|
+| JPEG→WebP | **58.2** (44 ms) | 82.6 (32 ms) | 37.2 (69 ms) |
+| JPEG→AVIF | 47.7 (53 ms) | 63.1 (41 ms) | **52.2** (51 ms) |
 
-JPEG→WebP leads imgproxy ~2x everywhere. JPEG→AVIF leads on Graviton3
-(+7%) and the Ryzen (+13%) and lands at parity on c7i (-0.7%) — while
-encoding at oximg's default operating point (10-bit tune=ssim q55),
-which produces smaller files at higher SSIMULACRA2 than the q65 the
-harness hands the competitors (see
+At the default, JPEG→WebP leads imgproxy 1.45-1.56x and JPEG→AVIF
+trails it by 9-15% — the full-size decode costs these cells what it
+costs the JPEG cell, while the encode stays the same. With margin 1.7
+the pre-0.11.0 picture returns (WebP ~2x, AVIF +8% / +21%). oximg's
+AVIF encodes at its own default operating point (10-bit tune=ssim
+q55), which produces smaller files at higher SSIMULACRA2 than the q65
+the harness hands the competitors (see
 [bench/quality/QUALITY.md](bench/quality/QUALITY.md)); nominal
 qualities are not comparable across encoders.
 
-The c7i cell traces to SMT: c7i.large is one physical core running two
+The rest of this subsection is the 2026-07 investigation of the c7i
+JPEG→AVIF cell, measured at the pre-0.11.0 decode default, when it
+stood at parity (44.6 vs imgproxy 44.9 req/s). The cell traces to SMT: c7i.large is one physical core running two
 hyperthreads, and pinning this Ryzen harness to an SMT sibling pair
 (cpuset 0,8) reproduces the effect — oximg's lead narrows from +13% to
 +3% (oximg loses 28% to SMT contention, imgproxy 22%; SVT-AV1's dense
@@ -318,96 +323,130 @@ target encode outside the decode wall.
 
 The same harness run unmodified on the instance types imgproxy uses for
 its published results, deployed with the harness's own CloudFormation
-template (Ubuntu 24.04, Docker, k6 with 2 VUs for 5 minutes per cell,
-all defaults). req/s (p95); all runs 100% successful checks. All four
-servers re-measured together per instance in one wholesale run
-(2026-07-05, fresh instances, oximg built from source at the
-cross-format + fused-overlap state).
+template (Docker, k6 with 2 VUs for 5 minutes per cell, all defaults).
+req/s (p95); all runs 100% successful checks. All four servers
+re-measured together per instance in one wholesale run (2026-09-29,
+fresh instances, kernel 7.0.0-1013-aws), every server from its
+published image: `ghcr.io/oximg/oximg:0.12.0`, imgproxy 4.0.16,
+imagor 1.9.6, thumbor 7.8.0 (image digests in each run's
+`versions.txt`).
 
-c7i.large (x86-64, 2 vCPU = one SMT core):
+c7i.large (x86-64, 2 vCPU = one SMT core, Xeon Platinum 8488C):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **78.7** (33 ms) | **32.8** (79 ms) | **30.9** (92 ms) | **15.6** (181 ms) |
-| imgproxy | 67.0 (40 ms) | 14.3 (187 ms) | 20.3 (136 ms) | 15.2 (190 ms) |
-| imagor 1.9.2 | 58.7 (44 ms) | 15.5 (174 ms) | 17.7 (152 ms) | 10.1 (283 ms) |
-| thumbor 7.x | 50.0 (50 ms) | 8.7 (304 ms) | 14.0 (187 ms) | 12.1 (225 ms) |
+| oximg 0.12.0 (defaults) | 62.8 (41 ms) | **37.3** (69 ms) | **35.6** (80 ms) | **17.8** (159 ms) |
+| imgproxy 4.0.16 | **74.4** (37 ms) | 16.6 (162 ms) | 23.1 (120 ms) | 17.4 (167 ms) |
+| imagor 1.9.6 | 67.0 (39 ms) | 17.6 (153 ms) | 19.0 (140 ms) | 11.4 (252 ms) |
+| thumbor 7.8.0 | 55.5 (45 ms) | 9.8 (271 ms) | 15.6 (166 ms) | 13.1 (208 ms) |
 
 c7g.large (Graviton3, 2 physical cores):
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **91.2** (28 ms) | **39.0** (66 ms) | **41.5** (70 ms) | **23.4** (124 ms) |
-| imgproxy | 68.0 (39 ms) | 21.0 (123 ms) | 25.4 (110 ms) | 20.3 (139 ms) |
-| imagor 1.9.2 | 57.5 (44 ms) | 22.1 (115 ms) | 19.7 (133 ms) | 13.7 (204 ms) |
-| thumbor 7.x | 63.2 (41 ms) | 12.5 (210 ms) | 20.2 (129 ms) | 14.7 (196 ms) |
+| oximg 0.12.0 (defaults) | 64.7 (38 ms) | **39.9** (65 ms) | **41.4** (69 ms) | **24.5** (120 ms) |
+| imgproxy 4.0.16 | **67.3** (40 ms) | 21.3 (123 ms) | 25.6 (110 ms) | 20.3 (140 ms) |
+| imagor 1.9.6 | 57.5 (44 ms) | 22.2 (115 ms) | 19.5 (132 ms) | 13.6 (208 ms) |
+| thumbor 7.8.0 | 60.6 (42 ms) | 12.3 (213 ms) | 20.1 (130 ms) | 14.7 (198 ms) |
+
+### Decode-default control cells
+
+After each instance's grid, the same run measured oximg's JPEG cell at
+explicit `OXIMG_DCT_MARGIN` values, with a second default round and an
+imgproxy anchor interleaved (the value was checked inside the running
+container). Margin 1.7 is the pre-0.11.0 default, DCT shrink-on-load;
+unset is the current full-size decode. At this ~4x reduction (DIV2K
+2040 px → 512 px) margin 3.5 selects no DCT scale, so it measures as
+the default.
+
+| JPEG cell, req/s (p95) | c7i | c7g | c8i | c9g |
+|---|---|---|---|---|
+| oximg default (grid) | 62.8 (41 ms) | 64.7 (38 ms) | 73.7 (34 ms) | 98.0 (26 ms) |
+| oximg default (control round) | 62.4 (41 ms) | 65.2 (38 ms) | 74.3 (34 ms) | 98.3 (26 ms) |
+| oximg `OXIMG_DCT_MARGIN=3.5` | 66.3 (38 ms) | 64.7 (39 ms) | 73.9 (34 ms) | 97.4 (26 ms) |
+| oximg `OXIMG_DCT_MARGIN=1.7` | **89.3** (30 ms) | **97.2** (27 ms) | **109.5** (24 ms) | **146.8** (18 ms) |
+| imgproxy (grid) | 74.4 (37 ms) | 67.3 (40 ms) | 88.2 (31 ms) | 112.6 (25 ms) |
+| imgproxy (control round) | 76.2 (36 ms) | 67.6 (39 ms) | 87.8 (31 ms) | 113.6 (25 ms) |
+
+| JPEG source → output, margin 1.7 | c7i | c7g | c8i | c9g |
+|---|---|---|---|---|
+| JPEG→WebP | 75.1 (36 ms) | 82.6 (32 ms) | 89.9 (30 ms) | 124.0 (22 ms) |
+| JPEG→AVIF | 51.1 (51 ms) | 63.1 (41 ms) | 63.8 (41 ms) | 103.9 (25 ms) |
 
 Notes:
 
-- Deltas vs the previous tables (2026-06, retired by this run): JPEG
-  on c7g jumped 81.3 → 91.2 — the fused-path scratch-pool fix (kernel
-  scratch now returns to the request thread's pool instead of dying
-  with the ephemeral worker's TLS) landed in between; the remaining
-  oximg cells and every competitor cell moved within the ~3%
-  instance-to-instance variance the same-run anchors bound (e.g.
-  imgproxy JPEG 68.4 → 67.0/68.0, AVIF 15.6 → 15.2 and 20.1 → 20.3).
+- **oximg trails imgproxy on the JPEG cell at the default** on every
+  instance: -15.6% (c7i), -3.9% (c7g), -16.4% (c8i), -13.0% (c9g).
+  The cause is the 0.11.0 decode default, not a regression elsewhere:
+  at margin 1.7 the same build leads imgproxy by +17% to +44% and
+  lands within -1% to +14% of the 2026-07 oximg cells, and the other
+  formats (which never used shrink-on-load on this corpus) moved with
+  the competitors. imgproxy/libvips shrinks DIV2K on load (~1/2 for
+  this reduction); oximg now decodes, converts and resamples all 4x the
+  pixels for the quality measured in "Decode scale" below.
+- Same-run anchors: the two default rounds and the two imgproxy rounds
+  agree within 0.9% everywhere except imgproxy on c7i (2.4%).
+- Deltas vs the previous tables (2026-07-05, retired by this run): on
+  c7g every competitor cell and every non-JPEG oximg cell moved within
+  ±5%. The c7i instance ran ~11-16% faster for all four servers alike
+  (e.g. imgproxy PNG 14.3 → 16.6, oximg PNG 32.8 → 37.3), so compare
+  c7i cells within this run only.
 - The AVIF cells reflect the current defaults and the pinned SVT-AV1
   revision. dav1d's in-frame threading works on Graviton3 (1.9x on two
   cores, verified against dav1d 1.4.1/1.5.1/1.5.3 with minimal
   repros).
 - History of what previous re-measures covered (encoder upgrade,
   index-free scalar conversion paths, architecture-aware decode-thread
-  default, counter-guided aarch64 work) is in the git log of this
-  file.
+  default, counter-guided aarch64 work, the fused-path scratch-pool
+  fix) is in the git log of this file.
 
 ## Newer instance generations (c8i.large and c9g.large)
 
 The same harness and deployment on the newest compute generations
-available in us-east-1 as of 2026-07 — c8i.large (Intel Xeon 6975P-C
-"Granite Rapids", one SMT core at 3.9 GHz) and c9g.large (next-gen
-Graviton, two physical cores at 2.8 GHz). us-east-1 offers no
-c9i.large yet. The c7 tables above remain the canonical comparison
-(imgproxy's published numbers are c7-based); this section is the
-forward-looking data point. All four servers measured together per
-instance, 100% checks; req/s (p95).
+available in us-east-1 — c8i.large (Intel Xeon 6975P-C "Granite
+Rapids", one SMT core) and c9g.large (next-gen Graviton, Neoverse-V3 cores,
+two physical cores). us-east-1 offered no c9i.large as of 2026-07. The c7
+tables above remain the canonical comparison (imgproxy's published
+numbers are c7-based); this section is the forward-looking data point.
+Same 2026-09-29 run and images as above, all four servers measured
+together per instance, 100% checks; req/s (p95).
 
 c8i.large:
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **110.3** (24 ms) | **44.7** (58 ms) | **40.7** (70 ms) | **21.5** (134 ms) |
-| imgproxy | 90.3 (31 ms) | 19.0 (142 ms) | 27.0 (104 ms) | 20.8 (140 ms) |
-| imagor 1.9.2 | 76.9 (34 ms) | 20.8 (130 ms) | 24.5 (110 ms) | 14.5 (199 ms) |
-| thumbor 7.x | 66.4 (38 ms) | 11.2 (235 ms) | 18.6 (139 ms) | 16.0 (171 ms) |
+| oximg 0.12.0 (defaults) | 73.7 (34 ms) | **43.3** (59 ms) | **40.7** (71 ms) | **20.7** (139 ms) |
+| imgproxy 4.0.16 | **88.2** (31 ms) | 18.6 (145 ms) | 26.6 (105 ms) | 20.0 (146 ms) |
+| imagor 1.9.6 | 75.5 (34 ms) | 20.0 (135 ms) | 23.2 (115 ms) | 13.9 (206 ms) |
+| thumbor 7.8.0 | 65.5 (38 ms) | 11.0 (239 ms) | 17.6 (145 ms) | 15.1 (181 ms) |
 
 c9g.large:
 
 | Server | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg (defaults) | **135.6** (19 ms) | **53.9** (48 ms) | **58.9** (51 ms) | **36.2** (82 ms) |
-| imgproxy | 112.8 (25 ms) | 32.8 (80 ms) | 36.3 (79 ms) | 32.4 (90 ms) |
-| imagor 1.9.2 | 100.6 (26 ms) | 34.5 (75 ms) | 29.7 (88 ms) | 22.3 (129 ms) |
-| thumbor 7.x | 100.4 (26 ms) | 18.7 (140 ms) | 30.6 (86 ms) | 22.1 (135 ms) |
+| oximg 0.12.0 (defaults) | 98.0 (26 ms) | **55.4** (46 ms) | **59.2** (50 ms) | **37.4** (80 ms) |
+| imgproxy 4.0.16 | **112.6** (25 ms) | 33.1 (78 ms) | 36.9 (78 ms) | 32.4 (90 ms) |
+| imagor 1.9.6 | 100.2 (26 ms) | 34.9 (74 ms) | 30.3 (87 ms) | 22.5 (129 ms) |
+| thumbor 7.8.0 | 98.1 (26 ms) | 18.5 (141 ms) | 30.5 (87 ms) | 22.0 (133 ms) |
 
 Cross-format cells (JPEG sources):
 
 | JPEG→ | c8i oximg | c8i imgproxy | c9g oximg | c9g imgproxy |
 |---|---|---|---|---|
-| WebP | **89.6** (30 ms) | 46.7 (55 ms) | **116.6** (23 ms) | 56.8 (46 ms) |
-| AVIF | **64.8** (40 ms) | 63.4 (43 ms) | **96.9** (27 ms) | 87.6 (33 ms) |
+| WebP | **64.3** (40 ms) | 46.6 (56 ms) | **86.0** (30 ms) | 57.3 (45 ms) |
+| AVIF | 50.4 (51 ms) | **62.0** (44 ms) | 76.6 (33 ms) | **88.5** (33 ms) |
 
 Notes:
 
-- oximg leads every cell on both generations — including JPEG→AVIF on
-  the Intel SMT topology (+2% on c8i at the preset-8 default), where
-  c7i measured at parity: Granite Rapids narrows the SMT contention
-  penalty that SVT-AV1's dense vector kernels pay on Sapphire Rapids.
-  `OXIMG_AVIF_SPEED=9` applies on top for deployments that want a
-  wider margin.
-- Generational uplift for oximg at unchanged defaults: c7i → c8i
-  +37-45% per cell; c7g → c9g +49-71% (JPEG→AVIF +71%, 56.5 → 96.9
-  req/s — the new Graviton is disproportionately good at the SVT
-  encode).
+- The picture matches c7: oximg leads PNG (+67% to +133% over
+  imgproxy), WebP (+53% / +60%), AVIF (+3.5% / +15%) and JPEG→WebP
+  (1.38x / 1.50x); it trails on JPEG (-16% / -13%) and JPEG→AVIF
+  (-19% / -13%). The decode-default control cells above cover these
+  two instances too: margin 1.7 turns both JPEG cells into leads
+  (+25% / +29%) and JPEG→AVIF into +3% / +17%.
+- Every cell moved within ±6% of the 2026-07 tables (imagor and
+  thumbor are newer releases than then) except the oximg JPEG-source
+  cells, which the decode default explains.
 
 ## Reproduction of the imgproxy benchmark gist (superseded)
 
@@ -719,17 +758,18 @@ across the change: CMYK 23.7 MB both ways, WebP 21.8 → 21.4 MB.
 
 ## Notes
 
-- **Every throughput table below this line predates the decode-scale
-  change** and was measured with shrink-on-load on, i.e. at the bottom
-  row of the frontier above. The oximg cells for large sources are the
-  ones that move; small-source cells (where no shrink was selected
-  anyway) do not, and no competitor cell does. Sized on the one cell
-  that could be re-run locally: 71.4 → 41.3 req/s at 7360x4912 → 500,
-  614.97 → 513.08 at 2000x1333 → 500. The AWS grids cannot be re-run
-  from here, so they are left as measured and labelled rather than
-  quietly adjusted.
-- Measurement provenance: the official-harness tables (local Ryzen and
-  AWS) were measured at the 0.3.0 cross-format + fused-overlap state
+- **The AWS official-harness tables were re-measured on 0.12.0
+  (2026-09-29), after the decode-scale change**, with control cells at
+  the old default beside them. **Every other throughput table predates
+  the change** and was measured with shrink-on-load on, i.e. at the
+  bottom row of the frontier above. The oximg cells for large sources
+  are the ones that move; small-source cells (where no shrink was
+  selected anyway) do not, and no competitor cell does. Sized on the
+  one cell that could be re-run locally: 71.4 → 41.3 req/s at
+  7360x4912 → 500, 614.97 → 513.08 at 2000x1333 → 500; on AWS the
+  harness's JPEG cell lost 29-33% (c7g, c8i, c9g).
+- Measurement provenance: the local Ryzen official-harness tables were
+  measured at the 0.3.0 cross-format + fused-overlap state
   (2026-07-05). The metadata work since (0.4.x: EXIF/AVIF orientation,
   ICC pass-through, animated first-frame) is byte-transparent for
   metadata-free sources — the benchmark dataset carries no orientation
@@ -746,8 +786,9 @@ across the change: CMYK 23.7 MB both ways, WebP 21.8 → 21.4 MB.
 - The sustained-load tables were measured with `PRESET=fast` as the
   encoder, before jpegli became the default; the preset table shows the
   relative cost of the current default.
-- oximg defaults resize in linear light with 1.7x DCT decode headroom;
-  speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`) matches the
+- oximg defaults resize in linear light from a full-size JPEG decode
+  (since 0.11.0; 1.7x DCT decode headroom before, which the pre-0.11.0
+  tables were measured with); speed mode (`OXIMG_RESIZE=srgb OXIMG_DCT_MARGIN=1.0`) matches the
   competitors' processing approach. Output quality for both settings is
   quantified in [bench/quality/QUALITY.md](bench/quality/QUALITY.md).
 - The plasma-fractal test images compress differently from real photos;

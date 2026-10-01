@@ -12,8 +12,10 @@ animated WebP); sources are format-sniffed by magic bytes and re-encoded
 in their own format (GIF, having no encoder here, becomes WebP). On
 imgproxy's official benchmark harness, run on
 the same AWS instance types as their published results, oximg leads
-every format cell on both x86-64 and Graviton while resizing in linear
-light at measurably higher output quality (see
+the PNG, WebP and AVIF cells on both x86-64 and Graviton while
+resizing in linear light at measurably higher output quality; on
+JPEG sources its full-size decode default trades throughput for that
+quality, with shrink-on-load one setting away (see
 [Benchmarks](#benchmarks)).
 
 ## Features
@@ -188,27 +190,35 @@ layer (axum/tokio) only does queueing and IO.
 
 imgproxy's official harness (DIV2K corpus over nginx, fit into 512x512,
 k6, all defaults) on the AWS instance types behind imgproxy's published
-numbers — req/s, higher is better, p95 in parentheses:
+numbers — req/s, higher is better, p95 in parentheses (oximg 0.12.0,
+measured 2026-09-29):
 
 | c7i.large (x86-64) | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg | **78.7** (33 ms) | **32.8** (79 ms) | **30.9** (92 ms) | **15.6** (181 ms) |
-| best of imgproxy/imagor/thumbor | 67.0 | 15.5 | 20.3 | 15.2 |
+| oximg | 62.8 (41 ms) | **37.3** (69 ms) | **35.6** (80 ms) | **17.8** (159 ms) |
+| best of imgproxy/imagor/thumbor | **74.4** | 17.6 | 23.1 | 17.4 |
 
 | c7g.large (Graviton3) | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|
-| oximg | **91.2** (28 ms) | **39.0** (66 ms) | **41.5** (70 ms) | **23.4** (124 ms) |
-| best of imgproxy/imagor/thumbor | 68.0 | 22.1 | 25.4 | 20.3 |
+| oximg | 64.7 (38 ms) | **39.9** (65 ms) | **41.4** (69 ms) | **24.5** (120 ms) |
+| best of imgproxy/imagor/thumbor | **67.3** | 22.2 | 25.6 | 20.3 |
 
 Cross-format cells (our harness extension; JPEG sources, oximg vs
 imgproxy):
 
 | JPEG→ | c7i oximg | c7i imgproxy | c7g oximg | c7g imgproxy |
 |---|---|---|---|---|
-| WebP | **65.3** (41 ms) | 35.3 | **79.3** (33 ms) | 37.0 |
-| AVIF | 44.6 (57 ms) | 44.9 | **56.5** (46 ms) | 52.7 |
+| WebP | **55.4** (47 ms) | 38.1 | **58.2** (44 ms) | 37.2 |
+| AVIF | 40.3 (63 ms) | **47.4** | 47.7 (53 ms) | **52.2** |
 
-At the same time, output quality is higher, not traded away:
+The JPEG-source cells are where the default gives up throughput for
+quality: since 0.11.0 JPEGs decode at full size, while imgproxy
+shrinks on load. `OXIMG_DCT_MARGIN=1.7` restores the old
+shrink-on-load default and, in the same run, leads imgproxy on JPEG by
++17% (c7i, 89.3 req/s) and +44% (c7g, 97.2 req/s) — see
+[BENCH.md](BENCH.md#decode-default-control-cells).
+
+Output quality is higher across the board:
 end-to-end JPEG at the same q80 scores +6 to +18 SSIMULACRA2 over
 imgproxy (77.5 vs 71.2 on the Kodak corpus, the gap widening with
 source size — and imgproxy at q90 with twice the bytes still scores
