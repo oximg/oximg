@@ -11,10 +11,11 @@ self-hostable HTTP server (PoC). JPEG, PNG, WebP — and AVIF with the
 animated WebP); sources are format-sniffed by magic bytes and re-encoded
 in their own format (GIF, having no encoder here, becomes WebP). On
 imgproxy's official benchmark harness, run on
-the same AWS instance types as their published results, oximg leads
-every format cell on both x86-64 and Graviton while resizing in linear
-light at measurably higher output quality (see
-[Benchmarks](#benchmarks)).
+the same AWS instance types as their published results, oximg led
+every format cell on both x86-64 and Graviton (2026-07, a pre-0.11
+build) while resizing in linear light at measurably higher output
+quality; 0.13.0 still leads on JPEG by 7-13% on a Zen 4 re-run, with
+AWS pending (see [Benchmarks](#benchmarks)).
 
 ## Features
 
@@ -190,7 +191,14 @@ layer (axum/tokio) only does queueing and IO.
 
 imgproxy's official harness (DIV2K corpus over nginx, fit into 512x512,
 k6, all defaults) on the AWS instance types behind imgproxy's published
-numbers — req/s, higher is better, p95 in parentheses:
+numbers — req/s, higher is better, p95 in parentheses. Measured
+2026-07-05 on a pre-0.11 build. Since 0.11.0, JPEG sources decode at
+full size, so the JPEG column and the JPEG-source cells overstate
+current releases. On the same harness shape on a Ryzen 7 8745HS
+(2026-10-01), 0.13.0 leads imgproxy 4.0.17 by 7-13% on JPEG→JPEG
+([BENCH.md](BENCH.md#jpeg-sources-since-011-2026-10)). An AWS
+re-measurement is pending
+([#63](https://github.com/oximg/oximg/issues/63)).
 
 | c7i.large (x86-64) | JPEG | PNG | WebP | AVIF |
 |---|---|---|---|---|

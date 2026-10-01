@@ -53,6 +53,9 @@ const runs = harness.runs;
           req/s (higher is better) · p95 latency · {harness.workload} · measured {r.measured} ·{" "}
           <a href={harness.source}>source table ↗</a>
         </p>
+        <p class="meta mono">
+          {harness.caveat} · <a href={harness.caveatSource}>re-run ↗</a>
+        </p>
       </div>
     ))
   }

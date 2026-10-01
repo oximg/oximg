@@ -30,12 +30,17 @@ export const harness = {
   title: "imgproxy's official benchmark harness",
   workload: "DIV2K corpus over nginx, fit into 512×512, k6 2 VUs × 5 min, all defaults",
   source: `${REPO}/BENCH.md#official-harness-on-real-aws-hardware-c7ilarge-and-c7glarge`,
+  // Since 0.11.0 JPEG sources decode at full size, so these JPEG cells
+  // overstate current releases (BENCH.md, "JPEG sources since 0.11").
+  caveat:
+    "JPEG cells predate 0.11.0's full-size decode; on a 2026-10 Zen 4 re-run, 0.13.0 leads imgproxy 4.0.17 by 7–13% on JPEG",
+  caveatSource: `${REPO}/BENCH.md#jpeg-sources-since-011-2026-10`,
   runs: [
     {
       id: "c7i",
       instance: "c7i.large",
       arch: "x86-64 · 2 vCPU",
-      measured: "2026-07-05",
+      measured: "2026-07-05 on a pre-0.11 build",
       rows: [
         {
           server: "oximg",
@@ -83,7 +88,7 @@ export const harness = {
       id: "c7g",
       instance: "c7g.large",
       arch: "Graviton3 · 2 cores",
-      measured: "2026-07-05",
+      measured: "2026-07-05 on a pre-0.11 build",
       rows: [
         {
           server: "oximg",
@@ -148,7 +153,7 @@ export const proofs: Proof[] = [
     unit: "req/s",
     label: "JPEG throughput",
     versus: "imgproxy 68.0",
-    context: "c7g.large, official harness",
+    context: "c7g.large, official harness, pre-0.11 build",
     source: harness.source,
   },
   {
@@ -156,7 +161,7 @@ export const proofs: Proof[] = [
     unit: "×",
     label: "JPEG → WebP",
     versus: "79.3 vs 37.0 req/s",
-    context: "c7g.large, cross-format cell",
+    context: "c7g.large, cross-format cell, pre-0.11 build",
     source: `${REPO}/README.md#benchmarks`,
   },
   {

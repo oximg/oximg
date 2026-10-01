@@ -13,6 +13,38 @@ Two load patterns are reported where relevant:
 - **diverse**: 16 concurrent workers, each requesting a distinct target
   width (485-500), so every request requires full processing.
 
+## JPEG sources since 0.11 (2026-10)
+
+**Most tables below were measured in 2026-07, before 0.11.0.** That
+includes the Linux and macOS sections, both runs of imgproxy's harness
+(local and AWS c7/c8/c9), and the cross-format cells. 0.11.0 stopped
+decoding JPEG sources at a reduced DCT scale by default (see
+[Decode scale](#decode-scale-the-throughputquality-frontier-2026-08)),
+which made every cell whose *source* is a JPEG slower: JPEG→JPEG,
+JPEG→WebP and JPEG→AVIF. Those columns overstate 0.11.0 and 0.12.0.
+They overstate 0.13.0 less, but still by some margin. PNG, WebP and
+AVIF sources were not affected by that change.
+
+The JPEG→JPEG cell re-measured on 0.13.0, on imgproxy's benchmark
+shape: 100 DIV2K photographs from nginx, fit 512 q80, k6. This run was
+on the Ryzen 7 8745HS, not AWS. The server was pinned to one SMT pair
+(the c7i.large analogue) or two physical cores (the c7g.large
+analogue). Configurations rotated each round. Values are req/s with
+CPU ms per request in parentheses, averaged over 3 rounds at 2 VUs and
+2 rounds at 8 VUs. Measured 2026-10-01; all 40 cells had 0 failed
+checks.
+
+| server | SMT pair, 2 VUs | SMT pair, 8 VUs | 2 cores, 2 VUs | 2 cores, 8 VUs |
+|---|---|---|---|---|
+| oximg 0.12.0 | 92.5 (21.2) | 94.0 (21.1) | 127.7 (14.8) | 135.2 (14.7) |
+| **oximg 0.13.0** | **124.0** (15.7) | **127.4** (15.6) | **170.3** (10.9) | **184.5** (10.7) |
+| imgproxy 4.0.17 | 115.4 (16.0) | 117.2 (16.5) | 153.8 (11.6) | 163.0 (11.7) |
+
+0.13.0 leads imgproxy by 7-13% here. The 2026-07 AWS run showed
+1.17-1.34x on its JPEG column, so read that column as the pre-0.11
+build. The AWS run itself is pending
+([#63](https://github.com/oximg/oximg/issues/63)).
+
 ## Linux x86_64 (AMD Ryzen 7 8745HS, 8C/16T, Arch Linux)
 
 All servers as Docker containers: oximg (this repo's Dockerfile),
@@ -158,14 +190,8 @@ both servers.
 
 ## imgproxy's official benchmark harness (JPEG, PNG, WebP, and AVIF)
 
-**Pre-0.11: these cells were measured on 2026-07-05, before 0.11.0 turned off JPEG
-shrink-on-load, and they have not been re-run since.** On Zen 4 at fit 512 q80, that
-default change raised oximg's CPU per request on the JPEG cell by 53% (42.77 →
-65.49 Mcyc, [#64](https://github.com/oximg/oximg/issues/64)). So the JPEG column,
-and any JPEG-source cross-format cell, overstates every release from 0.11.0 on.
-Re-measured on Zen 4 on imgproxy's harness shape, 0.12.0 ran at 0.78–0.84x
-imgproxy 4.0.17. The AWS re-run is tracked in
-[#63](https://github.com/oximg/oximg/issues/63).
+> Measured 2026-07 on a pre-0.11 build. The JPEG column overstates
+> current releases; see [JPEG sources since 0.11](#jpeg-sources-since-011-2026-10).
 
 [imgproxy's current benchmark](https://imgproxy.net/blog/image-processing-servers-benchmark/)
 ([harness](https://github.com/imgproxy/image-servers-benchmark)) replaces
@@ -326,14 +352,10 @@ target encode outside the decode wall.
 
 ## Official harness on real AWS hardware (c7i.large and c7g.large)
 
-**Pre-0.11: these cells were measured on 2026-07-05, before 0.11.0 turned off JPEG
-shrink-on-load, and they have not been re-run since.** On Zen 4 at fit 512 q80, that
-default change raised oximg's CPU per request on the JPEG cell by 53% (42.77 →
-65.49 Mcyc, [#64](https://github.com/oximg/oximg/issues/64)). So the JPEG column,
-and any JPEG-source cross-format cell, overstates every release from 0.11.0 on.
-Re-measured on Zen 4 on imgproxy's harness shape, 0.12.0 ran at 0.78–0.84x
-imgproxy 4.0.17. The AWS re-run is tracked in
-[#63](https://github.com/oximg/oximg/issues/63).
+> Measured 2026-07-05 on a pre-0.11 build. The JPEG column and the
+> JPEG-source cross-format cells overstate current releases; see
+> [JPEG sources since 0.11](#jpeg-sources-since-011-2026-10). Re-measuring
+> on AWS is [#63](https://github.com/oximg/oximg/issues/63).
 
 The same harness run unmodified on the instance types imgproxy uses for
 its published results, deployed with the harness's own CloudFormation
@@ -381,14 +403,8 @@ Notes:
 
 ## Newer instance generations (c8i.large and c9g.large)
 
-**Pre-0.11: these cells were measured in 2026-07, before 0.11.0 turned off JPEG
-shrink-on-load, and they have not been re-run since.** On Zen 4 at fit 512 q80, that
-default change raised oximg's CPU per request on the JPEG cell by 53% (42.77 →
-65.49 Mcyc, [#64](https://github.com/oximg/oximg/issues/64)). So the JPEG column,
-and any JPEG-source cross-format cell, overstates every release from 0.11.0 on.
-Re-measured on Zen 4 on imgproxy's harness shape, 0.12.0 ran at 0.78–0.84x
-imgproxy 4.0.17. The AWS re-run is tracked in
-[#63](https://github.com/oximg/oximg/issues/63).
+> Measured 2026-07 on a pre-0.11 build; the same caveat as the c7
+> tables applies to every JPEG-source cell.
 
 The same harness and deployment on the newest compute generations
 available in us-east-1 as of 2026-07 — c8i.large (Intel Xeon 6975P-C
