@@ -242,6 +242,8 @@ struct Scratch {
     acc: Vec<f32>,
     offs: Vec<usize>,
     outrow: Vec<u16>,
+    /// The current chroma row's terms for [`RowKernel::stage_ycc_h2`].
+    ycc: Vec<u8>,
 }
 
 /// The f32 batch buffer viewed as u16 for f16 staging.
@@ -350,6 +352,37 @@ pub(crate) trait RowKernel {
     // `row.len() >= 3 * w` and `stage.len() >= 3 * w`.
     unsafe fn stage_x3_u8_half(row: &[u8], lut: &[u16; 256], stage: &mut [u16], w: usize) {
         unsafe { stage_x3_u8_words(row, lut, stage, w, false) }
+    }
+    /// Whether this CPU stages YCbCr rows with 2x horizontally subsampled
+    /// chroma (JPEG 4:2:0 and 4:2:2) directly, fusing libjpeg's
+    /// replicating upsample and color conversion into the LUT staging
+    /// ([`RowKernel::ycc_terms_h2`], [`RowKernel::stage_ycc_h2`]).
+    fn ycc_h2() -> bool {
+        false
+    }
+    /// Precompute one chroma row's color terms for
+    /// [`RowKernel::stage_ycc_h2`]; every luma row sharing the chroma
+    /// row reuses them.
+    // SAFETY: caller must have verified `Self::ycc_h2()` and pass
+    // `cb.len() >= w.div_ceil(2)`, `cr.len() >= w.div_ceil(2)` and
+    // `terms.len() >= 6 * ycc_stride(w)`.
+    unsafe fn ycc_terms_h2(_cb: &[u8], _cr: &[u8], _w: usize, _terms: &mut [u8]) {
+        unreachable!("ycc_h2() is false for this kernel")
+    }
+    /// Stage one luma row through the terms of its chroma row and `lut`,
+    /// bit-identical to [`RowKernel::stage_x3_u8`] of the RGB row libjpeg
+    /// would output ([`ycc_to_rgb`] per pixel, chroma sample `x / 2`).
+    // SAFETY: caller must have verified `Self::ycc_h2()` and pass
+    // `y.len() >= w`, `terms` as written by `ycc_terms_h2` for the same
+    // `w`, and `stage.len() >= w * Self::STAGE3_FLOATS_PER_PIXEL`.
+    unsafe fn stage_ycc_h2(
+        _y: &[u8],
+        _terms: &[u8],
+        _lut: &[f32; 256],
+        _stage: &mut [f32],
+        _w: usize,
+    ) {
+        unreachable!("ycc_h2() is false for this kernel")
     }
     /// Half-precision counterpart of [`RowKernel::horiz_x3_batch`] over
     /// rows staged by [`RowKernel::stage_x3_u8_half`] (at 1/65536 scale,
@@ -550,6 +583,35 @@ pub(crate) unsafe fn stage_x3_u8_words<T: Copy + Default>(
     }
 }
 
+/// libjpeg's YCbCr -> RGB for one pixel (jdcolor.c and jdmerge.c): 16-bit
+/// fixed-point coefficients, rounded, range-limited to 0..=255. The
+/// reference the YCbCr staging kernels are tested against.
+#[cfg(test)]
+pub(crate) fn ycc_to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    const HALF: i32 = 1 << 15;
+    let (y, cb, cr) = (y as i32, cb as i32 - 128, cr as i32 - 128);
+    let r = (YCC_FIX_R * cr + HALF) >> 16;
+    let g = (-YCC_FIX_GB * cb - YCC_FIX_GR * cr + HALF) >> 16;
+    let b = (YCC_FIX_B * cb + HALF) >> 16;
+    [y + r, y + g, y + b].map(|v| v.clamp(0, 255) as u8)
+}
+
+/// libjpeg's FIX(1.40200), FIX(0.34414), FIX(0.71414), FIX(1.77200).
+#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) const YCC_FIX_R: i32 = 91881;
+#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) const YCC_FIX_GB: i32 = 22554;
+#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) const YCC_FIX_GR: i32 = 46802;
+#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) const YCC_FIX_B: i32 = 116130;
+
+/// Bytes per term plane of [`RowKernel::ycc_terms_h2`]: whole 64-pixel
+/// blocks.
+pub(crate) fn ycc_stride(w: usize) -> usize {
+    w.next_multiple_of(64)
+}
+
 pub(crate) fn clamp_u16(v: f32) -> u16 {
     (v + 0.5).clamp(0.0, 65535.0) as u16
 }
@@ -584,6 +646,8 @@ pub(crate) struct StreamResize<K: RowKernel> {
     half: bool,
     /// The stream's u8 LUT as f16 bits at 1/65536 scale (half mode).
     lut_h: [u16; 256],
+    /// `scratch.ycc` holds terms for this stream's current chroma row.
+    ycc_ready: bool,
     oy: usize,
     scratch: Scratch,
     _k: std::marker::PhantomData<K>,
@@ -659,6 +723,7 @@ impl<K: RowKernel> StreamResize<K> {
             stage_row_stride,
             half: false,
             lut_h: [0; 256],
+            ycc_ready: false,
             oy: 0,
             scratch,
             _k: std::marker::PhantomData,
@@ -759,6 +824,55 @@ impl<K: RowKernel> StreamResize<K> {
                     self.src_w,
                 );
             }
+        }
+        self.after_stage(emit);
+    }
+
+    /// Push the next source row as YCbCr planes with 2x horizontally
+    /// subsampled chroma, on kernels with [`RowKernel::ycc_h2`]
+    /// (3-channel streams only). `chroma` carries the row's Cb and Cr
+    /// rows whenever they differ from the previous row's: on the first
+    /// row, and on every other row for 4:2:0. Staged values are
+    /// bit-identical to [`StreamResize::push_row_u8`] of the RGB row
+    /// libjpeg's replicating (merged) upsampler outputs.
+    pub(crate) fn push_row_ycc(
+        &mut self,
+        y: &[u8],
+        chroma: Option<(&[u8], &[u8])>,
+        lut: &[f32; 256],
+        emit: impl FnMut(usize, &[u16]),
+    ) {
+        assert_eq!(self.channels, 3, "YCbCr staging is 3-channel only");
+        assert!(K::ycc_h2() && !self.half, "kernel lacks YCbCr staging");
+        let w = self.src_w;
+        assert!(y.len() >= w, "short luma row");
+        if self.next_row >= self.last_needed {
+            self.next_row += 1;
+            return; // trailing rows influence nothing
+        }
+        if let Some((cb, cr)) = chroma {
+            let cw = w.div_ceil(2);
+            assert!(cb.len() >= cw && cr.len() >= cw, "short chroma row");
+            let n = 6 * ycc_stride(w);
+            if self.scratch.ycc.len() < n {
+                self.scratch.ycc.resize(n, 0);
+            }
+            // SAFETY: ycc_h2() asserted; lengths checked above.
+            unsafe { K::ycc_terms_h2(cb, cr, w, &mut self.scratch.ycc[..n]) };
+            self.ycc_ready = true;
+        }
+        assert!(self.ycc_ready, "first YCbCr row without chroma");
+        let base = self.pending * self.stage_row_stride;
+        let px = K::STAGE3_FLOATS_PER_PIXEL;
+        // SAFETY: as in push_row; the terms were written for this `w`.
+        unsafe {
+            K::stage_ycc_h2(
+                y,
+                &self.scratch.ycc,
+                lut,
+                &mut self.scratch.stage[base..base + w * px],
+                w,
+            );
         }
         self.after_stage(emit);
     }
