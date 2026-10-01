@@ -133,8 +133,23 @@ impl<R> Decompress<R> {
         self.cinfo.do_fancy_upsampling = ffi::boolean::from(value);
     }
 
+    /// Component `i`'s (horizontal, vertical) sampling factors.
+    pub(crate) fn sampling(&self, i: usize) -> (i32, i32) {
+        let c = component(&self.cinfo, i);
+        (c.h_samp_factor, c.v_samp_factor)
+    }
+
     pub(crate) fn rgb(self) -> io::Result<DecompressStarted<R>> {
         self.start(ColorSpace::JCS_RGB)
+    }
+
+    /// Start in raw data mode: the component planes as stored, with no
+    /// upsampling or color conversion, read with
+    /// [`DecompressStarted::read_raw_chunk`].
+    pub(crate) fn raw(mut self) -> io::Result<DecompressStarted<R>> {
+        self.cinfo.raw_data_out = 1;
+        let cs = self.cinfo.jpeg_color_space;
+        self.start(cs)
     }
 
     pub(crate) fn start(mut self, colorspace: ColorSpace) -> io::Result<DecompressStarted<R>> {
@@ -205,12 +220,85 @@ impl<R> DecompressStarted<R> {
         Ok(dest)
     }
 
+    /// Raw data mode: component `i`'s vertical sampling factor and its
+    /// plane's row stride in bytes (whole DCT blocks, so a row runs
+    /// past the image width).
+    pub(crate) fn raw_plane(&self, i: usize) -> (usize, usize) {
+        let c = component(&self.dec.cinfo, i);
+        (
+            c.v_samp_factor.max(0) as usize,
+            c.width_in_blocks as usize * ffi::DCTSIZE,
+        )
+    }
+
+    /// Raw data mode: decode the next iMCU row into the three planes, in
+    /// rows of [`Self::raw_plane`]'s stride: `v_samp_factor * 8` rows
+    /// per component, past the image height on the last iMCU row (their
+    /// content is padding). The planes are grown as needed and reused
+    /// as they are, since libjpeg writes every row. Reading past the
+    /// last row is an `UnexpectedEof` error.
+    pub(crate) fn read_raw_chunk(&mut self, planes: &mut [Vec<u8>; 3]) -> io::Result<()> {
+        let cinfo = &mut *self.dec.cinfo;
+        assert!(
+            cinfo.raw_data_out != 0 && cinfo.num_components == 3,
+            "raw reads need a 3-component decoder started with raw()"
+        );
+        if cinfo.output_scanline >= cinfo.output_height {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        // libjpeg caps sampling factors at 4: 32 rows per component.
+        const MAX_ROWS: usize = 4 * ffi::DCTSIZE;
+        let imcu = cinfo.max_v_samp_factor.max(0) as usize * ffi::DCTSIZE;
+        let mut rows = [[ptr::null_mut::<ffi::JSAMPLE>(); MAX_ROWS]; 3];
+        let mut comps = [ptr::null_mut::<ffi::JSAMPROW_MUT>(); 3];
+        for (i, (plane, (rows, comp))) in planes
+            .iter_mut()
+            .zip(rows.iter_mut().zip(comps.iter_mut()))
+            .enumerate()
+        {
+            let c = component(cinfo, i);
+            let (h, stride) = (
+                c.v_samp_factor.max(0) as usize * ffi::DCTSIZE,
+                c.width_in_blocks as usize * ffi::DCTSIZE,
+            );
+            assert!(h <= MAX_ROWS, "sampling factor above 4");
+            if plane.len() < h * stride {
+                plane.resize(h * stride, 0);
+            }
+            for (r, p) in rows[..h].iter_mut().enumerate() {
+                // SAFETY: r < h, so the row lies inside the plane.
+                *p = unsafe { plane.as_mut_ptr().add(r * stride) };
+            }
+            *comp = rows.as_mut_ptr();
+        }
+        // SAFETY: each component gets v_samp_factor * 8 pointers to
+        // disjoint `stride`-byte rows, the most one iMCU row writes.
+        let read = unsafe { ffi::jpeg_read_raw_data(cinfo, comps.as_mut_ptr(), imcu as _) };
+        if read as usize != imcu {
+            // Only a suspending source reads less, and this one never
+            // suspends.
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(mut self) -> io::Result<()> {
         if unsafe { ffi::jpeg_finish_decompress(&mut self.dec.cinfo) } == 0 {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         Ok(())
     }
+}
+
+/// Component `i`'s info, which libjpeg fills in at the header parse.
+fn component(cinfo: &ffi::jpeg_decompress_struct, i: usize) -> &ffi::jpeg_component_info {
+    assert!(
+        i < cinfo.num_components.max(0) as usize,
+        "component {i} out of range"
+    );
+    // SAFETY: comp_info holds num_components entries once the header is
+    // read, which every Decompress has done.
+    unsafe { &*cinfo.comp_info.add(i) }
 }
 
 impl<R> Drop for Decompress<R> {

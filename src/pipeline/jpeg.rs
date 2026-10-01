@@ -138,6 +138,21 @@ pub(super) enum Fuse {
     Yuv { params: crate::avif::AvifParams },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Decode through RGB rows even where the raw YCbCr path applies
+    /// (tests comparing the two).
+    pub(super) static NO_RAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn raw_disabled() -> bool {
+    #[cfg(test)]
+    return NO_RAW.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
 pub(super) fn decode_resize<R: std::io::BufRead>(
     s: &mut Scratch,
     mut dec: Decompress<R>,
@@ -279,7 +294,42 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     if dst_w < (src_w * num).div_ceil(8) && dst_h < (src_h * num).div_ceil(8) {
         dec.do_fancy_upsampling(false);
     }
-    let mut started = dec.rgb().context("decode start failed")?;
+    // The kernel paths take the YCbCr planes raw where the kernel can
+    // stage them directly (see YccLayout): bit-identical to the
+    // replicated RGB rows, minus libjpeg's upsample and color-convert
+    // passes (and, fused, half the handoff bytes). That needs the
+    // replicating decode above, unscaled, with chroma halved
+    // horizontally (4:2:0 or 4:2:2), and a kernel consumer: a fused path
+    // or the serial streamed one. A fused path implies the same
+    // `parallel` and backend conditions, so these two cover both.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let raw = {
+        use crate::resize_kernel::RowKernel;
+        p.parallel <= 1
+            && !crate::config::config().fir_backend
+            && !raw_disabled()
+            && p.linear_light
+            && num == 8
+            && dst_w < src_w
+            && dst_h < src_h
+            && matches!(cs, ColorSpace::JCS_YCbCr)
+            && dec.num_components() == 3
+            && matches!(dec.sampling(0), (2, 1) | (2, 2))
+            && (1..3).all(|i| dec.sampling(i) == (1, 1))
+            && FuseKernel::detect()
+            && FuseKernel::ycc_h2()
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let raw = false;
+    let mut started = if raw { dec.raw() } else { dec.rgb() }.context("decode start failed")?;
+    let ycc = raw.then(|| {
+        let ((v, y_stride), (_, c_stride)) = (started.raw_plane(0), started.raw_plane(1));
+        YccLayout {
+            v,
+            y_stride,
+            c_stride,
+        }
+    });
     let (dec_w, dec_h) = (started.width(), started.height());
     let row_bytes = dec_w * 3;
     let linear = p.linear_light && (dec_w, dec_h) != (dst_w, dst_h);
@@ -302,7 +352,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     if let Fuse::Jpegli { quality } = fuse
         && linear
         && let Some((out, decode_ms)) =
-            fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality, icc)?
+            fused_resize_encode(&mut started, dec_w, dec_h, dst_w, dst_h, quality, icc, ycc)?
     {
         if timing {
             let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -328,6 +378,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             &mut s.out8[..dst_w * dst_h * 3],
             2,
             || Ok(()),
+            ycc,
         )? {
             if timing {
                 let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -361,6 +412,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             &mut s.out8[..dst_w * dst_h * 3],
             4,
             || Ok(crate::avif::start_color_session(disp_w, disp_h, &params).ok()),
+            ycc,
         )? {
             if timing {
                 let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -404,6 +456,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             &mut s.y16,
             &mut s.cb16,
             &mut s.cr16,
+            ycc,
         )? {
             if timing {
                 let total = t0.elapsed().as_secs_f64() * 1e3;
@@ -436,27 +489,35 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             scratch_u8(&mut s.chunk8, chunk_rows * row_bytes);
             scratch_u8(&mut s.out8, dst_w * dst_h * 3);
             let out8 = &mut s.out8;
-            let mut remaining = dec_h;
-            while remaining > 0 {
-                let want = remaining.min(chunk_rows) * row_bytes;
-                let got = started
-                    .read_scanlines_into(&mut s.chunk8[..want])
-                    .context("decode failed")?
-                    .len();
-                anyhow::ensure!(
-                    got > 0 && got % row_bytes == 0,
-                    "decoder returned a partial row"
-                );
-                remaining -= got / row_bytes;
-                for row in s.chunk8[..got].chunks_exact(row_bytes) {
-                    resizer.push_row_u8(row, fwd, |oy, out| {
-                        for (d, &v) in out8[oy * dst_w * 3..(oy + 1) * dst_w * 3]
-                            .iter_mut()
-                            .zip(out)
-                        {
-                            *d = back[v as usize];
-                        }
-                    });
+            let mut emit = |oy: usize, out: &[u16]| {
+                for (d, &v) in out8[oy * dst_w * 3..(oy + 1) * dst_w * 3]
+                    .iter_mut()
+                    .zip(out)
+                {
+                    *d = back[v as usize];
+                }
+            };
+            if let Some(l) = ycc {
+                super::fuse::raw_rows_inline(&mut started, dec_h, l, |row| {
+                    row.push(&mut resizer, fwd, &mut emit);
+                    Ok(())
+                })?;
+            } else {
+                let mut remaining = dec_h;
+                while remaining > 0 {
+                    let want = remaining.min(chunk_rows) * row_bytes;
+                    let got = started
+                        .read_scanlines_into(&mut s.chunk8[..want])
+                        .context("decode failed")?
+                        .len();
+                    anyhow::ensure!(
+                        got > 0 && got % row_bytes == 0,
+                        "decoder returned a partial row"
+                    );
+                    remaining -= got / row_bytes;
+                    for row in s.chunk8[..got].chunks_exact(row_bytes) {
+                        resizer.push_row_u8(row, fwd, &mut emit);
+                    }
                 }
             }
             anyhow::ensure!(
@@ -473,6 +534,14 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
             return Ok(Decoded::Pixels { dst_w, dst_h });
         }
 
+        // Unreachable: a raw start requires the streamed path's
+        // conditions, which only a failing StreamResize::new escapes,
+        // and its start requires the kernel too.
+        if ycc.is_some() {
+            return Err(
+                anyhow::anyhow!("raw decode reached the full-frame path").context(ServerFault)
+            );
+        }
         // Full-frame fallback (band-parallel resize, OXIMG_RESIZE_BACKEND
         // =fir, or CPUs without the SIMD kernel): decode in chunks and
         // apply the sRGB u8 -> linear u16 LUT on the fly; each chunk

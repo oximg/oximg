@@ -341,6 +341,110 @@ fn fused_path_bytes_match_serial_jpegli() {
     assert_eq!(run_jpeg(&jpeg, None), run_jpeg(&jpeg, Some(80.0)));
 }
 
+/// `make_test_jpeg`'s frame, color, with luma sampling `samp` (h, v)
+/// over full-resolution chroma: (2, 2) is 4:2:0, (2, 1) 4:2:2.
+fn make_sampled_jpeg(w: usize, h: usize, samp: (i32, i32)) -> Vec<u8> {
+    let mut seed = 0x9E3779B9u32;
+    let px: Vec<u8> = (0..w * h * 3)
+        .map(|i| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let (x, y, c) = (i / 3 % w, i / 3 / w, i % 3);
+            ((x * 200 / w + y * 40 / h + c * 5 + (seed >> 26) as usize).min(255)) as u8
+        })
+        .collect();
+    let mut comp = Compress::new(ColorSpace::JCS_RGB);
+    comp.set_size(w, h);
+    comp.set_quality(90.0);
+    for (i, c) in comp.components_mut().iter_mut().enumerate() {
+        (c.h_samp_factor, c.v_samp_factor) = if i == 0 { samp } else { (1, 1) };
+    }
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_scanlines(&px).unwrap();
+    started.finish().unwrap()
+}
+
+/// The YCbCr staging kernels' reference, `ycc_to_rgb` over replicated
+/// chroma, is libjpeg's own conversion: every pixel of the raw planes
+/// converts to exactly what the replicating RGB decode outputs, for
+/// both samplings the raw path takes and odd sizes. Also pins the raw
+/// reader's chunking: one iMCU row per call, then UnexpectedEof.
+#[test]
+fn ycc_reference_matches_libjpeg_replication() {
+    for samp in [(2, 1), (2, 2)] {
+        for (w, h) in [(1, 1), (17, 9), (64, 33), (799, 601)] {
+            let jpeg = make_sampled_jpeg(w, h, samp);
+            let mut dec = Decompress::new_mem(&jpeg).unwrap();
+            dec.do_fancy_upsampling(false);
+            let mut started = dec.rgb().unwrap();
+            let mut rgb = vec![0u8; w * h * 3];
+            started.read_scanlines_into(&mut rgb).unwrap();
+            started.finish().unwrap();
+
+            let mut started = Decompress::new_mem(&jpeg).unwrap().raw().unwrap();
+            let ((v, ys), (cv, cs)) = (started.raw_plane(0), started.raw_plane(1));
+            assert_eq!((v, cv), (samp.1 as usize, 1));
+            let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+            let mut planes = <[Vec<u8>; 3]>::default();
+            for _ in 0..h.div_ceil(v * 8) {
+                started.read_raw_chunk(&mut planes).unwrap();
+                y.extend_from_slice(&planes[0][..v * 8 * ys]);
+                cb.extend_from_slice(&planes[1][..8 * cs]);
+                cr.extend_from_slice(&planes[2][..8 * cs]);
+            }
+            let past = started.read_raw_chunk(&mut planes).unwrap_err();
+            assert_eq!(past.kind(), std::io::ErrorKind::UnexpectedEof);
+            started.finish().unwrap();
+            for (i, px) in rgb.as_chunks::<3>().0.iter().enumerate() {
+                let (x, r) = (i % w, i / w);
+                let c = r / v * cs + x / 2;
+                let want = crate::resize_kernel::ycc_to_rgb(y[r * ys + x], cb[c], cr[c]);
+                assert_eq!(*px, want, "{samp:?} {w}x{h} pixel ({x}, {r})");
+            }
+        }
+    }
+}
+
+/// Every kernel path matches the RGB-row decode byte for byte across
+/// the samplings: serial and fused, raw-decoded (4:2:0 and 4:2:2 on
+/// kernels with YCbCr staging) or not, and the raw path's spawn-failure
+/// fallback, which runs the fused worker inline.
+#[test]
+fn kernel_paths_match_rgb_rows_across_samplings() {
+    use crate::resize_kernel::RowKernel;
+    if !fuse_kernel_available() {
+        return;
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAIL_SPAWN.with(|f| f.set(false));
+            NO_RAW.with(|f| f.set(false));
+        }
+    }
+    let _reset = Reset;
+    for samp in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+        for (w, h) in [(799, 601), (1023, 677), (333, 999)] {
+            let jpeg = make_sampled_jpeg(w, h, samp);
+            NO_RAW.with(|f| f.set(true));
+            let (want, want_px) = (run_jpeg(&jpeg, None), run_jpeg_pixels(&jpeg, Fuse::Off));
+            NO_RAW.with(|f| f.set(false));
+            // Only a raw decode survives a failed spawn fused.
+            let raw = matches!(samp, (2, 1) | (2, 2)) && FuseKernel::ycc_h2();
+            for blocked in [false, true].into_iter().take(1 + usize::from(raw)) {
+                FAIL_SPAWN.with(|f| f.set(blocked));
+                let what = format!("{samp:?} {w}x{h} spawn blocked: {blocked}");
+                assert_eq!(want, run_jpeg(&jpeg, None), "serial jpegli {what}");
+                assert_eq!(want, run_jpeg(&jpeg, Some(80.0)), "fused jpegli {what}");
+                let px = run_jpeg_pixels(&jpeg, Fuse::Off);
+                assert_eq!(want_px, px, "serial pixels {what}");
+                let px = run_jpeg_pixels(&jpeg, Fuse::Pixels);
+                assert_eq!(want_px, px, "fused pixels {what}");
+            }
+            FAIL_SPAWN.with(|f| f.set(false));
+        }
+    }
+}
+
 #[test]
 fn fused_path_is_deterministic_and_valid() {
     if !fuse_kernel_available() {

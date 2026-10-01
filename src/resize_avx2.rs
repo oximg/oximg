@@ -24,7 +24,10 @@
 //! the cross-arch accuracy comparison sees; the f64 ground-truth tests
 //! hold both to the same ≤2 LSB envelope.
 
-use crate::resize_kernel::{RowKernel, Windows, clamp_u16, resize_u16, stage_x3_u8_words};
+use crate::resize_kernel::{
+    RowKernel, Windows, YCC_FIX_B, YCC_FIX_GB, YCC_FIX_GR, YCC_FIX_R, clamp_u16, resize_u16,
+    stage_x3_u8_words, ycc_stride,
+};
 use anyhow::Result;
 
 /// Marker type implementing [`RowKernel`] with AVX2+FMA intrinsics.
@@ -61,6 +64,16 @@ impl RowKernel for Avx2 {
                 stage_x3_u8_words(row, lut, stage, w, true)
             }
         }
+    }
+    fn ycc_h2() -> bool {
+        vbmi_detected()
+    }
+    // SAFETY (both): ycc_h2() is the VBMI check, verified by the caller.
+    unsafe fn ycc_terms_h2(cb: &[u8], cr: &[u8], w: usize, terms: &mut [u8]) {
+        unsafe { ycc_terms_h2_vbmi(cb, cr, w, terms) }
+    }
+    unsafe fn stage_ycc_h2(y: &[u8], terms: &[u8], lut: &[f32; 256], stage: &mut [f32], w: usize) {
+        unsafe { stage_ycc_h2_vbmi(y, terms, lut, stage, w) }
     }
     unsafe fn stage_x4(row: &[u16], stage: &mut [f32]) {
         unsafe { stage_row_x4(row, stage) }
@@ -306,10 +319,29 @@ unsafe fn stage_row_x3_u8_vbmi(row: &[u8], lut: &[f32; 256], stage: &mut [f32], 
         }
         e
     };
-    // Output register k, dword i <- [lo[16k + i], hi[16k + i], 0, 0]
-    // (indices >= 64 select from the second source, `hi`). `pix` keeps
-    // those two bytes and zeroes the rest, including every X dword
-    // (i % 4 == 3) — its looked-up value is a table entry, not 0.
+    let mut x = 0usize;
+    unsafe {
+        let expand = _mm512_loadu_si512(EXPAND.as_ptr().cast());
+        let pair = pair_indices();
+        let out = stage.as_mut_ptr();
+        while x + 16 <= w {
+            let src =
+                _mm512_maskz_loadu_epi8(0x0000_FFFF_FFFF_FFFF, row.as_ptr().add(x * 3).cast());
+            let idx = _mm512_permutexvar_epi8(expand, src);
+            stage_rgbx16(&tlo, &thi, &pair, idx, out.add(x * 4));
+            x += 16;
+        }
+        stage_x3_u8_words(&row[x * 3..], lut, &mut stage[x * 4..], w - x, true);
+    }
+}
+
+/// [`stage_rgbx16`]'s pairing indices: output register k, dword i <-
+/// [lo[16k + i], hi[16k + i], 0, 0] (indices >= 64 select from the second
+/// source, `hi`).
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+fn pair_indices() -> [std::arch::x86_64::__m512i; 4] {
+    use std::arch::x86_64::*;
     const PAIR: [[u8; 64]; 4] = {
         let mut t = [[0u8; 64]; 4];
         let mut k = 0;
@@ -324,29 +356,186 @@ unsafe fn stage_row_x3_u8_vbmi(row: &[u8], lut: &[f32; 256], stage: &mut [f32], 
         }
         t
     };
+    // SAFETY: each load reads one 64-byte table row.
+    PAIR.map(|p| unsafe { _mm512_loadu_si512(p.as_ptr().cast()) })
+}
+
+/// Stage sixteen pixels given as RGBX table indices (`idx`, X bytes
+/// arbitrary) as RGBX f32 through the split table: look up both byte
+/// halves, re-pair them into u16 dwords, convert, and store 64 f32 at
+/// `out`. The `pix` mask keeps each channel's two bytes and zeroes the
+/// rest, including every X dword — its looked-up value is a table entry,
+/// not 0.
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+// SAFETY: requires AVX-512 F/BW/VBMI and 64 writable f32 at `out`.
+unsafe fn stage_rgbx16(
+    tlo: &[std::arch::x86_64::__m512i; 4],
+    thi: &[std::arch::x86_64::__m512i; 4],
+    pair: &[std::arch::x86_64::__m512i; 4],
+    idx: std::arch::x86_64::__m512i,
+    out: *mut f32,
+) {
+    use std::arch::x86_64::*;
     let pix: __mmask64 = 0x0333_0333_0333_0333;
-    let mut x = 0usize;
+    let top = _mm512_movepi8_mask(idx);
+    let lo = lookup_bytes(tlo, idx, top);
+    let hi = lookup_bytes(thi, idx, top);
+    for (k, p) in pair.iter().enumerate() {
+        let d = _mm512_maskz_permutex2var_epi8(pix, lo, *p, hi);
+        // SAFETY: store k covers out[16k, 16k + 16) within the 64.
+        unsafe { _mm512_storeu_ps(out.add(16 * k), _mm512_cvtepi32_ps(d)) };
+    }
+}
+
+/// [`RowKernel::ycc_terms_h2`] for 64 pixels per step. libjpeg's
+/// 16-bit fixed-point terms, computed exactly in 16-bit lanes:
+/// FIX(1.402) = 65536 + 26345 and FIX(1.772) = 2 * 65536 - 14942 leave
+/// one rounded product each (the high product plus the low product's
+/// rounding bit), and G's two products are summed exactly by madd with
+/// -FIX(0.71414) = -65536 + 18734. Each term is stored as saturating
+/// byte addends (its positive and negative parts, planes R+, R-, G+, G-,
+/// B+, B- of `ycc_stride(w)` bytes each), replicated over each pixel
+/// pair, so a luma row costs two saturating byte ops per channel; the
+/// saturation is exactly libjpeg's range limit since the two addends
+/// never both apply.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+// SAFETY: requires AVX-512 F/BW/VBMI, `cb` and `cr` at least
+// `w.div_ceil(2)` long and `terms.len() >= 6 * ycc_stride(w)`. Block x
+// (a multiple of 64 below w) loads chroma [x / 2, x / 2 + 32) masked to
+// `w.div_ceil(2)`, and stores bytes [k * s + x, k * s + x + 64), within
+// plane k < 6 of `s = ycc_stride(w)` bytes.
+unsafe fn ycc_terms_h2_vbmi(cb: &[u8], cr: &[u8], w: usize, terms: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let s = ycc_stride(w);
+    let cw = w.div_ceil(2);
+    debug_assert!(cb.len() >= cw && cr.len() >= cw && terms.len() >= 6 * s);
+    // Pixel p of a block takes chroma word p / 2's low byte.
+    const DUP: [u8; 64] = {
+        let mut t = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            t[i] = (2 * (i / 2)) as u8;
+            i += 1;
+        }
+        t
+    };
+    const HALF: i32 = 1 << 15;
+    // madd pairs [cb, cr] with [-FIX(0.34414), 65536 - FIX(0.71414)].
+    const KG: i32 = (((65536 - YCC_FIX_GR) as u32) << 16 | (-YCC_FIX_GB) as u16 as u32) as i32;
     unsafe {
-        let expand = _mm512_loadu_si512(EXPAND.as_ptr().cast());
-        let mut pair = [_mm512_setzero_si512(); 4];
-        for (v, p) in pair.iter_mut().zip(&PAIR) {
-            *v = _mm512_loadu_si512(p.as_ptr().cast());
-        }
-        let out = stage.as_mut_ptr();
-        while x + 16 <= w {
-            let src =
-                _mm512_maskz_loadu_epi8(0x0000_FFFF_FFFF_FFFF, row.as_ptr().add(x * 3).cast());
-            let idx = _mm512_permutexvar_epi8(expand, src);
-            let top = _mm512_movepi8_mask(idx);
-            let lo = lookup_bytes(&tlo, idx, top);
-            let hi = lookup_bytes(&thi, idx, top);
-            for (k, p) in pair.iter().enumerate() {
-                let d = _mm512_maskz_permutex2var_epi8(pix, lo, *p, hi);
-                _mm512_storeu_ps(out.add((x + 4 * k) * 4), _mm512_cvtepi32_ps(d));
+        let dup = _mm512_loadu_si512(DUP.as_ptr().cast());
+        let c128 = _mm512_set1_epi16(128);
+        let zero = _mm512_setzero_si512();
+        let kg = _mm512_set1_epi32(KG);
+        let half = _mm512_set1_epi32(HALF);
+        // (a * k + 32768) >> 16.
+        let mulround = |a: __m512i, k: i32| {
+            let k = _mm512_set1_epi16(k as i16);
+            let hi = _mm512_mulhi_epi16(a, k);
+            _mm512_add_epi16(hi, _mm512_srli_epi16::<15>(_mm512_mullo_epi16(a, k)))
+        };
+        let widen = |c: &[u8], at: usize, m: __mmask64| {
+            let v = _mm512_maskz_loadu_epi8(m, c.as_ptr().add(at).cast());
+            _mm512_sub_epi16(_mm512_cvtepu8_epi16(_mm512_castsi512_si256(v)), c128)
+        };
+        let out = terms.as_mut_ptr();
+        let mut x = 0;
+        while x < w {
+            let c = x / 2;
+            let n = (cw - c).min(32);
+            let m = (u64::MAX >> (64 - n)) as __mmask64;
+            let (cb, cr) = (widen(cb, c, m), widen(cr, c, m));
+            let r = _mm512_add_epi16(cr, mulround(cr, YCC_FIX_R - 65536));
+            let b = _mm512_add_epi16(_mm512_add_epi16(cb, cb), mulround(cb, YCC_FIX_B - 131072));
+            let gw = |v: __m512i| {
+                _mm512_srai_epi32::<16>(_mm512_add_epi32(_mm512_madd_epi16(v, kg), half))
+            };
+            let g = _mm512_packs_epi32(
+                gw(_mm512_unpacklo_epi16(cb, cr)),
+                gw(_mm512_unpackhi_epi16(cb, cr)),
+            );
+            let g = _mm512_sub_epi16(g, cr);
+            for (k, t) in [r, g, b].into_iter().enumerate() {
+                let pos = _mm512_max_epi16(t, zero);
+                let neg = _mm512_max_epi16(_mm512_sub_epi16(zero, t), zero);
+                let at = out.add(2 * k * s + x);
+                _mm512_storeu_si512(at.cast(), _mm512_permutexvar_epi8(dup, pos));
+                _mm512_storeu_si512(at.add(s).cast(), _mm512_permutexvar_epi8(dup, neg));
             }
-            x += 16;
+            x += 64;
         }
-        stage_x3_u8_words(&row[x * 3..], lut, &mut stage[x * 4..], w - x, true);
+    }
+}
+
+/// [`RowKernel::stage_ycc_h2`]: per 64 pixels, R, G and B bytes from the
+/// luma bytes and the chroma row's saturating addends, interleaved into
+/// RGBX index order, then [`stage_rgbx16`] per sixteen pixels.
+#[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
+// SAFETY: requires AVX-512 F/BW/VBMI, `y.len() >= w`, `terms` as written by
+// `ycc_terms_h2_vbmi` for `w` and `stage.len() >= 4 * w`. Full blocks load
+// luma [x, x + 64) <= w and store stage [4x, 4x + 256) <= 4w; the last
+// partial block loads luma masked to w and stages into a local buffer,
+// of which the 4 (w - x) real f32 are copied out. Term loads stay within
+// their plane (every block x < w lies below `ycc_stride(w)`).
+unsafe fn stage_ycc_h2_vbmi(y: &[u8], terms: &[u8], lut: &[f32; 256], stage: &mut [f32], w: usize) {
+    use std::arch::x86_64::*;
+    let s = ycc_stride(w);
+    debug_assert!(y.len() >= w && terms.len() >= 6 * s && stage.len() >= 4 * w);
+    let (tlo, thi) = byte_tables(lut);
+    // Group h, byte 4p + c <- channel c of block pixel 16h + p: R and G
+    // from one two-source permute (G at indices >= 64), then B's lanes
+    // (mask `kb`) from a second.
+    const SEL: [[[u8; 64]; 2]; 4] = {
+        let mut t = [[[0u8; 64]; 2]; 4];
+        let mut h = 0;
+        while h < 4 {
+            let mut p = 0;
+            while p < 16 {
+                let q = (16 * h + p) as u8;
+                t[h][0][4 * p] = q;
+                t[h][0][4 * p + 1] = 64 + q;
+                t[h][1][4 * p + 2] = q;
+                p += 1;
+            }
+            h += 1;
+        }
+        t
+    };
+    let kb: __mmask64 = 0x4444_4444_4444_4444;
+    unsafe {
+        let sel = SEL.map(|g| g.map(|t| _mm512_loadu_si512(t.as_ptr().cast())));
+        let pair = pair_indices();
+        let t = terms.as_ptr();
+        let block = |yv: __m512i, x: usize, out: *mut f32| {
+            let ch = |k: usize| {
+                let pos = _mm512_loadu_si512(t.add(2 * k * s + x).cast());
+                let neg = _mm512_loadu_si512(t.add((2 * k + 1) * s + x).cast());
+                _mm512_subs_epu8(_mm512_adds_epu8(yv, pos), neg)
+            };
+            let (r, g, b) = (ch(0), ch(1), ch(2));
+            for (h, sel) in sel.iter().enumerate() {
+                let rg = _mm512_permutex2var_epi8(r, sel[0], g);
+                let idx = _mm512_mask_permutexvar_epi8(rg, kb, sel[1], b);
+                stage_rgbx16(&tlo, &thi, &pair, idx, out.add(64 * h));
+            }
+        };
+        let mut x = 0;
+        while x + 64 <= w {
+            block(
+                _mm512_loadu_si512(y.as_ptr().add(x).cast()),
+                x,
+                stage.as_mut_ptr().add(4 * x),
+            );
+            x += 64;
+        }
+        if x < w {
+            let n = w - x;
+            let yv = _mm512_maskz_loadu_epi8(u64::MAX >> (64 - n), y.as_ptr().add(x).cast());
+            let mut tmp = [0f32; 256];
+            block(yv, x, tmp.as_mut_ptr());
+            stage[4 * x..4 * w].copy_from_slice(&tmp[..4 * n]);
+        }
     }
 }
 
@@ -976,5 +1165,52 @@ mod tests {
             unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len() * 2) };
         assert!(resize_u16_avx2(src_bytes, 2, 2, dst_bytes, 0, 1, 3).is_err());
         assert!(resize_u16_avx2(src_bytes, 0, 2, dst_bytes, 1, 1, 3).is_err());
+    }
+
+    /// The fused YCbCr staging against libjpeg's replicating conversion
+    /// (`ycc_to_rgb`) plus the portable RGB staging, bit for bit: every
+    /// (Cb, Cr) pair, luma codes around both clamps, and widths around
+    /// the 64-pixel block including odd ones.
+    #[test]
+    fn vbmi_ycc_staging_matches_rgb() {
+        if !vbmi_detected() {
+            eprintln!("skipping: host lacks avx512f+bw+vbmi");
+            return;
+        }
+        let mut seed = 0x9e37_79b9u32;
+        let lut: [f32; 256] = std::array::from_fn(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 16) as f32
+        });
+        let check = |y: &[u8], cb: &[u8], cr: &[u8], w: usize| {
+            let rgb: Vec<u8> = (0..w)
+                .flat_map(|x| crate::resize_kernel::ycc_to_rgb(y[x], cb[x / 2], cr[x / 2]))
+                .collect();
+            let mut want = vec![1.0f32; 4 * w];
+            let mut got = vec![2.0f32; 4 * w];
+            let mut terms = vec![0u8; 6 * ycc_stride(w)];
+            // SAFETY: vbmi_detected() checked; lengths as required.
+            unsafe {
+                stage_x3_u8_words(&rgb, &lut, &mut want, w, true);
+                ycc_terms_h2_vbmi(cb, cr, w, &mut terms);
+                stage_ycc_h2_vbmi(y, &terms, &lut, &mut got, w);
+            }
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                if i % 4 != 3 {
+                    assert_eq!(a.to_bits(), b.to_bits(), "width {w} float {i}");
+                }
+            }
+        };
+        let cb: Vec<u8> = (0..=255).collect();
+        for c in 0..=255u8 {
+            let y: Vec<u8> = (0..512).map(|x| (x * 37 + c as usize * 11) as u8).collect();
+            check(&y, &cb, &[c; 256], 512);
+        }
+        for w in (1..=130usize).chain([255, 257, 2039, 2040]) {
+            let y: Vec<u8> = (0..w).map(|x| (x * 13 + w) as u8).collect();
+            let cb: Vec<u8> = (0..w.div_ceil(2)).map(|x| (x * 29 + 3) as u8).collect();
+            let cr: Vec<u8> = (0..w.div_ceil(2)).map(|x| (x * 53 + 7) as u8).collect();
+            check(&y, &cb, &cr, w);
+        }
     }
 }

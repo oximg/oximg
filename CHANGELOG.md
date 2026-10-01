@@ -10,6 +10,28 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **4:2:0 and 4:2:2 JPEGs decoded at full scale are read as raw YCbCr**
+  on x86 CPUs with AVX-512 VBMI (AMD Zen 4 and later, Intel Ice Lake
+  and later). libjpeg no longer upsamples the chroma or converts the
+  color. Instead, the resize kernel replicates the chroma, converts to
+  RGB and applies the sRGB-to-linear lookup in one pass while staging
+  each row. Serial and fused decodes both take this path. Output is
+  bit-identical.
+
+  Measured on DIV2K, Zen 4, fit 512 q80, at the default full decode.
+  Each figure is the change in user cycles and instructions per
+  request for the h75 and q92 sets:
+
+  | server | cycles | instructions |
+  |---|---|---|
+  | one logical CPU | -3.0%, -3.2% | -5.4%, -4.5% |
+  | fused, on one SMT pair | -3.0%, -2.1% | -5.4%, -4.4% |
+
+  Sources decoded at a reduced DCT scale (`OXIMG_DCT_MARGIN`) are
+  unchanged.
+
 ## [0.13.0] - 2026-10-01
 
 A JPEG CPU release ([#64]). 0.11.0 turned shrink-on-load off for
