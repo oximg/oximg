@@ -65,6 +65,26 @@ pub fn decode_avif(data: &[u8]) -> Result<(Vec<u8>, usize, usize, usize)> {
 
 /// Like [`decode_avif`], but reuses `out` as the pixel buffer.
 pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize, usize)> {
+    decode_into(data, out, true)
+}
+
+/// Like [`decode_avif_into`], but an alpha item that is 255 everywhere
+/// gives RGB8, the same as no alpha item. The pipeline drops an alpha
+/// that no pixel uses (#70). Reading the alpha plane before the RGBA
+/// expansion is cheaper than expanding and compacting back, and it
+/// scans a quarter of the bytes.
+pub(crate) fn decode_avif_frame_into(
+    data: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(usize, usize, usize)> {
+    decode_into(data, out, false)
+}
+
+fn decode_into(
+    data: &[u8],
+    out: &mut Vec<u8>,
+    keep_opaque_alpha: bool,
+) -> Result<(usize, usize, usize)> {
     let avif = match read_avif_container(data) {
         Ok(a) => a,
         Err(e) => {
@@ -88,6 +108,9 @@ pub fn decode_avif_into(data: &[u8], out: &mut Vec<u8>) -> Result<(usize, usize,
 
     let alpha = with_decoded_picture(alpha_item, |pic| picture_to_alpha(pic, w, h))
         .context("decode alpha item")?;
+    if !keep_opaque_alpha && alpha.iter().all(|&a| a == 255) {
+        return Ok((w, h, 3));
+    }
     // Expand RGB to RGBA in place, back to front (writes at i*4.. never
     // overlap reads at j*3..j*3+3 for j < i); every output position is
     // written, so growth does not need to re-zero.
