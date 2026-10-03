@@ -898,3 +898,74 @@ fn jpeg_chroma_is_replicated_when_reducing_and_filtered_at_one_to_one() {
         "reduced chroma amplitude {ar:.1} vs 1:1 {a11:.1}: expected replication (~2x)"
     );
 }
+
+/// #70: an RGBA PNG whose alpha is 255 everywhere is served exactly as
+/// the same pixels stored as RGB, so OXIMG_PNG_QUANTIZE applies to it.
+/// Through the real binary, with a resize, for PNG and WebP output.
+#[test]
+fn opaque_rgba_png_is_served_like_rgb() {
+    let (w, h) = (160usize, 120usize);
+    let rgb: Vec<u8> = (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            let n = (x * 37 + y * 101) ^ (x * y);
+            [(x * 3) as u8, (y * 5 + n % 7) as u8, (n % 251) as u8]
+        })
+        .collect();
+    let rgba: Vec<u8> = rgb
+        .chunks(3)
+        .flat_map(|p| [p[0], p[1], p[2], 255])
+        .collect();
+    let encode = |color: png::ColorType, data: &[u8]| {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+        writer.finish().unwrap();
+        out
+    };
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-opaque-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("rgb.png"), encode(png::ColorType::Rgb, &rgb)).unwrap();
+    std::fs::write(dir.join("rgba.png"), encode(png::ColorType::Rgba, &rgba)).unwrap();
+    let get = |path: &str, tag: &str| -> Vec<u8> {
+        let out = dir.join(tag);
+        let (code, v) = run(&[
+            "--images-dir",
+            dir.to_str().unwrap(),
+            "--env",
+            "OXIMG_PNG_QUANTIZE=1",
+            "get",
+            path,
+            "--expect",
+            "200",
+            "--write",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{v}");
+        std::fs::read(&out).unwrap()
+    };
+    let (png_rgba, png_rgb) = (
+        get("/resize/97/97/rgba.png", "a.png"),
+        get("/resize/97/97/rgb.png", "b.png"),
+    );
+    let (webp_rgba, webp_rgb) = (
+        get("/resize/97/97/rgba.png@webp", "a.webp"),
+        get("/resize/97/97/rgb.png@webp", "b.webp"),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(png_rgba == png_rgb, "PNG: opaque RGBA must serve like RGB");
+    assert!(
+        webp_rgba == webp_rgb,
+        "WebP: opaque RGBA must serve like RGB"
+    );
+    let color = png::Decoder::new(std::io::Cursor::new(&png_rgba))
+        .read_info()
+        .unwrap()
+        .info()
+        .color_type;
+    assert_eq!(color, png::ColorType::Indexed, "quantization must apply");
+}

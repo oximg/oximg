@@ -146,7 +146,7 @@ fn first_frame_into_chunk8(
     Ok((
         src_w,
         src_h,
-        compact_if_opaque(&mut s.chunk8, src_w * src_h),
+        compact_if_opaque(&mut s.chunk8, src_w * src_h, 4),
     ))
 }
 
@@ -547,27 +547,4 @@ fn draw_frame(canvas: &mut [u8], canvas_w: usize, canvas_h: usize, f: &Frame<'_>
         }
     }
     changed
-}
-
-/// Drop the alpha channel when no pixel uses it, and report the channel
-/// count now in `chunk8`. Worth the scan: most GIFs are fully opaque,
-/// and carrying a constant-255 channel costs a third more work in both
-/// the resize and the encoder, plus an alpha plane in the output.
-///
-/// Compaction is a forward pass — pixel i writes 3i..3i+3 after reading
-/// 4i..4i+3 — so it never clobbers unread input, the same trick as
-/// `flatten_alpha_in_out8`.
-fn compact_if_opaque(chunk8: &mut [u8], pixels: usize) -> usize {
-    if chunk8[..pixels * 4]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .any(|px| px[3] != 255)
-    {
-        return 4;
-    }
-    for i in 0..pixels {
-        chunk8.copy_within(i * 4..i * 4 + 3, i * 3);
-    }
-    3
 }
