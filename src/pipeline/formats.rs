@@ -162,6 +162,7 @@ pub(super) fn process_png<R: std::io::Read>(
         }
         png::ColorType::Indexed => anyhow::bail!("unexpanded indexed PNG"),
     };
+    let channels = compact_if_opaque(&mut s.chunk8, src_w * src_h, channels);
 
     let t_decode = t0.elapsed();
     let t1 = std::time::Instant::now();
@@ -220,8 +221,12 @@ pub(super) fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
 
 /// Drop the alpha channel when no pixel uses it, and return the channel
 /// count left in `chunk8`. Worth the scan: most GIFs are fully opaque,
-/// and carrying a constant-255 channel costs a third more work in both
-/// the resize and the encoder, plus an alpha plane in the output.
+/// and so are many RGBA PNGs from screenshot tools and canvas exports
+/// (#70). Carrying a constant-255 channel costs a third more work in
+/// both the resize and the encoder, plus an alpha plane in the output,
+/// and it keeps PNG output off the quantizer. The compacted frame
+/// encodes to the same bytes as a source without alpha. It does not
+/// take the fused RGB PNG path, which needs an RGB source.
 /// A frame with fewer than four channels is left as it is.
 ///
 /// The scan stops at the first alpha below 255. Compaction is a forward

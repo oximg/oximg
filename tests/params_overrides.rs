@@ -303,6 +303,208 @@ fn png_quantize_leaves_alpha_sources_lossless() {
     );
 }
 
+/// 160x120 RGB with edges and noise-like detail, so a resize has
+/// rounding to do.
+fn detail_rgb(w: usize, h: usize) -> Vec<u8> {
+    (0..w * h)
+        .flat_map(|i| {
+            let (x, y) = (i % w, i / w);
+            let n = (x * 37 + y * 101) ^ (x * y);
+            [(x * 3) as u8, (y * 5 + n % 7) as u8, (n % 251) as u8]
+        })
+        .collect()
+}
+
+/// `px` with an alpha of 255 appended to every `ch`-sample pixel.
+fn with_opaque_alpha(px: &[u8], ch: usize) -> Vec<u8> {
+    px.chunks(ch)
+        .flat_map(|p| p.iter().copied().chain([255]))
+        .collect()
+}
+
+/// Encode a PNG; `plte` is the palette and, if non-empty, its tRNS.
+fn png_bytes(
+    w: usize,
+    h: usize,
+    color: png::ColorType,
+    depth: png::BitDepth,
+    data: &[u8],
+    plte: Option<(&[u8], &[u8])>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+    enc.set_color(color);
+    enc.set_depth(depth);
+    if let Some((palette, trns)) = plte {
+        enc.set_palette(palette.to_vec());
+        if !trns.is_empty() {
+            enc.set_trns(trns.to_vec());
+        }
+    }
+    let mut writer = enc.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+/// A decoded frame keeps its alpha channel only if a pixel uses it
+/// (#70). Screenshot tools and canvas exports often write RGBA with
+/// every alpha at 255. Such a PNG source, of any color type, must give
+/// the same bytes as its twin without alpha, for every output format
+/// and resize mode, so PNG quantization applies to it.
+#[test]
+fn opaque_alpha_sources_encode_like_their_alpha_free_twin() {
+    use png::{BitDepth, ColorType};
+    let (w, h) = (160usize, 120usize);
+    let rgb = detail_rgb(w, h);
+    let gray: Vec<u8> = rgb.chunks(3).map(|p| p[1]).collect();
+    let to16 = |px: &[u8]| -> Vec<u8> { px.iter().flat_map(|&v| [v, v]).collect() };
+    let png = |color, depth, data: &[u8], plte| png_bytes(w, h, color, depth, data, plte);
+    // A 64-entry palette; tRNS at 255 for every entry says "opaque".
+    let palette: Vec<u8> = (0..64u8)
+        .flat_map(|i| [i * 4, 255 - i * 4, i * 2])
+        .collect();
+    let indices: Vec<u8> = (0..w * h)
+        .map(|i| ((i % w) / 3 + (i / w) / 5) as u8 % 64)
+        .collect();
+    let rgb_png = png(ColorType::Rgb, BitDepth::Eight, &rgb, None);
+
+    let pairs: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        (
+            "PNG RGBA",
+            png(
+                ColorType::Rgba,
+                BitDepth::Eight,
+                &with_opaque_alpha(&rgb, 3),
+                None,
+            ),
+            rgb_png.clone(),
+        ),
+        (
+            "PNG gray+alpha",
+            png(
+                ColorType::GrayscaleAlpha,
+                BitDepth::Eight,
+                &with_opaque_alpha(&gray, 1),
+                None,
+            ),
+            png(ColorType::Grayscale, BitDepth::Eight, &gray, None),
+        ),
+        (
+            "PNG 16-bit RGBA",
+            png(
+                ColorType::Rgba,
+                BitDepth::Sixteen,
+                &to16(&with_opaque_alpha(&rgb, 3)),
+                None,
+            ),
+            png(ColorType::Rgb, BitDepth::Sixteen, &to16(&rgb), None),
+        ),
+        (
+            "PNG palette+tRNS",
+            png(
+                ColorType::Indexed,
+                BitDepth::Eight,
+                &indices,
+                Some((&palette, &[255; 64])),
+            ),
+            png(
+                ColorType::Indexed,
+                BitDepth::Eight,
+                &indices,
+                Some((&palette, &[])),
+            ),
+        ),
+    ];
+
+    let at = |src: &[u8], output, size: u32, linear: bool, quantize: Option<bool>| {
+        run(
+            src,
+            &Params {
+                max_width: size,
+                max_height: size,
+                output: Some(output),
+                linear_light: Some(linear),
+                png_quantize: quantize,
+                ..Params::default()
+            },
+        )
+    };
+    // Per pair: 4 encodes (PNG, quantized PNG, WebP, JPEG) x 3 boxes
+    // (200 keeps the source size; 97 and 53 resize it) x 2 resize modes.
+    let mut cells = 0;
+    for (name, opaque, twin) in &pairs {
+        for (output, quantize) in [
+            (ImageFormat::Png, None),
+            (ImageFormat::Png, Some(true)),
+            (ImageFormat::Webp, None),
+            (ImageFormat::Jpeg, None),
+        ] {
+            for size in [200, 97, 53] {
+                for linear in [true, false] {
+                    let (a, b) = (
+                        at(opaque, output, size, linear, quantize),
+                        at(twin, output, size, linear, quantize),
+                    );
+                    assert!(
+                        a == b,
+                        "{name} must encode like its alpha-free twin: {output:?} box {size} \
+                         linear {linear} quantize {quantize:?}: {} vs {} bytes",
+                        a.len(),
+                        b.len()
+                    );
+                    cells += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(cells, pairs.len() * 4 * 3 * 2);
+    let quantized = at(&pairs[0].1, ImageFormat::Png, 97, true, Some(true));
+    assert_eq!(png_color_type(&quantized), ColorType::Indexed);
+}
+
+/// The other half of the contract: one alpha below 255, even on the
+/// last pixel, keeps the channel, so the source stays lossless RGBA
+/// and the quantize knob does not apply.
+#[test]
+fn one_transparent_pixel_keeps_the_alpha_channel() {
+    let (w, h) = (160usize, 120usize);
+    let mut rgba = with_opaque_alpha(&detail_rgb(w, h), 3);
+    *rgba.last_mut().unwrap() = 254;
+    let src = png_bytes(
+        w,
+        h,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &rgba,
+        None,
+    );
+    for quantize in [None, Some(true)] {
+        let out = run(
+            &src,
+            &Params {
+                max_width: 97,
+                max_height: 97,
+                png_quantize: quantize,
+                ..base(ImageFormat::Png)
+            },
+        );
+        assert_eq!(
+            png_color_type(&out),
+            png::ColorType::Rgba,
+            "quantize {quantize:?}"
+        );
+    }
+}
+
+fn png_color_type(png_bytes: &[u8]) -> png::ColorType {
+    png::Decoder::new(std::io::Cursor::new(png_bytes))
+        .read_info()
+        .unwrap()
+        .info()
+        .color_type
+}
+
 /// Quantization must not cost the ICC profile: the indexed encode
 /// carries the source profile through like the lossless one does.
 #[test]
