@@ -8,7 +8,10 @@
 
 mod common;
 
-use common::{corner_base, dims_of, fixture, jpeg_with_orientation, png_icc, png_with_icc};
+use common::{
+    corner_base, dims_of, fixture, jpeg_with_orientation, png_icc, png_with_icc,
+    webp_with_opaque_alph,
+};
 use oximg::pipeline::{self, ImageFormat, Params, PngEffort};
 
 fn run(src: &[u8], p: &Params) -> Vec<u8> {
@@ -349,7 +352,7 @@ fn png_bytes(
 
 /// A decoded frame keeps its alpha channel only if a pixel uses it
 /// (#70). Screenshot tools and canvas exports often write RGBA with
-/// every alpha at 255. Such a PNG source, of any color type, must give
+/// every alpha at 255. Such a source, in any source format, must give
 /// the same bytes as its twin without alpha, for every output format
 /// and resize mode, so PNG quantization applies to it.
 #[test]
@@ -368,6 +371,14 @@ fn opaque_alpha_sources_encode_like_their_alpha_free_twin() {
         .map(|i| ((i % w) / 3 + (i / w) / 5) as u8 % 64)
         .collect();
     let rgb_png = png(ColorType::Rgb, BitDepth::Eight, &rgb, None);
+    let lossy_webp = run(
+        &rgb_png,
+        &Params {
+            max_width: 1000,
+            max_height: 1000,
+            ..base(ImageFormat::Webp)
+        },
+    );
 
     let pairs: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
         (
@@ -414,6 +425,11 @@ fn opaque_alpha_sources_encode_like_their_alpha_free_twin() {
                 &indices,
                 Some((&palette, &[])),
             ),
+        ),
+        (
+            "WebP with ALPH",
+            webp_with_opaque_alph(&lossy_webp, w, h),
+            lossy_webp.clone(),
         ),
     ];
 
