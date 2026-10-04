@@ -703,8 +703,8 @@ notice. The `@oximg` npm package is a name reservation.
 [Apache-2.0](LICENSE).
 
 The compiled binary statically links third-party code (jpegli/libjxl —
-BSD-3-Clause, Highway — Apache-2.0, mozjpeg/libjpeg-turbo — IJG). Their
-license texts and required notices are bundled in
-[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md), generated with
-`cargo about`. Dependency licensing is gated in CI by `cargo deny`
+BSD-3-Clause, Highway — Apache-2.0, libwebp — BSD-3-Clause,
+mozjpeg/libjpeg-turbo — IJG). Their license texts and required
+notices are bundled in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md),
+generated with `cargo about`. Dependency licensing is gated in CI by `cargo deny`
 ([deny.toml](deny.toml)).
