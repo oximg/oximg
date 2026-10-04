@@ -85,7 +85,8 @@ The [CI workflow](.github/workflows/ci.yml) gates every PR on:
   it:
 
   ```sh
-  cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+  cargo install cargo-about@0.9.2 --locked --features cli   # CI pins 0.9.2
+  cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md
   ```
 
 The short local loop that catches most of it:
