@@ -3,6 +3,10 @@
 `oximg` statically links the open-source dependencies listed below. Each is
 reproduced with its license text and copyright notice as required by its terms.
 
+This software is based in part on the work of the Independent JPEG Group.
+(The IJG license asks for this sentence in the documentation that ships
+with the executable.)
+
 This file is generated — do not edit by hand. Regenerate with:
 
     cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md

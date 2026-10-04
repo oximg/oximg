@@ -706,5 +706,7 @@ The compiled binary statically links third-party code (jpegli/libjxl —
 BSD-3-Clause, Highway — Apache-2.0, libwebp — BSD-3-Clause,
 mozjpeg/libjpeg-turbo — IJG). Their license texts and required
 notices are bundled in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md),
-generated with `cargo about`. Dependency licensing is gated in CI by `cargo deny`
+generated with `cargo about`. The bundle also carries the statements
+some licenses ask for in the documentation, such as the IJG one.
+Dependency licensing is gated in CI by `cargo deny`
 ([deny.toml](deny.toml)).
