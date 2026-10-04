@@ -711,5 +711,7 @@ some licenses ask for in the documentation, such as the IJG one.
 The release archives also carry THIRD-PARTY-LICENSES-rust-std.html,
 the Rust standard library's notices from the toolchain that built
 them, since every Rust binary links the standard library statically.
+THIRD-PARTY-LICENSES.md also carries musl's COPYRIGHT, which the
+static musl builds need.
 Dependency licensing is gated in CI by `cargo deny`
 ([deny.toml](deny.toml)).
