@@ -2,7 +2,7 @@
 # bundle shipped with the binary/crate to satisfy the BSD/MIT/Apache/IJG
 # "reproduce the copyright notice and license text" obligation.
 #
-#   cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+#   cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md
 
 # Licenses we accept in the shipped artifact. Mirrors deny.toml's allow-list
 # plus IJG (mozjpeg / libjpeg-turbo decode path), which must be accepted here
