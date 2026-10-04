@@ -183,6 +183,11 @@ jobs:
           fi
           mkdir "$name"
           cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          # The Rust standard library is linked statically into every
+          # Rust binary. Its notices come with the toolchain that built
+          # this one, so take them from the same sysroot.
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+            "$name/THIRD-PARTY-LICENSES-rust-std.html"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
@@ -221,7 +226,9 @@ jobs:
             apk add --no-cache build-base cmake nasm >/dev/null &&
             cargo build --release --locked &&
             strip target/release/oximg &&
-            sh rubygem/oximg/ext/build.sh'
+            sh rubygem/oximg/ext/build.sh &&
+            cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+              target/release/THIRD-PARTY-LICENSES-rust-std.html'
           # The container builds as root into the mounted workspace, so
           # every artifact it leaves behind is root-owned. Hand the
           # whole tree back before any host-side step touches it.
@@ -257,7 +264,8 @@ jobs:
           set -euo pipefail
           name="oximg-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md \
+            target/release/THIRD-PARTY-LICENSES-rust-std.html "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
