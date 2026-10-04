@@ -708,5 +708,8 @@ mozjpeg/libjpeg-turbo — IJG). Their license texts and required
 notices are bundled in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md),
 generated with `cargo about`. The bundle also carries the statements
 some licenses ask for in the documentation, such as the IJG one.
+The release archives also carry THIRD-PARTY-LICENSES-rust-std.html,
+the Rust standard library's notices from the toolchain that built
+them, since every Rust binary links the standard library statically.
 Dependency licensing is gated in CI by `cargo deny`
 ([deny.toml](deny.toml)).
