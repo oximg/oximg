@@ -713,5 +713,8 @@ the Rust standard library's notices from the toolchain that built
 them, since every Rust binary links the standard library statically.
 THIRD-PARTY-LICENSES.md also carries musl's COPYRIGHT, which the
 static musl builds need.
+The Docker image carries the bundle and the standard library's notices
+under `/usr/share/doc/oximg/`, and SVT-AV1's license and the AOM
+patent license under `/usr/share/doc/svt-av1/`.
 Dependency licensing is gated in CI by `cargo deny`
 ([deny.toml](deny.toml)).
