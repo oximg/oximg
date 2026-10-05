@@ -41,7 +41,9 @@ Gem::Specification.new do |spec|
   # Rust tree. exe/ is empty here and populated at package time for the
   # platform gems — and there is deliberately no spec.executables, since
   # RubyGems would wrap a native binary in a Ruby binstub. Ask
-  # Oximg.executable for the path instead.
+  # Oximg.executable for the path instead. A platform gem also ships the
+  # third-party notices of the code that binary links, taken from the
+  # same release archive.
   #
   # lib/oximg/native/ is the same: empty here, and holding the probe
   # library built from ext/ when a gem bundles one.
@@ -49,7 +51,8 @@ Gem::Specification.new do |spec|
   # when the library is in the gem. Without one, ffi would be a native
   # build on install for nothing.
   library = Dir["lib/oximg/native/liboximg_probe.*"]
-  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + library + ["README.md", "LICENSE"]
+  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + Dir["exe/THIRD-PARTY-LICENSES*"] +
+    library + ["README.md", "LICENSE"]
   spec.require_paths = ["lib"]
   spec.add_dependency "ffi", "~> 1.17" unless library.empty?
 end
