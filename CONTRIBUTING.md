@@ -89,6 +89,11 @@ The [CI workflow](.github/workflows/ci.yml) gates every PR on:
   cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md
   ```
 
+  A dependency that links native code (a `-sys` crate, or C in a build
+  script) also has to name the license file of each library it links.
+  `tests/third_party_notices.rs` fails until it does, and says which
+  library is missing.
+
 The short local loop that catches most of it:
 
 ```sh

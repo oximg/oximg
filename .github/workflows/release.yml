@@ -123,6 +123,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # CI runs the linked-library test on Linux glibc and musl, but it
+      # has no macOS job. Run it here for macOS. It runs before the
+      # build: a test build pulls in the dev-dependencies, links its own
+      # target/release/oximg and replaces the one from cargo build.
+      - name: Linked libraries have notices
+        if: runner.os == 'macOS'
+        run: cargo test --release --locked --test third_party_notices
       - name: Build
         run: cargo build --release --locked
         env:
@@ -194,6 +201,8 @@ jobs:
       # "## musl libc <version>" heading (about.hbs). rustc links the musl
       # it carries (self-contained/libc.a), not Alpine's, so read the
       # version from that file and check the bundle names the same one.
+      # ci.yml runs the same checks, and the linked-library test, on
+      # every PR. They stay here as the last check before the upload.
       - name: Build in Alpine
         run: |
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '

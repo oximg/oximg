@@ -204,13 +204,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The musl checks from the release job run here too, on every PR.
+      # The musl checks from the release job run here too, on every PR,
+      # with the linked-library test before the build (see release.yml).
       # rust:alpine follows Rust stable, so a new musl in rustc fails a
       # PR here instead of a release tag after crates.io has published.
       - name: Build the musl binary in Alpine
         run: |
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
             apk add --no-cache build-base cmake nasm >/dev/null &&
+            cargo test --release --locked --test third_party_notices &&
             cargo build --release --locked &&
             cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
               target/release/THIRD-PARTY-LICENSES-rust-std.html &&
