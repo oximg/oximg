@@ -297,7 +297,7 @@ jobs:
         run: |
           set -euo pipefail
           dist="$GITHUB_WORKSPACE/dist"
-          mkdir -p exe && rm -f exe/oximg
+          mkdir -p exe && rm -f exe/oximg exe/THIRD-PARTY-LICENSES*
           # Plain-Ruby gem first, while exe/ is still empty.
           gem build oximg.gemspec -o "$dist/oximg-ruby.gem"
           # The Linux platforms are spelled out per libc: an
@@ -315,9 +315,20 @@ jobs:
             name="oximg-${GITHUB_REF_NAME}-${target}"
             tar xzf "$dist/$name.tar.gz" -C "$dist"
             install -m 0755 "$dist/$name/oximg" exe/oximg
+            rm -f exe/THIRD-PARTY-LICENSES*
+            install -m 0644 "$dist/$name"/THIRD-PARTY-LICENSES* exe/
             OXIMG_GEM_PLATFORM="$platform" gem build oximg.gemspec -o "$dist/oximg-$platform.gem"
+            # A platform gem redistributes the binary, so it carries the
+            # notices from the same archive. Check the built gem.
+            want="exe/THIRD-PARTY-LICENSES.md exe/THIRD-PARTY-LICENSES-rust-std.html"
+            gem spec "$dist/oximg-$platform.gem" files > files.txt
+            for f in $want; do
+              grep -qx -- "- $f" files.txt \
+                || { echo "::error::oximg-$platform.gem has no $f"; exit 1; }
+            done
+            rm -f files.txt
           done
-          rm -f exe/oximg
+          rm -f exe/oximg exe/THIRD-PARTY-LICENSES*
       - uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Publish
         run: |
