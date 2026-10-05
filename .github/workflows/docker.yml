@@ -36,6 +36,26 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
+      # The image redistributes the code linked into the binary (the
+      # crates in the bundle, and the standard library), SVT-AV1's shared
+      # library, and dav1d's. Each needs its notice inside the image.
+      - name: License notices are in the image
+        run: |
+          docker run --rm oximg:ci sh -c 'for f in \
+              /usr/share/doc/oximg/LICENSE \
+              /usr/share/doc/oximg/THIRD-PARTY-LICENSES.md \
+              /usr/share/doc/oximg/THIRD-PARTY-LICENSES-rust-std.html \
+              /usr/share/doc/svt-av1/LICENSE.md \
+              /usr/share/doc/svt-av1/PATENTS.md \
+              /usr/share/doc/libdav1d7/copyright; do
+            test -s "$f" || {
+              echo "missing: $f"
+              echo "The Dockerfile copies this file into the image. See the"
+              echo "COPY and install lines that write to /usr/share/doc."
+              exit 1
+            }
+          done'
+
       - name: Smoke test the served pipeline
         run: |
           set -euo pipefail
