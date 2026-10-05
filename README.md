@@ -704,17 +704,22 @@ notice. The `@oximg` npm package is a name reservation.
 
 The compiled binary statically links third-party code (jpegli/libjxl —
 BSD-3-Clause, Highway — Apache-2.0, libwebp — BSD-3-Clause,
-mozjpeg/libjpeg-turbo — IJG). Their license texts and required
-notices are bundled in [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md),
-generated with `cargo about`. The bundle also carries the statements
-some licenses ask for in the documentation, such as the IJG one.
-The release archives also carry THIRD-PARTY-LICENSES-rust-std.html,
-the Rust standard library's notices from the toolchain that built
-them, since every Rust binary links the standard library statically.
-THIRD-PARTY-LICENSES.md also carries musl's COPYRIGHT, which the
-static musl builds need.
-The Docker image carries the bundle and the standard library's notices
-under `/usr/share/doc/oximg/`, and SVT-AV1's license and the AOM
-patent license under `/usr/share/doc/svt-av1/`.
+mozjpeg/libjpeg-turbo — IJG). These files carry the notices:
+
+- [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md), generated with
+  `cargo about`. It also carries the statements some licenses ask for
+  in the documentation, such as the IJG one, and musl's COPYRIGHT for
+  the static musl builds.
+- THIRD-PARTY-LICENSES-rust-std.html, the Rust standard library's
+  notices, from the toolchain that built the binary. Every Rust binary
+  links the standard library statically.
+
+The release archives and the platform gems carry these files next to
+the binary. The Docker image has them under `/usr/share/doc/oximg/`,
+and SVT-AV1's license and the AOM patent license under
+`/usr/share/doc/svt-av1/`. Shared libraries from Debian packages keep
+their own copyright files under `/usr/share/doc/<package>/`.
+
 Dependency licensing is gated in CI by `cargo deny`
-([deny.toml](deny.toml)).
+([deny.toml](deny.toml)), and `tests/third_party_notices.rs` checks
+that every native library a build script links has a license source.
