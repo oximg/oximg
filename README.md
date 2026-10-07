@@ -693,8 +693,23 @@ notice. The `@oximg` npm package is a name reservation.
 [Apache-2.0](LICENSE).
 
 The compiled binary statically links third-party code (jpegli/libjxl —
-BSD-3-Clause, Highway — Apache-2.0, mozjpeg/libjpeg-turbo — IJG). Their
-license texts and required notices are bundled in
-[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md), generated with
-`cargo about`. Dependency licensing is gated in CI by `cargo deny`
-([deny.toml](deny.toml)).
+BSD-3-Clause, Highway — Apache-2.0, libwebp — BSD-3-Clause,
+mozjpeg/libjpeg-turbo — IJG). These files carry the notices:
+
+- [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md), generated with
+  `cargo about`. It also carries the statements some licenses ask for
+  in the documentation, such as the IJG one, and musl's COPYRIGHT for
+  the static musl builds.
+- THIRD-PARTY-LICENSES-rust-std.html, the Rust standard library's
+  notices, from the toolchain that built the binary. Every Rust binary
+  links the standard library statically.
+
+The release archives and the platform gems carry these files next to
+the binary. The Docker image has them under `/usr/share/doc/oximg/`,
+and SVT-AV1's license and the AOM patent license under
+`/usr/share/doc/svt-av1/`. Shared libraries from Debian packages keep
+their own copyright files under `/usr/share/doc/<package>/`.
+
+Dependency licensing is gated in CI by `cargo deny`
+([deny.toml](deny.toml)), and `tests/third_party_notices.rs` checks
+that every native library a build script links has a license source.

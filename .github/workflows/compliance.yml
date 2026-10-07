@@ -31,10 +31,13 @@ jobs:
       - name: cargo deny
         run: cargo deny check
       # Attribution bundle must stay in sync with the dependency tree.
+      # `--features avif`: the Docker image ships the avif build. One
+      # bundle serves every artifact, and a notice for a crate that an
+      # artifact does not use does no harm.
       - name: THIRD-PARTY-LICENSES up to date
         run: |
-          cargo about generate about.hbs -o /tmp/THIRD-PARTY-LICENSES.md
+          cargo about generate --features avif about.hbs -o /tmp/THIRD-PARTY-LICENSES.md
           if ! diff -u THIRD-PARTY-LICENSES.md /tmp/THIRD-PARTY-LICENSES.md; then
-            echo "::error::THIRD-PARTY-LICENSES.md is stale. Run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md"
+            echo "::error::THIRD-PARTY-LICENSES.md is stale. Run, with cargo-about 0.9.2: cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md"
             exit 1
           fi

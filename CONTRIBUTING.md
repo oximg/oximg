@@ -85,8 +85,12 @@ The [CI workflow](.github/workflows/ci.yml) gates every PR on:
   it:
 
   ```sh
-  cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md
+  cargo install cargo-about@0.9.2 --locked --features cli   # CI pins 0.9.2
+  cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md
   ```
+
+  See [Third-party notices](#third-party-notices) when a check about
+  license notices fails.
 
 The short local loop that catches most of it:
 
@@ -95,6 +99,37 @@ cargo fmt --check
 cargo clippy --release --all-targets -- -D warnings
 cargo test --release
 ```
+
+## Third-party notices
+
+Every artifact (release archive, platform gem, Docker image) ships
+the license notices of the code inside it. Three checks can fail on a
+normal PR. Each failure message says what to do.
+
+- **`tests/third_party_notices.rs`** (part of `cargo test`). A new
+  dependency links C code: a `-sys` crate builds a vendored library,
+  or a build script compiles C. cargo-about only reads the license that
+  a crate declares, so it misses code under another license in the
+  same crate. The test lists the library and the crate. Find the
+  license file of that code in the crate's sources, add a row to
+  `LINKED`, pin the file in `about.toml`, and regenerate the bundle.
+- **docker.yml, "Dynamic libraries are the expected ones".** The
+  binary in the image now needs a shared library the check does not
+  know, often from a new apt package. If its Debian package keeps
+  `/usr/share/doc/<package>/copyright`, add the name to the list. If
+  the Dockerfile builds or copies the library, copy its license files
+  into the image too, and add them to the check before it.
+- **ci.yml, rubygem-musl, "Build the musl binary in Alpine".** The
+  musl build is static, so musl is inside the binary and its COPYRIGHT
+  is in the bundle under a `## musl libc <version>` heading. The job
+  reads the version that rustc links. rust:alpine follows Rust stable,
+  so this can fail on a PR that changed nothing here, after rustc moves
+  to a new musl. Put `COPYRIGHT` from that musl tag in the musl section
+  of `about.hbs`, then regenerate the bundle.
+
+Before a new license joins the allow list in `deny.toml`, read what
+it asks for binary distribution. Some ask for more than the text,
+like the IJG sentence at the top of the bundle.
 
 ## Control CLI
 
