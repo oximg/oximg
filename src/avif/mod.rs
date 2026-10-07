@@ -15,6 +15,7 @@ mod rgb2yuv;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use decode::decode_avif_frame_into;
 pub use decode::{decode_avif, decode_avif_into, probe_avif};
 pub use encode::{AvifParams, encode_avif};
 pub(crate) use encode::{

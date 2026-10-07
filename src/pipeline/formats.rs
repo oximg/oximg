@@ -162,6 +162,7 @@ pub(super) fn process_png<R: std::io::Read>(
         }
         png::ColorType::Indexed => anyhow::bail!("unexpanded indexed PNG"),
     };
+    let channels = compact_if_opaque(&mut s.chunk8, src_w * src_h, channels);
 
     let t_decode = t0.elapsed();
     let t1 = std::time::Instant::now();
@@ -218,6 +219,36 @@ pub(super) fn gray_to_rgb(s: &mut Scratch, len: usize, in_ch: usize) {
     }
 }
 
+/// Drop the alpha channel when no pixel uses it, and return the channel
+/// count left in `chunk8`. A still frame keeps its alpha only if a pixel
+/// uses it: most GIFs are fully opaque, and so are many RGBA PNGs from
+/// screenshot tools and canvas exports (#70). A WebP alpha flag says
+/// only that alpha may be present. Carrying a constant-255 channel costs
+/// a third more work in both the resize and the encoder, plus an alpha
+/// plane in the output, and it keeps PNG output off the quantizer. The
+/// compacted frame encodes to the same bytes as a source without alpha.
+/// It does not take the fused RGB PNG path, which needs an RGB source.
+/// A frame with fewer than four channels is left as it is.
+///
+/// The scan stops at the first alpha below 255. Compaction is a forward
+/// pass — pixel i writes 3i..3i+3 after reading 4i..4i+3 — so it never
+/// clobbers unread input, the same trick as `flatten_alpha_in_out8`.
+pub(super) fn compact_if_opaque(chunk8: &mut [u8], pixels: usize, channels: usize) -> usize {
+    if channels != 4
+        || chunk8[..pixels * 4]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] != 255)
+    {
+        return channels;
+    }
+    for i in 0..pixels {
+        chunk8.copy_within(i * 4..i * 4 + 3, i * 3);
+    }
+    3
+}
+
 pub(super) fn process_webp<R: std::io::Read>(
     s: &mut Scratch,
     mut reader: R,
@@ -258,6 +289,7 @@ pub(super) fn process_webp<R: std::io::Read>(
     }
     let (src_w, src_h, channels, dec_w, dec_h) = webp_decode_into_chunk8(s, orientation, p)?;
     let _ = (src_w, src_h);
+    let channels = compact_if_opaque(&mut s.chunk8, dec_w * dec_h, channels);
     let t_dec = t0.elapsed();
 
     let t1 = std::time::Instant::now();
@@ -322,7 +354,7 @@ pub(super) fn process_avif<R: std::io::Read>(
             "AVIF",
         )?;
     }
-    let (src_w, src_h, channels) = crate::avif::decode_avif_into(&s.srcbuf, &mut s.chunk8)?;
+    let (src_w, src_h, channels) = crate::avif::decode_avif_frame_into(&s.srcbuf, &mut s.chunk8)?;
     let t_dec = t0.elapsed();
 
     let t1 = std::time::Instant::now();

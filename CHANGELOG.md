@@ -18,6 +18,31 @@ HTTP interface without notice.
   time per DIV2K image on that path drops 0.23 ms (Intel i7-1360P) and
   0.18 ms (Apple M2), about 4% of the decode.
 
+### Fixed
+
+- **A still frame keeps its alpha channel only if a pixel uses it**
+  ([#70]). Screenshot tools and canvas exports often write RGBA PNGs
+  with every alpha at 255. `OXIMG_PNG_QUANTIZE=1` did nothing for
+  them.
+  - **What changes:** PNG, WebP and AVIF sources now drop an all-255
+    alpha after the decode, as GIF sources already did. Such a source
+    gives the same bytes as the same pixels without alpha, for every
+    output format. Sources with any transparency, and animated output,
+    are unchanged.
+  - **Bytes:** with `OXIMG_PNG_QUANTIZE=1`, opaque RGBA PNGs are now
+    64-68% smaller (a 2200x1440 screenshot at fit 1100: 1,810,629 B to
+    585,846 B; three DIV2K photos and a 256 px icon in the same
+    range). Lossless PNG output is 8-11% smaller. WebP and JPEG output
+    change only by a few pixels of resize rounding.
+  - **CPU:** the resize has one channel less. `OXIMG_TIMING` on an
+    Apple M4: a request takes 4-7% less time for PNG output and 3-4%
+    less for WebP. The scan runs at the source resolution, so a
+    source whose only transparent pixels are at the end pays for a
+    full pass (+2% on the screenshot).
+  - Output bytes change for opaque RGBA sources.
+
+[#70]: https://github.com/oximg/oximg/issues/70
+
 ## [0.14.0] - 2026-10-02
 
 Large JPEG reductions get cheaper ([#60], part of [#64]). A 4:2:0 or
