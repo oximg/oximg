@@ -31,9 +31,11 @@ pending (see [Benchmarks](#benchmarks)).
   `/image/width=750,quality=80/path/to/photo.png` — so URLs built for
   Cloudflare Images survive a migration without a rewrite layer,
   per-request quality included.
-- **Sources**: a local directory, any HTTP(S) origin, or a **private
+- **Sources**: a local directory, any HTTP(S) origin, a **private
   GCS bucket** (`gs://` with GCP-attached credentials — no public
-  bucket, no public-endpoint egress). The origin round trip never
+  bucket, no public-endpoint egress), or a **private S3 or
+  S3-compatible bucket** (`s3://` with static keys: AWS S3, R2,
+  MinIO). The origin round trip never
   holds a CPU slot (fetches are buffered and separately bounded), and
   transient fetch failures are retried, so a network blip is a slower
   response, not a broken image.
@@ -367,7 +369,45 @@ filename is taken literally on this route (no `@fmt` token).
   GCE metadata credentials; tokens cached and refreshed; boot fails
   closed with a clear message when no credentials are reachable).
   `service_account` JSON keys are not supported — on GCP use Workload
-  Identity, off GCP use the HTTP mode. `s3://` is planned (issue #11).
+  Identity, off GCP use the HTTP mode.
+- `s3://bucket[/prefix]` — a **private S3 or S3-compatible bucket**
+  (AWS S3, Cloudflare R2, MinIO), read with static keys from
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (plus
+  `AWS_SESSION_TOKEN` for temporary keys). `AWS_REGION` is required.
+  For R2 and MinIO, set `OXIMG_S3_ENDPOINT` too. An `http://` endpoint
+  logs a warning at boot, because session tokens and images then
+  travel unencrypted. At boot, oximg asks
+  for a key that does not exist and expects 404, so a wrong endpoint,
+  region or key refuses to start. A 403 `AccessDenied` only warns:
+  AWS sends it when the key lacks `s3:ListBucket`, and R2 when the
+  bucket does not exist. Temporary keys are not refreshed: when
+  `AWS_SESSION_TOKEN` expires, every fetch answers 500 until the
+  process restarts with new keys. The `~/.aws` profile files are not
+  read. To use a profile, export it with
+  `aws configure export-credentials --format env`.
+
+For `s3://` on AWS, give the key `s3:GetObject` on the objects and
+`s3:ListBucket` on the bucket. Without `s3:ListBucket`, AWS answers 403
+for a missing object, and oximg can only report that as a 500. Note
+that `s3:ListBucket` also lets the key list the object names:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-bucket/originals/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket"
+    }
+  ]
+}
+```
 
 Remote sources are downloaded into a bounded buffer (`OXIMG_MAX_SOURCE_BYTES`)
 *before* the request takes a CPU slot, so the origin round trip never
@@ -376,8 +416,9 @@ corpus before the split (issue #20/#22). Download concurrency has its
 own bound, `OXIMG_FETCH_CONCURRENCY`, and local sources keep the
 streaming decode (no buffering, the page cache serves the read).
 Connection-level transients (reset, refused, DNS blips) are retried
-once before any body bytes are consumed, and the `gs://` mode also
-retries 429/5xx SDK-style; `oximg_upstream_retries_total` counts both.
+once before any body bytes are consumed, and the `gs://` and `s3://`
+modes also retry 429/5xx SDK-style; `oximg_upstream_retries_total`
+counts both.
 
 **Format ceilings are part of the fit**: WebP cannot express a side
 past 16383 px, so a request whose output would exceed that is scaled
@@ -459,9 +500,10 @@ animated source (GIF and WebP) without decoding pixels. Depend on it
 with `default-features = false` to drop the entire HTTP stack (axum,
 tokio, reqwest, hmac, sha2, serde_json); add `features = ["avif"]`
 for AVIF. The remote-source functions need the `server` feature:
-`fetch_url`/`fetch_gcs` download a bounded buffer (with `_async`
-variants for callers already inside a runtime), and
-`process_url`/`process_gcs` are fetch-then-decode in one call.
+`fetch_url`/`fetch_gcs`/`fetch_s3` download a bounded buffer (with
+`_async` variants for callers already inside a runtime), and
+`process_url`/`process_gcs`/`process_s3` are fetch-then-decode in one
+call.
 
 Failures are typed: every entry point returns `pipeline::Error`, whose
 `kind()` (`ErrorKind`: SourceNotFound / SourceTooLarge /
@@ -503,14 +545,20 @@ never silently falls back to a default.
 | `OXIMG_FETCH_CONCURRENCY` | `4 x permits`, max 256 | Bounds concurrent origin downloads (1-1024). Fetches hold no CPU permit (issue #22), so they need their own bound: the buffered-source memory hazard is this knob times `OXIMG_MAX_SOURCE_BYTES` at worst case. The default absorbs an 8-wide `srcset` burst per permit at production-like fetch shares; raise it when the origin RTT is large relative to per-request CPU work (many fetches must overlap to keep one core fed) and the sources are known-small |
 | `GLIBC_TUNABLES` | unset | glibc's own allocator settings (Linux glibc builds; not musl, not `--features mimalloc`). When no `glibc.malloc.*` tunable is set, the server pins `mmap_threshold` to 32 MiB, `trim_threshold` to 64 MiB and `arena_max` to 2. A request then reuses the heap pages the previous one freed, where glibc's defaults made it fault them back in: about 350 minor faults per DIV2K fit-512 request. Peak RSS is unchanged. What a burst leaves resident stays resident, up to that peak. Setting any `glibc.malloc.*` tunable hands all of it back to glibc and to you |
 | `OXIMG_LOG` | `error` | `error` = one stderr line per failure; `request` also logs successes. The RUST_LOG names work too, case-insensitively: `warn` = `error`; `info`/`debug`/`trace` = `request`. Like `OXIMG_AUTO_FORMAT`'s unknown tokens, an unknown value warns rather than refusing to boot, and logs failures only, since verbosity cannot make output wrong |
-| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault — and note that `rejected` reading zero is itself the signal in `gs://` mode: an over-length key is refused locally, so the store is never asked and the request lands in `not_found`. If `rejected` ever moves there, the store refused something, which is a different event), duration histograms split into remote-source `fetch` (everything between "ready to fetch" and "source in hand" — fetch-slot wait plus the whole download — none of it holding a CPU permit since issue #22), CPU-permit queue wait, and processing (the permit's actual hold). `fetch/process` therefore no longer names recoverable throughput; it names the wait the permit no longer pays for. Read fetch numbers from *warm* traffic, since a fresh process pays connection and TLS setup and reads high for its first requests. Permit/coalescing gauges included. Outside the signing scheme — expose it to your scrape network only |
+| `OXIMG_METRICS` | `0` | `1` serves Prometheus text at `/metrics`: requests by status class and resolved format, upstream outcomes (timeout distinct from fault — and note that `rejected` reading zero is itself the signal in `gs://` and `s3://` modes: an over-length key is refused locally, so the store is never asked and the request lands in `not_found`. If `rejected` ever moves there, the store refused something, which is a different event), duration histograms split into remote-source `fetch` (everything between "ready to fetch" and "source in hand" — fetch-slot wait plus the whole download — none of it holding a CPU permit since issue #22), CPU-permit queue wait, and processing (the permit's actual hold). `fetch/process` therefore no longer names recoverable throughput; it names the wait the permit no longer pays for. Read fetch numbers from *warm* traffic, since a fresh process pays connection and TLS setup and reads high for its first requests. Permit/coalescing gauges included. Outside the signing scheme — expose it to your scrape network only |
 
 ### Sources
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OXIMG_SOURCE_BASE_URL` | unset | `https://…` or `gs://bucket[/prefix]` (see [Serving](#serving)) |
+| `OXIMG_SOURCE_BASE_URL` | unset | `https://…`, `gs://bucket[/prefix]` or `s3://bucket[/prefix]` (see [Serving](#serving)) |
 | `OXIMG_GCS_ENDPOINT` | `https://storage.googleapis.com` | Override for Private Service Connect or emulators; `GCE_METADATA_HOST` is honored the same way for the token source |
+| `OXIMG_S3_ENDPOINT` | `https://s3.<AWS_REGION>.amazonaws.com` | `s3://` endpoint as `scheme://host[:port]`, for R2 (`https://<account-id>.r2.cloudflarestorage.com`), MinIO, or another S3-compatible store |
+| `OXIMG_S3_PATH_STYLE` | `1` with `OXIMG_S3_ENDPOINT` or for a bucket name with a `.`, else `0` | `1` puts the bucket in the path (`host/bucket/key`), `0` in the host name (`bucket.host/key`). MinIO only accepts path style by default |
+| `AWS_REGION` | unset | Required for `s3://`: the bucket's region, which the signature includes. R2 accepts `auto`. ECS sets it for you |
+| `AWS_ACCESS_KEY_ID` | unset | `s3://` access key |
+| `AWS_SECRET_ACCESS_KEY` | unset | `s3://` secret key |
+| `AWS_SESSION_TOKEN` | unset | `s3://` session token, for temporary keys only |
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch — bounds how long a stalled upstream can hold a fetch slot (and its buffer); timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
@@ -659,9 +707,9 @@ drain.
 
 ## Not yet implemented (out of PoC scope)
 
-- Private S3 / S3-compatible sources (`gs://` landed in 0.7.4; `s3://`
-  is tracked in [#11](https://github.com/oximg/oximg/issues/11) and
-  fails at boot with a pointer rather than misbehaving)
+- The AWS credential chain for `s3://` (container, instance and web
+  identity roles). Static keys work today
+  ([#11](https://github.com/oximg/oximg/issues/11))
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output from an animated **AVIF or WebP** source (those render
   their first frame; animated GIF sources do animate — see
@@ -674,8 +722,8 @@ drain.
 
 Rough order, subject to change (experimental PoC):
 
-- **`s3://` sources** — S3 and S3-compatible endpoints (R2, MinIO,
-  B2) with static credentials first, the AWS credential chain after
+- **The AWS credential chain for `s3://`** — static keys are in. The
+  container provider, IMDSv2 and web identity are next
   ([#11](https://github.com/oximg/oximg/issues/11)).
 - **Per-image output format selection** — choose quantized-PNG vs
   WebP per image rather than per deployment

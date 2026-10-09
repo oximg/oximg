@@ -18,6 +18,10 @@ Lenient exceptions (the process still boots):
   it names a `glibc.malloc.*` tunable, and if so leaves the allocator
   alone
 
+`OXIMG_S3_ENDPOINT` and the `AWS_*` names are read on first use, not
+at startup, but they stay fail-closed: the `s3://` boot probe reads
+them, and a bad value refuses to boot.
+
 Validated booleans are `0`/`1` only. Long form: [README Configuration](../../README.md#configuration).
 Pipeline knobs are pinned to that README **and this file** by
 `src/config.rs` (`knobs_are_documented`).
@@ -37,9 +41,15 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_FETCH_CONCURRENCY` | default `min(4 × permits, 256)`; explicit 1–1024 | Concurrent origin downloads |
 | `OXIMG_LOG` | `error` | `request` (or `info`/`debug`/`trace`) also logs 200s; unknown warns, not fatal |
 | `OXIMG_METRICS` | `0` | `1` serves `/metrics` |
-| `OXIMG_SOURCE_BASE_URL` | unset | `https://…` or `gs://bucket[/prefix]` |
+| `OXIMG_SOURCE_BASE_URL` | unset | `https://…`, `gs://bucket[/prefix]` or `s3://bucket[/prefix]` |
 | `OXIMG_GCS_ENDPOINT` | GCS default | Emulator / PSC; read per `gs://` request, not fail-closed at boot |
 | `GCE_METADATA_HOST` | Google metadata | GCS auth emulator / PSC; read when fetching or refreshing the metadata token (including the startup credential probe) |
+| `OXIMG_S3_ENDPOINT` | AWS for `AWS_REGION` | `scheme://host[:port]` of an S3-compatible store (R2, MinIO) |
+| `OXIMG_S3_PATH_STYLE` | `1` with a custom endpoint or for a bucket name with a `.`, else `0` | `0`/`1`: bucket in the path or in the host name |
+| `AWS_REGION` | unset | Required for `s3://`; signed into every request. R2 accepts `auto` |
+| `AWS_ACCESS_KEY_ID` | unset | `s3://` static key |
+| `AWS_SECRET_ACCESS_KEY` | unset | `s3://` static key |
+| `AWS_SESSION_TOKEN` | unset | `s3://` temporary keys only |
 | `GLIBC_TUNABLES` | unset | Any `glibc.malloc.*` entry turns off the server's malloc pins (`mmap_threshold` 32 MiB, `trim_threshold` 64 MiB, `arena_max` 2; Linux glibc, no `mimalloc`) |
 | `OXIMG_AUTO_FORMAT` | unset | `avif,webp` preference list |
 | `QUALITY` | `80` | JPEG quality (process-wide) |
@@ -69,7 +79,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_AVIF_ALPHA_QUALITY` | color quality | |
 | `OXIMG_AVIF_SPEED` | `8` | SVT preset |
 | `OXIMG_AVIF_DECODE_THREADS` | arch-dependent | 2 on x86-64, 1 elsewhere |
-| `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | HTTP/GCS download buffer cap → 413 (local `process_path` is not buffered) |
+| `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | HTTP/GCS/S3 download buffer cap → 413 (local `process_path` is not buffered) |
 | `OXIMG_MAX_SRC_PIXELS` | 64e6 | Header-parsed `w*h` cap → 413 |
 | `OXIMG_MAX_DECODED_BYTES` | unset | Estimated decode allocation → 413 |
 | `OXIMG_LOG_DECODED_BYTES_ABOVE` | unset | Name expensive decodes; still serve |

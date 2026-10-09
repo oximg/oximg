@@ -1033,6 +1033,34 @@ pub fn gcs_startup() -> Result<(), String> {
     gcs::startup()
 }
 
+/// S3-source variant (`s3://` mode): fetch `key` from `bucket` with
+/// static AWS keys from the environment into a bounded buffer, then
+/// decode. Same contract as [`process_url`]. `key` must already be
+/// percent-encoded segment-wise. Requires the `server` feature.
+#[cfg(feature = "server")]
+pub fn process_s3(bucket: &str, key: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    let bytes = fetch_s3(bucket, key)?;
+    process(&bytes, p)
+}
+
+/// Async buffered S3 fetch: [`fetch_s3`] for callers already inside a
+/// runtime. The server awaits this directly. Requires the `server`
+/// feature.
+#[cfg(feature = "server")]
+pub async fn fetch_s3_async(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let inner = async { buffer_body_async(s3::fetch(bucket, key).await?).await };
+    inner.await.map_err(|e| Error::classify(e, true))
+}
+
+/// Startup probe for the `s3://` mode. The server calls this at boot,
+/// so a wrong endpoint, region, key or bucket refuses to start instead
+/// of failing on the first cache miss. `prefix` is the key prefix from
+/// `OXIMG_SOURCE_BASE_URL`, so the probe asks where reads will go.
+#[cfg(feature = "server")]
+pub fn s3_startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> {
+    s3::startup(bucket, prefix)
+}
+
 /// Buffered remote fetch: download `url` whole, bounded by
 /// `OXIMG_MAX_SOURCE_BYTES`, and return the bytes without decoding
 /// anything. The split from [`process`] exists so a caller can put
@@ -1061,6 +1089,21 @@ pub fn fetch_gcs(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
     let t0 = std::time::Instant::now();
     let (bucket, key) = (bucket.to_string(), key.to_string());
     let result = block_on_fetch(async move { fetch_gcs_async(&bucket, &key).await });
+    record_fetch_time(t0.elapsed().as_secs_f64());
+    result
+}
+
+/// Buffered S3 fetch: [`fetch_url`]'s contract for the `s3://` mode,
+/// signed with static AWS keys, with the same caps and classification
+/// as [`process_s3`]. `key` must already be percent-encoded
+/// segment-wise. Sync bridge over [`fetch_s3_async`]. Requires the
+/// `server` feature.
+#[cfg(feature = "server")]
+pub fn fetch_s3(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    clear_fetch_time();
+    let t0 = std::time::Instant::now();
+    let (bucket, key) = (bucket.to_string(), key.to_string());
+    let result = block_on_fetch(async move { fetch_s3_async(&bucket, &key).await });
     record_fetch_time(t0.elapsed().as_secs_f64());
     result
 }
@@ -1661,6 +1704,8 @@ mod jpeg;
 mod jpeg_dec;
 mod jpegli_enc;
 mod resolved;
+#[cfg(feature = "server")]
+mod s3;
 #[cfg(test)]
 mod tests;
 

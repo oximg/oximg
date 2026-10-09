@@ -47,6 +47,25 @@ The fetcher sends no credentials, so the origin must be reachable
 without authentication (public bucket, internal service, or a URL
 that embeds its own auth).
 
+For a private bucket, use `gs://` or `s3://` instead (see
+[Serving](../README.md#serving)). Static keys suit a Docker host
+outside a cloud. For example, Cloudflare R2:
+
+```sh
+docker run -d --name oximg -p 8081:8081 \
+  -e OXIMG_SOURCE_BASE_URL=s3://my-bucket/originals \
+  -e OXIMG_S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com \
+  -e AWS_REGION=auto \
+  -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY \
+  ghcr.io/oximg/oximg:<version>
+```
+
+`-e NAME` with no value copies the variable from your shell, so the
+keys stay out of the command line and the shell history. The server
+checks the endpoint and the keys at boot and refuses to start if they
+are wrong. R2 answers a missing bucket with 403 `AccessDenied`, so a
+wrong bucket name only logs a warning at boot.
+
 ## docker-compose
 
 ```yaml
