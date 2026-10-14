@@ -958,7 +958,27 @@ async fn buffer_body_async(mut resp: reqwest::Response) -> Result<Vec<u8>> {
 #[cfg(feature = "server")]
 pub async fn fetch_url_async(url: &str) -> Result<Vec<u8>, Error> {
     let inner = async { buffer_body_async(fetch_head_async(url).await?).await };
-    inner.await.map_err(|e| Error::classify(e, true))
+    fetch_with_deadline(inner)
+        .await
+        .map_err(|e| Error::classify(e, true))
+}
+
+/// One budget for credentials, all attempts, backoff and the complete body.
+/// reqwest's own timeout starts afresh on every send; the outer deadline
+/// makes OXIMG_UPSTREAM_TIMEOUT a whole-fetch limit for every transport.
+#[cfg(feature = "server")]
+async fn fetch_with_deadline<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(crate::config::config().upstream_timeout),
+        future,
+    )
+    .await
+    .map_err(|_| {
+        anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "source fetch exceeded OXIMG_UPSTREAM_TIMEOUT (including retries and body)",
+        ))
+    })?
 }
 
 /// Run a fetch future to completion from sync code, from any thread —
@@ -1022,7 +1042,9 @@ pub fn process_gcs(bucket: &str, key: &str, p: &Params) -> Result<(Vec<u8>, Imag
 #[cfg(feature = "server")]
 pub async fn fetch_gcs_async(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
     let inner = async { buffer_body_async(gcs::fetch(bucket, key).await?).await };
-    inner.await.map_err(|e| Error::classify(e, true))
+    fetch_with_deadline(inner)
+        .await
+        .map_err(|e| Error::classify(e, true))
 }
 
 /// Startup credential probe for the `gs://` mode — the server calls
@@ -1031,6 +1053,36 @@ pub async fn fetch_gcs_async(bucket: &str, key: &str) -> Result<Vec<u8>, Error> 
 #[cfg(feature = "server")]
 pub fn gcs_startup() -> Result<(), String> {
     gcs::startup()
+}
+
+/// S3-source variant (`s3://` mode): fetch `key` from `bucket` with
+/// static AWS keys from the environment into a bounded buffer, then
+/// decode. Same contract as [`process_url`]. `key` must already be
+/// percent-encoded segment-wise. Requires the `server` feature.
+#[cfg(feature = "server")]
+pub fn process_s3(bucket: &str, key: &str, p: &Params) -> Result<(Vec<u8>, ImageFormat), Error> {
+    let bytes = fetch_s3(bucket, key)?;
+    process(&bytes, p)
+}
+
+/// Async buffered S3 fetch: [`fetch_s3`] for callers already inside a
+/// runtime. The server awaits this directly. Requires the `server`
+/// feature.
+#[cfg(feature = "server")]
+pub async fn fetch_s3_async(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    let inner = async { buffer_body_async(s3::fetch(bucket, key).await?).await };
+    fetch_with_deadline(inner)
+        .await
+        .map_err(|e| Error::classify(e, true))
+}
+
+/// Startup probe for the `s3://` mode. Rejects confirmed configuration
+/// and transport errors. Ambiguous `AccessDenied` only warns, so success
+/// does not guarantee object readability. `prefix` is the key prefix from
+/// `OXIMG_SOURCE_BASE_URL`; the probe stays within it and the key byte limit.
+#[cfg(feature = "server")]
+pub fn s3_startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> {
+    s3::startup(bucket, prefix)
 }
 
 /// Buffered remote fetch: download `url` whole, bounded by
@@ -1061,6 +1113,21 @@ pub fn fetch_gcs(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
     let t0 = std::time::Instant::now();
     let (bucket, key) = (bucket.to_string(), key.to_string());
     let result = block_on_fetch(async move { fetch_gcs_async(&bucket, &key).await });
+    record_fetch_time(t0.elapsed().as_secs_f64());
+    result
+}
+
+/// Buffered S3 fetch: [`fetch_url`]'s contract for the `s3://` mode,
+/// signed with static AWS keys, with the same caps and classification
+/// as [`process_s3`]. `key` must already be percent-encoded
+/// segment-wise. Sync bridge over [`fetch_s3_async`]. Requires the
+/// `server` feature.
+#[cfg(feature = "server")]
+pub fn fetch_s3(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
+    clear_fetch_time();
+    let t0 = std::time::Instant::now();
+    let (bucket, key) = (bucket.to_string(), key.to_string());
+    let result = block_on_fetch(async move { fetch_s3_async(&bucket, &key).await });
     record_fetch_time(t0.elapsed().as_secs_f64());
     result
 }
@@ -1661,6 +1728,8 @@ mod jpeg;
 mod jpeg_dec;
 mod jpegli_enc;
 mod resolved;
+#[cfg(feature = "server")]
+mod s3;
 #[cfg(test)]
 mod tests;
 

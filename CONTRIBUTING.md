@@ -55,6 +55,10 @@ What the suites assume — and deliberately don't:
   `tests/ctl.rs` drives it as an agent would (JSON on stdout).
 - All fixtures are committed under `tests/fixtures/` — no downloads,
   no generation step.
+- The [S3 harness](tools/s3-harness/README.md) provides a loopback
+  signature-checking store and JSON checks through `oximg-ctl`, including
+  delayed/truncated error bodies, retries and key limits. Its scenarios
+  also run in `tests/s3_harness.rs`; AWS credentials are never required.
 - Library-level tests share one process-wide config (a `OnceLock`),
   so env-dependent tests funnel through a single `init()` — see the
   note at the top of `tests/remote_api.rs` before adding one.

@@ -159,6 +159,8 @@ const KNOBS: &[&str] = &[
     "OXIMG_UPSTREAM_CONNECT_TIMEOUT",
     "OXIMG_UPSTREAM_TIMEOUT",
     "OXIMG_GCS_ENDPOINT",
+    "OXIMG_S3_ENDPOINT",
+    "OXIMG_S3_PATH_STYLE",
     "OXIMG_OVERLAP",
 ];
 
@@ -187,6 +189,10 @@ const PROCESS: &[&str] = &[
     "QUALITY",
     "PRESET",
     "GCE_METADATA_HOST",
+    "AWS_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
     "GLIBC_TUNABLES",
 ];
 
@@ -272,6 +278,7 @@ pub(crate) fn validate() -> Result<(), String> {
         "OXIMG_WEBP_DECODE_THREADS",
         "OXIMG_PNG_QUANTIZE",
         "OXIMG_GIF_ANIMATION",
+        "OXIMG_S3_PATH_STYLE",
     ] {
         one_of(b, &["0", "1"])?;
     }
@@ -426,6 +433,8 @@ mod tests {
             include_str!("pipeline/resolved.rs"),
             #[cfg(feature = "server")]
             include_str!("pipeline/gcs.rs"),
+            #[cfg(feature = "server")]
+            include_str!("pipeline/s3.rs"),
             include_str!("pipeline/encode.rs"),
             #[cfg(feature = "avif")]
             include_str!("avif/encode.rs"),
@@ -454,12 +463,14 @@ mod tests {
             }
         }
         // Do not scan config.rs: PROCESS names appear in the inventory
-        // itself. Always include gcs.rs so --no-default-features still
-        // sees GCE_METADATA_HOST.
+        // itself. Always include gcs.rs and s3.rs so
+        // --no-default-features still sees GCE_METADATA_HOST and the
+        // AWS_* names.
         let process_sources = [
             include_str!("main.rs"),
             include_str!("cli.rs"),
             include_str!("pipeline/gcs.rs"),
+            include_str!("pipeline/s3.rs"),
         ];
         let mut reads: HashSet<&str> = HashSet::new();
         for src in process_sources {

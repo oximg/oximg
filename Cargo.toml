@@ -109,6 +109,11 @@ name = "qcli"
 path = "bench/tools/qcli.rs"
 
 [[example]]
+name = "s3-harness"
+path = "tools/s3-harness/main.rs"
+required-features = ["server"]
+
+[[example]]
 name = "decode_bench"
 path = "bench/tools/decode_bench.rs"
 

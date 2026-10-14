@@ -165,6 +165,7 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
     let resp = match attempt(false).await {
         Ok(resp) if retryable_status(resp.status().as_u16()) => {
             let force_token = resp.status().as_u16() == 401;
+            drop(resp);
             super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::time::sleep(Duration::from_millis(100)).await;
             attempt(force_token).await.map_err(map_transport_err)?

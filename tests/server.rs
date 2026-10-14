@@ -2626,7 +2626,6 @@ fn gcs_boot_is_fail_closed() {
             ("GCE_METADATA_HOST", format!("127.0.0.1:{dead_port}")),
         ],
         vec![("OXIMG_SOURCE_BASE_URL", "gs://".to_string())],
-        vec![("OXIMG_SOURCE_BASE_URL", "s3://bucket".to_string())],
         vec![("OXIMG_SOURCE_BASE_URL", "ftp://host".to_string())],
         vec![("OXIMG_SOURCE_BASE_URL", "bucket-host/path".to_string())],
     ] {
@@ -2660,6 +2659,628 @@ fn gcs_boot_is_fail_closed() {
             "{envs:?}: no fatal diagnostic on stderr: {stderr:?}"
         );
     }
+}
+
+// The reusable transport also powers tools/s3-harness.
+#[path = "support/s3.rs"]
+mod s3_harness;
+use s3_harness::{Reply, S3, s3_env, s3_error};
+
+fn fake_s3(
+    route: fn(&str, &str) -> Option<String>,
+) -> (S3, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let s3 = S3::spawn(move |path, req| match route(path, req).as_deref() {
+        Some("photo") => Reply::photo(),
+        Some(raw) => Reply::raw(raw),
+        None => Reply::error("404 Not Found", "NoSuchKey"),
+    })
+    .unwrap();
+    let hits = s3.hits.clone();
+    (s3, hits)
+}
+
+#[test]
+fn s3_error_body_failures_preserve_transport_errors() {
+    let s3 = S3::spawn(|path, _| {
+        let status = if path.contains("400") {
+            "400 Bad Request"
+        } else {
+            "404 Not Found"
+        };
+        if path.contains("timeout") || path.contains("truncated") {
+            let reply = Reply::raw(format!(
+                "HTTP/1.1 {status}\r\nContent-Length: 128\r\nConnection: close\r\n\r\n<Error><Code>"
+            ));
+            if path.contains("timeout") {
+                reply.then(std::time::Duration::from_secs(5), Vec::new())
+            } else {
+                reply
+            }
+        } else if path.ends_with("bucket.jpg") {
+            Reply::error("404 Not Found", "NoSuchBucket")
+        } else {
+            Reply::error("404 Not Found", "NoSuchKey")
+        }
+    })
+    .unwrap();
+    let mut env = s3_env(s3.port());
+    env.extend([
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+        ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+        ("OXIMG_METRICS", "1".into()),
+    ]);
+    let server = Server::start(&env);
+    for (key, status) in [
+        ("truncated400.jpg", 502),
+        ("truncated404.jpg", 502),
+        ("timeout400.jpg", 504),
+        ("timeout404.jpg", 504),
+        ("missing.jpg", 404),
+        ("bucket.jpg", 500),
+    ] {
+        assert_eq!(
+            server.status_of(&format!("/resize/100/100/{key}")),
+            status,
+            "{key}"
+        );
+    }
+    let body = String::from_utf8(server.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"timeout\"}"),
+        2.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"error\"}"),
+        2.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"not_found\"}"),
+        1.0
+    );
+}
+
+#[test]
+fn s3_error_body_limits_are_strict() {
+    let s3 = S3::spawn(|path, _| {
+        if path.ends_with(".oximg-startup-probe") {
+            return Reply::error("404 Not Found", "NoSuchKey");
+        }
+        let size = if path.contains("under") {
+            16383
+        } else if path.contains("over") {
+            16385
+        } else {
+            16384
+        };
+        let mut body = b"<Error><Code>NoSuchBucket</Code></Error>".to_vec();
+        body.resize(size, b' ');
+        let framing = if path.contains("chunked") {
+            format!("Transfer-Encoding: chunked\r\n\r\n{size:X}\r\n")
+        } else {
+            format!("Content-Length: {size}\r\n\r\n")
+        };
+        let mut raw =
+            format!("HTTP/1.1 404 Not Found\r\nConnection: close\r\n{framing}").into_bytes();
+        raw.extend_from_slice(&body);
+        if path.contains("chunked") {
+            raw.extend_from_slice(b"\r\n0\r\n\r\n");
+        }
+        Reply::raw(raw)
+    })
+    .unwrap();
+    let mut env = s3_env(s3.port());
+    env.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()));
+    let server = Server::start(&env);
+    for framing in ["declared", "chunked"] {
+        for (size, status) in [("under", 500), ("exact", 500), ("over", 502)] {
+            let path = format!("/resize/100/100/{framing}-{size}.jpg");
+            assert_eq!(server.status_of(&path), status, "{path}");
+        }
+    }
+}
+
+#[test]
+fn remote_retries_share_the_deadline_in_http_and_gcs_modes() {
+    use std::io::Write;
+    use std::time::Duration;
+    for gcs in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(&mut stream);
+                loop {
+                    let mut line = String::new();
+                    assert!(std::io::BufRead::read_line(&mut reader, &mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(650));
+                if attempt == 0 {
+                    // HTTP retries EOF, GCS also retries a 503 response.
+                    if gcs {
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                } else {
+                    let photo = include_bytes!("fixtures/photo.jpg");
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        photo.len()
+                    );
+                    let _ = stream.write_all(photo);
+                }
+            }
+            done.send(()).unwrap();
+        });
+        let mut env = vec![
+            ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+            ("OXIMG_SOURCE_BASE_URL", format!("http://127.0.0.1:{port}")),
+        ];
+        if gcs {
+            let (metadata, _) = fake_metadata_server(3600);
+            env[1].1 = "gs://test-bucket".into();
+            env.extend([
+                ("GCE_METADATA_HOST", format!("127.0.0.1:{metadata}")),
+                ("OXIMG_GCS_ENDPOINT", format!("http://127.0.0.1:{port}")),
+            ]);
+        }
+        let server = Server::start(&env);
+        assert_eq!(
+            server.status_of("/resize/100/100/photo.jpg"),
+            504,
+            "gcs={gcs}"
+        );
+        finished.recv_timeout(Duration::from_secs(4)).unwrap();
+    }
+}
+
+#[test]
+fn s3_retry_shares_the_deadline_with_headers_and_body() {
+    use std::time::Duration;
+    let counts = std::sync::Mutex::new(std::collections::HashMap::<String, usize>::new());
+    let s3 = S3::spawn(move |path, _| {
+        if path.ends_with(".oximg-startup-probe") {
+            return Reply::error("404 Not Found", "NoSuchKey");
+        }
+        if path.ends_with("photo.jpg") {
+            return Reply::photo();
+        }
+        let mut counts = counts.lock().unwrap();
+        let count = counts.entry(path.to_string()).or_default();
+        *count += 1;
+        if *count == 1 {
+            return Reply::error("503 Service Unavailable", "SlowDown")
+                .delay_headers(Duration::from_millis(650));
+        }
+        if path.ends_with("headers.jpg") {
+            Reply::photo().delay_headers(Duration::from_millis(650))
+        } else {
+            let photo = include_bytes!("fixtures/photo.jpg");
+            Reply::raw(format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                photo.len()
+            ))
+            .then(Duration::from_millis(650), photo.to_vec())
+        }
+    })
+    .unwrap();
+    let mut env = s3_env(s3.port());
+    env.extend([
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+        ("OXIMG_UPSTREAM_TIMEOUT", "1".into()),
+        ("OXIMG_FETCH_CONCURRENCY", "1".into()),
+    ]);
+    let server = Server::start(&env);
+    for key in ["headers.jpg", "body.jpg"] {
+        assert_eq!(
+            server.status_of(&format!("/resize/100/100/{key}")),
+            504,
+            "{key}"
+        );
+        // Cancellation must release the only fetch slot.
+        assert_eq!(server.status_of("/resize/100/100/photo.jpg"), 200);
+        assert_eq!(s3.requests().iter().filter(|p| p.ends_with(key)).count(), 2);
+    }
+}
+
+#[test]
+fn s3_probe_respects_the_key_limit_with_long_prefixes() {
+    let s3 = S3::spawn(|path, _| {
+        // Decode with an independent URL decoder, including multibyte prefixes.
+        let key = path.strip_prefix("/test-bucket/").unwrap();
+        let bytes = key.as_bytes();
+        let mut len = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            i += if bytes[i] == b'%' { 3 } else { 1 };
+            len += 1;
+        }
+        if len > 1024 {
+            return Reply::error("400 Bad Request", "KeyTooLongError");
+        }
+        if path.ends_with("/x") {
+            Reply::photo()
+        } else {
+            Reply::error("404 Not Found", "NoSuchKey")
+        }
+    })
+    .unwrap();
+    for prefix in [
+        "p".repeat(1006),
+        "p".repeat(1022),
+        format!("{}aa", "中".repeat(340)),
+    ] {
+        let mut env = s3_env(s3.port());
+        env.push((
+            "OXIMG_SOURCE_BASE_URL",
+            format!("s3://test-bucket/{prefix}"),
+        ));
+        let server = Server::start(&env);
+        assert_eq!(
+            server.status_of("/resize/100/100/x"),
+            200,
+            "prefix bytes={}",
+            prefix.len()
+        );
+    }
+}
+
+#[test]
+fn s3_harness_shuts_down_inflight_connections() {
+    let s3 = S3::spawn(|_, _| {
+        Reply::photo()
+            .delay_headers(std::time::Duration::from_millis(5))
+            .then(std::time::Duration::from_secs(30), Vec::new())
+    })
+    .unwrap();
+    let port = s3.port();
+    let mut env = s3_env(port);
+    env.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()));
+    let server = Server::start(&env);
+    assert_eq!(server.status_of("/resize/100/100/photo.jpg"), 200);
+    assert_eq!(
+        s3.requests(),
+        [
+            "/test-bucket/.oximg-startup-probe",
+            "/test-bucket/photo.jpg"
+        ]
+    );
+    let start = std::time::Instant::now();
+    drop(s3);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+}
+
+/// Issue #11: the s3:// mode reads a private bucket with static keys.
+/// The fake checks the signed shape and the exact path (bucket, prefix,
+/// nested key, SigV4 encoding). Statuses map by the error `<Code>`:
+/// the stores use 400 for deployment faults too, so a 400 is not always
+/// the requester's fault. Measured on AWS, R2 and MinIO.
+#[test]
+fn s3_source_mode_signs_and_maps_statuses() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FLAKY_HITS: AtomicUsize = AtomicUsize::new(0);
+    let (s3, hits) = fake_s3(|path, _| match path {
+        "/test-bucket/originals/.oximg-startup-probe" => None,
+        "/test-bucket/originals/albums/2026/photo.jpg" => Some("photo".into()),
+        "/test-bucket/originals/wrong-region.jpg" => {
+            Some(s3_error("400 Bad Request", "AuthorizationHeaderMalformed"))
+        }
+        "/test-bucket/originals/bad-name.jpg" => {
+            Some(s3_error("400 Bad Request", "InvalidObjectName"))
+        }
+        "/test-bucket/originals/always-503.jpg" => {
+            Some(s3_error("503 Service Unavailable", "SlowDown"))
+        }
+        "/test-bucket/originals/flaky.jpg" => {
+            if FLAKY_HITS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(s3_error("503 Service Unavailable", "SlowDown"))
+            } else {
+                Some("photo".into())
+            }
+        }
+        _ => None,
+    });
+
+    let mut envs = s3_env(s3.port());
+    envs.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket/originals".into()));
+    envs.push(("OXIMG_METRICS", "1".into()));
+    let s = Server::start(&envs);
+
+    // Happy path: nested key under the configured prefix, signed.
+    let (status, ct, body) = s.get("/resize/100/100/albums/2026/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+
+    // Absent object 404. A region fault is a deployment fault (500),
+    // never blamed on the requester, even when the store says 400. A
+    // bad object name is the requester's fault (400). The unit test
+    // `statuses_map_by_code` covers the other codes.
+    assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
+    assert_eq!(s.status_of("/resize/100/100/wrong-region.jpg"), 500);
+    assert_eq!(s.status_of("/resize/100/100/bad-name.jpg"), 400);
+
+    // A transient 503 is retried once, SDK-style. A store that keeps
+    // failing gets exactly one retry, then an upstream fault (502).
+    assert_eq!(s.get("/resize/100/100/flaky.jpg").unwrap().0, 200);
+    let before = hits.load(Ordering::SeqCst);
+    assert_eq!(s.status_of("/resize/100/100/always-503.jpg"), 502);
+    assert_eq!(hits.load(Ordering::SeqCst) - before, 2, "one retry only");
+
+    // The key limit counts decoded bytes. A CJK key of exactly 1024
+    // bytes, with the prefix "originals/", still reaches the store.
+    let at_limit = format!("{}ab.jpg", "\u{4e2d}".repeat(336));
+    assert_eq!("originals/".len() + at_limit.len(), 1024);
+    let encoded: String = at_limit
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'.' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let before = hits.load(Ordering::SeqCst);
+    assert_eq!(s.status_of(&format!("/resize/100/100/{encoded}")), 404);
+    assert_eq!(
+        hits.load(Ordering::SeqCst) - before,
+        1,
+        "a 1024-byte key is fetched"
+    );
+
+    // S3 caps keys at 1024 bytes: an over-length key never leaves the
+    // process. (The prefix "originals/" counts toward the limit.)
+    let before = hits.load(Ordering::SeqCst);
+    let over = "y".repeat(1020);
+    assert_eq!(s.status_of(&format!("/resize/100/100/{over}.png")), 404);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "over-length keys must not be fetched"
+    );
+
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    // flaky.jpg and always-503.jpg, one retry each. The boot probe
+    // does not retry.
+    assert_eq!(metric(&body, "oximg_upstream_retries_total"), 2.0);
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"not_found\"}"),
+        3.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"rejected\"}"),
+        1.0
+    );
+}
+
+/// Temporary keys sign `x-amz-security-token` too. (Virtual-host
+/// style is pinned in the unit tests: it needs a DNS name per bucket,
+/// which a local fake cannot get everywhere.)
+#[test]
+fn s3_session_token_is_signed() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: test-session-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let mut envs = s3_env(s3.port());
+    envs.retain(|(k, _)| *k != "AWS_SESSION_TOKEN");
+    envs.extend([
+        ("AWS_SESSION_TOKEN", "test-session-token".into()),
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+    ]);
+    let s = Server::start(&envs);
+    // The fake answers 200 only when the token is sent and signed.
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+}
+
+/// Keys with characters that the HTTP mode, SigV4 and the URL parser
+/// each treat differently. The fake answers 200 only for the exact
+/// SigV4 path, and only with a valid signature over what arrived, so
+/// a 200 means that we sent the path we signed.
+#[test]
+fn s3_sends_the_path_it_signs() {
+    let (s3, _) = fake_s3(|path, _| match path {
+        "/test-bucket/space%20name.jpg"
+        | "/test-bucket/plus%2Bsign.jpg"
+        | "/test-bucket/100%25.jpg"
+        | "/test-bucket/tilde~_-.jpg"
+        | "/test-bucket/%E4%B8%AD%E6%96%87.jpg"
+        | "/test-bucket/a%3Bb%3Dc%26d.jpg"
+        | "/test-bucket/a%21b%2Ac%28d%29e%27.jpg"
+        | "/test-bucket/a%40b%24c%2Cd%3A.jpg" => Some("photo".into()),
+        _ => None,
+    });
+    let mut envs = s3_env(s3.port());
+    envs.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()));
+    let s = Server::start(&envs);
+    for key in [
+        "space%20name.jpg",
+        "plus+sign.jpg",
+        "100%25.jpg",
+        "tilde~_-.jpg",
+        "%E4%B8%AD%E6%96%87.jpg",
+        "a;b=c&d.jpg",
+        "a!b*c(d)e'.jpg",
+        "a@b$c,d:.jpg",
+    ] {
+        assert_eq!(s.status_of(&format!("/resize/100/100/{key}")), 200, "{key}");
+    }
+}
+
+/// s3:// refuses to boot when the settings are missing or wrong, with
+/// a message that names the cause. The boot probe catches what the
+/// store reports. 403 `AccessDenied` is the one exception: AWS sends it
+/// for a missing key when the key lacks `s3:ListBucket`, and R2 for a
+/// missing bucket, so the server boots with a warning. Any other 403
+/// stops the boot. The probe asks under the prefix, where reads go.
+#[test]
+fn s3_boot_is_fail_closed() {
+    let (s3, _) = fake_s3(|path, _| match path {
+        "/no-list/.oximg-startup-probe" => Some(s3_error("403 Forbidden", "AccessDenied")),
+        "/no-bucket/.oximg-startup-probe" => Some(s3_error("404 Not Found", "NoSuchBucket")),
+        "/bad-secret/.oximg-startup-probe" => {
+            Some(s3_error("403 Forbidden", "SignatureDoesNotMatch"))
+        }
+        // Only the prefix is readable: the probe must ask there.
+        "/scoped/.oximg-startup-probe" => Some(s3_error("403 Forbidden", "InvalidAccessKeyId")),
+        "/scoped/ok/.oximg-startup-probe" => None,
+        "/wrong-region/.oximg-startup-probe" => {
+            Some(s3_error("400 Bad Request", "AuthorizationHeaderMalformed"))
+        }
+        _ => None,
+    });
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let boot = |extra: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in s3_env(s3.port()) {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        // Read until the listening line or until stderr closes.
+        let mut seen = String::new();
+        let mut line = String::new();
+        while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
+            seen.push_str(&line);
+            if line.starts_with("oximg listening on :") {
+                break;
+            }
+            line.clear();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        seen
+    };
+
+    let dead_endpoint = format!("http://127.0.0.1:{dead_port}");
+    for (extra, cause) in [
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_REGION", ""),
+            ],
+            "AWS_DEFAULT_REGION is not read",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_SECRET_ACCESS_KEY", ""),
+            ],
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://no-bucket")],
+            "NoSuchBucket",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://bad-secret")],
+            "SignatureDoesNotMatch",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_REGION", "us-east-1.example.com"),
+            ],
+            "not a region name",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://wrong-region")],
+            "AuthorizationHeaderMalformed",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_PATH_STYLE", "0"),
+            ],
+            "needs path style",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", "ftp://x"),
+            ],
+            "OXIMG_S3_ENDPOINT",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", dead_endpoint.as_str()),
+            ],
+            "could not reach",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://bad_bucket")],
+            "invalid bucket name",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", ""),
+                ("AWS_REGION", "auto"),
+            ],
+            "AWS_REGION=auto",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://test-bucket/a/../b")],
+            "segment",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_PATH_STYLE", "true"),
+            ],
+            "OXIMG_S3_PATH_STYLE",
+        ),
+    ] {
+        let stderr = boot(&extra);
+        assert!(
+            stderr.contains("oximg: fatal:") && stderr.contains(cause),
+            "{extra:?}: expected a fatal line naming {cause:?}, got {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("oximg listening on"),
+            "{extra:?} must not boot"
+        );
+    }
+
+    // 403 AccessDenied on the probe: boot, but warn.
+    let stderr = boot(&[("OXIMG_SOURCE_BASE_URL", "s3://no-list")]);
+    assert!(
+        stderr.contains("oximg: warning:")
+            && stderr.contains("s3:ListBucket")
+            && stderr.contains("bucket does not exist"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("oximg listening on"), "{stderr:?}");
+
+    // A prefix-scoped bucket boots: the probe asks under the prefix.
+    // The fake endpoint is http://, so the boot also warns about that.
+    let stderr = boot(&[("OXIMG_SOURCE_BASE_URL", "s3://scoped/ok")]);
+    assert!(
+        !stderr.contains("oximg: fatal:") && stderr.contains("oximg listening on"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("uses http://"), "{stderr:?}");
 }
 
 /// Issue #13: a source key no store can serve is the requester's

@@ -10,6 +10,38 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`s3://` source mode** ([#11]): `OXIMG_SOURCE_BASE_URL=s3://bucket[/prefix]`
+  reads a private S3 or S3-compatible bucket (AWS S3, Cloudflare R2,
+  MinIO) with static keys from `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and the optional `AWS_SESSION_TOKEN`.
+  `AWS_REGION` is required; `OXIMG_S3_ENDPOINT` and
+  `OXIMG_S3_PATH_STYLE` set the endpoint and addressing for R2 and
+  MinIO. Store errors map by their error code, so a wrong region or key
+  is a 500, never the requester's 400. A signed startup probe rejects
+  confirmed configuration and transport faults; ambiguous `AccessDenied`
+  only warns and does not establish read permission. An `http://` endpoint
+  warns. China regions use `.amazonaws.com.cn`. Throttling and temporary server errors get
+  one retry, as in `gs://`. Session tokens are not refreshed, and the
+  `~/.aws` profile files are not read. Signed in-tree with `hmac` and
+  `sha2`, already dependencies. The library gets `process_s3` and
+  friends next to the `gcs` ones.
+- **S3 test harness**: `cargo run --release --example s3-harness -- check`
+  drives the compiled control CLI against a local signature-checking store.
+  The same fault catalog runs in CI; `serve` exposes it for manual tests.
+  See [the harness guide](tools/s3-harness/README.md).
+
+### Fixed
+
+- Remote fetches now share one timeout across credentials, retries, backoff
+  and body download. Cancellation releases the fetch slot.
+- S3 error-body timeouts and interrupted transfers remain 504/502. Error
+  bodies above 16 KiB are upstream failures, never partially classified as
+  missing objects or invalid keys.
+- S3 startup probes fit long prefixes without exceeding the 1024-byte key
+  limit; prefixes with no room for an object name are rejected locally.
+
 ### Changed
 
 - **The linear-light half-size decode reads two neighbouring pixels per

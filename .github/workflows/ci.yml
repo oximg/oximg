@@ -72,6 +72,8 @@ jobs:
         run: cargo test --release --features avif
       - name: Build all targets
         run: cargo build --release --all-targets --features avif
+      - name: S3 harness against the compiled control CLI
+        run: ./target/release/examples/s3-harness check
       # `--all-targets` above silently skips examples whose
       # required-features are off, so the bench tools never compiled in
       # CI at all: resize_bench and resolve_bench could rot unnoticed
