@@ -60,7 +60,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_JPEG_PROGRESSIVE` | `1` | `0` = sequential jpegli (SOF1, extended sequential) |
 | `OXIMG_FLATTEN_BG` | `ffffff` | Alpha→JPEG background |
 | `OXIMG_PNG_EFFORT` | path-dependent | `fastest`/`fast`/`balanced`/`high`, or zlib-style `0`–`9` |
-| `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG |
+| `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG (RGBA with every alpha 255 counts) |
 | `OXIMG_PNG_QUANTIZE_COLORS` | `256` | Palette size 2–256 |
 | `OXIMG_WEBP_QUALITY` | `75` | |
 | `OXIMG_WEBP_EFFORT` | `2` | libwebp `method` |
