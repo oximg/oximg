@@ -77,7 +77,8 @@ Adding or removing a knob, an `ErrorKind`, an HTTP status mapping, or
 an `@{fmt}` token fails `src/config.rs` tests until `README.md` and the
 matching `docs/features/` file agree. Update them in the same commit.
 After a dependency change, regenerate the license bundle:
-`cargo about generate about.hbs -o THIRD-PARTY-LICENSES.md`.
+`cargo about generate --features avif about.hbs -o THIRD-PARTY-LICENSES.md`
+(cargo-about 0.9.2, the version CI pins).
 
 ## Performance claims
 
