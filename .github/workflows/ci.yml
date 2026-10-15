@@ -204,11 +204,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The musl checks from the release job run here too, on every PR,
+      # with the linked-library test before the build (see release.yml).
+      # rust:alpine follows Rust stable, so a new musl in rustc fails a
+      # PR here instead of a release tag after crates.io has published.
       - name: Build the musl binary in Alpine
         run: |
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
             apk add --no-cache build-base cmake nasm >/dev/null &&
-            cargo build --release --locked'
+            cargo test --release --locked --test third_party_notices &&
+            cargo build --release --locked &&
+            cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+              target/release/THIRD-PARTY-LICENSES-rust-std.html &&
+            readelf -d target/release/oximg > /tmp/dynamic &&
+            if grep -q NEEDED /tmp/dynamic; then
+              echo "expected a static binary, found dynamic dependencies" >&2
+              exit 1
+            fi &&
+            v=$(strings "$(rustc --print target-libdir)/self-contained/libc.a" |
+              grep -xE "1\.[0-9]+\.[0-9]+" | sort -u) &&
+            if [ -z "$v" ] || [ "$(echo "$v" | wc -l)" -ne 1 ]; then
+              echo "expected one musl version in libc.a, found: $v" >&2
+              exit 1
+            fi &&
+            if ! grep -qx "## musl libc $v" THIRD-PARTY-LICENSES.md; then
+              echo "rustc links musl $v, but the bundle has no \"## musl libc $v\" section." >&2
+              echo "Put COPYRIGHT from tag v$v of git.musl-libc.org in the musl" >&2
+              echo "section of about.hbs, then regenerate THIRD-PARTY-LICENSES.md." >&2
+              exit 1
+            fi'
           # Root inside the container is root on the mount too, so the
           # build output lands root-owned on the runner. Give it back
           # here rather than discovering it in a later step.
@@ -251,8 +275,16 @@ jobs:
             apk add --no-cache ruby >/dev/null
             cd /src/rubygem/oximg
             mkdir -p exe && install -m 0755 /src/target/release/oximg exe/oximg
+            install -m 0644 /src/THIRD-PARTY-LICENSES.md \
+              /src/target/release/THIRD-PARTY-LICENSES-rust-std.html exe/
             OXIMG_GEM_PLATFORM=x86_64-linux-musl gem build oximg.gemspec -o /tmp/musl.gem >/dev/null
-            rm -f exe/oximg
+            rm -f exe/oximg exe/THIRD-PARTY-LICENSES*
+            # The release job ships the notices in each platform gem the
+            # same way. Check the built gem, as the release job does.
+            gem spec /tmp/musl.gem files > /tmp/files.txt
+            for f in exe/THIRD-PARTY-LICENSES.md exe/THIRD-PARTY-LICENSES-rust-std.html; do
+              grep -qx -- "- $f" /tmp/files.txt || { echo "musl.gem has no $f"; exit 1; }
+            done
             GEM_HOME=/tmp/gh gem install /tmp/musl.gem --no-document >/dev/null
             env -u OXIMG_BIN PATH=/usr/bin:/bin GEM_HOME=/tmp/gh ruby /smoke.rb'
           sudo chown -R "$(id -u):$(id -g)" rubygem target
