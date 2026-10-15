@@ -12,6 +12,20 @@ HTTP interface without notice.
 
 ### Added
 
+- **`s3://` source mode** ([#11]): `OXIMG_SOURCE_BASE_URL=s3://bucket[/prefix]`
+  reads a private S3 or S3-compatible bucket (AWS S3, Cloudflare R2,
+  MinIO) with static keys from `AWS_ACCESS_KEY_ID`,
+  `AWS_SECRET_ACCESS_KEY` and the optional `AWS_SESSION_TOKEN`.
+  `AWS_REGION` is required; `OXIMG_S3_ENDPOINT` and
+  `OXIMG_S3_PATH_STYLE` set the endpoint and addressing for R2 and
+  MinIO. Store errors map by their error code, so a wrong region or key
+  is a 500, never the requester's 400. Boot fails closed: a signed GET
+  of a missing key checks the endpoint, region and keys, and an
+  `http://` endpoint warns. Throttling and temporary server errors get
+  one retry, as in `gs://`. Session tokens are not refreshed, and the
+  `~/.aws` profile files are not read. Signed in-tree with `hmac` and
+  `sha2`, already dependencies. The library gets `process_s3` and
+  friends next to the `gcs` ones.
 - **`oximg-ctl parity --against OTHER/oximg` compares two builds byte
   for byte.** It requests the same cells as `matrix` (every fixture
   that probes as an image, at three boxes, bare and `@webp`) from the

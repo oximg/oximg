@@ -38,12 +38,17 @@ type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>
 /// Where sources come from when OXIMG_SOURCE_BASE_URL is set. The
 /// scheme selects the transport: http(s):// is the anonymous HTTP
 /// mode, gs:// reads a private GCS bucket with GCP-attached
-/// credentials (issue #11). The base is operator-configured, so user
-/// input never chooses the host (no SSRF surface).
+/// credentials, and s3:// reads a private S3 or S3-compatible bucket
+/// with static AWS keys (issue #11). The base is operator-configured,
+/// so user input never chooses the host (no SSRF surface).
 #[derive(Clone)]
 enum SourceMode {
     Http(Arc<str>),
     Gcs {
+        bucket: Arc<str>,
+        prefix: Option<Arc<str>>,
+    },
+    S3 {
         bucket: Arc<str>,
         prefix: Option<Arc<str>>,
     },
@@ -429,6 +434,18 @@ async fn async_main(workers: usize, fetch_limit: usize) -> anyhow::Result<()> {
             None => eprintln!("oximg: gcs source enabled (bucket {bucket:?})"),
         }
     }
+    if let Some(SourceMode::S3 { bucket, prefix }) = &app.source {
+        // Fail closed at boot, like gs://. One signed GET of a missing
+        // key checks the endpoint, region and keys together.
+        if let Err(e) = pipeline::s3_startup(bucket, prefix.as_deref()) {
+            eprintln!("oximg: fatal: {e}");
+            std::process::exit(2);
+        }
+        match prefix {
+            Some(p) => eprintln!("oximg: s3 source enabled (bucket {bucket:?}, prefix {p:?})"),
+            None => eprintln!("oximg: s3 source enabled (bucket {bucket:?})"),
+        }
+    }
     if !app.auto_format.is_empty() {
         eprintln!(
             "oximg: Accept negotiation enabled ({})",
@@ -606,10 +623,11 @@ fn options_prefix_from_env() -> Option<String> {
 }
 
 /// OXIMG_SOURCE_BASE_URL: scheme-dispatched source location.
-/// http(s):// keeps the anonymous HTTP mode byte-for-byte; gs://
-/// selects the GCS mode (bucket + optional key prefix). Anything else
-/// is fatal — a typo'd scheme must not silently fall back to a mode
-/// that needs a public bucket (issue #11's exposure trap in reverse).
+/// http(s):// keeps the anonymous HTTP mode byte-for-byte; gs:// and
+/// s3:// select the GCS and S3 modes (bucket + optional key prefix).
+/// Anything else is fatal — a typo'd scheme must not silently fall
+/// back to a mode that needs a public bucket (issue #11's exposure
+/// trap in reverse).
 fn source_mode_from_env() -> Option<SourceMode> {
     let raw = std::env::var("OXIMG_SOURCE_BASE_URL").ok()?;
     let v = raw.trim();
@@ -620,7 +638,9 @@ fn source_mode_from_env() -> Option<SourceMode> {
         eprintln!("oximg: fatal: OXIMG_SOURCE_BASE_URL={raw:?} {why}");
         std::process::exit(2);
     };
-    if let Some(rest) = v.strip_prefix("gs://") {
+    // `bucket[/prefix]`. The two stores allow the same characters,
+    // except that S3 has no `_` in bucket names.
+    let bucket_and_prefix = |rest: &str, underscore: bool| {
         let rest = rest.trim_matches('/');
         let (bucket, prefix) = match rest.split_once('/') {
             Some((b, p)) => (b, Some(p.trim_matches('/'))),
@@ -628,23 +648,31 @@ fn source_mode_from_env() -> Option<SourceMode> {
         };
         if bucket.is_empty()
             || !bucket.bytes().all(|b| {
-                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'-' | b'.')
+                    || (underscore && b == b'_')
             })
         {
             fatal("has an invalid bucket name");
         }
-        return Some(SourceMode::Gcs {
-            bucket: Arc::from(bucket),
-            prefix: prefix.filter(|p| !p.is_empty()).map(Arc::from),
-        });
+        (
+            Arc::from(bucket),
+            prefix.filter(|p| !p.is_empty()).map(Arc::from),
+        )
+    };
+    if let Some(rest) = v.strip_prefix("gs://") {
+        let (bucket, prefix) = bucket_and_prefix(rest, true);
+        return Some(SourceMode::Gcs { bucket, prefix });
     }
-    if v.starts_with("s3://") {
-        fatal("s3:// is not supported yet (see issue #11; use an HTTPS endpoint meanwhile)");
+    if let Some(rest) = v.strip_prefix("s3://") {
+        let (bucket, prefix) = bucket_and_prefix(rest, false);
+        return Some(SourceMode::S3 { bucket, prefix });
     }
     if v.starts_with("http://") || v.starts_with("https://") {
         return Some(SourceMode::Http(Arc::from(v.trim_end_matches('/'))));
     }
-    fatal("must be http(s):// or gs://");
+    fatal("must be http(s)://, gs:// or s3://");
 }
 
 /// OXIMG_AUTO_FORMAT: comma-separated output formats to negotiate from
@@ -1178,22 +1206,29 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
     let path = app.images_dir.join(file);
 
     // Resolve the fetch target before anything blocks: the URL for
-    // the HTTP mode, the encoded (prefixed) key for the GCS mode.
+    // the HTTP mode, the encoded (prefixed) key for the GCS and S3
+    // modes.
     enum Fetch {
         Url(String),
         Gcs { bucket: String, key: String },
+        S3 { bucket: String, key: String },
         Local,
     }
+    let object_key = |prefix: &Option<Arc<str>>| match prefix {
+        Some(p) => encode_upstream_path(&format!("{p}/{file}")),
+        None => encode_upstream_path(file),
+    };
     let fetch = match &app.source {
         Some(SourceMode::Http(base)) => {
             Fetch::Url(format!("{base}/{}", encode_upstream_path(file)))
         }
         Some(SourceMode::Gcs { bucket, prefix }) => Fetch::Gcs {
             bucket: bucket.to_string(),
-            key: match prefix {
-                Some(p) => encode_upstream_path(&format!("{p}/{file}")),
-                None => encode_upstream_path(file),
-            },
+            key: object_key(prefix),
+        },
+        Some(SourceMode::S3 { bucket, prefix }) => Fetch::S3 {
+            bucket: bucket.to_string(),
+            key: object_key(prefix),
         },
         None => Fetch::Local,
     };
@@ -1226,6 +1261,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
             let fetched = match remote {
                 Fetch::Url(url) => pipeline::fetch_url_async(&url).await,
                 Fetch::Gcs { bucket, key } => pipeline::fetch_gcs_async(&bucket, &key).await,
+                Fetch::S3 { bucket, key } => pipeline::fetch_s3_async(&bucket, &key).await,
                 Fetch::Local => unreachable!("local sources are not fetched"),
             };
             metrics::METRICS.observe_fetch(t_fetch.elapsed().as_secs_f64());

@@ -2626,7 +2626,6 @@ fn gcs_boot_is_fail_closed() {
             ("GCE_METADATA_HOST", format!("127.0.0.1:{dead_port}")),
         ],
         vec![("OXIMG_SOURCE_BASE_URL", "gs://".to_string())],
-        vec![("OXIMG_SOURCE_BASE_URL", "s3://bucket".to_string())],
         vec![("OXIMG_SOURCE_BASE_URL", "ftp://host".to_string())],
         vec![("OXIMG_SOURCE_BASE_URL", "bucket-host/path".to_string())],
     ] {
@@ -2660,6 +2659,542 @@ fn gcs_boot_is_fail_closed() {
             "{envs:?}: no fatal diagnostic on stderr: {stderr:?}"
         );
     }
+}
+
+/// The empty-body SHA-256, which every signed S3 GET must send as
+/// `x-amz-content-sha256`.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// An S3 error body, as AWS, R2 and MinIO send it.
+fn s3_error(status: &str, code: &str) -> String {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code><Message>test</Message></Error>"
+    );
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// Check a SigV4 signature against the request as it arrived: the
+/// request line and the signed headers on the wire. This is a second,
+/// small implementation that does not call oximg's signer, so it fails
+/// when the request we send differs from the request we signed (a path
+/// encoded again, another `Host`). The AWS test vectors in
+/// `src/pipeline/s3.rs` pin the algorithm itself.
+fn sigv4_is_valid(req: &str, secret: &str) -> bool {
+    use hmac::Mac;
+    use hmac::digest::KeyInit;
+    use sha2::{Digest, Sha256};
+    let hmac = |key: &[u8], data: &str| {
+        let mut mac = hmac::Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(data.as_bytes());
+        mac.finalize().into_bytes().to_vec()
+    };
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let mut lines = req.split("\r\n");
+    let mut request_line = lines.next().unwrap_or("").split(' ');
+    let (Some(method), Some(path)) = (request_line.next(), request_line.next()) else {
+        return false;
+    };
+    let headers: Vec<(String, String)> = lines
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_once(':'))
+        .map(|(n, v)| {
+            (
+                n.trim().to_ascii_lowercase(),
+                v.split_whitespace().collect::<Vec<_>>().join(" "),
+            )
+        })
+        .collect();
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    };
+    let (Some(auth), Some(datetime), Some(payload)) = (
+        get("authorization"),
+        get("x-amz-date"),
+        get("x-amz-content-sha256"),
+    ) else {
+        return false;
+    };
+    let field = |name: &str| {
+        auth.trim_start_matches("AWS4-HMAC-SHA256 ")
+            .split(", ")
+            .find_map(|f| f.strip_prefix(name))
+    };
+    let (Some(credential), Some(signed), Some(signature)) = (
+        field("Credential="),
+        field("SignedHeaders="),
+        field("Signature="),
+    ) else {
+        return false;
+    };
+    let scope = credential.split_once('/').map_or("", |(_, scope)| scope);
+    let names: Vec<&str> = signed.split(';').collect();
+    if !scope.starts_with(datetime.get(..8).unwrap_or("-")) || !names.is_sorted() {
+        return false;
+    }
+    let mut canonical_headers = String::new();
+    for name in &names {
+        let Some(value) = get(name) else { return false };
+        canonical_headers.push_str(&format!("{name}:{value}\n"));
+    }
+    let canonical = format!("{method}\n{path}\n\n{canonical_headers}\n{signed}\n{payload}");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{}",
+        hex(&Sha256::digest(canonical.as_bytes()))
+    );
+    // The scope is date/region/service/aws4_request, in signing order.
+    let mut key = format!("AWS4{secret}").into_bytes();
+    for part in scope.split('/') {
+        key = hmac(&key, part);
+    }
+    hex(&hmac(&key, &string_to_sign)) == signature
+}
+
+/// The verifier must accept a signature that AWS published, or it
+/// proves nothing about ours. This is the GET Object example from the
+/// S3 API reference.
+#[test]
+fn sigv4_verifier_accepts_the_aws_example() {
+    let req = "GET /test.txt HTTP/1.1\r\n\
+        Host: examplebucket.s3.amazonaws.com\r\n\
+        Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+        SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
+        Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41\r\n\
+        Range: bytes=0-9\r\n\
+        x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n\
+        x-amz-date: 20130524T000000Z\r\n\r\n";
+    let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    assert!(sigv4_is_valid(req, secret));
+    assert!(!sigv4_is_valid(
+        &req.replace("/test.txt", "/test2.txt"),
+        secret
+    ));
+    assert!(!sigv4_is_valid(req, "another-secret"));
+}
+
+/// A fake S3 endpoint. Every request must carry a valid signature for
+/// the test keys (`sigv4_is_valid`), with the headers that oximg must
+/// sign. Other requests get 403 `SignatureDoesNotMatch`. `route`
+/// answers by path (it also gets the lower-cased request, to check a
+/// header).
+fn fake_s3(
+    route: fn(&str, &str) -> Option<String>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let fixtures = fixtures.clone();
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                counter.fetch_add(1, Ordering::SeqCst);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let lower = req.to_lowercase();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let header = |name: &str| {
+                    lower
+                        .lines()
+                        .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+                        .map(|v| v.trim().to_string())
+                };
+                let token = header("x-amz-security-token");
+                let signed = if token.is_some() {
+                    "signedheaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token,"
+                } else {
+                    "signedheaders=host;x-amz-content-sha256;x-amz-date,"
+                };
+                let well_formed = header("authorization").is_some_and(|auth| {
+                    auth.starts_with("aws4-hmac-sha256 credential=akidtest/")
+                        && auth.contains("/us-east-1/s3/aws4_request,")
+                        && auth.contains(signed)
+                }) && header("x-amz-content-sha256").as_deref()
+                    == Some(EMPTY_SHA256)
+                    && sigv4_is_valid(&req, "test-secret");
+                if !well_formed {
+                    let _ = write!(
+                        stream,
+                        "{}",
+                        s3_error("403 Forbidden", "SignatureDoesNotMatch")
+                    );
+                    return;
+                }
+                match route(&path, &lower).as_deref() {
+                    Some("photo") => {
+                        let data = std::fs::read(format!("{fixtures}/photo.jpg")).unwrap();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(&data);
+                    }
+                    Some(raw) => {
+                        let _ = write!(stream, "{raw}");
+                    }
+                    None => {
+                        let _ = write!(stream, "{}", s3_error("404 Not Found", "NoSuchKey"));
+                    }
+                }
+            });
+        }
+    });
+    (port, hits)
+}
+
+/// The env every s3:// test starts from. Blank values read as unset,
+/// so this also clears whatever the developer's shell has exported.
+fn s3_env(endpoint_port: u16) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "OXIMG_S3_ENDPOINT",
+            format!("http://127.0.0.1:{endpoint_port}"),
+        ),
+        ("AWS_REGION", "us-east-1".into()),
+        ("AWS_ACCESS_KEY_ID", "AKIDTEST".into()),
+        ("AWS_SECRET_ACCESS_KEY", "test-secret".into()),
+        ("AWS_SESSION_TOKEN", String::new()),
+        ("OXIMG_S3_PATH_STYLE", String::new()),
+    ]
+}
+
+/// Issue #11: the s3:// mode reads a private bucket with static keys.
+/// The fake checks the signed shape and the exact path (bucket, prefix,
+/// nested key, SigV4 encoding). Statuses map by the error `<Code>`:
+/// the stores use 400 for deployment faults too, so a 400 is not always
+/// the requester's fault. Measured on AWS, R2 and MinIO.
+#[test]
+fn s3_source_mode_signs_and_maps_statuses() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static FLAKY_HITS: AtomicUsize = AtomicUsize::new(0);
+    let (port, hits) = fake_s3(|path, _| match path {
+        "/test-bucket/originals/.oximg-startup-probe" => None,
+        "/test-bucket/originals/albums/2026/photo.jpg" => Some("photo".into()),
+        "/test-bucket/originals/wrong-region.jpg" => {
+            Some(s3_error("400 Bad Request", "AuthorizationHeaderMalformed"))
+        }
+        "/test-bucket/originals/bad-name.jpg" => {
+            Some(s3_error("400 Bad Request", "InvalidObjectName"))
+        }
+        "/test-bucket/originals/always-503.jpg" => {
+            Some(s3_error("503 Service Unavailable", "SlowDown"))
+        }
+        "/test-bucket/originals/flaky.jpg" => {
+            if FLAKY_HITS.fetch_add(1, Ordering::SeqCst) == 0 {
+                Some(s3_error("503 Service Unavailable", "SlowDown"))
+            } else {
+                Some("photo".into())
+            }
+        }
+        _ => None,
+    });
+
+    let mut envs = s3_env(port);
+    envs.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket/originals".into()));
+    envs.push(("OXIMG_METRICS", "1".into()));
+    let s = Server::start(&envs);
+
+    // Happy path: nested key under the configured prefix, signed.
+    let (status, ct, body) = s.get("/resize/100/100/albums/2026/photo.jpg").unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(ct, "image/jpeg");
+    let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+    assert_eq!((w, h), (100, 75));
+
+    // Absent object 404. A region fault is a deployment fault (500),
+    // never blamed on the requester, even when the store says 400. A
+    // bad object name is the requester's fault (400). The unit test
+    // `statuses_map_by_code` covers the other codes.
+    assert_eq!(s.status_of("/resize/100/100/missing.jpg"), 404);
+    assert_eq!(s.status_of("/resize/100/100/wrong-region.jpg"), 500);
+    assert_eq!(s.status_of("/resize/100/100/bad-name.jpg"), 400);
+
+    // A transient 503 is retried once, SDK-style. A store that keeps
+    // failing gets exactly one retry, then an upstream fault (502).
+    assert_eq!(s.get("/resize/100/100/flaky.jpg").unwrap().0, 200);
+    let before = hits.load(Ordering::SeqCst);
+    assert_eq!(s.status_of("/resize/100/100/always-503.jpg"), 502);
+    assert_eq!(hits.load(Ordering::SeqCst) - before, 2, "one retry only");
+
+    // The key limit counts decoded bytes. A CJK key of exactly 1024
+    // bytes, with the prefix "originals/", still reaches the store.
+    let at_limit = format!("{}ab.jpg", "\u{4e2d}".repeat(336));
+    assert_eq!("originals/".len() + at_limit.len(), 1024);
+    let encoded: String = at_limit
+        .bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'.' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    let before = hits.load(Ordering::SeqCst);
+    assert_eq!(s.status_of(&format!("/resize/100/100/{encoded}")), 404);
+    assert_eq!(
+        hits.load(Ordering::SeqCst) - before,
+        1,
+        "a 1024-byte key is fetched"
+    );
+
+    // S3 caps keys at 1024 bytes: an over-length key never leaves the
+    // process. (The prefix "originals/" counts toward the limit.)
+    let before = hits.load(Ordering::SeqCst);
+    let over = "y".repeat(1020);
+    assert_eq!(s.status_of(&format!("/resize/100/100/{over}.png")), 404);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        before,
+        "over-length keys must not be fetched"
+    );
+
+    let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+    // flaky.jpg and always-503.jpg, one retry each. The boot probe
+    // does not retry.
+    assert_eq!(metric(&body, "oximg_upstream_retries_total"), 2.0);
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"not_found\"}"),
+        3.0
+    );
+    assert_eq!(
+        metric(&body, "oximg_upstream_fetch_total{outcome=\"rejected\"}"),
+        1.0
+    );
+}
+
+/// Temporary keys sign `x-amz-security-token` too. (Virtual-host
+/// style is pinned in the unit tests: it needs a DNS name per bucket,
+/// which a local fake cannot get everywhere.)
+#[test]
+fn s3_session_token_is_signed() {
+    let (port, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: test-session-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let mut envs = s3_env(port);
+    envs.retain(|(k, _)| *k != "AWS_SESSION_TOKEN");
+    envs.extend([
+        ("AWS_SESSION_TOKEN", "test-session-token".into()),
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+    ]);
+    let s = Server::start(&envs);
+    // The fake answers 200 only when the token is sent and signed.
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+}
+
+/// Keys with characters that the HTTP mode, SigV4 and the URL parser
+/// each treat differently. The fake answers 200 only for the exact
+/// SigV4 path, and only with a valid signature over what arrived, so
+/// a 200 means that we sent the path we signed.
+#[test]
+fn s3_sends_the_path_it_signs() {
+    let (port, _) = fake_s3(|path, _| match path {
+        "/test-bucket/space%20name.jpg"
+        | "/test-bucket/plus%2Bsign.jpg"
+        | "/test-bucket/100%25.jpg"
+        | "/test-bucket/tilde~_-.jpg"
+        | "/test-bucket/%E4%B8%AD%E6%96%87.jpg"
+        | "/test-bucket/a%3Bb%3Dc%26d.jpg"
+        | "/test-bucket/a%21b%2Ac%28d%29e%27.jpg"
+        | "/test-bucket/a%40b%24c%2Cd%3A.jpg" => Some("photo".into()),
+        _ => None,
+    });
+    let mut envs = s3_env(port);
+    envs.push(("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()));
+    let s = Server::start(&envs);
+    for key in [
+        "space%20name.jpg",
+        "plus+sign.jpg",
+        "100%25.jpg",
+        "tilde~_-.jpg",
+        "%E4%B8%AD%E6%96%87.jpg",
+        "a;b=c&d.jpg",
+        "a!b*c(d)e'.jpg",
+        "a@b$c,d:.jpg",
+    ] {
+        assert_eq!(s.status_of(&format!("/resize/100/100/{key}")), 200, "{key}");
+    }
+}
+
+/// s3:// refuses to boot when the settings are missing or wrong, with
+/// a message that names the cause. The boot probe catches what the
+/// store reports. 403 `AccessDenied` is the one exception: AWS sends it
+/// for a missing key when the key lacks `s3:ListBucket`, and R2 for a
+/// missing bucket, so the server boots with a warning. Any other 403
+/// stops the boot. The probe asks under the prefix, where reads go.
+#[test]
+fn s3_boot_is_fail_closed() {
+    let (port, _) = fake_s3(|path, _| match path {
+        "/no-list/.oximg-startup-probe" => Some(s3_error("403 Forbidden", "AccessDenied")),
+        "/no-bucket/.oximg-startup-probe" => Some(s3_error("404 Not Found", "NoSuchBucket")),
+        "/bad-secret/.oximg-startup-probe" => {
+            Some(s3_error("403 Forbidden", "SignatureDoesNotMatch"))
+        }
+        // Only the prefix is readable: the probe must ask there.
+        "/scoped/.oximg-startup-probe" => Some(s3_error("403 Forbidden", "InvalidAccessKeyId")),
+        "/scoped/ok/.oximg-startup-probe" => None,
+        "/wrong-region/.oximg-startup-probe" => {
+            Some(s3_error("400 Bad Request", "AuthorizationHeaderMalformed"))
+        }
+        _ => None,
+    });
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+
+    let boot = |extra: &[(&str, &str)]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+        cmd.env("PORT", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        for (k, v) in s3_env(port) {
+            cmd.env(k, v);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawn oximg");
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        // Read until the listening line or until stderr closes.
+        let mut seen = String::new();
+        let mut line = String::new();
+        while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
+            seen.push_str(&line);
+            if line.starts_with("oximg listening on :") {
+                break;
+            }
+            line.clear();
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        seen
+    };
+
+    let dead_endpoint = format!("http://127.0.0.1:{dead_port}");
+    for (extra, cause) in [
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_REGION", ""),
+            ],
+            "AWS_DEFAULT_REGION is not read",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_SECRET_ACCESS_KEY", ""),
+            ],
+            "AWS_SECRET_ACCESS_KEY",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://no-bucket")],
+            "NoSuchBucket",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://bad-secret")],
+            "SignatureDoesNotMatch",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("AWS_REGION", "us-east-1.example.com"),
+            ],
+            "not a region name",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://wrong-region")],
+            "AuthorizationHeaderMalformed",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_PATH_STYLE", "0"),
+            ],
+            "needs path style",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", "ftp://x"),
+            ],
+            "OXIMG_S3_ENDPOINT",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", dead_endpoint.as_str()),
+            ],
+            "could not reach",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://bad_bucket")],
+            "invalid bucket name",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_ENDPOINT", ""),
+                ("AWS_REGION", "auto"),
+            ],
+            "AWS_REGION=auto",
+        ),
+        (
+            vec![("OXIMG_SOURCE_BASE_URL", "s3://test-bucket/a/../b")],
+            "segment",
+        ),
+        (
+            vec![
+                ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket"),
+                ("OXIMG_S3_PATH_STYLE", "true"),
+            ],
+            "OXIMG_S3_PATH_STYLE",
+        ),
+    ] {
+        let stderr = boot(&extra);
+        assert!(
+            stderr.contains("oximg: fatal:") && stderr.contains(cause),
+            "{extra:?}: expected a fatal line naming {cause:?}, got {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("oximg listening on"),
+            "{extra:?} must not boot"
+        );
+    }
+
+    // 403 AccessDenied on the probe: boot, but warn.
+    let stderr = boot(&[("OXIMG_SOURCE_BASE_URL", "s3://no-list")]);
+    assert!(
+        stderr.contains("oximg: warning:")
+            && stderr.contains("s3:ListBucket")
+            && stderr.contains("bucket does not exist"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("oximg listening on"), "{stderr:?}");
+
+    // A prefix-scoped bucket boots: the probe asks under the prefix.
+    // The fake endpoint is http://, so the boot also warns about that.
+    let stderr = boot(&[("OXIMG_SOURCE_BASE_URL", "s3://scoped/ok")]);
+    assert!(
+        !stderr.contains("oximg: fatal:") && stderr.contains("oximg listening on"),
+        "{stderr:?}"
+    );
+    assert!(stderr.contains("uses http://"), "{stderr:?}");
 }
 
 /// Issue #13: a source key no store can serve is the requester's
