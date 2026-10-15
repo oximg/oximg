@@ -297,7 +297,8 @@ parentheses):
 | JPEG→WebP | **158.8** (17 ms) | 81.5 (34 ms) |
 | JPEG→AVIF | **115.0** (23 ms) | 102.2 (28 ms) |
 
-AWS reference instances, measured 2026-07-05 in the wholesale re-run
+AWS reference instances (pre-0.11, see the note at the top of this
+section), measured 2026-07-05 in the wholesale re-run
 (fresh instances, current build, same run as the tables in the next
 section):
 
