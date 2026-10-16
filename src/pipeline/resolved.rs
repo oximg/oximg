@@ -154,6 +154,7 @@ mod tests {
             dct_margin: None,
             linear_shrink: true,
             jpegli_progressive: true,
+            jpegli_sequential_pixels: crate::config::DEFAULT_SEQUENTIAL_PIXELS,
             flatten_bg: [255, 255, 255],
             png_compression: None,
             png_quantize: false,

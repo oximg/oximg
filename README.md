@@ -68,8 +68,10 @@ pending (see [Benchmarks](#benchmarks)).
   memory stays at a fraction of imgproxy's under identical load
   ([BENCH.md](BENCH.md)).
 - **Tunable profiles**: the default maximizes quality per byte
-  (progressive jpegli); one env flip (`OXIMG_JPEG_PROGRESSIVE=0`)
-  trades ~10% output size for the lowest latency at unchanged pixels.
+  (progressive jpegli, sequential for thumbnails up to 20k pixels);
+  one env flip (`OXIMG_JPEG_PROGRESSIVE=0`) trades 2-3% output size on
+  photos (up to ~11% on graphics) for 5-28% less server CPU, at
+  unchanged pixels.
   `PRESET=fast|small` selects mozjpeg profiles instead.
 - **Self-contained deploys**: multi-arch Docker images
   (linux/amd64 + linux/arm64) on Docker Hub (`oximg/oximg`) and GHCR
@@ -83,7 +85,7 @@ combines with any encode column:
 
 | Format | Decode | Encode |
 |---|---|---|
-| JPEG | baseline, extended sequential (SOF1) & progressive, grayscale; streaming, full-size decode (4:2:0 luma at 1/2 in linear light from ~3.8x; libjpeg shrink-on-load opt-in) | jpegli progressive (default) or sequential (SOF1, `OXIMG_JPEG_PROGRESSIVE=0`), mozjpeg profiles via `PRESET` |
+| JPEG | baseline, extended sequential (SOF1) & progressive, grayscale; streaming, full-size decode (4:2:0 luma at 1/2 in linear light from ~3.8x; libjpeg shrink-on-load opt-in) | jpegli progressive (default; sequential up to 20k output pixels) or sequential (SOF1, `OXIMG_JPEG_PROGRESSIVE=0`), mozjpeg profiles via `PRESET` |
 | PNG | palette / grayscale / 16-bit, normalized to RGB(A)8 | lossless RGB(A); opt-in palette quantization (`OXIMG_PNG_QUANTIZE`) |
 | WebP | lossy & lossless, alpha | lossy (`OXIMG_WEBP_QUALITY`, 75), alpha; output is scaled to fit WebP's 16383 px limit |
 | AVIF (`--features avif`) | dav1d: 8/10/12-bit, all subsamplings, alpha | SVT-AV1: 10-bit 4:2:0, tune=ssim, alpha as auxiliary image |
@@ -187,7 +189,7 @@ source bytes (local file or HTTP origin)
        other formats resize full-frame: pic-scale on x86-64, the same
        in-tree kernel on aarch64)
   → encode in the source format (GIF sources: WebP, the default target)
-      JPEG: jpegli, progressive (PRESET=fast / PRESET=small select mozjpeg profiles)
+      JPEG: jpegli, progressive above 20k output pixels (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
       animated GIF: each frame composited, resized and streamed into
             libwebp's animation encoder (one canvas in memory, not N)
@@ -524,7 +526,8 @@ never silently falls back to a default.
 |---|---|---|
 | `QUALITY` | `80` | JPEG quality |
 | `PRESET` | `jpegli` | `fast` = mozjpeg baseline, `small` = mozjpeg trellis+progressive |
-| `OXIMG_JPEG_PROGRESSIVE` | `1` | `0` = sequential jpegli (SOF1, extended sequential; not baseline SOF0): a few percent larger output for lower latency; with `OXIMG_OVERLAP` this is the speed profile (~-13% single-request latency, ~+9% saturated throughput) |
+| `OXIMG_JPEG_PROGRESSIVE` | `1` | `0` = sequential jpegli (SOF1, extended sequential; not baseline SOF0) with optimized Huffman tables, at every size: the speed profile. Same pixels; output +2.2% at fit 512 (up to +10.7% on graphics) for -5.5% server CPU at fit 512 and -28% on large graphics (Zen 4, single client) |
+| `OXIMG_JPEG_SEQUENTIAL_PIXELS` | `20000` | With progressive on, outputs of at most this many pixels are written sequential: on thumbnails that is both smaller and cheaper. `0` = progressive at every size |
 | `OXIMG_WEBP_QUALITY` | `75` | WebP quality |
 | `OXIMG_WEBP_EFFORT` | `2` | libwebp `method` |
 | `OXIMG_AVIF_QUALITY` | `55` | AVIF quality (libavif semantics; chosen by operating point, see [bench/quality/QUALITY.md](bench/quality/QUALITY.md)) |

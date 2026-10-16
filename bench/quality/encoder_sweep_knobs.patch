@@ -1,0 +1,140 @@
+diff --git a/src/pipeline/jpegli_enc.rs b/src/pipeline/jpegli_enc.rs
+index 7b1c5e0..0b78c6b 100644
+--- a/src/pipeline/jpegli_enc.rs
++++ b/src/pipeline/jpegli_enc.rs
+@@ -107,6 +107,13 @@ impl Dest {
+     }
+ }
+ 
++unsafe extern "C-unwind" {
++    fn jpegli_enable_adaptive_quantization(
++        cinfo: &mut ffi::jpegli_compress_struct,
++        value: ffi::boolean,
++    );
++}
++
+ extern "C-unwind" fn silence_message(_cinfo: &mut ffi::jpegli_common_struct, _level: c_int) {}
+ 
+ /// Only the message code: the binding types `format_message`'s output
+@@ -128,10 +135,27 @@ pub(super) struct JpegliEncoder {
+     dest: Box<Dest>,
+ }
+ 
++/// EXPERIMENT (#61): encoder settings under evaluation.
++#[derive(Clone, Copy)]
++pub(super) struct X {
++    pub aq_off: bool,
++    pub opt: bool,
++    pub s420: bool,
++}
++
+ impl JpegliEncoder {
+     /// Start a `w` x `h` RGB encode at jpegli `quality`, progressive with
+     /// [`SCAN_SCRIPT`] or baseline.
+     pub(super) fn new(w: usize, h: usize, quality: f32, progressive: bool) -> JpegliEncoder {
++        let x = X {
++            aq_off: std::env::var("OXIMG_X_AQ").as_deref() == Ok("0"),
++            opt: std::env::var("OXIMG_X_OPT").as_deref() == Ok("1"),
++            s420: std::env::var("OXIMG_X_SAMPLING").as_deref() == Ok("420"),
++        };
++        Self::new_x(w, h, quality, progressive, x)
++    }
++
++    pub(super) fn new_x(w: usize, h: usize, quality: f32, progressive: bool, x: X) -> JpegliEncoder {
+         // SAFETY: zeroed structs are the libjpeg idiom before
+         // jpegli_std_error / jpegli_CreateCompress initialize them; every
+         // pointer handed to jpegli targets a Box owned by the returned
+@@ -164,6 +188,18 @@ impl JpegliEncoder {
+             enc.cinfo.image_width = w as ffi::JDIMENSION;
+             enc.cinfo.image_height = h as ffi::JDIMENSION;
+             ffi::jpegli_set_quality(&mut enc.cinfo, quality as c_int, 0);
++            // EXPERIMENT (#61 corpus eval): not for merge.
++            if x.aq_off {
++                jpegli_enable_adaptive_quantization(&mut enc.cinfo, 0);
++            }
++            if x.opt {
++                enc.cinfo.optimize_coding = 1;
++            }
++            if x.s420 {
++                let c = &mut *enc.cinfo.comp_info;
++                c.h_samp_factor = 2;
++                c.v_samp_factor = 2;
++            }
+             if progressive {
+                 debug_assert_eq!(enc.cinfo.num_components, 3);
+                 enc.cinfo.scan_info = SCAN_SCRIPT.as_ptr();
+@@ -242,6 +278,74 @@ impl Drop for JpegliEncoder {
+ mod tests {
+     use super::*;
+ 
++    fn read_ppm(path: &std::path::Path) -> (Vec<u8>, usize, usize) {
++        let data = std::fs::read(path).unwrap();
++        let mut fields = Vec::new();
++        let mut i = 0;
++        while fields.len() < 4 {
++            while data[i].is_ascii_whitespace() {
++                i += 1;
++            }
++            let start = i;
++            while !data[i].is_ascii_whitespace() {
++                i += 1;
++            }
++            fields.push(String::from_utf8_lossy(&data[start..i]).into_owned());
++        }
++        assert_eq!(fields[0], "P6");
++        let (w, h): (usize, usize) = (fields[1].parse().unwrap(), fields[2].parse().unwrap());
++        (data[i + 1..i + 1 + w * h * 3].to_vec(), w, h)
++    }
++
++    /// EXPERIMENT (#61): encode CPU per configuration, one thread, best
++    /// of 7 passes over every PPM in OXIMG_ENCODE_BENCH_DIR/<set>.
++    #[test]
++    #[ignore]
++    fn encode_configs_bench() {
++        let dir = std::path::PathBuf::from(std::env::var("OXIMG_ENCODE_BENCH_DIR").unwrap());
++        let q: f32 = std::env::var("OXIMG_ENCODE_BENCH_Q").map_or(80.0, |v| v.parse().unwrap());
++        let mut sets: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
++        sets.sort();
++        let cfgs: [(&str, bool, X); 7] = [
++            ("P/aq-444", true, X { aq_off: false, opt: false, s420: false }),
++            ("O/aq-444", false, X { aq_off: false, opt: true, s420: false }),
++            ("S/aq-444", false, X { aq_off: false, opt: false, s420: false }),
++            ("P/noaq-444", true, X { aq_off: true, opt: false, s420: false }),
++            ("O/noaq-444", false, X { aq_off: true, opt: true, s420: false }),
++            ("P/aq-420", true, X { aq_off: false, opt: false, s420: true }),
++            ("O/aq-420", false, X { aq_off: false, opt: true, s420: true }),
++        ];
++        for set in sets {
++            let mut paths: Vec<_> = std::fs::read_dir(&set).unwrap().map(|e| e.unwrap().path()).collect();
++            paths.sort();
++            let imgs: Vec<_> = paths.iter().map(|p| read_ppm(p)).collect();
++            let mut line = format!("{:<12} n={:<3}", set.file_name().unwrap().to_string_lossy(), imgs.len());
++            let mut base = 0.0;
++            // Interleave the configurations pass by pass.
++            let mut best = [f64::MAX; 7];
++            for _ in 0..7 {
++                for (k, (_, prog, x)) in cfgs.iter().enumerate() {
++                    let t = std::time::Instant::now();
++                    for (px, w, h) in &imgs {
++                        let mut enc = JpegliEncoder::new_x(*w, *h, q, *prog, *x);
++                        enc.write_scanlines(px).unwrap();
++                        std::hint::black_box(enc.finish());
++                    }
++                    best[k] = best[k].min(t.elapsed().as_secs_f64() * 1e3 / imgs.len() as f64);
++                }
++            }
++            for (k, (name, _, _)) in cfgs.iter().enumerate() {
++                if k == 0 {
++                    base = best[0];
++                    line += &format!("  {name} {:.3} ms", best[0]);
++                } else {
++                    line += &format!("  {name} {:+.1}%", (best[k] / base - 1.0) * 100.0);
++                }
++            }
++            println!("{line}");
++        }
++    }
++
+     fn encode(px: &[u8], w: usize, h: usize, progressive: bool) -> Vec<u8> {
+         let mut enc = JpegliEncoder::new(w, h, 85.0, progressive);
+         enc.write_marker(JPEG_APP2, b"not an icc profile");

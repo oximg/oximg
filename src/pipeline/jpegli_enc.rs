@@ -168,6 +168,14 @@ impl JpegliEncoder {
                 debug_assert_eq!(enc.cinfo.num_components, 3);
                 enc.cinfo.scan_info = SCAN_SCRIPT.as_ptr();
                 enc.cinfo.num_scans = SCAN_SCRIPT.len() as c_int;
+            } else {
+                // jpegli_set_defaults leaves sequential output on the
+                // standard Huffman tables (progressive always optimizes).
+                // Those cost 30-100% in bytes on small and graphic
+                // outputs (issue #61); optimized tables cost a second
+                // pass over the buffered coefficients, which is still
+                // cheaper than the scan script.
+                enc.cinfo.optimize_coding = 1;
             }
             enc.cinfo.dest = &mut enc.dest.iface;
             ffi::jpegli_start_compress(&mut enc.cinfo, 1);
@@ -346,19 +354,43 @@ mod tests {
         assert_eq!(seg.iter().filter(|s| s.0 == 0xDA).count(), 1);
     }
 
+    /// Sequential output carries tables built for the image, not the
+    /// standard ones jpegli_set_defaults leaves in place.
+    #[test]
+    fn sequential_output_optimizes_huffman_tables() {
+        // JPEG Annex K.3: the standard luminance DC table's code counts.
+        const STD_DC_LUMA: [u8; 17] = [0x00, 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+        let (px, w, h) = frame();
+        for (w, h) in [(w, h), (40, 30)] {
+            let base = encode(&px[..w * h * 3], w, h, false);
+            let dht: Vec<&[u8]> = segments(&base)
+                .into_iter()
+                .filter(|s| s.0 == 0xC4)
+                .map(|s| s.1)
+                .collect();
+            assert!(!dht.is_empty(), "{w}x{h}: no DHT");
+            assert!(
+                dht.iter().all(|t| !t.starts_with(&STD_DC_LUMA)),
+                "{w}x{h}: standard luminance DC table"
+            );
+        }
+    }
+
     /// Batching must not depend on how the caller slices the rows: the
     /// whole frame at once (serial path) and one row at a time (fused
     /// path) produce the same file.
     #[test]
     fn write_granularity_does_not_change_bytes() {
         let (px, w, h) = frame();
-        let whole = encode(&px, w, h, true);
-        let mut enc = JpegliEncoder::new(w, h, 85.0, true);
-        enc.write_marker(JPEG_APP2, b"not an icc profile");
-        for row in px.chunks_exact(w * 3) {
-            enc.write_scanlines(row).unwrap();
+        for progressive in [true, false] {
+            let whole = encode(&px, w, h, progressive);
+            let mut enc = JpegliEncoder::new(w, h, 85.0, progressive);
+            enc.write_marker(JPEG_APP2, b"not an icc profile");
+            for row in px.chunks_exact(w * 3) {
+                enc.write_scanlines(row).unwrap();
+            }
+            assert!(enc.finish() == whole, "progressive={progressive}");
         }
-        assert!(enc.finish() == whole);
     }
 
     #[test]

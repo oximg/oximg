@@ -651,11 +651,15 @@ pub(super) fn icc_app2_chunks(icc: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ 
 /// jpegli encode via its libjpeg-compatible API (symbols are
 /// `jpegli_`-prefixed, so it links alongside mozjpeg without conflicts).
 /// OXIMG_JPEG_PROGRESSIVE=0 selects sequential jpegli (SOF1, extended
-/// sequential, which is how jpegli marks it; not baseline SOF0): a few percent
-/// larger output, but the entropy pass at finish_compress shrinks,
-/// which is the fused path's only serial tail.
-pub(super) fn jpegli_progressive() -> bool {
-    crate::config::config().jpegli_progressive
+/// sequential, which is how jpegli marks it; not baseline SOF0) with
+/// optimized Huffman tables: a few percent larger output at 512 px and
+/// up, for about a quarter less encoder CPU than the scan script.
+///
+/// Below OXIMG_JPEG_SEQUENTIAL_PIXELS output pixels the default is
+/// sequential too: the identical pixels in fewer bytes and less CPU.
+pub(super) fn jpegli_progressive(w: usize, h: usize) -> bool {
+    let c = crate::config::config();
+    c.jpegli_progressive && (w as u64) * (h as u64) > c.jpegli_sequential_pixels
 }
 
 pub(super) fn encode_jpegli(
@@ -668,7 +672,7 @@ pub(super) fn encode_jpegli(
     // cjpegli emits progressive by default; the libjpeg-compat layer does
     // not. Progressive is worth several percent at these sizes; the scan
     // script is oximg's own (see jpegli_enc.rs), not jpegli's level 2.
-    let mut enc = JpegliEncoder::new(w, h, quality, jpegli_progressive());
+    let mut enc = JpegliEncoder::new(w, h, quality, jpegli_progressive(w, h));
     if let Some(icc) = icc {
         for chunk in icc_app2_chunks(icc) {
             enc.write_marker(JPEG_APP2, &chunk);

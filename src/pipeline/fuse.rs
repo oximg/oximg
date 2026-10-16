@@ -190,7 +190,8 @@ pub(super) fn fused_resize_encode<R: std::io::BufRead>(
             let mut row8 = vec![0u8; dst_w * 3];
 
             // Mirrors encode_jpegli (including the progressive knob).
-            let mut enc = JpegliEncoder::new(dst_w, dst_h, quality, jpegli_progressive());
+            let mut enc =
+                JpegliEncoder::new(dst_w, dst_h, quality, jpegli_progressive(dst_w, dst_h));
             // Same chunker, same position as encode_jpegli: the profile
             // precedes the scanlines, so fused output stays
             // byte-identical to the serial encoder.

@@ -4,7 +4,7 @@ Sources are sniffed by magic bytes. Extensions are never trusted.
 
 | Format | Decode | Encode | Default output |
 |---|---|---|---|
-| JPEG | baseline, extended sequential (SOF1) & progressive, grayscale, CMYK/YCCK | jpegli progressive (default) or sequential (SOF1, `OXIMG_JPEG_PROGRESSIVE=0`); `PRESET=fast\|small` → mozjpeg | itself |
+| JPEG | baseline, extended sequential (SOF1) & progressive, grayscale, CMYK/YCCK | jpegli progressive (default; sequential up to `OXIMG_JPEG_SEQUENTIAL_PIXELS`, 20k) or sequential (SOF1, `OXIMG_JPEG_PROGRESSIVE=0`); `PRESET=fast\|small` → mozjpeg | itself |
 | PNG | palette / gray / 16-bit → RGB(A)8 | lossless RGB(A); opt-in quantize | itself |
 | WebP | lossy & lossless, alpha | lossy + alpha; canvas ≤ 16383 px | itself |
 | AVIF (`--features avif`) | dav1d 8/10/12-bit, all subsamplings, alpha | SVT-AV1 10-bit 4:2:0, tune=ssim, alpha auxiliary | itself |

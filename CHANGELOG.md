@@ -44,6 +44,27 @@ HTTP interface without notice.
   table instead of two 256-entry ones. Output is bit-identical. Decode
   time per DIV2K image on that path drops 0.23 ms (Intel i7-1360P) and
   0.18 ms (Apple M2), about 4% of the decode.
+- **Small JPEG outputs are written sequential** ([#61]). An output of
+  at most 20,000 pixels (a 160x120 thumbnail is 19,200) now gets one
+  sequential scan instead of the progressive scan script, because at
+  that size the scan headers cost more than progressive coding saves.
+  Pixels are identical. On a 762-image mixed corpus at q80, fit-128
+  photos are 0.9% smaller and the repo's small fixtures 7.2% smaller;
+  larger outputs are unchanged. Server CPU at fit 128 drops about
+  0.5%. `OXIMG_JPEG_SEQUENTIAL_PIXELS` moves the threshold, and `0`
+  restores progressive everywhere.
+
+### Fixed
+
+- **Sequential jpegli output (`OXIMG_JPEG_PROGRESSIVE=0`) uses
+  optimized Huffman tables.** jpegli's defaults left it on the standard
+  tables, which made sequential files 11-58% larger than progressive
+  ones at equal quality, most on small and graphic images. With
+  optimized tables the gap is 1.5-3.7% on photos and 4.5-11.7% on
+  graphics. The knob still saves server CPU: 5.5% at fit 512 and 28%
+  on large graphics (Zen 4). Pixels are unchanged. The same defaults
+  were behind the size regression in [#79], which was reverted before
+  it shipped.
 
 ## [0.14.0] - 2026-10-02
 
@@ -252,6 +273,7 @@ NEON changes alter pixels. Library and HTTP APIs are unchanged.
 [#54]: https://github.com/oximg/oximg/pull/54
 [#60]: https://github.com/oximg/oximg/issues/60
 [#61]: https://github.com/oximg/oximg/issues/61
+[#79]: https://github.com/oximg/oximg/pull/79
 
 ## [0.12.0] - 2026-09-29
 

@@ -1022,13 +1022,14 @@ fn preset_bytes_do_not_depend_on_overlap_gate() {
     }
 }
 
-/// The default jpegli encode is progressive with oximg's own scan
-/// script — no successive-approximation refinements — on every route
-/// into the encoder: the fused JPEG worker, the serial JPEG path, and a
-/// PNG source's whole-frame encode. `OXIMG_JPEG_PROGRESSIVE=0` is one
-/// sequential scan instead.
+/// jpegli encodes progressive with oximg's own scan script — no
+/// successive-approximation refinements — on every route into the
+/// encoder: the fused JPEG worker, the serial JPEG path, and a PNG
+/// source's whole-frame encode. Outputs of at most
+/// OXIMG_JPEG_SEQUENTIAL_PIXELS pixels are one sequential scan instead,
+/// as is everything under OXIMG_JPEG_PROGRESSIVE=0.
 #[test]
-fn jpegli_default_uses_the_scan_script_and_the_knob_selects_sequential() {
+fn jpegli_scan_script_and_the_sequential_cases() {
     let script: Vec<common::Scan> = vec![
         (vec![0, 1, 2], 0, 0, 0, 0),
         (vec![0], 1, 2, 0, 0),
@@ -1039,21 +1040,41 @@ fn jpegli_default_uses_the_scan_script_and_the_knob_selects_sequential() {
         (vec![2], 1, 2, 0, 0),
         (vec![2], 3, 63, 0, 0),
     ];
-    let urls = ["/resize/100/100/photo.jpg", "/resize/100/100/rgb.png@jpg"];
+    let sequential: Vec<common::Scan> = vec![(vec![0, 1, 2], 0, 63, 0, 0)];
+    // 200x150 (30000 px) and 100x75 (7500 px) outputs.
+    let large = ["/resize/200/200/photo.jpg", "/resize/200/200/rgb.png@jpg"];
+    let small = ["/resize/100/100/photo.jpg", "/resize/100/100/rgb.png@jpg"];
+    let px = |n: &str| ("OXIMG_JPEG_SEQUENTIAL_PIXELS", n.to_string());
     for overlap in ["1", "0"] {
-        let s = Server::start(&[("OXIMG_OVERLAP", overlap.into())]);
-        for url in urls {
+        let s = Server::start(&[("OXIMG_OVERLAP", overlap.into()), px("10000")]);
+        for url in large {
             let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
             assert_eq!(sof, 0xC2, "OVERLAP={overlap} {url}: not progressive");
             assert_eq!(scans, script, "OVERLAP={overlap} {url}");
         }
+        for url in small {
+            let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
+            // jpegli's sequential output is SOF1 (extended), not SOF0.
+            assert_eq!(sof, 0xC1, "OVERLAP={overlap} {url}: not sequential");
+            assert_eq!(scans, sequential, "OVERLAP={overlap} {url}");
+        }
+    }
+    // 0 keeps even the smallest output progressive.
+    let s = Server::start(&[px("0")]);
+    for url in small {
+        let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
+        assert_eq!((sof, scans), (0xC2, script.clone()), "{url}");
+    }
+    // The default threshold covers a 100x75 thumbnail.
+    let s = Server::start(&[]);
+    for url in small {
+        let (sof, _) = common::jpeg_scans(&s.get(url).unwrap().2);
+        assert_eq!(sof, 0xC1, "default {url}: not sequential");
     }
     let s = Server::start(&[("OXIMG_JPEG_PROGRESSIVE", "0".into())]);
-    for url in urls {
+    for url in large.iter().chain(&small) {
         let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
-        // jpegli's sequential output is SOF1 (extended), not SOF0.
-        assert_eq!(sof, 0xC1, "{url}: not sequential");
-        assert_eq!(scans, vec![(vec![0, 1, 2], 0, 63, 0, 0)], "{url}");
+        assert_eq!((sof, scans), (0xC1, sequential.clone()), "{url}");
     }
 }
 
