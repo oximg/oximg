@@ -3732,10 +3732,20 @@ fn faults_per_request(envs: &[(&str, String)]) -> f64 {
     let s = Server::start(&all);
     let get = |i: usize| assert_eq!(s.status_of(&format!("/resize/512/512/p{i}.jpg")), 200);
     (0..5).for_each(get);
-    let before = minor_faults(s.child.id());
-    let n = 30;
-    (5..5 + n).for_each(get);
-    (minor_faults(s.child.id()) - before) as f64 / n as f64
+    // The median of three windows: on the CI runners a single window
+    // occasionally takes a one-off burst (15-37 faults per request
+    // against a typical 0.1-5, both architectures), which a plain mean
+    // over all requests would carry into the result.
+    let (windows, n) = (3, 10);
+    let mut rates: Vec<f64> = (0..windows)
+        .map(|w| {
+            let before = minor_faults(s.child.id());
+            (5 + w * n..5 + (w + 1) * n).for_each(get);
+            (minor_faults(s.child.id()) - before) as f64 / n as f64
+        })
+        .collect();
+    rates.sort_by(f64::total_cmp);
+    rates[windows / 2]
 }
 
 #[test]
@@ -3745,9 +3755,16 @@ fn faults_per_request(envs: &[(&str, String)]) -> f64 {
     ignore = "70 DIV2K-sized requests; CI runs it under --release"
 )]
 fn warm_requests_do_not_fault_their_buffers_back_in() {
-    // Measured on Zen 4 / glibc 2.44 (4 KiB pages): 0.5-17 faults per
-    // warm request with the pinned allocator, 120-135 with glibc's
-    // dynamic thresholds. The bound leaves room for the kernel's socket
+    // A regression bound on the warm fault rate. When the pins landed it
+    // also told pinned from unpinned: Zen 4 / glibc 2.44 measured 0.5-17
+    // faults per warm request pinned and 120-135 with glibc's dynamic
+    // thresholds. It no longer does. Re-measured 2026-10-22:
+    //   - starship (glibc 2.44): pinned 0.0-0.8, dynamic 0.9-2.6;
+    //   - the CI runners (Ubuntu glibc 2.39, amd64 and arm64): pinned
+    //     0.1-5 per window, with rare one-window bursts of 15-37;
+    //     dynamic 0.4-10.
+    // The override check below is the one that still separates
+    // configurations. The bound leaves room for the kernel's socket
     // pages. A count is an upper bound for larger pages, which take
     // fewer faults to touch the same bytes.
     //
@@ -3756,7 +3773,7 @@ fn warm_requests_do_not_fault_their_buffers_back_in() {
     let pinned = faults_per_request(&[("GLIBC_TUNABLES", String::new())]);
     assert!(
         pinned < 40.0,
-        "{pinned:.1} minor faults per warm request: the glibc malloc pins are not applied"
+        "{pinned:.1} minor faults per warm request: warm requests fault their buffers back in"
     );
     // An operator's own glibc.malloc tunable wins. Restating the stock
     // 128 KiB mmap threshold (which also turns off glibc's dynamic
