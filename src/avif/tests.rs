@@ -541,3 +541,74 @@ fn yuv_conversion_hits_known_anchors() {
     assert!(y.iter().all(|&v| v == 0));
     assert_eq!((cb[0], cr[0]), (512, 512));
 }
+
+/// An AVIF whose alpha auxiliary item is 255 everywhere decodes to an
+/// opaque frame, and the pipeline must then serve it exactly like the
+/// same color item without the alpha item (#70). oximg's own encoder
+/// drops such an item, so the test assembles one: the same color AV1
+/// bitstream, once with a flat alpha item and once without.
+#[test]
+fn opaque_alpha_item_serves_like_no_alpha_item() {
+    let (w, h) = (160usize, 120usize);
+    let rgb = pixel_samples(w * h * 3, 7);
+    let p = AvifParams {
+        quality: 85,
+        alpha_quality: 100,
+        ..AvifParams::default()
+    };
+    let (mut y, mut cb, mut cr) = (Vec::new(), Vec::new(), Vec::new());
+    rgb_to_yuv420_10bit(&rgb, w, h, 3, &mut y, &mut cb, &mut cr);
+    let color =
+        encode::encode_svt(&y, &cb, &cr, w, h, quality_to_qp(p.quality), false, &p).unwrap();
+    let a_plane = vec![1023u16; w * h];
+    let uv = vec![0u16; w.div_ceil(2) * h.div_ceil(2)];
+    let alpha = encode::encode_svt(
+        &a_plane,
+        &uv,
+        &uv,
+        w,
+        h,
+        quality_to_qp(p.alpha_quality),
+        true,
+        &p,
+    )
+    .unwrap();
+    let with_alpha = encode::finish_avif(&color, Some(&alpha), w, h, None);
+    let without = encode::finish_avif(&color, None, w, h, None);
+
+    // The premise: the file really carries alpha, and every value is 255.
+    let mut px = Vec::new();
+    let (_, _, channels) = decode_avif_into(&with_alpha, &mut px).unwrap();
+    assert_eq!(channels, 4, "the alpha item must decode");
+    assert!(px.as_chunks::<4>().0.iter().all(|q| q[3] == 255));
+
+    use crate::pipeline::{ImageFormat, Params, process};
+    for output in [
+        ImageFormat::Png,
+        ImageFormat::Webp,
+        ImageFormat::Jpeg,
+        ImageFormat::Avif,
+    ] {
+        for size in [200, 97] {
+            for linear in [true, false] {
+                let params = Params {
+                    max_width: size,
+                    max_height: size,
+                    output: Some(output),
+                    linear_light: Some(linear),
+                    ..Params::default()
+                };
+                let (a, b) = (
+                    process(&with_alpha, &params).unwrap().0,
+                    process(&without, &params).unwrap().0,
+                );
+                assert!(
+                    a == b,
+                    "{output:?} box {size} linear {linear}: {} vs {} bytes",
+                    a.len(),
+                    b.len()
+                );
+            }
+        }
+    }
+}
