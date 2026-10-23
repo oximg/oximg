@@ -36,6 +36,63 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
 
+      # The image redistributes the code linked into the binary (the
+      # crates in the bundle, and the standard library), SVT-AV1's shared
+      # library, and dav1d's. Each needs its notice inside the image.
+      - name: License notices are in the image
+        run: |
+          docker run --rm oximg:ci sh -c 'for f in \
+              /usr/share/doc/oximg/LICENSE \
+              /usr/share/doc/oximg/THIRD-PARTY-LICENSES.md \
+              /usr/share/doc/oximg/THIRD-PARTY-LICENSES-rust-std.html \
+              /usr/share/doc/svt-av1/LICENSE.md \
+              /usr/share/doc/svt-av1/PATENTS.md \
+              /usr/share/doc/libdav1d7/copyright; do
+            test -s "$f" || {
+              echo "missing: $f"
+              echo "The Dockerfile copies this file into the image. See the"
+              echo "COPY and install lines that write to /usr/share/doc."
+              exit 1
+            }
+          done'
+
+      # The notices above cover the shared libraries the binary needs
+      # today. A new one (a new apt package, a dependency that switches
+      # to dynamic linking) must fail here until its notice is sorted
+      # out: either its Debian package keeps a copyright file, or the
+      # image ships one and the step above checks it.
+      - name: Dynamic libraries are the expected ones
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm oximg:ci ldd /usr/local/bin/oximg \
+            | awk '{print $1}' | sed 's|.*/||; s|\.so.*||' | sort -u)
+          want="ld-linux-aarch64 ld-linux-x86-64 libSvtAv1Enc libc libdav1d libgcc_s libm libstdc++ linux-vdso"
+          extra=$(comm -23 <(echo "$got") <(tr ' ' '\n' <<< "$want" | sort -u))
+          if [ -n "$extra" ]; then
+            echo "::error::unexpected shared libraries: $extra"
+            echo "The binary now needs a shared library that this list does"
+            echo "not know. Its license must ship with the image:"
+            echo "- If a Debian package provides it and keeps"
+            echo "  /usr/share/doc/<package>/copyright, add the name to want."
+            echo "- If the Dockerfile builds or copies it, also copy its"
+            echo "  license files and add them to the step above."
+            echo "See \"Third-party notices\" in CONTRIBUTING.md."
+            exit 1
+          fi
+          # Every library outside /usr/local comes from a Debian package.
+          # Find the package that owns the file, and check that it keeps
+          # its copyright file in the image.
+          docker run --rm oximg:ci sh -c '
+            ldd /usr/local/bin/oximg | grep -o "/[^ ]*" | grep -v "^/usr/local/" |
+            while read -r f; do
+              p=$(dpkg -S "$(readlink -f "$f")") || exit 1
+              p=${p%%:*}
+              test -s "/usr/share/doc/$p/copyright" || {
+                echo "missing: /usr/share/doc/$p/copyright (for $f)"
+                exit 1
+              }
+            done'
+
       - name: Smoke test the served pipeline
         run: |
           set -euo pipefail

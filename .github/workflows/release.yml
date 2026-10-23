@@ -123,6 +123,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake nasm
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # CI runs the linked-library test on Linux glibc and musl, but it
+      # has no macOS job. Run it here for macOS. It runs before the
+      # build: a test build pulls in the dev-dependencies, links its own
+      # target/release/oximg and replaces the one from cargo build.
+      - name: Linked libraries have notices
+        if: runner.os == 'macOS'
+        run: cargo test --release --locked --test third_party_notices
       - name: Build
         run: cargo build --release --locked
         env:
@@ -152,6 +159,11 @@ jobs:
           fi
           mkdir "$name"
           cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          # The Rust standard library is linked statically into every
+          # Rust binary. Its notices come with the toolchain that built
+          # this one, so take them from the same sysroot.
+          cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+            "$name/THIRD-PARTY-LICENSES-rust-std.html"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
@@ -184,12 +196,38 @@ jobs:
       - uses: actions/checkout@v5
       # rust:alpine is multi-arch, so each runner pulls its own
       # architecture and builds natively — no QEMU in the loop.
+      # The binary is static, so musl itself is inside it and its MIT
+      # notice must ship too. The bundle carries musl's COPYRIGHT under a
+      # "## musl libc <version>" heading (about.hbs). rustc links the musl
+      # it carries (self-contained/libc.a), not Alpine's, so read the
+      # version from that file and check the bundle names the same one.
+      # ci.yml runs the same checks, and the linked-library test, on
+      # every PR. They stay here as the last check before the upload.
       - name: Build in Alpine
         run: |
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
             apk add --no-cache build-base cmake nasm >/dev/null &&
             cargo build --release --locked &&
-            strip target/release/oximg'
+            strip target/release/oximg &&
+            cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+              target/release/THIRD-PARTY-LICENSES-rust-std.html &&
+            readelf -d target/release/oximg > /tmp/dynamic &&
+            if grep -q NEEDED /tmp/dynamic; then
+              echo "expected a static binary, found dynamic dependencies" >&2
+              exit 1
+            fi &&
+            v=$(strings "$(rustc --print target-libdir)/self-contained/libc.a" |
+              grep -xE "1\.[0-9]+\.[0-9]+" | sort -u) &&
+            if [ -z "$v" ] || [ "$(echo "$v" | wc -l)" -ne 1 ]; then
+              echo "expected one musl version in libc.a, found: $v" >&2
+              exit 1
+            fi &&
+            if ! grep -qx "## musl libc $v" THIRD-PARTY-LICENSES.md; then
+              echo "rustc links musl $v, but the bundle has no \"## musl libc $v\" section." >&2
+              echo "Put COPYRIGHT from tag v$v of git.musl-libc.org in the musl" >&2
+              echo "section of about.hbs, then regenerate THIRD-PARTY-LICENSES.md." >&2
+              exit 1
+            fi'
           # The container builds as root into the mounted workspace, so
           # every artifact it leaves behind is root-owned. Hand the
           # whole tree back before any host-side step touches it.
@@ -210,7 +248,8 @@ jobs:
           set -euo pipefail
           name="oximg-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md "$name/"
+          cp target/release/oximg LICENSE README.md THIRD-PARTY-LICENSES.md \
+            target/release/THIRD-PARTY-LICENSES-rust-std.html "$name/"
           tar czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" "$name.tar.gz" "$name.tar.gz.sha256" \
@@ -267,7 +306,7 @@ jobs:
         run: |
           set -euo pipefail
           dist="$GITHUB_WORKSPACE/dist"
-          mkdir -p exe && rm -f exe/oximg
+          mkdir -p exe && rm -f exe/oximg exe/THIRD-PARTY-LICENSES*
           # Plain-Ruby gem first, while exe/ is still empty.
           gem build oximg.gemspec -o "$dist/oximg-ruby.gem"
           # The Linux platforms are spelled out per libc: an
@@ -285,9 +324,20 @@ jobs:
             name="oximg-${GITHUB_REF_NAME}-${target}"
             tar xzf "$dist/$name.tar.gz" -C "$dist"
             install -m 0755 "$dist/$name/oximg" exe/oximg
+            rm -f exe/THIRD-PARTY-LICENSES*
+            install -m 0644 "$dist/$name"/THIRD-PARTY-LICENSES* exe/
             OXIMG_GEM_PLATFORM="$platform" gem build oximg.gemspec -o "$dist/oximg-$platform.gem"
+            # A platform gem redistributes the binary, so it carries the
+            # notices from the same archive. Check the built gem.
+            want="exe/THIRD-PARTY-LICENSES.md exe/THIRD-PARTY-LICENSES-rust-std.html"
+            gem spec "$dist/oximg-$platform.gem" files > files.txt
+            for f in $want; do
+              grep -qx -- "- $f" files.txt \
+                || { echo "::error::oximg-$platform.gem has no $f"; exit 1; }
+            done
+            rm -f files.txt
           done
-          rm -f exe/oximg
+          rm -f exe/oximg exe/THIRD-PARTY-LICENSES*
       - uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Publish
         run: |
