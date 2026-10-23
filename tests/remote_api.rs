@@ -1,5 +1,6 @@
-//! The library-level remote-source contract: `fetch_url`/`fetch_gcs`
-//! (buffered, issue #22) and `process_url`/`process_gcs` (streaming),
+//! The library-level remote-source contract: `fetch_url`/`fetch_gcs`/
+//! `fetch_s3` (buffered, issue #22) and `process_url`/`process_gcs`/
+//! `process_s3` (streaming),
 //! exercised directly as an embedder would — the server binary stopped
 //! calling the streaming pair in #22, so without this file they have
 //! no coverage at all.
@@ -42,6 +43,14 @@ fn init() {
             std::env::set_var("OXIMG_UPSTREAM_TIMEOUT", "2");
             std::env::set_var("GCE_METADATA_HOST", format!("127.0.0.1:{md_port}"));
             std::env::set_var("OXIMG_GCS_ENDPOINT", format!("http://127.0.0.1:{gcs_port}"));
+            // The same origin serves s3:// in path style. Blank values
+            // read as unset, so the developer's own AWS_* do not leak in.
+            std::env::set_var("OXIMG_S3_ENDPOINT", format!("http://127.0.0.1:{gcs_port}"));
+            std::env::set_var("OXIMG_S3_PATH_STYLE", "");
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDTEST");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+            std::env::set_var("AWS_SESSION_TOKEN", "");
         }
     });
 }
@@ -266,6 +275,44 @@ fn gcs_paths_share_the_http_contract() {
 
     let e = pipeline::fetch_gcs("test-bucket", "missing.jpg").unwrap_err();
     assert_eq!(e.kind(), ErrorKind::SourceNotFound);
+}
+
+/// The s3:// pair rides the same tails as the other two. Signing and
+/// status mapping are pinned in src/pipeline/s3.rs and
+/// tests/server.rs. Here: the library surface returns the object
+/// verbatim, the two decode paths agree, and an absent object
+/// classifies as SourceNotFound.
+#[test]
+fn s3_paths_share_the_http_contract() {
+    init();
+    let bytes = pipeline::fetch_s3("test-bucket", "photo.jpg").unwrap();
+    assert_eq!(
+        bytes,
+        fixture("photo.jpg"),
+        "fetch_s3 returns the object verbatim"
+    );
+
+    let p = Params {
+        max_width: 100,
+        max_height: 100,
+        ..Params::default()
+    };
+    let (direct, _) = pipeline::process_s3("test-bucket", "photo.jpg", &p).unwrap();
+    let (buffered, _) = pipeline::process(&bytes, &p).unwrap();
+    assert_eq!(direct, buffered, "process_s3 and fetch_s3 + process agree");
+
+    let e = pipeline::fetch_s3("test-bucket", "missing.jpg").unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::SourceNotFound);
+
+    // A dot segment would be removed from the URL after signing, so the
+    // store would answer 403. It is refused before any request.
+    // The same, percent-encoded: the check runs after decoding. A
+    // missing object is also a 404, so check the reason too.
+    for key in ["a/../photo.jpg", "a/%2E%2E/photo.jpg"] {
+        let e = pipeline::fetch_s3("test-bucket", key).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::SourceNotFound);
+        assert!(e.to_string().contains("segment"), "{key}: {e}");
+    }
 }
 
 /// Sequential fetches to one host reuse a pooled connection. Pinned

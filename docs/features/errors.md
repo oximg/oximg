@@ -16,7 +16,7 @@ and turns a crawler into origin load.
 | 405 | method other than GET/HEAD/OPTIONS | |
 | 413 | `OXIMG_MAX_SOURCE_BYTES` / `OXIMG_MAX_SRC_PIXELS` / `OXIMG_MAX_DECODED_BYTES` | generic; which limit is on stderr |
 | 422 | undecodable bytes | top-level message, safe to echo |
-| 500 | unreadable local source, encoder/internal fault, worker panic | generic; chain on stderr |
+| 500 | unreadable local source; object store refusing our settings or keys (`gs://`/`s3://` permission, `s3://` region, keys, missing bucket); encoder/internal fault; worker panic | generic; chain on stderr |
 | 502 | upstream broken (connect/reset/5xx) | generic |
 | 503 | request coalescing exhausted (leader died before publishing) | generic |
 | 504 | upstream slow (`OXIMG_UPSTREAM_*` deadline) | generic |
