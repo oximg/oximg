@@ -4,9 +4,10 @@
 //! caps and deadlines apply unchanged. `fetch` has its own copy of the
 //! one-retry rule.
 //!
-//! Credentials: static keys from the environment (`AWS_ACCESS_KEY_ID`
-//! and `AWS_SECRET_ACCESS_KEY`, plus `AWS_SESSION_TOKEN` for temporary
-//! keys). The `~/.aws` profile files are out of scope.
+//! Credentials come from a chain of sources in `creds`: static keys
+//! from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
+//! plus `AWS_SESSION_TOKEN` for temporary keys). The `~/.aws` profile
+//! files are out of scope.
 //! `aws configure export-credentials --format env` turns a profile
 //! into static keys.
 //!
@@ -37,12 +38,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{SourceRejected, UpstreamFault};
 
+mod creds;
+
 type HmacSha256 = hmac::Hmac<Sha256>;
 
 /// SHA-256 of an empty body. Every request this module signs is a GET,
 /// so this is always the payload hash.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+#[derive(Clone)]
 struct Credentials {
     access_key_id: String,
     secret_access_key: String,
@@ -196,7 +200,7 @@ struct Settings {
     /// Whether `OXIMG_S3_ENDPOINT` is set. A custom endpoint defaults to
     /// path style.
     custom_endpoint: bool,
-    credentials: Credentials,
+    credentials: creds::Chain,
 }
 
 impl Settings {
@@ -261,23 +265,14 @@ fn load_settings() -> Result<Settings, String> {
              (OXIMG_S3_PATH_STYLE=1)"
         ));
     }
-    let (Some(access_key_id), Some(secret_access_key)) = (
-        aws_var(std::env::var("AWS_ACCESS_KEY_ID")),
-        aws_var(std::env::var("AWS_SECRET_ACCESS_KEY")),
-    ) else {
-        return Err("s3:// needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY".into());
-    };
+    let credentials = creds::Chain::from_env()?;
     Ok(Settings {
         scheme,
         host,
         region,
         path_style,
         custom_endpoint: custom.is_some(),
-        credentials: Credentials {
-            access_key_id,
-            secret_access_key,
-            session_token: aws_var(std::env::var("AWS_SESSION_TOKEN")),
-        },
+        credentials,
     })
 }
 
@@ -368,14 +363,18 @@ fn unix_now() -> u64 {
 
 /// Sign and send one GET. Every attempt is signed again, so a retry
 /// carries a fresh `x-amz-date`.
-async fn send_signed(s: &Settings, t: &Target) -> reqwest::Result<reqwest::Response> {
+async fn send_signed(
+    s: &Settings,
+    creds: &Credentials,
+    t: &Target,
+) -> reqwest::Result<reqwest::Response> {
     let datetime = amz_datetime(unix_now());
     let mut headers = vec![
         ("host", t.host.as_str()),
         ("x-amz-content-sha256", EMPTY_SHA256),
         ("x-amz-date", datetime.as_str()),
     ];
-    if let Some(token) = &s.credentials.session_token {
+    if let Some(token) = &creds.session_token {
         headers.push(("x-amz-security-token", token));
     }
     let req = Request {
@@ -385,7 +384,7 @@ async fn send_signed(s: &Settings, t: &Target) -> reqwest::Result<reqwest::Respo
         headers: &headers,
         payload_hash: EMPTY_SHA256,
     };
-    let auth = authorization(&req, &s.credentials, &s.region, "s3", &datetime);
+    let auth = authorization(&req, creds, &s.region, "s3", &datetime);
     // reqwest sets `Host` from the URL. We signed the same value.
     let mut builder = super::fetch_client()
         .get(&t.url)
@@ -468,9 +467,12 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
         anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
     })?;
     let target = Target::new(s, bucket, &raw_key);
+    let creds = s.credentials.current().await.map_err(|e| {
+        anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+    })?;
     // One retry, on connection transients and on `retryable_status`.
     // Unlike `gs://`, a 401 is not retried.
-    let first = send_signed(s, &target).await;
+    let first = send_signed(s, &creds, &target).await;
     let retry = match &first {
         Ok(resp) => retryable_status(resp.status().as_u16()),
         Err(e) => !e.is_timeout() && (e.is_connect() || e.is_request()),
@@ -480,7 +482,7 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
         drop(first);
         super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        send_signed(s, &target).await
+        send_signed(s, &creds, &target).await
     } else {
         first
     }
@@ -737,17 +739,25 @@ pub(crate) fn startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> 
     let target = Target::new(s, bucket, key.as_bytes());
     // `block_on_fetch` runs the future on another thread, so it must
     // own what it uses.
-    super::block_on_fetch(probe(s, bucket.to_string(), target))
+    super::block_on_fetch(probe(s, bucket.to_string(), target))?;
+    // With more than one source configured (IRSA and Pod Identity on
+    // one pod), this is the only place that says which one won.
+    eprintln!("oximg: s3:// credentials: {}", s.credentials.source_name());
+    Ok(())
 }
 
 async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(), String> {
     let fail = |what: String| {
         format!(
-            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {:?}) {what}",
-            s.scheme, s.host, s.region
+            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {:?}, {}) {what}",
+            s.scheme,
+            s.host,
+            s.region,
+            s.credentials.source_name()
         )
     };
-    let resp = send_signed(s, &target).await.map_err(|e| {
+    let creds = s.credentials.current().await.map_err(fail)?;
+    let resp = send_signed(s, &creds, &target).await.map_err(|e| {
         fail(format!(
             "could not reach the endpoint: {:#}",
             anyhow::Error::new(e)
@@ -982,7 +992,7 @@ mod tests {
             region: "us-east-1".into(),
             path_style,
             custom_endpoint: false,
-            credentials: creds(None),
+            credentials: creds::fixed(creds(None)),
         }
     }
 

@@ -489,7 +489,7 @@ mod tests {
             }
         }
         // Do not scan config.rs: PROCESS names appear in the inventory
-        // itself. Always include gcs.rs and s3.rs so
+        // itself. Always include gcs.rs and the s3 files so
         // --no-default-features still sees GCE_METADATA_HOST and the
         // AWS_* names.
         let process_sources = [
@@ -497,6 +497,7 @@ mod tests {
             include_str!("cli.rs"),
             include_str!("pipeline/gcs.rs"),
             include_str!("pipeline/s3.rs"),
+            include_str!("pipeline/s3/creds.rs"),
         ];
         let mut reads: HashSet<&str> = HashSet::new();
         for src in process_sources {
