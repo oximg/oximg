@@ -6,6 +6,7 @@
 //! background shortly before they expire.
 
 use std::future::Future;
+use std::net::Ipv6Addr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -23,7 +24,56 @@ pub(super) struct Keys {
     pub(super) expires_at: Option<SystemTime>,
 }
 
-pub(super) type KeysFuture<'a> = Pin<Box<dyn Future<Output = Result<Keys, String>> + Send + 'a>>;
+pub(super) type KeysFuture<'a> = Pin<Box<dyn Future<Output = Result<Keys, CredError>> + Send + 'a>>;
+
+/// Why keys could not be had. The fault decides the status a request
+/// gets, as for the store itself: our settings are the deployment's
+/// fault (500), a source that does not answer in time is a timeout
+/// (504), and a source that is down is an upstream fault (502).
+#[derive(Clone, Debug)]
+pub(super) struct CredError {
+    pub(super) fault: Fault,
+    pub(super) message: String,
+    /// The `<Code>` of an AWS XML error answer, as STS sends.
+    pub(super) code: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fault {
+    Settings,
+    TimedOut,
+    Unavailable,
+}
+
+impl CredError {
+    /// A fault in our settings or in what the source answered: a missing
+    /// file, a role without keys, an answer we cannot read. Status 500.
+    pub(super) fn settings(message: impl Into<String>) -> Self {
+        Self::new(Fault::Settings, message.into())
+    }
+
+    fn new(fault: Fault, message: String) -> Self {
+        Self {
+            fault,
+            message,
+            code: None,
+        }
+    }
+
+    /// The same error with `what` in front of the message.
+    pub(super) fn context(self, what: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("{what}: {}", self.message),
+            ..self
+        }
+    }
+}
+
+impl std::fmt::Display for CredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
 
 /// One place keys can come from.
 pub(super) trait Source: Send + Sync {
@@ -58,7 +108,7 @@ impl Cached {
 /// The last fetch that gave no usable keys.
 struct Failure {
     at: Instant,
-    error: String,
+    error: CredError,
 }
 
 #[derive(Default)]
@@ -86,7 +136,7 @@ struct Inner {
 
 /// What a request does next.
 enum Step {
-    Ready(Result<Arc<Credentials>, String>),
+    Ready(Result<Arc<Credentials>, CredError>),
     /// Wait for the running fetch.
     Wait,
     /// No runtime to spawn on: run the fetch here.
@@ -138,7 +188,7 @@ impl Chain {
     /// `min_reuse`. Until then, requests sign with the cached keys while
     /// they have not expired, or get the same error. So a source that is
     /// down or slow costs one fetch per `min_reuse`, not one per request.
-    pub(super) async fn current(&self) -> Result<Arc<Credentials>, String> {
+    pub(super) async fn current(&self) -> Result<Arc<Credentials>, CredError> {
         let mut waited = false;
         loop {
             // The lock is released at the end of this block, before any
@@ -225,7 +275,10 @@ impl Inner {
         impl Drop for Unfinished {
             fn drop(&mut self) {
                 if let Some(inner) = self.0.take() {
-                    inner.finish(Err("the fetch stopped before it finished".into()));
+                    inner.finish(Err(CredError::new(
+                        Fault::Unavailable,
+                        "the fetch stopped before it finished".into(),
+                    )));
                 }
             }
         }
@@ -235,16 +288,16 @@ impl Inner {
         self.finish(result);
     }
 
-    fn finish(&self, result: Result<Keys, String>) {
+    fn finish(&self, result: Result<Keys, CredError>) {
         let mut state = self.lock();
         state.fetching = false;
         let name = self.source.name();
         let error = match result {
             Ok(keys) if keys.expires_at.is_some_and(|t| t <= SystemTime::now()) => {
-                format!(
+                CredError::settings(format!(
                     "s3:// credentials from {name}: the source returned keys that have \
                      already expired. Check this host's clock"
-                )
+                ))
             }
             Ok(keys) => {
                 state.cached = Some(Cached {
@@ -257,7 +310,7 @@ impl Inner {
                 self.done.notify_waiters();
                 return;
             }
-            Err(e) => format!("s3:// credentials from {name}: {e}"),
+            Err(e) => e.context(format_args!("s3:// credentials from {name}")),
         };
         if let Some(c) = &state.cached
             && !c.expired(SystemTime::now())
@@ -324,6 +377,158 @@ impl Source for Static {
             })
         })
     }
+}
+
+/// Credential answers are well under a kilobyte. A larger one is a
+/// fault, not keys.
+const BODY_LIMIT: usize = 16 * 1024;
+
+/// The client for a credential endpoint at `url`.
+///
+/// The agents and IMDS live on link-local or loopback addresses, or on
+/// their `fd00:ec2::` IPv6 addresses. Requests to them skip `HTTP_PROXY` and
+/// friends: a proxy would see the session token, the authorization
+/// token and the keys in clear, and these addresses are only reachable
+/// from the host anyway. Any other host (STS, an https container
+/// endpoint) goes through the shared client, proxy and all, because
+/// some networks reach the internet only through one. Neither follows
+/// redirects.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) fn client_for(url: &str) -> &'static reqwest::Client {
+    if host_is_local(url) {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("construct the credential client")
+        })
+    } else {
+        super::super::fetch_client()
+    }
+}
+
+/// The EKS Pod Identity Agent's IPv6 address.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) const EKS_AGENT_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x23);
+
+/// IMDS's IPv6 address, on Nitro instances.
+const IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
+
+/// Whether `url`'s host is loopback, link-local, the EKS agent or IMDS.
+fn host_is_local(url: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "localhost" {
+        return true;
+    }
+    match host_ip(host) {
+        Some(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_link_local(),
+        Some(IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unicast_link_local() || [EKS_AGENT_V6, IMDS_V6].contains(&ip)
+        }
+        None => false,
+    }
+}
+
+/// `host` as an IP address. An IPv6 host comes in brackets.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) fn host_ip(host: &str) -> Option<std::net::IpAddr> {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// Send one request to a credential endpoint and read its answer. Each
+/// request has its own `timeout`, so a stalled endpoint fails the fetch
+/// instead of leaving every request that needs keys waiting.
+///
+/// A connection error, 429 or 5xx gets one more try, as S3 requests do
+/// in `send_with_retry`. A failed fetch is not tried again for
+/// `MIN_REUSE`, so without this one blip would cost a minute without
+/// keys. A timeout is not tried again: a stalled source costs one
+/// `timeout`, not two.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) async fn send(
+    req: reqwest::RequestBuilder,
+    timeout: Duration,
+) -> Result<Vec<u8>, CredError> {
+    // A form or empty body always clones.
+    let again = req.try_clone();
+    let first = req.timeout(timeout).send().await;
+    let retry = match &first {
+        Ok(resp) => resp.status().as_u16() == 429 || resp.status().is_server_error(),
+        Err(e) => !e.is_timeout() && (e.is_connect() || e.is_request()),
+    };
+    let resp = match again {
+        Some(again) if retry => {
+            // Release the failed response before waiting.
+            drop(first);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            again.timeout(timeout).send().await
+        }
+        _ => first,
+    }
+    .map_err(transport)?;
+    read_body(resp).await
+}
+
+/// A transport error: a timeout, or a source we could not reach.
+fn transport(e: reqwest::Error) -> CredError {
+    let fault = if e.is_timeout() {
+        Fault::TimedOut
+    } else {
+        Fault::Unavailable
+    };
+    // reqwest puts the full URL in its message, userinfo and query
+    // included. The caller adds a URL without them.
+    CredError::new(fault, format!("{:#}", anyhow::Error::new(e.without_url())))
+}
+
+/// Read a credential endpoint's answer, refusing anything over
+/// `BODY_LIMIT` and any status other than 2xx. 429 and 5xx are the
+/// source being down; other statuses are our settings.
+async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, CredError> {
+    let status = resp.status();
+    let body = super::read_capped(resp, BODY_LIMIT)
+        .await
+        .map_err(|e| match e {
+            super::ReadError::TooLarge => CredError::new(
+                Fault::Unavailable,
+                format!("{status} answer is over {BODY_LIMIT} bytes"),
+            ),
+            super::ReadError::Transport(e) => transport(e),
+        })?;
+    if !status.is_success() {
+        let fault = if status.as_u16() == 429 || status.is_server_error() {
+            Fault::Unavailable
+        } else {
+            Fault::Settings
+        };
+        // An AWS XML error (STS): show its code and message, not the XML.
+        let parsed = super::parse_error_body(&body);
+        if let Some(code) = parsed.code {
+            let message = parsed.message.unwrap_or_default();
+            let mut e = CredError::new(fault, format!("{status} {code}: {message}"));
+            e.code = Some(code);
+            return Err(e);
+        }
+        let text = String::from_utf8_lossy(&body);
+        let shown: String = text
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(200)
+            .collect();
+        return Err(CredError::new(fault, format!("{status}: {shown}")));
+    }
+    Ok(body)
 }
 
 /// Keys in the JSON shape that the container endpoint and IMDS share:
@@ -420,7 +625,7 @@ mod tests {
             Box::pin(async move {
                 tokio::time::sleep(self.delay).await;
                 if n >= self.fail_from {
-                    return Err("down".to_string());
+                    return Err(CredError::new(Fault::Unavailable, "down".into()));
                 }
                 Ok(Keys {
                     credentials: Credentials {
@@ -591,7 +796,8 @@ mod tests {
             .collect();
         for call in calls {
             let e = call.await.unwrap().err().unwrap();
-            assert!(e.contains("counting: down"), "{e}");
+            assert!(e.message.contains("counting: down"), "{e}");
+            assert_eq!(e.fault, Fault::Unavailable);
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         assert!(chain.current().await.is_err());
@@ -608,7 +814,7 @@ mod tests {
         let (chain, fetches) = chain_with(counting(Some(Duration::ZERO)), MIN_REUSE);
         for _ in 0..5 {
             let e = chain.current().await.err().unwrap();
-            assert!(e.contains("already expired"), "{e}");
+            assert!(e.message.contains("already expired"), "{e}");
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
@@ -670,6 +876,168 @@ mod tests {
             br#"{"Code":"AssumeRoleUnauthorizedAccess","AccessKeyId":"AKID","SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#,
         ] {
             assert!(keys_from_json(body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn answers_are_classed_by_status() {
+        let resp = |status: u16, body: String| {
+            reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(body)
+                    .unwrap(),
+            )
+        };
+        assert_eq!(read_body(resp(200, "{}".into())).await.unwrap(), b"{}");
+        for (status, fault) in [
+            (503, Fault::Unavailable),
+            (500, Fault::Unavailable),
+            (429, Fault::Unavailable),
+            (403, Fault::Settings),
+            (404, Fault::Settings),
+        ] {
+            let e = read_body(resp(status, "no".into())).await.unwrap_err();
+            assert_eq!(e.fault, fault, "{status}");
+            assert!(e.message.starts_with(&status.to_string()), "{e}");
+        }
+        let big = "x".repeat(BODY_LIMIT + 1);
+        let e = read_body(resp(200, big)).await.unwrap_err();
+        assert_eq!(e.fault, Fault::Unavailable);
+
+        // An AWS XML error shows its code and message, not the XML.
+        let xml = "<ErrorResponse><Error><Type>Sender</Type><Code>AccessDenied</Code>\
+                   <Message>Not authorized</Message></Error></ErrorResponse>";
+        let e = read_body(resp(403, xml.into())).await.unwrap_err();
+        assert_eq!(e.code.as_deref(), Some("AccessDenied"));
+        assert_eq!(e.message, "403 Forbidden AccessDenied: Not authorized");
+    }
+
+    /// An answer without a length that grows past the limit is refused
+    /// while it streams.
+    #[tokio::test]
+    async fn a_chunked_answer_over_the_limit_is_refused() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes()).await;
+            let chunk = format!("1000\r\n{}\r\n", "x".repeat(0x1000));
+            for _ in 0..5 {
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let e = send(client_for(&url).get(&url), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(e.fault, Fault::Unavailable);
+        assert!(e.message.contains("over"), "{e}");
+    }
+
+    /// A source that answers 503 once gets one more try, and the fetch
+    /// succeeds. A 503 every time fails after two requests.
+    #[tokio::test]
+    async fn a_503_is_tried_once_more() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn serve(statuses: &'static [u16]) -> (String, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let status = statuses[n.min(statuses.len() - 1)];
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                }
+            });
+            (url, hits)
+        }
+        let (url, hits) = serve(&[503, 200]).await;
+        let body = send(client_for(&url).get(&url), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(body, b"ok");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let (url, hits) = serve(&[503]).await;
+        let e = send(client_for(&url).get(&url), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(e.fault, Fault::Unavailable);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A source that does not answer in time is not tried again.
+    #[tokio::test]
+    async fn a_timeout_is_not_tried_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Hold the connection open and never answer.
+                held.push(stream);
+            }
+        });
+        let e = send(client_for(&url).get(&url), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert_eq!(e.fault, Fault::TimedOut);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// reqwest names the URL in its errors. The secret parts of a
+    /// container endpoint URL must not reach the log.
+    #[tokio::test]
+    async fn transport_errors_do_not_name_the_url() {
+        // Nothing listens on port 9 here; the connection is refused.
+        let url = "http://user:pass-secret@127.0.0.1:9/creds?sig=query-secret";
+        let e = send(client_for(url).get(url), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(!e.message.contains("secret"), "{e}");
+        assert_eq!(e.fault, Fault::Unavailable);
+    }
+
+    #[test]
+    fn only_local_hosts_skip_the_proxy() {
+        for local in [
+            "http://169.254.169.254/latest",
+            "http://169.254.170.2/v2/credentials/x",
+            "http://169.254.170.23/v1/credentials",
+            "http://[fd00:ec2::23]/v1/credentials",
+            "http://[fd00:ec2::254]/latest",
+            "http://[fe80::1]/x",
+            "http://127.0.0.1:8080/creds",
+            "http://localhost/creds",
+        ] {
+            assert!(host_is_local(local), "{local}");
+        }
+        for remote in [
+            "https://creds.example.com/x",
+            "https://sts.us-east-1.amazonaws.com/",
+            "http://10.0.0.1/x",
+            "http://[fd00:ec2::1]/x",
+            "nope",
+        ] {
+            assert!(!host_is_local(remote), "{remote}");
         }
     }
 }
