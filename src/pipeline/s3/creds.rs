@@ -326,6 +326,70 @@ impl Source for Static {
     }
 }
 
+/// Keys in the JSON shape that the container endpoint and IMDS share:
+/// `AccessKeyId`, `SecretAccessKey`, `Token` and `Expiration`. IMDS
+/// also sends `Code`, which is `Success` when the keys are good.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) fn keys_from_json(body: &[u8]) -> Result<Keys, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("answer is not JSON ({e})"))?;
+    if let Some(code) = v["Code"].as_str()
+        && code != "Success"
+    {
+        return Err(format!("answer has Code {code:?}"));
+    }
+    let field = |name: &str| -> Result<String, String> {
+        v[name]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("answer has no {name}"))
+    };
+    Ok(Keys {
+        credentials: Credentials {
+            access_key_id: field("AccessKeyId")?,
+            secret_access_key: field("SecretAccessKey")?,
+            session_token: field("Token").ok(),
+        },
+        expires_at: Some(parse_expiration(&field("Expiration")?)?),
+    })
+}
+
+/// Parse an `Expiration` such as `2026-10-28T13:00:00Z`. AWS sends UTC
+/// with a `Z`, sometimes with fractional seconds, which we drop.
+#[allow(dead_code)] // the container endpoint is the first user
+pub(super) fn parse_expiration(text: &str) -> Result<SystemTime, String> {
+    let bad = || format!("Expiration {text:?} is not a UTC time");
+    let rest = text.strip_suffix('Z').ok_or_else(bad)?;
+    let rest = rest.split_once('.').map_or(rest, |(whole, _)| whole);
+    let (date, time) = rest.split_once('T').ok_or_else(bad)?;
+    let num = |s: &str| s.parse::<i64>().map_err(|_| bad());
+    let d: Vec<&str> = date.split('-').collect();
+    let t: Vec<&str> = time.split(':').collect();
+    let ([y, mo, da], [h, mi, se]) = (d.as_slice(), t.as_slice()) else {
+        return Err(bad());
+    };
+    let (y, mo, da, h, mi, se) = (num(y)?, num(mo)?, num(da)?, num(h)?, num(mi)?, num(se)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 60 {
+        return Err(bad());
+    }
+    let secs = days_from_civil(y, mo, da) * 86_400 + h * 3600 + mi * 60 + se;
+    let secs = u64::try_from(secs).map_err(|_| bad())?;
+    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date. The inverse of
+/// `civil_from_days` in `s3.rs`.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Fixed keys, for tests that build `Settings` by hand.
 #[cfg(test)]
 pub(super) fn fixed(credentials: Credentials) -> Chain {
@@ -573,5 +637,39 @@ mod tests {
         assert!(refresh_due(&cached(Some(margin), 60), now, at, min));
         assert!(cached(Some(0), 0).expired(now));
         assert!(!cached(Some(1), 0).expired(now));
+    }
+
+    #[test]
+    fn expirations_parse_as_utc() {
+        let t = parse_expiration("2026-10-28T13:00:00Z").unwrap();
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(super::super::amz_datetime(secs), "20261028T130000Z");
+        assert_eq!(parse_expiration("2026-10-28T13:00:00.123Z").unwrap(), t);
+        assert_eq!(
+            parse_expiration("2024-02-29T00:00:00Z").unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_709_164_800)
+        );
+        for bad in ["2026-10-28T13:00:00", "2026-13-01T00:00:00Z", "soon", ""] {
+            assert!(parse_expiration(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn json_keys_need_an_id_a_secret_and_an_expiry() {
+        let keys = keys_from_json(
+            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S","Token":"T","Expiration":"2026-10-28T13:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(keys.credentials.access_key_id, "AKID");
+        assert_eq!(keys.credentials.session_token.as_deref(), Some("T"));
+        assert!(keys.expires_at.is_some());
+        for body in [
+            &br#"{"SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#[..],
+            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S"}"#,
+            b"not json",
+            br#"{"Code":"AssumeRoleUnauthorizedAccess","AccessKeyId":"AKID","SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#,
+        ] {
+            assert!(keys_from_json(body).is_err());
+        }
     }
 }
