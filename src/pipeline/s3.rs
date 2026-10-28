@@ -467,9 +467,7 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
         anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
     })?;
     let target = Target::new(s, bucket, &raw_key);
-    let creds = s.credentials.current().await.map_err(|e| {
-        anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
-    })?;
+    let creds = s.credentials.current().await.map_err(map_cred_err)?;
     // One retry, on connection transients and on `retryable_status`.
     // Unlike `gs://`, a 401 is not retried.
     let first = send_signed(s, &creds, &target).await;
@@ -493,6 +491,24 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
     }
     let body = read_error_body(resp).await?;
     Err(status_error(status, body.code.as_deref(), bucket))
+}
+
+/// A credential failure, classed as a store failure would be: our
+/// settings are a deployment fault, a source that times out is a
+/// timeout, and a source that is down is an upstream fault.
+fn map_cred_err(e: creds::CredError) -> anyhow::Error {
+    match e.fault {
+        creds::Fault::Settings => anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            e.message,
+        )),
+        creds::Fault::TimedOut => {
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, e.message))
+        }
+        creds::Fault::Unavailable => anyhow::anyhow!(e.message)
+            .context("fetch s3 credentials")
+            .context(UpstreamFault),
+    }
 }
 
 /// Transport failures: timeouts keep their io shape for
@@ -608,25 +624,39 @@ struct ErrorBody {
 /// faults; never classify a truncated error as a missing object or bad key.
 const ERROR_BODY_LIMIT: usize = 16 * 1024;
 
-async fn read_error_body(mut resp: reqwest::Response) -> Result<ErrorBody> {
-    let too_large = || {
-        anyhow::anyhow!("S3 error response exceeds the {ERROR_BODY_LIMIT}-byte limit")
-            .context(UpstreamFault)
-    };
-    if resp
-        .content_length()
-        .is_some_and(|len| len > ERROR_BODY_LIMIT as u64)
-    {
-        return Err(too_large());
+async fn read_error_body(resp: reqwest::Response) -> Result<ErrorBody> {
+    let body = read_capped(resp, ERROR_BODY_LIMIT)
+        .await
+        .map_err(|e| match e {
+            ReadError::TooLarge => {
+                anyhow::anyhow!("S3 error response exceeds the {ERROR_BODY_LIMIT}-byte limit")
+                    .context(UpstreamFault)
+            }
+            ReadError::Transport(e) => map_transport_err(e),
+        })?;
+    Ok(parse_error_body(&body))
+}
+
+/// Why `read_capped` gave no body.
+enum ReadError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+/// Read a whole body of at most `limit` bytes. A larger one is refused,
+/// not cut short, so a truncated answer is never read as a whole one.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, ReadError> {
+    if resp.content_length().is_some_and(|len| len > limit as u64) {
+        return Err(ReadError::TooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(map_transport_err)? {
-        if chunk.len() > ERROR_BODY_LIMIT - body.len() {
-            return Err(too_large());
+    while let Some(chunk) = resp.chunk().await.map_err(ReadError::Transport)? {
+        if chunk.len() > limit - body.len() {
+            return Err(ReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(parse_error_body(&body))
+    Ok(body)
 }
 
 /// Read `<Code>` and `<Message>` from an S3 error body. These two
@@ -756,7 +786,11 @@ async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(
             s.credentials.source_name()
         )
     };
-    let creds = s.credentials.current().await.map_err(fail)?;
+    let creds = s
+        .credentials
+        .current()
+        .await
+        .map_err(|e| fail(e.to_string()))?;
     let resp = send_signed(s, &creds, &target).await.map_err(|e| {
         fail(format!(
             "could not reach the endpoint: {:#}",
@@ -1244,5 +1278,21 @@ mod tests {
         for code in [400, 401, 403, 404] {
             assert!(!retryable_status(code));
         }
+    }
+
+    #[test]
+    fn credential_faults_map_like_store_faults() {
+        use super::super::error::{Error, ErrorKind};
+        let kind = |fault| {
+            let e = creds::CredError {
+                fault,
+                message: "x".into(),
+                code: None,
+            };
+            Error::classify(map_cred_err(e), true).kind()
+        };
+        assert_eq!(kind(creds::Fault::Settings), ErrorKind::SourceUnreadable);
+        assert_eq!(kind(creds::Fault::TimedOut), ErrorKind::UpstreamTimeout);
+        assert_eq!(kind(creds::Fault::Unavailable), ErrorKind::Upstream);
     }
 }
