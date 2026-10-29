@@ -6,8 +6,8 @@
 //!
 //! Credentials come from a chain of sources in `creds`: static keys
 //! from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
-//! plus `AWS_SESSION_TOKEN` for temporary keys). The `~/.aws` profile
-//! files are out of scope.
+//! plus `AWS_SESSION_TOKEN` for temporary keys), then the container
+//! endpoint (`container`). The `~/.aws` profile files are out of scope.
 //! `aws configure export-credentials --format env` turns a profile
 //! into static keys.
 //!
@@ -38,6 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{SourceRejected, UpstreamFault};
 
+mod container;
 mod creds;
 
 type HmacSha256 = hmac::Hmac<Sha256>;
@@ -310,6 +311,20 @@ fn parse_endpoint(raw: &str) -> Result<(String, String), String> {
         None => host.to_string(),
     };
     Ok((url.scheme().to_string(), host))
+}
+
+/// `url` without user info, query or fragment, for messages: a setting
+/// can carry a secret there.
+fn shown_url(url: &str) -> String {
+    let Ok(mut u) = reqwest::Url::parse(url) else {
+        return String::new();
+    };
+    // Both only fail for URLs that cannot have them.
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_query(None);
+    u.set_fragment(None);
+    u.to_string()
 }
 
 /// True for an IPv4 or bracketed IPv6 host, with or without a port.
@@ -1120,6 +1135,18 @@ mod tests {
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad} should be refused");
         }
+    }
+
+    #[test]
+    fn messages_show_the_url_without_secrets() {
+        assert_eq!(
+            shown_url("https://user:pw@creds.example.com/x?sig=abc#frag"),
+            "https://creds.example.com/x"
+        );
+        assert_eq!(
+            shown_url("http://169.254.170.2/v2/credentials/id"),
+            "http://169.254.170.2/v2/credentials/id"
+        );
     }
 
     #[test]

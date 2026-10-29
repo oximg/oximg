@@ -3205,6 +3205,117 @@ fn s3_session_token_is_signed() {
     assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
 }
 
+/// Start the server with `envs` and return what it printed on stderr,
+/// up to the listening line or until it exits.
+fn s3_boot_stderr(envs: &[(&str, String)]) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+    cmd.env("PORT", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn oximg");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    let mut line = String::new();
+    while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
+        seen.push_str(&line);
+        if line.starts_with("oximg listening on :") {
+            break;
+        }
+        line.clear();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    seen
+}
+
+/// The env for keys from a credential endpoint: the static keys of
+/// `s3_env` cleared, so the chain moves past them.
+fn s3_env_without_keys(endpoint_port: u16) -> Vec<(&'static str, String)> {
+    let mut envs = s3_env(endpoint_port);
+    envs.extend([
+        ("AWS_ACCESS_KEY_ID", String::new()),
+        ("AWS_SECRET_ACCESS_KEY", String::new()),
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+    ]);
+    envs
+}
+
+/// ECS and EKS Pod Identity: keys come from the container endpoint,
+/// with the authorization token read from its file. The fake S3 answers
+/// 200 only when the endpoint's session token is signed in.
+#[test]
+fn s3_keys_from_the_container_endpoint() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: container-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let agent = S3::spawn_unsigned(|path, req| match path {
+        "/v1/credentials" if req.contains("authorization: pod-token") => Reply::json(
+            "200 OK",
+            r#"{"AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"container-token","Expiration":"2099-01-01T00:00:00Z"}"#,
+        ),
+        _ => Reply::json("401 Unauthorized", r#"{"code":"denied"}"#),
+    })
+    .unwrap();
+    let token_file = std::env::temp_dir().join(format!("oximg-pod-token-{}", std::process::id()));
+    std::fs::write(&token_file, "pod-token\n").unwrap();
+    let full_uri = format!("http://127.0.0.1:{}/v1/credentials", agent.port());
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.extend([
+        ("AWS_CONTAINER_CREDENTIALS_FULL_URI", full_uri.clone()),
+        (
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            token_file.display().to_string(),
+        ),
+    ]);
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    // One fetch for the boot probe and the request: the keys are cached.
+    assert_eq!(agent.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(s);
+
+    // A proxy in the env does not see the credential requests. The
+    // agent is named `localhost` and S3 `127.0.0.1`, and NO_PROXY covers
+    // only the latter, so only a client that ignores the proxy works.
+    let mut proxied = envs.clone();
+    proxied.extend([
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            format!("http://localhost:{}/v1/credentials", agent.port()),
+        ),
+        ("HTTP_PROXY", "http://127.0.0.1:9".into()),
+        ("http_proxy", "http://127.0.0.1:9".into()),
+        ("NO_PROXY", "127.0.0.1".into()),
+        ("no_proxy", "127.0.0.1".into()),
+    ]);
+    let s = Server::start(&proxied);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    drop(s);
+
+    // A wrong token fails at boot and names the source.
+    std::fs::write(&token_file, "wrong").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(stderr.contains("oximg: fatal:"), "{stderr}");
+    assert!(stderr.contains("container credential endpoint"), "{stderr}");
+    assert!(stderr.contains("401"), "{stderr}");
+    std::fs::remove_file(&token_file).unwrap();
+
+    // A full URI over http to any other host is refused before a request.
+    let mut far = s3_env_without_keys(s3.port());
+    far.push((
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "http://creds.example.com/v1".into(),
+    ));
+    let stderr = s3_boot_stderr(&far);
+    assert!(stderr.contains("must use https://"), "{stderr}");
+}
+
 /// Keys with characters that the HTTP mode, SigV4 and the URL parser
 /// each treat differently. The fake answers 200 only for the exact
 /// SigV4 path, and only with a valid signature over what arrived, so
@@ -3266,31 +3377,9 @@ fn s3_boot_is_fail_closed() {
     drop(dead);
 
     let boot = |extra: &[(&str, &str)]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
-        cmd.env("PORT", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        for (k, v) in s3_env(s3.port()) {
-            cmd.env(k, v);
-        }
-        for (k, v) in extra {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn().expect("spawn oximg");
-        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-        // Read until the listening line or until stderr closes.
-        let mut seen = String::new();
-        let mut line = String::new();
-        while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
-            seen.push_str(&line);
-            if line.starts_with("oximg listening on :") {
-                break;
-            }
-            line.clear();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        seen
+        let mut envs: Vec<(&str, String)> = s3_env(s3.port());
+        envs.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        s3_boot_stderr(&envs)
     };
 
     let dead_endpoint = format!("http://127.0.0.1:{dead_port}");

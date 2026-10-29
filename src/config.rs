@@ -205,6 +205,10 @@ const PROCESS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
     "GLIBC_TUNABLES",
 ];
 
@@ -498,6 +502,7 @@ mod tests {
             include_str!("pipeline/gcs.rs"),
             include_str!("pipeline/s3.rs"),
             include_str!("pipeline/s3/creds.rs"),
+            include_str!("pipeline/s3/container.rs"),
         ];
         let mut reads: HashSet<&str> = HashSet::new();
         for src in process_sources {

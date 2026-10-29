@@ -88,10 +88,16 @@ type FromEnv = fn() -> Result<Option<Box<dyn Source>>, String>;
 
 /// The chain, in order. `hint` lists what the source reads, for the
 /// error when none of them is set.
-const SOURCES: &[(FromEnv, &str)] = &[(
-    Static::from_env,
-    "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
-)];
+const SOURCES: &[(FromEnv, &str)] = &[
+    (
+        Static::from_env,
+        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
+    ),
+    (
+        super::container::from_env,
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or _FULL_URI (ECS, EKS Pod Identity)",
+    ),
+];
 
 struct Cached {
     credentials: Arc<Credentials>,
@@ -393,7 +399,6 @@ const BODY_LIMIT: usize = 16 * 1024;
 /// endpoint) goes through the shared client, proxy and all, because
 /// some networks reach the internet only through one. Neither follows
 /// redirects.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) fn client_for(url: &str) -> &'static reqwest::Client {
     if host_is_local(url) {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -410,7 +415,6 @@ pub(super) fn client_for(url: &str) -> &'static reqwest::Client {
 }
 
 /// The EKS Pod Identity Agent's IPv6 address.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) const EKS_AGENT_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x23);
 
 /// IMDS's IPv6 address, on Nitro instances.
@@ -438,7 +442,6 @@ fn host_is_local(url: &str) -> bool {
 }
 
 /// `host` as an IP address. An IPv6 host comes in brackets.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) fn host_ip(host: &str) -> Option<std::net::IpAddr> {
     host.trim_start_matches('[')
         .trim_end_matches(']')
@@ -455,7 +458,6 @@ pub(super) fn host_ip(host: &str) -> Option<std::net::IpAddr> {
 /// `MIN_REUSE`, so without this one blip would cost a minute without
 /// keys. A timeout is not tried again: a stalled source costs one
 /// `timeout`, not two.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) async fn send(
     req: reqwest::RequestBuilder,
     timeout: Duration,
@@ -534,7 +536,6 @@ async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, CredError> {
 /// Keys in the JSON shape that the container endpoint and IMDS share:
 /// `AccessKeyId`, `SecretAccessKey`, `Token` and `Expiration`. IMDS
 /// also sends `Code`, which is `Success` when the keys are good.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) fn keys_from_json(body: &[u8]) -> Result<Keys, String> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("answer is not JSON ({e})"))?;
@@ -562,7 +563,6 @@ pub(super) fn keys_from_json(body: &[u8]) -> Result<Keys, String> {
 
 /// Parse an `Expiration` such as `2026-10-28T13:00:00Z`. AWS sends UTC
 /// with a `Z`, sometimes with fractional seconds, which we drop.
-#[allow(dead_code)] // the container endpoint is the first user
 pub(super) fn parse_expiration(text: &str) -> Result<SystemTime, String> {
     let bad = || format!("Expiration {text:?} is not a UTC time");
     let rest = text.strip_suffix('Z').ok_or_else(bad)?;

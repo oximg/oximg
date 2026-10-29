@@ -611,6 +611,10 @@ never silently falls back to a default.
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` access key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` secret key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` session token, for temporary keys only |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role, used when no static keys are set. ECS sets it |
+| `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity (which sets it) or another credential agent. Over `http://` only loopback, `169.254.170.2`, `169.254.170.23` and `fd00:ec2::23` are allowed |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | `Authorization` value for the container endpoint, read from this file on every fetch (EKS rotates it). Wins over the next row |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | `Authorization` value for the container endpoint |
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch, including credentials, retries/backoff and body download (fetch-slot queueing is excluded) — bounds how long a stalled upstream can hold a fetch slot (and its buffer); timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
