@@ -26,14 +26,16 @@
 //! `OXIMG_S3_ENDPOINT` defaults to the regional AWS endpoint, with
 //! `.amazonaws.com.cn` for China regions and `.amazonaws.com` otherwise.
 //! `OXIMG_S3_PATH_STYLE` is explained at `Settings::path_style`.
-//! Temporary keys are not refreshed. When `AWS_SESSION_TOKEN` expires,
-//! every fetch fails until the process restarts with new keys.
+//! Keys from a credential endpoint are fetched again before they
+//! expire, and once more when S3 says they have expired. Static keys
+//! are not refreshed: when `AWS_SESSION_TOKEN` expires, every fetch
+//! fails until the process restarts with new keys.
 
 use anyhow::Result;
 use hmac::Mac;
 use hmac::digest::KeyInit;
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{SourceRejected, UpstreamFault};
@@ -450,10 +452,17 @@ fn percent_decode(encoded: &str) -> Vec<u8> {
 }
 
 /// Statuses worth one retry, as the SDKs retry reads: throttling and
-/// temporary server errors. Unlike `gs://`, 401 is not here. Static
-/// keys do not refresh, so a second try would fail the same way.
+/// temporary server errors. Unlike `gs://`, 401 is not here: S3 reports
+/// expired keys with a code, see `needs_new_keys`.
 fn retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Error codes that mean the keys ran out. Keys from a credential
+/// endpoint can expire between our refresh and S3's check, or be
+/// replaced early, so one fetch of new keys and one more try is worth it.
+fn needs_new_keys(code: &str) -> bool {
+    matches!(code, "ExpiredToken" | "TokenRefreshRequired")
 }
 
 /// GET one object, signed. `key` is already percent-encoded by the
@@ -482,30 +491,61 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
         anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
     })?;
     let target = Target::new(s, bucket, &raw_key);
-    let creds = s.credentials.current().await.map_err(map_cred_err)?;
-    // One retry, on connection transients and on `retryable_status`.
-    // Unlike `gs://`, a 401 is not retried.
-    let first = send_signed(s, &creds, &target).await;
+    let refreshes = s.credentials.refreshes();
+    // The keys the store refused as expired, and its code. Keys from a
+    // credential source get one more try with new keys.
+    let mut expired: Option<(Arc<Credentials>, String)> = None;
+    loop {
+        // Pass the keys that failed: if another request already replaced
+        // them, this one uses the new keys instead of fetching again.
+        let creds = s
+            .credentials
+            .current(expired.as_ref().map(|(c, _)| c))
+            .await
+            .map_err(|e| {
+                map_cred_err(match &expired {
+                    Some((_, code)) => e.context(format_args!("after the store answered {code}")),
+                    None => e,
+                })
+            })?;
+        let resp = send_with_retry(s, &creds, &target).await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        let body = read_error_body(resp).await?;
+        match body.code {
+            Some(code) if expired.is_none() && refreshes && needs_new_keys(&code) => {
+                super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                expired = Some((creds, code));
+            }
+            code => return Err(status_error(status, code.as_deref(), bucket, refreshes)),
+        }
+    }
+}
+
+/// Send once, and once more on connection transients and on
+/// `retryable_status`. Unlike `gs://`, a 401 is not retried.
+async fn send_with_retry(
+    s: &Settings,
+    creds: &Credentials,
+    target: &Target,
+) -> Result<reqwest::Response> {
+    let first = send_signed(s, creds, target).await;
     let retry = match &first {
         Ok(resp) => retryable_status(resp.status().as_u16()),
         Err(e) => !e.is_timeout() && (e.is_connect() || e.is_request()),
     };
-    let resp = if retry {
-        // Release the failed response before waiting or opening another request.
-        drop(first);
-        super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        send_signed(s, &creds, &target).await
-    } else {
-        first
+    if !retry {
+        return first.map_err(map_transport_err);
     }
-    .map_err(map_transport_err)?;
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
-    }
-    let body = read_error_body(resp).await?;
-    Err(status_error(status, body.code.as_deref(), bucket))
+    // Release the failed response before waiting or opening another request.
+    drop(first);
+    super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send_signed(s, creds, target)
+        .await
+        .map_err(map_transport_err)
 }
 
 /// A credential failure, classed as a store failure would be: our
@@ -566,7 +606,14 @@ const REQUESTER_CODES: &[&str] = &[
 ///
 /// Deployment faults use `PermissionDenied`, which classifies as
 /// `SourceUnreadable` (HTTP 500).
-fn status_error(status: reqwest::StatusCode, code: Option<&str>, bucket: &str) -> anyhow::Error {
+/// `refreshes` says whether the keys come from a source that can hand
+/// out new ones, which changes the advice for an expired token.
+fn status_error(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    bucket: &str,
+    refreshes: bool,
+) -> anyhow::Error {
     let answer = match code {
         Some(code) => format!("{status} {code}"),
         None => status.to_string(),
@@ -598,15 +645,19 @@ fn status_error(status: reqwest::StatusCode, code: Option<&str>, bucket: &str) -
             deployment("check AWS_REGION and OXIMG_S3_ENDPOINT (redirects are not followed)".into())
         }
         (429, _) => upstream(),
-        (400..=499, _) => deployment(deployment_hint(status.as_u16(), code, bucket)),
+        (400..=499, _) => deployment(deployment_hint(status.as_u16(), code, bucket, refreshes)),
         _ => upstream(),
     }
 }
 
 /// What an operator should check, by error code.
-fn deployment_hint(status: u16, code: Option<&str>, bucket: &str) -> String {
+fn deployment_hint(status: u16, code: Option<&str>, bucket: &str, refreshes: bool) -> String {
     match code {
-        Some("ExpiredToken") => "AWS_SESSION_TOKEN has expired. Temporary keys are not \
+        Some("ExpiredToken") if refreshes => "the keys from the credential source were \
+                                              fetched again and still expired. Check this \
+                                              host's clock and the source"
+            .into(),
+        Some("ExpiredToken") => "the session token has expired. AWS_SESSION_TOKEN is not \
                                  refreshed, so restart with new keys"
             .into(),
         Some("RequestTimeTooSkewed") => {
@@ -803,7 +854,7 @@ async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(
     };
     let creds = s
         .credentials
-        .current()
+        .current(None)
         .await
         .map_err(|e| fail(e.to_string()))?;
     let resp = send_signed(s, &creds, &target).await.map_err(|e| {
@@ -1227,7 +1278,7 @@ mod tests {
 
     fn kind_of(status: u16, code: Option<&str>) -> crate::pipeline::ErrorKind {
         let status = reqwest::StatusCode::from_u16(status).unwrap();
-        crate::pipeline::Error::classify(status_error(status, code, "pics"), true).kind()
+        crate::pipeline::Error::classify(status_error(status, code, "pics", false), true).kind()
     }
 
     /// What AWS S3, Cloudflare R2 and MinIO answered to signed requests
@@ -1289,12 +1340,21 @@ mod tests {
 
     #[test]
     fn deployment_hints_name_the_cause() {
-        assert!(deployment_hint(400, Some("ExpiredToken"), "b").contains("restart"));
-        assert!(deployment_hint(403, Some("RequestTimeTooSkewed"), "b").contains("clock"));
-        assert!(deployment_hint(403, Some("SignatureDoesNotMatch"), "b").contains("AWS_REGION"));
-        let denied = deployment_hint(403, Some("AccessDenied"), "b");
+        assert!(deployment_hint(400, Some("ExpiredToken"), "b", false).contains("restart"));
+        let chain = deployment_hint(400, Some("ExpiredToken"), "b", true);
+        assert!(
+            chain.contains("fetched again") && !chain.contains("restart"),
+            "{chain}"
+        );
+        assert!(deployment_hint(403, Some("RequestTimeTooSkewed"), "b", false).contains("clock"));
+        assert!(
+            deployment_hint(403, Some("SignatureDoesNotMatch"), "b", false).contains("AWS_REGION")
+        );
+        let denied = deployment_hint(403, Some("AccessDenied"), "b", false);
         assert!(denied.contains("s3:ListBucket") && denied.contains("bucket exists"));
-        assert!(deployment_hint(400, Some("InvalidRequest"), "b").contains("not the requester"));
+        assert!(
+            deployment_hint(400, Some("InvalidRequest"), "b", false).contains("not the requester")
+        );
     }
 
     #[test]

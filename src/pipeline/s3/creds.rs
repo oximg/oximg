@@ -80,6 +80,10 @@ pub(super) trait Source: Send + Sync {
     /// Shown in errors, so an operator can tell which source failed.
     fn name(&self) -> &'static str;
     fn fetch(&self) -> KeysFuture<'_>;
+    /// Whether a second fetch can return different keys.
+    fn refreshes(&self) -> bool {
+        true
+    }
 }
 
 /// A source's constructor: `Ok(None)` when its settings are absent,
@@ -123,6 +127,9 @@ struct State {
     failure: Option<Failure>,
     /// A fetch runs. There is never more than one.
     fetching: bool,
+    /// Keys the store refused as expired while a fetch runs. That fetch
+    /// must not hand them out again.
+    refused: Option<Arc<Credentials>>,
 }
 
 pub(super) struct Chain {
@@ -182,6 +189,10 @@ impl Chain {
         self.inner.source.name()
     }
 
+    pub(super) fn refreshes(&self) -> bool {
+        self.inner.source.refreshes()
+    }
+
     /// The keys to sign with.
     ///
     /// Keys that still work are returned at once. When they are inside
@@ -189,19 +200,27 @@ impl Chain {
     /// request waits for it. Only a request without working keys waits,
     /// and all such requests wait for the same fetch.
     ///
-    /// A fetch that gives no usable keys (an error, or keys that already
-    /// expired) is not tried again for
+    /// `refused` is the keys a request just used when the store said they
+    /// expired. They are replaced only if the cache still holds them: when
+    /// many requests fail at once, the first one fetches and the rest get
+    /// its keys.
+    ///
+    /// A fetch that gives no usable keys (an error, keys that already
+    /// expired, or the keys the store just refused) is not tried again for
     /// `min_reuse`. Until then, requests sign with the cached keys while
     /// they have not expired, or get the same error. So a source that is
     /// down or slow costs one fetch per `min_reuse`, not one per request.
-    pub(super) async fn current(&self) -> Result<Arc<Credentials>, CredError> {
+    pub(super) async fn current(
+        &self,
+        refused: Option<&Arc<Credentials>>,
+    ) -> Result<Arc<Credentials>, CredError> {
         let mut waited = false;
         loop {
             // The lock is released at the end of this block, before any
             // await.
             let step = {
                 let mut state = self.inner.lock();
-                match self.inner.next(&mut state, waited) {
+                match self.inner.next(&mut state, refused, waited) {
                     Step::Ready(result) => return result,
                     Step::Run(fetch) => Err(fetch),
                     Step::Wait => Ok(self.inner.done.notified()),
@@ -223,24 +242,34 @@ impl Inner {
 
     /// `waited` says a fetch has finished since the request asked. Its
     /// result is the answer, so a failed fetch is not started again.
-    fn next(self: &Arc<Self>, state: &mut State, waited: bool) -> Step {
+    fn next(
+        self: &Arc<Self>,
+        state: &mut State,
+        refused: Option<&Arc<Credentials>>,
+        waited: bool,
+    ) -> Step {
         let now = Instant::now();
         let cooling = state
             .failure
             .as_ref()
             .is_some_and(|f| now < f.at + self.min_reuse);
-        if let Some(c) = &state.cached
-            && !c.expired(SystemTime::now())
-        {
-            let keys = c.credentials.clone();
-            if !cooling
-                && !state.fetching
-                && refresh_due(c, SystemTime::now(), now, self.min_reuse)
-                && let Some(fetch) = self.start(state)
-            {
-                return Step::Run(fetch);
+        if let Some(c) = &state.cached {
+            let usable = match refused {
+                Some(r) => !Arc::ptr_eq(r, &c.credentials),
+                None => !c.expired(SystemTime::now()),
+            };
+            if usable {
+                let keys = c.credentials.clone();
+                if refused.is_none()
+                    && !cooling
+                    && !state.fetching
+                    && refresh_due(c, SystemTime::now(), now, self.min_reuse)
+                    && let Some(fetch) = self.start(state, None)
+                {
+                    return Step::Run(fetch);
+                }
+                return Step::Ready(Ok(keys));
             }
-            return Step::Ready(Ok(keys));
         }
         if (cooling || waited)
             && let Some(f) = &state.failure
@@ -248,9 +277,12 @@ impl Inner {
             return Step::Ready(Err(f.error.clone()));
         }
         if state.fetching {
+            if refused.is_some() {
+                state.refused = refused.cloned();
+            }
             return Step::Wait;
         }
-        match self.start(state) {
+        match self.start(state, refused.cloned()) {
             Some(fetch) => Step::Run(fetch),
             None => Step::Wait,
         }
@@ -261,8 +293,10 @@ impl Inner {
     fn start(
         self: &Arc<Self>,
         state: &mut State,
+        refused: Option<Arc<Credentials>>,
     ) -> Option<Pin<Box<dyn Future<Output = ()> + Send>>> {
         state.fetching = true;
+        state.refused = refused;
         let fetch = Box::pin(self.clone().fetch());
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
@@ -297,8 +331,19 @@ impl Inner {
     fn finish(&self, result: Result<Keys, CredError>) {
         let mut state = self.lock();
         state.fetching = false;
+        let refused = state.refused.take();
         let name = self.source.name();
         let error = match result {
+            Ok(keys)
+                if refused
+                    .as_ref()
+                    .is_some_and(|r| same_keys(r, &keys.credentials)) =>
+            {
+                CredError::settings(format!(
+                    "s3:// credentials from {name}: the source returned the keys that the \
+                     store refused as expired"
+                ))
+            }
             Ok(keys) if keys.expires_at.is_some_and(|t| t <= SystemTime::now()) => {
                 CredError::settings(format!(
                     "s3:// credentials from {name}: the source returned keys that have \
@@ -318,7 +363,8 @@ impl Inner {
             }
             Err(e) => e.context(format_args!("s3:// credentials from {name}")),
         };
-        if let Some(c) = &state.cached
+        if refused.is_none()
+            && let Some(c) = &state.cached
             && !c.expired(SystemTime::now())
         {
             eprintln!("oximg: warning: {error}; using the cached keys until they expire");
@@ -343,6 +389,11 @@ const MIN_REUSE: Duration = Duration::from_secs(60);
 /// not fetched within `min_reuse`.
 fn refresh_due(c: &Cached, now: SystemTime, at: Instant, min_reuse: Duration) -> bool {
     c.expires_at.is_some_and(|t| now + REFRESH_MARGIN >= t) && at >= c.fetched_at + min_reuse
+}
+
+/// Whether a fetch returned the keys a request already used.
+fn same_keys(a: &Credentials, b: &Credentials) -> bool {
+    a.access_key_id == b.access_key_id && a.session_token == b.session_token
 }
 
 /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, plus
@@ -372,6 +423,10 @@ impl Static {
 impl Source for Static {
     fn name(&self) -> &'static str {
         "static keys"
+    }
+
+    fn refreshes(&self) -> bool {
+        false
     }
 
     fn fetch(&self) -> KeysFuture<'_> {
@@ -669,19 +724,19 @@ mod tests {
     async fn keys_inside_the_margin_are_fetched_again() {
         // Four minutes left is inside the margin.
         let (chain, fetches) = chain(counting(Some(Duration::from_secs(4 * 60))));
-        chain.current().await.unwrap();
+        chain.current(None).await.unwrap();
         // The request gets the keys it has; the fetch runs behind it.
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-0");
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-0");
         settle().await;
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-1");
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-1");
         assert!(fetches.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
     async fn keys_inside_the_margin_are_reused_for_a_minute() {
         let (chain, fetches) = chain_with(counting(Some(Duration::from_secs(4 * 60))), MIN_REUSE);
-        chain.current().await.unwrap();
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-0");
+        chain.current(None).await.unwrap();
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-0");
         settle().await;
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
@@ -694,7 +749,7 @@ mod tests {
         let calls: Vec<_> = (0..10)
             .map(|_| {
                 let chain = chain.clone();
-                tokio::spawn(async move { chain.current().await.unwrap() })
+                tokio::spawn(async move { chain.current(None).await.unwrap() })
             })
             .collect();
         for call in calls {
@@ -710,12 +765,12 @@ mod tests {
         let mut source = counting(Some(Duration::from_secs(4 * 60)));
         source.delay = Duration::from_millis(300);
         let (chain, fetches) = chain(source);
-        chain.current().await.unwrap();
+        chain.current(None).await.unwrap();
         let start = Instant::now();
         let calls: Vec<_> = (0..10)
             .map(|_| {
                 let chain = chain.clone();
-                tokio::spawn(async move { chain.current().await.unwrap() })
+                tokio::spawn(async move { chain.current(None).await.unwrap() })
             })
             .collect();
         for call in calls {
@@ -733,11 +788,42 @@ mod tests {
         let mut source = counting(Some(Duration::from_secs(60 * 60)));
         source.delay = Duration::from_millis(100);
         let (chain, fetches) = chain_with(source, MIN_REUSE);
-        let gave_up = tokio::time::timeout(Duration::from_millis(20), chain.current()).await;
+        let gave_up = tokio::time::timeout(Duration::from_millis(20), chain.current(None)).await;
         assert!(gave_up.is_err());
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-0");
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-0");
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_keys_are_replaced_once() {
+        let (chain, fetches) = chain(counting(Some(Duration::from_secs(60 * 60))));
+        let first = chain.current(None).await.unwrap();
+        for _ in 0..5 {
+            let k = chain.current(Some(&first)).await.unwrap();
+            assert_eq!(k.access_key_id, "key-1");
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// Many requests that S3 told "expired" at once, as after keys are
+    /// replaced early: one fetch, and they all sign with its keys.
+    #[tokio::test]
+    async fn concurrent_failures_share_one_fetch() {
+        let mut source = counting(Some(Duration::from_secs(60 * 60)));
+        source.delay = Duration::from_millis(50);
+        let (chain, fetches) = chain(source);
+        let first = chain.current(None).await.unwrap();
+        let calls: Vec<_> = (0..10)
+            .map(|_| {
+                let (chain, first) = (chain.clone(), first.clone());
+                tokio::spawn(async move { chain.current(Some(&first)).await.unwrap() })
+            })
+            .collect();
+        for call in calls {
+            assert_eq!(call.await.unwrap().access_key_id, "key-1");
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -745,11 +831,13 @@ mod tests {
         let mut source = counting(Some(Duration::from_secs(4 * 60)));
         source.fail_from = 1;
         let (chain, fetches) = chain(source);
-        chain.current().await.unwrap();
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-0");
+        let first = chain.current(None).await.unwrap();
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-0");
         settle().await;
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
-        assert_eq!(chain.current().await.unwrap().access_key_id, "key-0");
+        assert_eq!(chain.current(None).await.unwrap().access_key_id, "key-0");
+        // Keys the store refused are not kept.
+        assert!(chain.current(Some(&first)).await.is_err());
     }
 
     /// The source fails, slowly, while the cached keys still work: ten
@@ -761,12 +849,12 @@ mod tests {
         source.fail_from = 1;
         source.delay = Duration::from_millis(50);
         let (chain, fetches) = chain_with(source, Duration::from_millis(200));
-        chain.current().await.unwrap();
+        chain.current(None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(250)).await;
         let calls: Vec<_> = (0..10)
             .map(|_| {
                 let chain = chain.clone();
-                tokio::spawn(async move { chain.current().await.unwrap() })
+                tokio::spawn(async move { chain.current(None).await.unwrap() })
             })
             .collect();
         for call in calls {
@@ -774,8 +862,46 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
-        chain.current().await.unwrap();
+        chain.current(None).await.unwrap();
         settle().await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    /// A source that hands out the same keys every time, as IMDS does
+    /// until it rotates them.
+    struct Same(Arc<AtomicUsize>);
+
+    impl Source for Same {
+        fn name(&self) -> &'static str {
+            "same"
+        }
+
+        fn fetch(&self) -> KeysFuture<'_> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(Keys {
+                    credentials: Credentials {
+                        access_key_id: "key".into(),
+                        secret_access_key: "secret".into(),
+                        session_token: Some("token".into()),
+                    },
+                    expires_at: Some(SystemTime::now() + Duration::from_secs(60 * 60)),
+                })
+            })
+        }
+    }
+
+    /// The store refused the keys, and the source returns them again:
+    /// an error, and requests that follow do not ask the source again.
+    #[tokio::test]
+    async fn refused_keys_from_the_source_are_not_fetched_per_request() {
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let chain = Chain::new(Box::new(Same(fetches.clone())));
+        let first = chain.current(None).await.unwrap();
+        for _ in 0..5 {
+            let e = chain.current(Some(&first)).await.err().unwrap();
+            assert!(e.message.contains("refused as expired"), "{e}");
+        }
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 
@@ -791,7 +917,7 @@ mod tests {
         let calls: Vec<_> = (0..10)
             .map(|_| {
                 let chain = chain.clone();
-                tokio::spawn(async move { chain.current().await })
+                tokio::spawn(async move { chain.current(None).await })
             })
             .collect();
         for call in calls {
@@ -800,10 +926,10 @@ mod tests {
             assert_eq!(e.fault, Fault::Unavailable);
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
-        assert!(chain.current().await.is_err());
+        assert!(chain.current(None).await.is_err());
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(chain.current().await.is_err());
+        assert!(chain.current(None).await.is_err());
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
     }
 
@@ -813,7 +939,7 @@ mod tests {
     async fn expired_keys_from_the_source_are_an_error() {
         let (chain, fetches) = chain_with(counting(Some(Duration::ZERO)), MIN_REUSE);
         for _ in 0..5 {
-            let e = chain.current().await.err().unwrap();
+            let e = chain.current(None).await.err().unwrap();
             assert!(e.message.contains("already expired"), "{e}");
         }
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -843,40 +969,6 @@ mod tests {
         assert!(refresh_due(&cached(Some(margin), 60), now, at, min));
         assert!(cached(Some(0), 0).expired(now));
         assert!(!cached(Some(1), 0).expired(now));
-    }
-
-    #[test]
-    fn expirations_parse_as_utc() {
-        let t = parse_expiration("2026-10-28T13:00:00Z").unwrap();
-        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-        assert_eq!(super::super::amz_datetime(secs), "20261028T130000Z");
-        assert_eq!(parse_expiration("2026-10-28T13:00:00.123Z").unwrap(), t);
-        assert_eq!(
-            parse_expiration("2024-02-29T00:00:00Z").unwrap(),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1_709_164_800)
-        );
-        for bad in ["2026-10-28T13:00:00", "2026-13-01T00:00:00Z", "soon", ""] {
-            assert!(parse_expiration(bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
-    fn json_keys_need_an_id_a_secret_and_an_expiry() {
-        let keys = keys_from_json(
-            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S","Token":"T","Expiration":"2026-10-28T13:00:00Z"}"#,
-        )
-        .unwrap();
-        assert_eq!(keys.credentials.access_key_id, "AKID");
-        assert_eq!(keys.credentials.session_token.as_deref(), Some("T"));
-        assert!(keys.expires_at.is_some());
-        for body in [
-            &br#"{"SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#[..],
-            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S"}"#,
-            b"not json",
-            br#"{"Code":"AssumeRoleUnauthorizedAccess","AccessKeyId":"AKID","SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#,
-        ] {
-            assert!(keys_from_json(body).is_err());
-        }
     }
 
     #[tokio::test]
@@ -1038,6 +1130,40 @@ mod tests {
             "nope",
         ] {
             assert!(!host_is_local(remote), "{remote}");
+        }
+    }
+
+    #[test]
+    fn expirations_parse_as_utc() {
+        let t = parse_expiration("2026-10-28T13:00:00Z").unwrap();
+        let secs = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(super::super::amz_datetime(secs), "20261028T130000Z");
+        assert_eq!(parse_expiration("2026-10-28T13:00:00.123Z").unwrap(), t);
+        assert_eq!(
+            parse_expiration("2024-02-29T00:00:00Z").unwrap(),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_709_164_800)
+        );
+        for bad in ["2026-10-28T13:00:00", "2026-13-01T00:00:00Z", "soon", ""] {
+            assert!(parse_expiration(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn json_keys_need_an_id_a_secret_and_an_expiry() {
+        let keys = keys_from_json(
+            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S","Token":"T","Expiration":"2026-10-28T13:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(keys.credentials.access_key_id, "AKID");
+        assert_eq!(keys.credentials.session_token.as_deref(), Some("T"));
+        assert!(keys.expires_at.is_some());
+        for body in [
+            &br#"{"SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#[..],
+            br#"{"AccessKeyId":"AKID","SecretAccessKey":"S"}"#,
+            b"not json",
+            br#"{"Code":"AssumeRoleUnauthorizedAccess","AccessKeyId":"AKID","SecretAccessKey":"S","Expiration":"2026-10-28T13:00:00Z"}"#,
+        ] {
+            assert!(keys_from_json(body).is_err());
         }
     }
 }
