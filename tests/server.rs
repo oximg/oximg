@@ -3326,6 +3326,47 @@ fn s3_keys_from_the_container_endpoint() {
     assert!(stderr.contains("must use https://"), "{stderr}");
 }
 
+/// Keys that S3 reports as expired are fetched again once. The agent
+/// hands out an old token first and a new one after; the cache would
+/// keep the old one (it does not expire for years), so only the forced
+/// fetch after `ExpiredToken` can get the request through.
+#[test]
+fn s3_expired_keys_are_fetched_again_once() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: new-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" | "/test-bucket/always.jpg" => {
+            Some(s3_error("400 Bad Request", "ExpiredToken"))
+        }
+        _ => None,
+    });
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = served.clone();
+    let agent = S3::spawn_unsigned(move |_, _| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let token = if n == 0 { "old-token" } else { "new-token" };
+        Reply::json(
+            "200 OK",
+            &format!(
+                r#"{{"AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"{token}","Expiration":"2099-01-01T00:00:00Z"}}"#
+            ),
+        )
+    })
+    .unwrap();
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.push((
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        format!("http://127.0.0.1:{}/v1/credentials", agent.port()),
+    ));
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Still expired after the new keys: one more fetch, then 500.
+    assert_eq!(s.status_of("/resize/100/100/always.jpg"), 500);
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
 /// Keys with characters that the HTTP mode, SigV4 and the URL parser
 /// each treat differently. The fake answers 200 only for the exact
 /// SigV4 path, and only with a valid signature over what arrived, so
