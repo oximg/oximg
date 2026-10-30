@@ -17,7 +17,7 @@ and turns a crawler into origin load.
 | 413 | `OXIMG_MAX_SOURCE_BYTES` / `OXIMG_MAX_SRC_PIXELS` / `OXIMG_MAX_DECODED_BYTES` | generic; which limit is on stderr |
 | 422 | undecodable bytes | top-level message, safe to echo |
 | 500 | unreadable local source; object store refusing our settings or keys (`gs://`/`s3://` permission, `s3://` region, keys, missing bucket, a credential source refusing our settings); encoder/internal fault; worker panic | generic; chain on stderr |
-| 502 | upstream broken (connect/reset/5xx); truncated or over-16-KiB S3 error body; `s3://` credential source unreachable or answering 429/5xx | generic |
+| 502 | upstream broken (connect/reset/5xx); truncated or over-16-KiB S3 error body; `s3://` credential source unreachable, answering 429/5xx, or STS throttling (400 `Throttling`, `IDPCommunicationError`) | generic |
 | 503 | request coalescing exhausted (leader died before publishing) | generic |
 | 504 | upstream slow (`OXIMG_UPSTREAM_*` deadline); `s3://` credential source too slow | generic |
 
