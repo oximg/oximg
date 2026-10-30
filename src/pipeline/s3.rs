@@ -7,7 +7,7 @@
 //! Credentials come from a chain of sources in `creds`: static keys
 //! from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
 //! plus `AWS_SESSION_TOKEN` for temporary keys), then the container
-//! endpoint (`container`). The `~/.aws` profile files are out of scope.
+//! endpoint (`container`), then EC2 instance metadata (`imds`). The `~/.aws` profile files are out of scope.
 //! `aws configure export-credentials --format env` turns a profile
 //! into static keys.
 //!
@@ -42,6 +42,7 @@ use super::{SourceRejected, UpstreamFault};
 
 mod container;
 mod creds;
+mod imds;
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -251,7 +252,7 @@ fn load_settings() -> Result<Settings, String> {
         );
     }
     let endpoint = custom.clone().unwrap_or_else(|| default_endpoint(&region));
-    let (scheme, host) = parse_endpoint(&endpoint)?;
+    let (scheme, host) = parse_endpoint("OXIMG_S3_ENDPOINT", &endpoint)?;
     // `config::validate` refuses other values at boot. A library caller
     // that skips it gets the default.
     let path_style = match crate::config::var("OXIMG_S3_PATH_STYLE").as_deref() {
@@ -264,8 +265,9 @@ fn load_settings() -> Result<Settings, String> {
     // custom endpoint already uses path style.
     if path_style == Some(false) && is_ip_literal(&host) {
         return Err(format!(
-            "OXIMG_S3_ENDPOINT={endpoint:?} is an IP address, so it needs path style \
-             (OXIMG_S3_PATH_STYLE=1)"
+            "OXIMG_S3_ENDPOINT={:?} is an IP address, so it needs path style \
+             (OXIMG_S3_PATH_STYLE=1)",
+            shown_url(&endpoint)
         ));
     }
     let credentials = creds::Chain::from_env()?;
@@ -288,12 +290,13 @@ fn default_endpoint(region: &str) -> String {
     format!("https://s3.{region}.{suffix}")
 }
 
-/// Split an endpoint URL into its scheme and its `Host` value. Only
-/// `scheme://host[:port]` is accepted: a path, a query or user info in
-/// the endpoint would change what we sign.
-fn parse_endpoint(raw: &str) -> Result<(String, String), String> {
-    let bad = |why: &str| format!("OXIMG_S3_ENDPOINT={raw:?} {why}");
-    let url = reqwest::Url::parse(raw).map_err(|e| bad(&format!("is not a URL ({e})")))?;
+/// Split the endpoint URL in setting `var` into its scheme and its
+/// `Host` value. Only `scheme://host[:port]` is accepted: a path, a
+/// query or user info in the endpoint would change what we sign or
+/// where the request goes.
+fn parse_endpoint(var: &str, raw: &str) -> Result<(String, String), String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("{var} is not a URL ({e})"))?;
+    let bad = |why: &str| format!("{var}={:?} {why}", shown_url(raw));
     if !matches!(url.scheme(), "http" | "https") {
         return Err(bad("must be http:// or https://"));
     }
@@ -831,6 +834,9 @@ pub(crate) fn startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> 
              outside a trusted network."
         );
     }
+    if let Some(warning) = s.credentials.warning() {
+        eprintln!("oximg: warning: {warning}");
+    }
     let key = probe_key(prefix)?;
     let target = Target::new(s, bucket, key.as_bytes());
     // `block_on_fetch` runs the future on another thread, so it must
@@ -1168,13 +1174,17 @@ mod tests {
     #[test]
     fn endpoint_must_be_scheme_and_host() {
         assert_eq!(
-            parse_endpoint("http://127.0.0.1:9000").unwrap(),
+            parse_endpoint("OXIMG_S3_ENDPOINT", "http://127.0.0.1:9000").unwrap(),
             ("http".into(), "127.0.0.1:9000".into())
         );
         // A trailing slash is fine. A default port is dropped, because
         // reqwest drops it from `Host` too.
         assert_eq!(
-            parse_endpoint("https://example.r2.cloudflarestorage.com:443/").unwrap(),
+            parse_endpoint(
+                "OXIMG_S3_ENDPOINT",
+                "https://example.r2.cloudflarestorage.com:443/"
+            )
+            .unwrap(),
             ("https".into(), "example.r2.cloudflarestorage.com".into())
         );
         for bad in [
@@ -1184,8 +1194,19 @@ mod tests {
             "https://host/?x=1",
             "https://user:pw@host",
         ] {
-            assert!(parse_endpoint(bad).is_err(), "{bad} should be refused");
+            assert!(
+                parse_endpoint("OXIMG_S3_ENDPOINT", bad).is_err(),
+                "{bad} should be refused"
+            );
         }
+        // The message names the setting and shows no secret.
+        let e = parse_endpoint(
+            "AWS_ENDPOINT_URL_STS",
+            "https://user:pw-secret@host/?sig=q-secret",
+        )
+        .unwrap_err();
+        assert!(e.starts_with("AWS_ENDPOINT_URL_STS="), "{e}");
+        assert!(!e.contains("secret"), "{e}");
     }
 
     #[test]
@@ -1210,7 +1231,7 @@ mod tests {
         ] {
             let endpoint = default_endpoint(region);
             assert_eq!(endpoint, format!("https://s3.{region}.{suffix}"));
-            let (_, host) = parse_endpoint(&endpoint).unwrap();
+            let (_, host) = parse_endpoint("OXIMG_S3_ENDPOINT", &endpoint).unwrap();
             let target = Target::new(&settings_for("https", &host, None), "pics", b"photo.jpg");
             assert_eq!(
                 target.url,
@@ -1375,6 +1396,7 @@ mod tests {
                 fault,
                 message: "x".into(),
                 code: None,
+                status: None,
             };
             Error::classify(map_cred_err(e), true).kind()
         };

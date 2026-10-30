@@ -36,6 +36,8 @@ pub(super) struct CredError {
     pub(super) message: String,
     /// The `<Code>` of an AWS XML error answer, as STS sends.
     pub(super) code: Option<String>,
+    /// The HTTP status of an answer that was not 2xx.
+    pub(super) status: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +59,7 @@ impl CredError {
             fault,
             message,
             code: None,
+            status: None,
         }
     }
 
@@ -79,6 +82,11 @@ impl std::fmt::Display for CredError {
 pub(super) trait Source: Send + Sync {
     /// Shown in errors, so an operator can tell which source failed.
     fn name(&self) -> &'static str;
+    /// A boot warning about these settings, such as a plain-HTTP
+    /// endpoint.
+    fn warning(&self) -> Option<String> {
+        None
+    }
     fn fetch(&self) -> KeysFuture<'_>;
     /// Whether a second fetch can return different keys.
     fn refreshes(&self) -> bool {
@@ -100,6 +108,10 @@ const SOURCES: &[(FromEnv, &str)] = &[
     (
         super::container::from_env,
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or _FULL_URI (ECS, EKS Pod Identity)",
+    ),
+    (
+        super::imds::from_env,
+        "an EC2 instance role (IMDS, off with AWS_EC2_METADATA_DISABLED=true)",
     ),
 ];
 
@@ -157,6 +169,10 @@ enum Step {
 }
 
 impl Chain {
+    pub(super) fn warning(&self) -> Option<String> {
+        self.inner.source.warning()
+    }
+
     pub(super) fn from_env() -> Result<Self, String> {
         for (from_env, _) in SOURCES {
             if let Some(source) = from_env()? {
@@ -476,7 +492,7 @@ pub(super) const EKS_AGENT_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 
 const IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
 
 /// Whether `url`'s host is loopback, link-local, the EKS agent or IMDS.
-fn host_is_local(url: &str) -> bool {
+pub(super) fn host_is_local(url: &str) -> bool {
     use std::net::IpAddr;
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
@@ -571,19 +587,25 @@ async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, CredError> {
         };
         // An AWS XML error (STS): show its code and message, not the XML.
         let parsed = super::parse_error_body(&body);
-        if let Some(code) = parsed.code {
-            let message = parsed.message.unwrap_or_default();
-            let mut e = CredError::new(fault, format!("{status} {code}: {message}"));
-            e.code = Some(code);
-            return Err(e);
-        }
-        let text = String::from_utf8_lossy(&body);
-        let shown: String = text
-            .chars()
-            .filter(|c| c.is_ascii_graphic() || *c == ' ')
-            .take(200)
-            .collect();
-        return Err(CredError::new(fault, format!("{status}: {shown}")));
+        let mut e = match parsed.code {
+            Some(code) => {
+                let message = parsed.message.unwrap_or_default();
+                let mut e = CredError::new(fault, format!("{status} {code}: {message}"));
+                e.code = Some(code);
+                e
+            }
+            None => {
+                let text = String::from_utf8_lossy(&body);
+                let shown: String = text
+                    .chars()
+                    .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                    .take(200)
+                    .collect();
+                CredError::new(fault, format!("{status}: {shown}"))
+            }
+        };
+        e.status = Some(status.as_u16());
+        return Err(e);
     }
     Ok(body)
 }
