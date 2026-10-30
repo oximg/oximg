@@ -615,6 +615,8 @@ never silently falls back to a default.
 | `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity (which sets it) or another credential agent. Over `http://` only loopback, `169.254.170.2`, `169.254.170.23` and `fd00:ec2::23` are allowed |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | `Authorization` value for the container endpoint, read from this file on every fetch (EKS rotates it). Wins over the next row |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | `Authorization` value for the container endpoint |
+| `AWS_EC2_METADATA_DISABLED` | `false` | `true` stops `s3://` from asking EC2 instance metadata (IMDSv2) for keys. IMDS is the last source and is tried when nothing else is set; off EC2 that costs a few seconds at boot before it fails |
+| `AWS_EC2_METADATA_SERVICE_ENDPOINT` | `http://169.254.169.254` | IMDS address, `scheme://host[:port]`. Use `http://[fd00:ec2::254]` on IPv6-only subnets |
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch, including credentials, retries/backoff and body download (fetch-slot queueing is excluded) — bounds how long a stalled upstream can hold a fetch slot (and its buffer); timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |

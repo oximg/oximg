@@ -3401,6 +3401,99 @@ fn s3_sends_the_path_it_signs() {
     }
 }
 
+/// EC2 instance profiles: with nothing else set, keys come from IMDSv2.
+/// The fake requires the session token from the PUT on both GETs, as
+/// IMDS does when v1 is off.
+#[test]
+fn s3_keys_from_imds_v2() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: imds-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let imds = S3::spawn_unsigned(|path, req| {
+        let session = req.contains("x-aws-ec2-metadata-token: session-1");
+        match path {
+            "/latest/api/token"
+                if req.starts_with("put ")
+                    && req.contains("x-aws-ec2-metadata-token-ttl-seconds: 21600") =>
+            {
+                Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsession-1")
+            }
+            "/latest/meta-data/iam/security-credentials/" if session => Reply::raw(
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nweb-role",
+            ),
+            "/latest/meta-data/iam/security-credentials/web-role" if session => Reply::json(
+                "200 OK",
+                r#"{"Code":"Success","Type":"AWS-HMAC","AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"imds-token","Expiration":"2099-01-01T00:00:00Z"}"#,
+            ),
+            _ => Reply::json("401 Unauthorized", "{}"),
+        }
+    })
+    .unwrap();
+    // Nothing but IMDS, at `port`.
+    let imds_env = |port: u16| {
+        let mut envs = s3_env_without_keys(s3.port());
+        envs.push((
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        ));
+        envs
+    };
+    let s = Server::start(&imds_env(imds.port()));
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    assert_eq!(imds.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    drop(s);
+
+    // Off EC2: IMDS does not answer, and the boot error says what to set.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let off = imds_env(dead_port);
+    let stderr = s3_boot_stderr(&off);
+    assert!(stderr.contains("IMDSv2"), "{stderr}");
+    assert!(stderr.contains("set static keys"), "{stderr}");
+    assert!(!stderr.contains("hop limit"), "{stderr}");
+
+    // Another cloud's metadata service answers, but not the IMDSv2 call:
+    // no word about EC2 hop limits.
+    let other = S3::spawn_unsigned(|_, _| Reply::json("404 Not Found", "{}")).unwrap();
+    let stderr = s3_boot_stderr(&imds_env(other.port()));
+    assert!(stderr.contains("404"), "{stderr}");
+    assert!(!stderr.contains("hop limit"), "{stderr}");
+
+    // An instance without a profile: IMDS gives a session, then 404 for
+    // the role name.
+    let no_role = S3::spawn_unsigned(|path, _| match path {
+        "/latest/api/token" => {
+            Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsession-1")
+        }
+        _ => Reply::json("404 Not Found", "{}"),
+    })
+    .unwrap();
+    let stderr = s3_boot_stderr(&imds_env(no_role.port()));
+    assert!(stderr.contains("has no IAM role"), "{stderr}");
+
+    // In a container with hop limit 1 the token answer never arrives:
+    // a listener that accepts nothing stands in for it.
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let stderr = s3_boot_stderr(&imds_env(stalled.local_addr().unwrap().port()));
+    assert!(stderr.contains("hop limit of 2"), "{stderr}");
+    drop(stalled);
+
+    // Turned off, and nothing else set: the error lists every source.
+    let mut none = off.clone();
+    none.push(("AWS_EC2_METADATA_DISABLED", "true".into()));
+    let stderr = s3_boot_stderr(&none);
+    assert!(stderr.contains("s3:// needs credentials"), "{stderr}");
+    assert!(
+        stderr.contains("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
+        "{stderr}"
+    );
+}
+
 /// s3:// refuses to boot when the settings are missing or wrong, with
 /// a message that names the cause. The boot probe catches what the
 /// store reports. 403 `AccessDenied` is the one exception: AWS sends it
