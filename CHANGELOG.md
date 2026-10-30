@@ -10,6 +10,24 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`s3://` gets keys from the AWS credential chain** ([#11]). Without
+  static keys, oximg now asks, in the AWS SDK order: web identity (EKS
+  IRSA, through STS), the container endpoint (ECS task roles, EKS Pod
+  Identity) and EC2 instance metadata (IMDSv2). Static keys still come
+  first and work as before. Keys from these sources are cached and
+  fetched again five minutes before they expire. When S3 answers
+  `ExpiredToken`, oximg fetches new keys once and tries again. If a
+  refresh fails, the cached keys stay in use until they expire. A
+  credential source that times out answers 504, one that is down 502,
+  and wrong settings 500. Requests to IMDS and the ECS and EKS agents
+  skip `HTTP_PROXY`. Boot prints the source in use. With no keys set,
+  boot now asks IMDS before it stops, so a host off EC2 waits up to two
+  seconds; `AWS_EC2_METADATA_DISABLED=true` skips it. In a container on
+  EC2, IMDS needs a hop limit of 2. The `~/.aws` files, SSO and
+  `credential_process` are not read. No new dependency.
+
 ## [0.21.0] - 2026-11-12
 
 Animated GIF sources get an optional budget for the decode half
