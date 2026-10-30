@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
+  file gets `probe.jpeg.{sof,progressive}` (the SOFn number: 0
+  baseline, 1 extended sequential, 2 progressive), so a proof of which
+  scan layout the encoder chose needs no second tool.
+
 ## [0.17.0] - 2026-10-26
 
 Private S3 buckets as an image source ([#11], [#86], [#88]):

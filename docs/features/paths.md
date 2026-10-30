@@ -15,7 +15,10 @@ cargo build --release
 
 Auto-spawns `oximg` on `PORT=0` with `IMAGES_DIR=tests/fixtures`
 unless `--base URL` points at an already-running server. Proof is
-`status`, `content_type`, `probe.{width,height}`, `sha256`.
+`status`, `content_type`, `probe.{width,height}`, `sha256`. A JPEG body
+also gets `probe.jpeg.{sof,progressive}`: the SOFn frame number (0
+baseline, 1 extended sequential, 2 progressive), which is how a knob
+that picks the scan layout is proved.
 
 ## CLI (one-shot, no HTTP)
 

@@ -1,5 +1,5 @@
 //! The fields every command reports about bytes it saw: a header probe
-//! (format, stored size, animation) and a sha256.
+//! (format, stored size, animation, a JPEG's frame type) and a sha256.
 
 use oximg::pipeline::{self, Animation};
 use serde_json::{Value, json};
@@ -32,9 +32,50 @@ pub fn probe_value(bytes: &[u8]) -> Value {
                     v["animation_error"] = json!(e.to_string());
                 }
             }
+            if let Some(n) = jpeg_sof(bytes) {
+                // Which frame the encoder chose is behavior the knobs
+                // control (progressive vs sequential), so a proof needs
+                // to see it without a second tool.
+                v["jpeg"] = json!({"sof": n, "progressive": matches!(n, 2 | 6 | 10 | 14)});
+            }
             v
         }
         Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// The `n` of a JPEG's SOFn frame marker (0 baseline, 1 extended
+/// sequential, 2 progressive, ...), found by walking the marker
+/// segments that precede it. `None` for anything that is not a JPEG or
+/// reaches the first scan without a frame header.
+fn jpeg_sof(b: &[u8]) -> Option<u8> {
+    if !b.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        if *b.get(i)? != 0xFF {
+            return None;
+        }
+        // Any number of 0xFF fill bytes may precede a marker code.
+        while *b.get(i + 1)? == 0xFF {
+            i += 1;
+        }
+        let m = b[i + 1];
+        match m {
+            // DHT, JPG, DAC share the SOF range but are not frames.
+            0xC4 | 0xC8 | 0xCC => {}
+            0xC0..=0xCF => return Some(m - 0xC0),
+            0xDA => return None,
+            // Standalone markers carry no length.
+            0x01 | 0xD0..=0xD7 => {
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        let len = u16::from_be_bytes([*b.get(i + 2)?, *b.get(i + 3)?]) as usize;
+        i += 2 + len;
     }
 }
 
@@ -73,8 +114,33 @@ mod tests {
             (Some(200), Some(150))
         );
         assert_eq!(v["stored_pixels"], 30_000);
+        assert_eq!(v["jpeg"], json!({"sof": 0, "progressive": false}));
         assert!(v.get("animation").is_none(), "{v}");
         assert!(v.get("error").is_none(), "{v}");
+    }
+
+    #[test]
+    fn probe_reports_the_jpeg_frame_type() {
+        let v = probe_value(&fixture("cmyk_prog.jpg"));
+        assert_eq!(v["jpeg"], json!({"sof": 2, "progressive": true}));
+        // Non-JPEGs carry no `jpeg` object.
+        assert!(probe_value(&fixture("rgb.png")).get("jpeg").is_none());
+    }
+
+    #[test]
+    fn jpeg_sof_walks_fill_bytes_and_standalone_markers() {
+        // SOI, fill bytes, RST0 (standalone), DHT (in the SOF range but
+        // not a frame), then SOF1.
+        let b = [
+            0xFF, 0xD8, 0xFF, 0xFF, 0xD0, 0xFF, 0xC4, 0x00, 0x03, 0x00, 0xFF, 0xC1, 0x00, 0x02,
+        ];
+        assert_eq!(jpeg_sof(&b), Some(1));
+        // A scan before any frame, garbage between segments, truncation,
+        // and a non-JPEG all report nothing.
+        assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02]), None);
+        assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0x00]), None);
+        assert_eq!(jpeg_sof(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]), None);
+        assert_eq!(jpeg_sof(b"\x89PNG"), None);
     }
 
     #[test]

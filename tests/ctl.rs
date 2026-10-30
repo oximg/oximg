@@ -82,6 +82,12 @@ fn probe_photo_jpg() {
     assert_eq!(v["probe"]["content_type"], "image/jpeg");
     assert_eq!(v["probe"]["width"], 200);
     assert_eq!(v["probe"]["height"], 150);
+    assert_eq!(v["probe"]["jpeg"]["sof"], 0);
+    assert_eq!(v["probe"]["jpeg"]["progressive"], false);
+    let (code, v) = run(&["probe", &fixture("cmyk_prog.jpg")]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["jpeg"]["sof"], 2);
+    assert_eq!(v["probe"]["jpeg"]["progressive"], true);
 }
 
 #[test]
