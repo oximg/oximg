@@ -2789,6 +2789,112 @@ fn fake_s3(
     (s3, hits)
 }
 
+/// EKS IRSA: the OIDC token from its file goes to STS in a POST form,
+/// and STS's keys sign the request. Web identity comes before the
+/// container endpoint in the chain, so it wins when both are set.
+#[test]
+fn s3_keys_from_web_identity() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: sts-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        "/test-bucket/rotated.jpg" if req.contains("x-amz-security-token: sts-token-2") => {
+            Some("photo".into())
+        }
+        "/test-bucket/rotated.jpg" => Some(s3_error("400 Bad Request", "ExpiredToken")),
+        _ => None,
+    });
+    let sts = S3::spawn_unsigned(|path, req| {
+        let form = req.rsplit("\r\n\r\n").next().unwrap_or("");
+        let session = if form.contains("webidentitytoken=rotated-token") {
+            "sts-token-2"
+        } else {
+            "sts-token"
+        };
+        if path == "/"
+            && req.starts_with("post ")
+            && form.contains("action=assumerolewithwebidentity")
+            && form.contains("rolearn=arn%3aaws%3aiam%3a%3a123456789012%3arole%2foximg")
+            && (form.contains("webidentitytoken=oidc-token")
+                || form.contains("webidentitytoken=rotated-token"))
+            && !req.lines().next().unwrap_or("").contains("-token")
+        {
+            let xml = format!("<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKIDTEST</AccessKeyId><SecretAccessKey>test-secret</SecretAccessKey><SessionToken>{session}</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>");
+            Reply::raw(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                xml.len()
+            ))
+        } else {
+            let xml =
+                "<ErrorResponse><Error><Code>InvalidIdentityToken</Code></Error></ErrorResponse>";
+            Reply::raw(format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                xml.len()
+            ))
+        }
+    })
+    .unwrap();
+    let token_file = std::env::temp_dir().join(format!("oximg-oidc-token-{}", std::process::id()));
+    std::fs::write(&token_file, "oidc-token\n").unwrap();
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.extend([
+        (
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            token_file.display().to_string(),
+        ),
+        (
+            "AWS_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/oximg".into(),
+        ),
+        (
+            "AWS_ENDPOINT_URL_STS",
+            format!("http://127.0.0.1:{}", sts.port()),
+        ),
+        // Set too, and unused: web identity comes first.
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://127.0.0.1:9/never".into(),
+        ),
+    ]);
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    // EKS rotates the token file. When the keys run out, the next fetch
+    // reads the new token: STS gives other keys only for it.
+    std::fs::write(&token_file, "rotated-token\n").unwrap();
+    assert_eq!(s.status_of("/resize/100/100/rotated.jpg"), 200);
+    drop(s);
+
+    // A plain-HTTP STS endpoint warns at boot.
+    std::fs::write(&token_file, "oidc-token\n").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(
+        stderr.contains("AWS_ENDPOINT_URL_STS uses http://"),
+        "{stderr}"
+    );
+    // Boot names the source that gave the keys.
+    assert!(
+        stderr.contains("s3:// credentials: web identity"),
+        "{stderr}"
+    );
+
+    // A token STS refuses stops the boot with STS's answer.
+    std::fs::write(&token_file, "other-token").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(stderr.contains("web identity"), "{stderr}");
+    assert!(stderr.contains("InvalidIdentityToken"), "{stderr}");
+    std::fs::remove_file(&token_file).unwrap();
+
+    // Half a web identity is a setting error, not a fall-through.
+    let mut half = s3_env_without_keys(s3.port());
+    half.push(("AWS_ROLE_ARN", "arn:aws:iam::1:role/x".into()));
+    let stderr = s3_boot_stderr(&half);
+    assert!(
+        stderr.contains("needs both AWS_WEB_IDENTITY_TOKEN_FILE"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn s3_error_body_failures_preserve_transport_errors() {
     let s3 = S3::spawn(|path, _| {
