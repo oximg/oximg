@@ -1269,3 +1269,36 @@ fn truncated_in_memory_source_is_still_too_short() {
         "unexpected error: {e:#}"
     );
 }
+
+/// The progressive window: sequential at and under the floor,
+/// progressive above it up to and including the ceiling, sequential
+/// above the ceiling; `0` disables either bound, and
+/// OXIMG_JPEG_PROGRESSIVE=0 wins over both.
+#[test]
+fn progressive_window_has_a_floor_and_a_ceiling() {
+    let (floor, ceiling) = (12_000, crate::config::DEFAULT_PROGRESSIVE_MAX_PIXELS);
+    assert!(!progressive_at(7_500, true, floor, ceiling), "thumbnail");
+    assert!(
+        !progressive_at(12_000, true, floor, ceiling),
+        "at the floor"
+    );
+    assert!(progressive_at(12_001, true, floor, ceiling));
+    // 4000x4000 sits exactly on the default ceiling and stays progressive.
+    assert!(
+        progressive_at(4000 * 4000, true, floor, ceiling),
+        "at the ceiling"
+    );
+    assert!(!progressive_at(4000 * 4000 + 1, true, floor, ceiling));
+    assert!(
+        !progressive_at(8000 * 8000, true, floor, ceiling),
+        "8000x8000"
+    );
+    // 0 = no ceiling; 0 = no floor.
+    assert!(progressive_at(8000 * 8000, true, floor, 0));
+    assert!(progressive_at(1, true, 0, 0));
+    // A ceiling at or below the floor leaves no progressive window.
+    assert!(!progressive_at(12_000, true, floor, floor));
+    // Progressive off overrides the window.
+    assert!(!progressive_at(1_000_000, false, floor, ceiling));
+    assert!(!progressive_at(1_000_000, false, 0, 0));
+}

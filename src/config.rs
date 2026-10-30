@@ -52,6 +52,12 @@ pub(crate) struct Config {
     /// #61). The scan script's per-scan overhead outweighs what it
     /// saves on small images; 0 keeps every output progressive.
     pub jpegli_sequential_pixels: u64,
+    /// OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS: with progressive on, an
+    /// output of more than this many pixels is written sequential
+    /// (issue #129), the mirror of the floor above. Progressive jpegli
+    /// holds the whole image's DCT coefficients until the last scan;
+    /// sequential streams them. 0 = no ceiling.
+    pub jpegli_progressive_max_pixels: u64,
     /// OXIMG_FLATTEN_BG: alpha→JPEG flatten background, RRGGBB hex.
     pub flatten_bg: [u8; 3],
     /// OXIMG_PNG_EFFORT: fastest / fast / balanced / high. `None` =
@@ -143,6 +149,7 @@ const KNOBS: &[&str] = &[
     "OXIMG_LINEAR_SHRINK",
     "OXIMG_JPEG_PROGRESSIVE",
     "OXIMG_JPEG_SEQUENTIAL_PIXELS",
+    "OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS",
     "OXIMG_FLATTEN_BG",
     "OXIMG_PNG_EFFORT",
     "OXIMG_PNG_QUANTIZE",
@@ -308,6 +315,7 @@ pub(crate) fn validate() -> Result<(), String> {
     one_of("OXIMG_METRICS", &["0", "1"])?;
     num("OXIMG_DCT_MARGIN", 1.0f64, 8.0)?;
     num("OXIMG_JPEG_SEQUENTIAL_PIXELS", 0u64, u64::MAX)?;
+    num("OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS", 0u64, u64::MAX)?;
     num("OXIMG_WEBP_QUALITY", 0.0f32, 100.0)?;
     num("OXIMG_WEBP_EFFORT", 0i64, 6)?;
     num("OXIMG_AVIF_QUALITY", 0i64, 100)?;
@@ -341,6 +349,12 @@ pub(crate) fn validate() -> Result<(), String> {
 /// OXIMG_JPEG_SEQUENTIAL_PIXELS when unset.
 pub(crate) const DEFAULT_SEQUENTIAL_PIXELS: u64 = 12_000;
 
+/// OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS when unset: 16 MP. An 8000x8000
+/// re-encode peaked at 601 MiB progressive vs 238 MiB sequential (M2
+/// Max, issue #129) for ~4% smaller output; 4000x4000 and below keep
+/// progressive.
+pub(crate) const DEFAULT_PROGRESSIVE_MAX_PIXELS: u64 = 16_000_000;
+
 pub(crate) fn config() -> &'static Config {
     static CONFIG: OnceLock<Config> = OnceLock::new();
     CONFIG.get_or_init(|| Config {
@@ -354,6 +368,8 @@ pub(crate) fn config() -> &'static Config {
         jpegli_progressive: var("OXIMG_JPEG_PROGRESSIVE").as_deref() != Some("0"),
         jpegli_sequential_pixels: parsed("OXIMG_JPEG_SEQUENTIAL_PIXELS")
             .unwrap_or(DEFAULT_SEQUENTIAL_PIXELS),
+        jpegli_progressive_max_pixels: parsed("OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS")
+            .unwrap_or(DEFAULT_PROGRESSIVE_MAX_PIXELS),
         flatten_bg: var("OXIMG_FLATTEN_BG")
             .and_then(|v| {
                 let v = v.trim_start_matches('#');

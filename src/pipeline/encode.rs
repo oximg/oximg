@@ -657,9 +657,24 @@ pub(super) fn icc_app2_chunks(icc: &[u8]) -> impl Iterator<Item = Vec<u8>> + '_ 
 ///
 /// Below OXIMG_JPEG_SEQUENTIAL_PIXELS output pixels the default is
 /// sequential too: the identical pixels in fewer bytes and less CPU.
+/// Above OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS it is sequential for memory:
+/// progressive buffers every DCT coefficient of the image until the
+/// last scan (8000x8000: 601 MiB peak vs 238 MiB, for ~4% fewer bytes).
 pub(super) fn jpegli_progressive(w: usize, h: usize) -> bool {
     let c = crate::config::config();
-    c.jpegli_progressive && (w as u64) * (h as u64) > c.jpegli_sequential_pixels
+    progressive_at(
+        (w as u64) * (h as u64),
+        c.jpegli_progressive,
+        c.jpegli_sequential_pixels,
+        c.jpegli_progressive_max_pixels,
+    )
+}
+
+/// The progressive decision as a pure function of the output size and
+/// the three knobs: on, above the floor, and at most the ceiling
+/// (`0` = no ceiling).
+pub(super) fn progressive_at(px: u64, on: bool, floor: u64, ceiling: u64) -> bool {
+    on && px > floor && (ceiling == 0 || px <= ceiling)
 }
 
 pub(super) fn encode_jpegli(

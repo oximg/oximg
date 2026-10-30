@@ -370,6 +370,8 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_FETCH_CONCURRENCY", "2000"),
         ("OXIMG_FETCH_CONCURRENCY", "many"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "300"),
+        ("OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS", "16MP"),
+        ("OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS", "-1"),
         ("OXIMG_PNG_QUANTIZE_COLORS", "1"),
         ("OXIMG_GIF_ANIMATION", "off"),
         ("OXIMG_MAX_ANIM_FRAMES", "0"),
@@ -1080,6 +1082,35 @@ fn jpegli_scan_script_and_the_sequential_cases() {
     for url in large.iter().chain(&small) {
         let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
         assert_eq!((sof, scans), (0xC1, sequential.clone()), "{url}");
+    }
+}
+
+/// OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS is the ceiling mirroring the
+/// floor: outputs above it are one sequential scan (progressive holds
+/// the whole coefficient image in memory), at or below it progressive,
+/// on every route into jpegli. `0` lifts the ceiling.
+#[test]
+fn jpegli_progressive_ceiling_writes_large_outputs_sequential() {
+    let max = |n: &str| ("OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS", n.to_string());
+    // 200x150 = 30000 px; 160x120 = 19200 px.
+    let above = ["/resize/200/200/photo.jpg", "/resize/200/200/rgb.png@jpg"];
+    let at_or_below = ["/resize/160/120/photo.jpg", "/resize/160/120/rgb.png@jpg"];
+    for overlap in ["1", "0"] {
+        let s = Server::start(&[("OXIMG_OVERLAP", overlap.into()), max("19200")]);
+        for url in above {
+            let (sof, scans) = common::jpeg_scans(&s.get(url).unwrap().2);
+            assert_eq!(sof, 0xC1, "OVERLAP={overlap} {url}: not sequential");
+            assert_eq!(scans.len(), 1, "OVERLAP={overlap} {url}");
+        }
+        for url in at_or_below {
+            let (sof, _) = common::jpeg_scans(&s.get(url).unwrap().2);
+            assert_eq!(sof, 0xC2, "OVERLAP={overlap} {url}: not progressive");
+        }
+    }
+    let s = Server::start(&[max("0")]);
+    for url in above {
+        let (sof, _) = common::jpeg_scans(&s.get(url).unwrap().2);
+        assert_eq!(sof, 0xC2, "no ceiling {url}: not progressive");
     }
 }
 

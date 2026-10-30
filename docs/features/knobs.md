@@ -69,6 +69,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_LINEAR_SHRINK` | `1` | `0` = full-size decode for every reduction |
 | `OXIMG_JPEG_PROGRESSIVE` | `1` | `0` = sequential jpegli (SOF1, extended sequential) at every size |
 | `OXIMG_JPEG_SEQUENTIAL_PIXELS` | `12000` | Outputs up to this many pixels are sequential; `0` = always progressive |
+| `OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS` | `16000000` | Outputs above this many pixels are sequential, for memory (8000² peak 601 → 238 MiB, ~4% more bytes); `0` = no ceiling; jpegli only |
 | `OXIMG_FLATTEN_BG` | `ffffff` | Alpha→JPEG background |
 | `OXIMG_PNG_EFFORT` | path-dependent | `fastest`/`fast`/`balanced`/`high`, or zlib-style `0`–`9` |
 | `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG |

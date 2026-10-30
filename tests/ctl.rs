@@ -90,6 +90,28 @@ fn probe_photo_jpg() {
     assert_eq!(v["probe"]["jpeg"]["progressive"], true);
 }
 
+/// The progressive ceiling, proved the way an operator would: the
+/// default keeps a 200x150 output progressive; a ceiling under its
+/// 30000 pixels makes it sequential (SOF1).
+#[test]
+fn get_reports_sequential_jpeg_above_the_progressive_ceiling() {
+    let url = "/resize/200/200/photo.jpg";
+    let (code, v) = run(&["get", url, "--expect", "200"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["jpeg"]["progressive"], true, "{v}");
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS=29999",
+        "get",
+        url,
+        "--expect",
+        "200",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["jpeg"]["sof"], 1, "{v}");
+    assert_eq!(v["probe"]["jpeg"]["progressive"], false, "{v}");
+}
+
 #[test]
 fn probe_anim_gif_reports_frames() {
     let (code, v) = run(&["probe", &fixture("anim.gif")]);

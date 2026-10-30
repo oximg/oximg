@@ -10,6 +10,19 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **JPEG outputs above 16 megapixels are sequential, for memory.**
+  Progressive jpegli holds every DCT coefficient of the image until its
+  last scan; sequential streams them. An 8000x8000 re-encode now peaks
+  at about 238 MiB instead of 601 MiB (M2 Max), for output ~4% larger
+  (4.84 vs 4.66 MB). Outputs of at most 16 MP, 4000x4000 included, are
+  byte-identical to before. The new `OXIMG_JPEG_PROGRESSIVE_MAX_PIXELS`
+  moves the ceiling and `0` removes it. The mozjpeg presets are
+  unchanged: they buffer the whole coefficient image for Huffman
+  optimization (`fast`) and trellis quantization (`small`) whatever the
+  scan layout.
+
 ### Added
 
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
