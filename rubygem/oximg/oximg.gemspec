@@ -41,7 +41,10 @@ Gem::Specification.new do |spec|
   # Rust tree. exe/ is empty here and populated at package time for the
   # platform gems — and there is deliberately no spec.executables, since
   # RubyGems would wrap a native binary in a Ruby binstub. Ask
-  # Oximg.executable for the path instead.
-  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + ["README.md", "LICENSE"]
+  # Oximg.executable for the path instead. A platform gem also ships the
+  # third-party notices of the code that binary links, taken from the
+  # same release archive.
+  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + Dir["exe/THIRD-PARTY-LICENSES*"] +
+    ["README.md", "LICENSE"]
   spec.require_paths = ["lib"]
 end
