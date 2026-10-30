@@ -69,3 +69,23 @@ oximg-ctl get /resize/60/60/anim.gif   # probe.animation.frames == 3
   bench delta as real. See [bench/METHODOLOGY.md](../../bench/METHODOLOGY.md).
 - Quality: [bench/quality/QUALITY.md](../../bench/quality/QUALITY.md).
   ~2 SSIMULACRA2 points is the perceptible threshold.
+
+## When output bytes may change
+
+What oximg guarantees is **determinism within a release**: the same
+URL gives the same bytes on x86-64 and aarch64, on the fused and
+serial paths, and with every SIMD kernel. Identity with libjpeg's or
+any other library's output is not part of the contract (0.14 changed
+bytes for the linear-light half-size decode).
+
+A performance change that alters output bytes is accepted only when
+it meets all four of these:
+
+1. **Gain:** at least 3% server CPU per request, measured on both
+   x86-64 and aarch64 per [bench/METHODOLOGY.md](../../bench/METHODOLOGY.md).
+2. **Quality:** against a lossless truth (`bench/quality/dct_sweep.py`
+   or equivalent), the mean is no worse than −0.05 SSIMULACRA2, and
+   no new image drops more than 2 points.
+3. **Determinism:** the scalar, AVX2 and NEON implementations are
+   bit-identical to each other, and tests pin it.
+4. **Disclosure:** a CHANGELOG entry and a minor version.
