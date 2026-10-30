@@ -20,6 +20,9 @@ oximg-ctl get /resize/100/100/tiny.jpg    # stays 40×30
 
 - Resize in linear light on 16-bit samples, Lanczos3. `OXIMG_RESIZE=srgb` disables.
 - Alpha is premultiplied before the resample, unpremultiplied after.
+- A still frame keeps its alpha channel only if a pixel uses it. An
+  all-255 alpha is dropped after the decode. Animated output keeps
+  RGBA frames.
 - JPEG sources decode at full size by default, except that 4:2:0 and
   grayscale sources reduced ~3.8× or more decode luma at 1/2 through a
   linear-light 2×2 average of the full IDCT (`OXIMG_LINEAR_SHRINK`;
