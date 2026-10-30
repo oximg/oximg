@@ -54,6 +54,8 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity or another agent. `http://` only to loopback or the ECS or EKS agent address |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | Token for the container endpoint, read again on every fetch. Wins over `AWS_CONTAINER_AUTHORIZATION_TOKEN` |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | Token for the container endpoint, as a value |
+| `AWS_EC2_METADATA_DISABLED` | `false` | `true`: do not try EC2 instance metadata (IMDSv2) for `s3://` keys. IMDS is the last source and is tried when nothing else is set |
+| `AWS_EC2_METADATA_SERVICE_ENDPOINT` | `http://169.254.169.254` | IMDS address as `scheme://host[:port]`; tests and the IPv6 address `http://[fd00:ec2::254]` |
 | `GLIBC_TUNABLES` | unset | Any `glibc.malloc.*` entry turns off the server's malloc pins (`mmap_threshold` 32 MiB, `trim_threshold` 64 MiB, `arena_max` 2; Linux glibc, no `mimalloc`) |
 | `OXIMG_AUTO_FORMAT` | unset | `avif,webp` preference list |
 | `QUALITY` | `80` | JPEG quality (process-wide) |
