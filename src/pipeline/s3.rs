@@ -6,8 +6,9 @@
 //!
 //! Credentials come from a chain of sources in `creds`: static keys
 //! from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
-//! plus `AWS_SESSION_TOKEN` for temporary keys), then the container
-//! endpoint (`container`), then EC2 instance metadata (`imds`). The `~/.aws` profile files are out of scope.
+//! plus `AWS_SESSION_TOKEN` for temporary keys), then web identity
+//! (`web_identity`), then the container endpoint (`container`), then EC2
+//! instance metadata (`imds`). The `~/.aws` profile files are out of scope.
 //! `aws configure export-credentials --format env` turns a profile
 //! into static keys.
 //!
@@ -43,6 +44,7 @@ use super::{SourceRejected, UpstreamFault};
 mod container;
 mod creds;
 mod imds;
+mod web_identity;
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -282,12 +284,16 @@ fn load_settings() -> Result<Settings, String> {
 }
 
 fn default_endpoint(region: &str) -> String {
-    let suffix = if region.starts_with("cn-") {
+    format!("https://s3.{region}.{}", aws_domain(region))
+}
+
+/// The domain of the AWS partition that `region` is in.
+fn aws_domain(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
         "amazonaws.com.cn"
     } else {
         "amazonaws.com"
-    };
-    format!("https://s3.{region}.{suffix}")
+    }
 }
 
 /// Split the endpoint URL in setting `var` into its scheme and its
@@ -734,12 +740,7 @@ async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8
 /// printable ASCII, and the code must look like a code.
 fn parse_error_body(body: &[u8]) -> ErrorBody {
     let text = String::from_utf8_lossy(body);
-    let element = |name: &str| -> Option<String> {
-        let open = format!("<{name}>");
-        let start = text.find(&open)? + open.len();
-        let end = start + text[start..].find(&format!("</{name}>"))?;
-        Some(unescape_xml(&text[start..end]))
-    };
+    let element = |name: &str| xml_element(&text, name).map(unescape_xml);
     let code = element("Code").filter(|c| {
         !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
     });
@@ -750,6 +751,15 @@ fn parse_error_body(body: &[u8]) -> ErrorBody {
             .collect()
     });
     ErrorBody { code, message }
+}
+
+/// The raw text of the first `<name>` element in `xml`. It does not
+/// handle nesting, so it is only for elements that never nest.
+fn xml_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{name}>"))?;
+    Some(&xml[start..end])
 }
 
 /// Replace the five predefined XML entities and the numeric form that

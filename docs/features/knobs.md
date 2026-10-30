@@ -50,7 +50,11 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` static key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` static key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` temporary keys only |
-| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role; a path on `169.254.170.2`. Used when no static keys are set |
+| `AWS_WEB_IDENTITY_TOKEN_FILE` | unset | `s3://` keys from EKS IRSA: the OIDC token, read again on every fetch. Needs `AWS_ROLE_ARN` |
+| `AWS_ROLE_ARN` | unset | Role that STS `AssumeRoleWithWebIdentity` assumes |
+| `AWS_ROLE_SESSION_NAME` | `oximg-<unix time>` | Session name in CloudTrail |
+| `AWS_ENDPOINT_URL_STS` | `https://sts.<AWS_REGION>.amazonaws.com` (`.com.cn` in China) | STS endpoint for web identity |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role; a path on `169.254.170.2`. Used when neither static keys nor web identity are set |
 | `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity or another agent. `http://` only to loopback or the ECS or EKS agent address |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | Token for the container endpoint, read again on every fetch. Wins over `AWS_CONTAINER_AUTHORIZATION_TOKEN` |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | Token for the container endpoint, as a value |

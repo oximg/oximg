@@ -106,6 +106,10 @@ const SOURCES: &[(FromEnv, &str)] = &[
         "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY",
     ),
     (
+        super::web_identity::from_env,
+        "AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN (EKS IRSA)",
+    ),
+    (
         super::container::from_env,
         "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or _FULL_URI (ECS, EKS Pod Identity)",
     ),
@@ -568,7 +572,7 @@ fn transport(e: reqwest::Error) -> CredError {
 /// Read a credential endpoint's answer, refusing anything over
 /// `BODY_LIMIT` and any status other than 2xx. 429 and 5xx are the
 /// source being down; other statuses are our settings.
-async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, CredError> {
+pub(super) async fn read_body(resp: reqwest::Response) -> Result<Vec<u8>, CredError> {
     let status = resp.status();
     let body = super::read_capped(resp, BODY_LIMIT)
         .await
