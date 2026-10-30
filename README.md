@@ -611,7 +611,11 @@ never silently falls back to a default.
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` access key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` secret key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` session token, for temporary keys only |
-| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role, used when no static keys are set. ECS sets it |
+| `AWS_WEB_IDENTITY_TOKEN_FILE` | unset | `s3://` keys from EKS IAM roles for service accounts (IRSA, which sets it): an OIDC token that STS exchanges for keys. Read again on every fetch, since EKS rotates it. Needs `AWS_ROLE_ARN` |
+| `AWS_ROLE_ARN` | unset | The role to assume with the web identity token |
+| `AWS_ROLE_SESSION_NAME` | `oximg-<unix time>` | Session name for that role, shown in CloudTrail |
+| `AWS_ENDPOINT_URL_STS` | `https://sts.<AWS_REGION>.amazonaws.com` (`.amazonaws.com.cn` for `cn-*`) | STS endpoint for web identity, e.g. a VPC endpoint |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role, used when neither static keys nor web identity are set. ECS sets it |
 | `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity (which sets it) or another credential agent. Over `http://` only loopback, `169.254.170.2`, `169.254.170.23` and `fd00:ec2::23` are allowed |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | `Authorization` value for the container endpoint, read from this file on every fetch (EKS rotates it). Wins over the next row |
 | `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | `Authorization` value for the container endpoint |
