@@ -40,12 +40,16 @@ process held.
 `strip` shells out to `oximg strip <in> <out> [--icc keep|strip]`:
 lossless metadata removal for JPEG/PNG/WebP (GIF, AVIF: exit 1). Its
 JSON proves the result: `removed` (what went, per block kind),
-`orientation` (written back, 2-8, else null), `residue` (what a second
+`orientation` (read back from the output, 2-8, else null),
+`matches_library` (the output is byte for byte the library's strip of
+the input, which pins the kept orientation and ICC profile), `residue` (what a second
 strip under the same ICC policy would remove; must be `[]`),
-`pixels_identical` (decoded pixels of input and output compared),
+`pixels_identical` (decoded pixels of input and output compared; a
+PNG at its native bit depth),
 `frames_identical` (animated WebP: every frame's bitstream compared,
 else null), `peak_rss_bytes` (O(file size)). `ok` is false unless the
-residue is empty, both sides decode, and pixels and frames match. The
+residue is empty, both sides decode, pixels and frames match, the
+orientation survives, and the output matches the library's. The
 input is read before the child runs, so `--out` may be the input. A CMYK JPEG
 with `--icc strip` exits 1 (refused, never written).
 

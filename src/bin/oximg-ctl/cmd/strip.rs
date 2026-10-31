@@ -108,6 +108,10 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             icc: Some(keep_icc),
         },
     );
+    // Pixels, residue and frames cannot see what must be kept (the
+    // orientation EXIF, the ICC profile); the library's own answer for
+    // the input pins those down, byte for byte.
+    let matches_library = matches!(&removed, Ok(s) if s.bytes == bytes);
     let (pin, pout) = (pixels(&src), pixels(&bytes));
     let frames_identical = match (webp_frames(&src), webp_frames(&bytes)) {
         (None, None) => None,
@@ -125,7 +129,9 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             Ok(s) => removed_value(&s.removed),
             Err(e) => json!({ "error": e.to_string() }),
         },
-        "orientation": removed.as_ref().ok().and_then(|s| s.orientation),
+        // Read back from the output: what a viewer will honor.
+        "orientation": residue.as_ref().ok().and_then(|s| s.orientation),
+        "matches_library": matches_library,
         "residue": match &residue {
             Ok(s) => removed_value(&s.removed),
             Err(e) => json!({ "error": e.to_string() }),
@@ -142,6 +148,10 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         report["out"] = json!(out_path.display().to_string());
     }
     let clean = matches!(&residue, Ok(s) if s.removed.is_empty());
+    let orientation_kept = match (&removed, &residue) {
+        (Ok(i), Ok(o)) => i.orientation == o.orientation,
+        _ => false,
+    };
     let failure = if !clean {
         Some("output still carries removable metadata")
     } else if report["probe"].get("error").is_some() {
@@ -150,6 +160,10 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         Some("pixels could not be decoded for comparison")
     } else if pin != pout {
         Some("decoded pixels differ")
+    } else if !orientation_kept {
+        Some("output lost the source's orientation")
+    } else if !matches_library {
+        Some("output differs from the library's strip of the input")
     } else if frames_identical == Some(false) {
         Some("animation frames differ")
     } else {
@@ -172,8 +186,13 @@ fn removed_value(removed: &[pipeline::Removed]) -> Value {
 }
 
 /// sha256 of the decoded pixels in stored orientation (lossless PNG,
-/// no profile), so a strip that touched image data cannot match.
+/// no profile), so a strip that touched image data cannot match. A
+/// PNG is decoded at its native depth: the pipeline strips 16-bit
+/// samples to 8, which would hide a change in a low byte.
 fn pixels(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return png_native(bytes).map(|px| sha256_hex(&px));
+    }
     let p = Params {
         output: Some(ImageFormat::Png),
         auto_rotate: Some(false),
@@ -184,6 +203,23 @@ fn pixels(bytes: &[u8]) -> Result<String, String> {
     pipeline::process(bytes, &p)
         .map(|(png, _)| sha256_hex(&png))
         .map_err(|e| e.to_string())
+}
+
+/// Every sample of a PNG's first image at its stored bit depth (palette
+/// expanded, so a changed PLTE shows), behind its colour type and depth.
+fn png_native(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let mut d = png::Decoder::new(std::io::Cursor::new(bytes));
+    d.set_transformations(png::Transformations::EXPAND);
+    let mut r = d.read_info().map_err(|e| e.to_string())?;
+    let size = r.output_buffer_size().ok_or("PNG frame too large")?;
+    let mut px = vec![0; size];
+    let info = r.next_frame(&mut px).map_err(|e| e.to_string())?;
+    px.truncate(info.buffer_size());
+    let mut out = vec![info.color_type as u8, info.bit_depth as u8];
+    out.extend_from_slice(&info.width.to_be_bytes());
+    out.extend_from_slice(&info.height.to_be_bytes());
+    out.extend_from_slice(&px);
+    Ok(out)
 }
 
 /// For an animated WebP, the `ANIM` chunk and each frame's 16-byte
@@ -206,8 +242,11 @@ fn webp_frames(b: &[u8]) -> Option<Vec<&[u8]>> {
     if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WEBP" {
         return None;
     }
+    // Bytes past the declared RIFF size are a trailer, not frames
+    // (strip drops them), exactly as the library bounds its walk.
+    let riff_end = (u32::from_le_bytes(b[4..8].try_into().ok()?) as usize).checked_add(8)?;
     let mut out = Vec::new();
-    for (fourcc, data) in chunks(&b[12..])? {
+    for (fourcc, data) in chunks(b.get(12..riff_end)?)? {
         match fourcc {
             b"ANIM" => out.push(data),
             b"ANMF" => {
@@ -241,6 +280,37 @@ fn strip_argv(input: &Path, out: &Path, icc: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 16-bit grey PNG, one pixel, sample `v`.
+    fn gray16(v: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, 1, 1);
+        e.set_color(png::ColorType::Grayscale);
+        e.set_depth(png::BitDepth::Sixteen);
+        e.write_header()
+            .unwrap()
+            .write_image_data(&v.to_be_bytes())
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn pixels_see_the_low_byte_of_a_16_bit_png() {
+        assert_eq!(pixels(&gray16(0x1234)), pixels(&gray16(0x1234)));
+        assert_ne!(pixels(&gray16(0x1234)), pixels(&gray16(0x1235)));
+    }
+
+    #[test]
+    fn frames_stop_at_the_riff_size() {
+        let anim = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/animated.webp"
+        ))
+        .unwrap();
+        let with_trailer = [&anim[..], b"SECRET"].concat();
+        assert!(webp_frames(&anim).is_some());
+        assert_eq!(webp_frames(&with_trailer), webp_frames(&anim));
+    }
 
     #[test]
     fn argv_is_what_a_user_types() {

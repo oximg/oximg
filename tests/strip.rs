@@ -21,8 +21,19 @@ fn drop_icc() -> StripParams {
 }
 
 /// The decoded pixels in stored orientation, as a lossless PNG — the
-/// "decoded hash" #127 asks to stay byte-identical.
+/// "decoded hash" #127 asks to stay byte-identical. A PNG is decoded at
+/// its native depth: the pipeline strips 16-bit samples to 8, which
+/// would hide a change in a low byte.
 fn pixels(b: &[u8]) -> Vec<u8> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let mut d = png::Decoder::new(std::io::Cursor::new(b));
+        d.set_transformations(png::Transformations::EXPAND);
+        let mut r = d.read_info().unwrap();
+        let mut px = vec![0; r.output_buffer_size().unwrap()];
+        let info = r.next_frame(&mut px).unwrap();
+        px.truncate(info.buffer_size());
+        return [&[info.color_type as u8, info.bit_depth as u8][..], &px].concat();
+    }
     let p = Params {
         output: Some(ImageFormat::Png),
         auto_rotate: Some(false),
@@ -280,6 +291,28 @@ fn png_chunk_types(b: &[u8]) -> Vec<String> {
         i += 12 + len;
     }
     v
+}
+
+#[test]
+fn png_16_bit_keeps_every_sample_bit() {
+    let src = fixture("rgb16.png");
+    strip_clean(&src, &keep_icc());
+
+    // The comparison itself must see a low-byte-only change.
+    let mut d = png::Decoder::new(std::io::Cursor::new(&src[..]));
+    d.set_transformations(png::Transformations::IDENTITY);
+    let mut r = d.read_info().unwrap();
+    let mut px = vec![0; r.output_buffer_size().unwrap()];
+    let info = r.next_frame(&mut px).unwrap();
+    px.truncate(info.buffer_size());
+    assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
+    px[1] ^= 1;
+    let mut nudged = Vec::new();
+    let mut e = png::Encoder::new(&mut nudged, info.width, info.height);
+    e.set_color(info.color_type);
+    e.set_depth(info.bit_depth);
+    e.write_header().unwrap().write_image_data(&px).unwrap();
+    assert_ne!(pixels(&nudged), pixels(&src));
 }
 
 #[test]
