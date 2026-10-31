@@ -106,17 +106,80 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
-  # A File whose name no longer leads to it is read as the stream it
-  # still is.
-  def test_reads_an_unlinked_file_as_a_stream
+  PNG = {content_type: "image/png", format: :png, width: 200, height: 150}.freeze
+
+  # An open File is read through its descriptor, from the start: what
+  # it holds, whatever its name leads to by now, and wherever it was
+  # left. Each case opens rgb.png, reads 100 bytes, then moves the name
+  # (photo.jpg is what a lookup by name would find instead).
+  def test_reads_an_open_file_by_its_descriptor
+    with_library do
+      {
+        "untouched" => ->(_dir, _path) {},
+        "name replaced" => ->(dir, path) {
+          File.binwrite(File.join(dir, "new"), File.binread(fixture("photo.jpg")))
+          File.rename(File.join(dir, "new"), path)
+        },
+        "renamed away" => ->(dir, path) { File.rename(path, File.join(dir, "moved")) },
+        "unlinked" => ->(_dir, path) { File.delete(path) }
+      }.each do |name, move|
+        in_tmpdir do |dir|
+          path = File.join(dir, "x.png")
+          File.binwrite(path, File.binread(fixture("rgb.png")))
+          File.open(path, "rb") do |file|
+            file.read(100)
+            move.call(dir, path)
+            assert_equal PNG, Oximg.probe(file), name
+            assert_equal 100, file.pos, "#{name}: position untouched"
+          end
+        end
+      end
+    end
+  end
+
+  # A File opened by a relative name, after the process moved to a
+  # directory where that name is another image.
+  def test_reads_an_open_file_after_the_working_directory_moved
     with_library do
       in_tmpdir do |dir|
-        path = File.join(dir, "gone.png")
-        File.binwrite(path, File.binread(fixture("rgb.png")))
-        File.open(path, "rb") do |file|
-          File.delete(path)
-          assert_equal({content_type: "image/png", format: :png, width: 200, height: 150}, Oximg.probe(file))
+        Dir.mkdir(File.join(dir, "a"))
+        Dir.mkdir(File.join(dir, "b"))
+        File.binwrite(File.join(dir, "a", "x"), File.binread(fixture("rgb.png")))
+        File.binwrite(File.join(dir, "b", "x"), File.binread(fixture("photo.jpg")))
+        home = Dir.pwd
+        begin
+          file = Dir.chdir(File.join(dir, "a")) { File.open("x", "rb") }
+          Dir.chdir(File.join(dir, "b"))
+          assert_equal PNG, Oximg.probe(file)
+        ensure
+          Dir.chdir(home)
+          file&.close
         end
+      end
+    end
+  end
+
+  # A write-only File cannot be read through its descriptor; it is
+  # read by its name, as before.
+  def test_reads_a_write_only_file_by_its_name
+    with_library do
+      in_tmpdir do |dir|
+        path = File.join(dir, "x.png")
+        File.binwrite(path, File.binread(fixture("rgb.png")))
+        File.open(path, "ab") { |file| assert_equal PNG, Oximg.probe(file) }
+      end
+    end
+  end
+
+  # A File on a FIFO has no start to come back to: it is a stream.
+  def test_reads_a_fifo_as_a_stream
+    with_library do
+      in_tmpdir do |dir|
+        fifo = File.join(dir, "fifo")
+        File.mkfifo(fifo)
+        writer = Thread.new { File.open(fifo, "wb") { |w| w.write(File.binread(fixture("rgb.png"))) } }
+        File.open(fifo, "rb") { |file| assert_equal PNG, Oximg.probe(file) }
+        writer.join
       end
     end
   end

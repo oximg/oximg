@@ -104,6 +104,26 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_equal Oximg.probe(fixture("photo.jpg")), Oximg.probe(io)
   end
 
+  # Without the library an open File is still what it holds, not what
+  # its name leads to by now: the executable reads the name only while
+  # it is the same file, and a copy made with positioned reads
+  # otherwise. The position is untouched either way.
+  def test_probe_reads_an_open_file_through_the_executable
+    want = Oximg.probe(fixture("rgb.png"))
+    in_tmpdir do |dir|
+      path = File.join(dir, "x.png")
+      File.binwrite(path, File.binread(fixture("rgb.png")))
+      File.open(path, "rb") do |file|
+        file.read(100)
+        assert_equal want, Oximg.probe(file), "same file"
+        File.binwrite(File.join(dir, "new"), File.binread(fixture("photo.jpg")))
+        File.rename(File.join(dir, "new"), path)
+        assert_equal want, Oximg.probe(file), "name replaced"
+        assert_equal 100, file.pos
+      end
+    end
+  end
+
   # An object that names its file only through #to_path.
   def test_probe_takes_a_to_path_object
     named = Object.new

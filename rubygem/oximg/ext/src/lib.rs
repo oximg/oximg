@@ -64,6 +64,45 @@ pub unsafe extern "C" fn oximg_probe_path(
     unsafe { finish(result, dims, msg, msg_cap) }
 }
 
+/// Probe the open file `fd` from its start, reading only as much of it
+/// as the header takes. The descriptor, not a name, so the answer is
+/// the file the caller holds even after its name moved on (replaced,
+/// renamed, or relative to a directory the process left); positioned
+/// reads (`pread`) on a duplicate, so the caller's offset is untouched
+/// and `fd` stays the caller's to close.
+///
+/// # Safety
+/// `fd` is an open descriptor for the duration of the call; `dims`
+/// writable for two `u64`s and `msg` for `msg_cap` bytes.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oximg_probe_fd(
+    fd: c_int,
+    dims: *mut u64,
+    msg: *mut u8,
+    msg_cap: usize,
+) -> c_int {
+    use std::os::fd::BorrowedFd;
+    use std::os::unix::fs::FileExt;
+    struct At {
+        file: std::fs::File,
+        offset: u64,
+    }
+    impl std::io::Read for At {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.file.read_at(buf, self.offset)?;
+            self.offset += n as u64;
+            Ok(n)
+        }
+    }
+    let result = catch_unwind(|| {
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let file = std::fs::File::from(fd.try_clone_to_owned().map_err(|e| format!("read: {e}"))?);
+        pipeline::probe_reader(At { file, offset: 0 }).map_err(|e| format!("{e:#}"))
+    });
+    unsafe { finish(result, dims, msg, msg_cap) }
+}
+
 /// One step of a header read the caller drives (`pipeline::probe_step`):
 /// `prefix[..len]` is everything read from the source so far, `eof`
 /// nonzero once it has ended. Returns [`READ`] with `dims[0]` set to the

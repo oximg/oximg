@@ -65,18 +65,20 @@ knob is a startup error, never a silent default.
 Oximg.probe("in.jpg")                          # a path
 Oximg.probe(Pathname("in.jpg"))                # also a path
 Oximg.probe(upload.tempfile)                   # anything with #path
+Oximg.probe(File.open("in.jpg", "rb"))         # an open File
 Oximg.probe(StringIO.new(bytes))               # an IO: bytes in memory
 #=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
 ```
 
 `probe` reads the header only and decodes no pixels. The dimensions are
 the stored ones, before any EXIF rotation. A String is always a path,
-so bytes already in memory go in as a `StringIO`. A `File` is read by
-its name, its position untouched, while that name still leads to a
-regular file, and always once it is closed. Other IO — a `StringIO`, a
-pipe, a socket, or an open `File` whose name no longer leads to it — is
-read from its current position through `#read(n)` and left where the
-read stopped.
+so bytes already in memory go in as a `StringIO`. An open `File` is
+read from its start, its position untouched, and it is the file you
+hold that is read, even if its name has since been replaced, renamed,
+or was relative to a directory the process has left; a closed one is
+read by its name. Other IO — a `StringIO`, a pipe, a socket — is read
+from its current position through `#read(n)` and left where the read
+stopped.
 
 The gem does that reading itself, in Ruby, between calls into the
 library, so `#read` behaves as it would anywhere: whatever it raises

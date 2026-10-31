@@ -56,6 +56,13 @@ module Oximg
         call { |dims, msg| binding_module.oximg_probe_path(bytes, path.bytesize, dims, msg, MESSAGE_BYTES) }
       end
 
+      # Header of the open, readable regular +file+, read through its
+      # descriptor from the start with positioned reads: what it holds,
+      # whatever its name leads to by now, its position untouched.
+      def probe_file(file)
+        call { |dims, msg| binding_module.oximg_probe_fd(file.fileno, dims, msg, MESSAGE_BYTES) }
+      end
+
       # Header of +io+, read from its current position through
       # IO#read(n) — a pipe, a socket, a StringIO. Only what the header
       # needs is read, and the IO is left where the read stopped.
@@ -148,10 +155,11 @@ module Oximg
           extend FFI::Library
           ffi_lib path
           attach_function :oximg_probe_abi_version, [], :uint32
-          # A path read blocks on the filesystem, so it runs without the
-          # GVL. A step only parses bytes already in memory and keeps
-          # it, which also keeps the prefix String where it is.
+          # A path or descriptor read blocks on the filesystem, so it runs
+          # without the GVL. A step only parses bytes already in memory and
+          # keeps it, which also keeps the prefix String where it is.
           attach_function :oximg_probe_path, %i[pointer size_t pointer pointer size_t], :int, blocking: true
+          attach_function :oximg_probe_fd, %i[int pointer pointer size_t], :int, blocking: true
           attach_function :oximg_probe_step, %i[buffer_in size_t uint8 pointer pointer size_t], :int
         end
         abi = mod.oximg_probe_abi_version
