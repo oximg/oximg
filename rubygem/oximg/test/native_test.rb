@@ -320,6 +320,21 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # A bare file name in OXIMG_PROBE_LIB is the file the check found in
+  # the working directory, not whatever dlopen's search finds under
+  # that name.
+  def test_loads_a_relative_library_name_from_the_working_directory
+    home = Dir.pwd
+    Dir.chdir(File.dirname(probe_library))
+    with_env("OXIMG_PROBE_LIB", File.basename(probe_library)) do
+      Oximg::Native.reset!
+      assert Oximg.in_process_probe?
+      assert_equal 200, Oximg.probe(fixture("photo.jpg"))[:width]
+    end
+  ensure
+    Dir.chdir(home)
+  end
+
   # An explicit library is never second-guessed: a wrong one raises,
   # where a broken bundled one would fall back to spawning.
   def test_refuses_an_explicit_library_that_is_not_there

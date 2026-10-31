@@ -145,7 +145,10 @@ module Oximg
             raise LoadError, "OXIMG_PROBE_LIB is set to #{configured.inspect}, which is not a file"
           end
 
-          open_library(configured)
+          # Absolute, so the file loaded is the one just checked: dlopen
+          # does not look in the working directory for a bare name, and
+          # would search the system's library paths for it instead.
+          open_library(File.expand_path(configured))
         end
       end
 
