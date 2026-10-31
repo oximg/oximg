@@ -20,6 +20,7 @@ pub enum Cmd {
     Get(GetArgs),
     Probe(ProbeArgs),
     Resize(ResizeArgs),
+    Strip(StripArgs),
     Sign(SignArgs),
     Matrix(MatrixArgs),
     Parity(ParityArgs),
@@ -50,6 +51,12 @@ pub struct ResizeArgs {
     pub format: Option<String>,
     pub quality: Option<String>,
     pub preset: Option<String>,
+}
+
+pub struct StripArgs {
+    pub input: PathBuf,
+    pub out: Option<PathBuf>,
+    pub icc: Option<String>,
 }
 
 pub struct SignArgs {
@@ -132,12 +139,13 @@ pub fn parse_args(args: &[String]) -> Result<(Opts, Cmd), CtlError> {
         "get" => Cmd::Get(parse_get(tail)?),
         "probe" => Cmd::Probe(parse_probe(tail)?),
         "resize" => Cmd::Resize(parse_resize(tail)?),
+        "strip" => Cmd::Strip(parse_strip(tail)?),
         "sign" => Cmd::Sign(parse_sign(tail)?),
         "matrix" => Cmd::Matrix(parse_matrix(tail)?),
         "parity" => Cmd::Parity(parse_parity(tail)?),
         other => {
             return Err(CtlError::usage(format!(
-                "unknown command {other:?} (serve|get|probe|resize|sign|matrix|parity)"
+                "unknown command {other:?} (serve|get|probe|resize|strip|sign|matrix|parity)"
             )));
         }
     };
@@ -279,6 +287,39 @@ fn parse_probe(args: &[String]) -> Result<ProbeArgs, CtlError> {
     }
     let file = file.ok_or_else(|| CtlError::usage("usage: oximg-ctl probe <file>"))?;
     Ok(ProbeArgs { file })
+}
+
+fn parse_strip(args: &[String]) -> Result<StripArgs, CtlError> {
+    let mut input = None;
+    let mut out = None;
+    let mut icc = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => {
+                out = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| CtlError::usage("--out needs a value"))?,
+                ));
+            }
+            "--icc" => {
+                icc = Some(
+                    it.next()
+                        .ok_or_else(|| CtlError::usage("--icc needs a value"))?
+                        .clone(),
+                );
+            }
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(CtlError::usage(format!("strip: unknown option {flag:?}")));
+            }
+            p if input.is_none() => input = Some(PathBuf::from(p)),
+            _ => return Err(CtlError::usage("strip takes one input")),
+        }
+    }
+    let input = input.ok_or_else(|| {
+        CtlError::usage("usage: oximg-ctl strip <in> [--out PATH] [--icc keep|strip]")
+    })?;
+    Ok(StripArgs { input, out, icc })
 }
 
 fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
@@ -604,6 +645,17 @@ mod tests {
             (r.format.as_deref(), r.quality.as_deref()),
             (Some("webp"), Some("70"))
         );
+    }
+
+    #[test]
+    fn strip_takes_one_input() {
+        assert!(usage(&["strip"]).contains("usage: oximg-ctl strip"));
+        assert!(usage(&["strip", "a.jpg", "b.jpg"]).contains("one input"));
+        let (_, cmd) = parse(&["strip", "a.jpg", "--icc", "strip"]).unwrap();
+        let Cmd::Strip(s) = cmd else {
+            panic!("not strip")
+        };
+        assert_eq!(s.icc.as_deref(), Some("strip"));
     }
 
     #[test]

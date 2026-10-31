@@ -18,6 +18,7 @@ gem "oximg"
 ```ruby
 Oximg.resize("in.jpg", "out.jpg", width: 750)
 Oximg.resize("in.jpg", "out.webp", width: 750, height: 500, quality: 80)
+Oximg.strip("upload.jpg", "clean.jpg")
 Oximg.probe("in.jpg")
 #=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
 ```
@@ -54,6 +55,21 @@ Oximg.resize("photo.jpg", "smaller.jpg", quality: 70)
 on failure, carrying the binary's own message and exit status. Paths are
 expanded before they reach the CLI, so an uploaded file called `-q.jpg`
 cannot be read as a flag.
+
+## Stripping metadata
+
+```ruby
+Oximg.strip(source, destination, icc: nil)
+```
+
+Removes EXIF (GPS, camera, timestamps), XMP, IPTC and comments from a
+JPEG, PNG or WebP **without re-encoding**. Decoded pixels are identical,
+and it costs a fraction of a `0 x 0` resize in time and memory. This
+replaces `saver(strip: true)` (libvips) or `-strip` (ImageMagick). A
+rotated photo keeps an EXIF block holding only its orientation, so it
+still displays upright. `icc: :strip` also drops the colour profile.
+The default is `:keep`, or `OXIMG_ICC`. Dropping a CMYK JPEG's profile
+raises `Oximg::ProcessingError`, as do GIF and AVIF sources.
 
 Everything the server tunes through `OXIMG_*` environment variables
 applies here too, and is validated the same fail-closed way: a typo'd

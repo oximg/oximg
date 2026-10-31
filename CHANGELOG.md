@@ -12,6 +12,19 @@ HTTP interface without notice.
 
 ### Added
 
+- **`oximg strip`: lossless metadata removal** ([#127]). `oximg strip
+  <in> <out> [--icc keep|strip]` (library: `pipeline::strip`, gem:
+  `Oximg.strip`) drops EXIF (GPS, camera, timestamps), XMP, IPTC,
+  comments and unknown blocks from a JPEG, PNG or WebP without
+  re-encoding: the image data is copied byte for byte, so decoded
+  pixels are identical and memory is O(file size). A 21 MB 8000x8000
+  JPEG strips in 0.02 s at 45 MB peak RSS. The `resize 0 0` workaround
+  took 0.96 s and 602 MiB on a similar file (M2 Max). What survives is
+  an allowlist of what rendering needs. A rotated photo keeps an EXIF
+  block with only its orientation, so it still displays upright. `--icc` defaults to
+  `OXIMG_ICC` (keep). Dropping a CMYK JPEG's profile is refused, and
+  GIF and AVIF are not supported (exit 1). `oximg-ctl strip` proves a
+  run: removed blocks, residue, pixel identity, and peak RSS.
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
   file gets `probe.jpeg.{sof,progressive}` (the SOFn number: 0
   baseline, 1 extended sequential, 2 progressive), so a proof of which
@@ -157,6 +170,7 @@ HTTP interface without notice.
   held 74 MB against a 40 MB estimate. Over `OXIMG_MAX_DECODED_BYTES`
   an animation still degrades to a still rather than answering 413.
 
+[#127]: https://github.com/oximg/oximg/issues/127
 [#129]: https://github.com/oximg/oximg/issues/129
 [#130]: https://github.com/oximg/oximg/issues/130
 [#133]: https://github.com/oximg/oximg/issues/133

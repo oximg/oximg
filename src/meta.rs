@@ -19,6 +19,27 @@ impl Orientation {
         self.0 == 1
     }
 
+    /// The EXIF tag value, 1..=8.
+    pub(crate) fn value(self) -> u8 {
+        self.0
+    }
+
+    /// A big-endian TIFF structure whose IFD0 holds this orientation
+    /// and nothing else: what a metadata strip writes back so a rotated
+    /// photo still displays upright (#127). Shaped exactly as
+    /// [`parse_tiff_orientation`] and browsers require (SHORT, count 1).
+    pub(crate) fn minimal_exif_tiff(self) -> [u8; 26] {
+        let mut t = [0u8; 26];
+        t[..8].copy_from_slice(b"MM\0\x2a\0\0\0\x08"); // header, IFD0 at 8
+        t[8..10].copy_from_slice(&1u16.to_be_bytes()); // one entry
+        t[10..12].copy_from_slice(&0x0112u16.to_be_bytes());
+        t[12..14].copy_from_slice(&3u16.to_be_bytes()); // SHORT
+        t[14..18].copy_from_slice(&1u32.to_be_bytes()); // count
+        t[18..20].copy_from_slice(&u16::from(self.0).to_be_bytes());
+        // t[20..22]: value padding; t[22..26]: no next IFD.
+        t
+    }
+
     /// Orientations 5..=8 exchange width and height on display.
     pub(crate) fn swaps_axes(self) -> bool {
         self.0 >= 5
@@ -502,6 +523,14 @@ mod tests {
                     "o={o} be={be}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn minimal_exif_round_trips_every_orientation() {
+        for v in 1..=8 {
+            let t = Orientation(v).minimal_exif_tiff();
+            assert_eq!(parse_tiff_orientation(&t), Some(Orientation(v)));
         }
     }
 

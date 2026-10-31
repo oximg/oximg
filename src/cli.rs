@@ -1,4 +1,4 @@
-//! One-shot subcommands (`oximg resize`, `oximg probe`): the same
+//! One-shot subcommands (`oximg resize`, `oximg strip`, `oximg probe`): the same
 //! pipeline as the server, without the HTTP layer. Argument handling
 //! stays dependency-free, like the server's flag handling in main.rs.
 //!
@@ -31,6 +31,14 @@ pub fn print_help() {
              -q, --quality N    JPEG quality, 1-100 (default 80)\n          \
              -f, --format FMT   {}\n          \
              --preset P         jpegli (default) | fast | small\n  \
+           oximg strip <in> <out> [--icc keep|strip]\n          \
+             Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
+             and other non-rendering metadata from a JPEG, PNG or WebP\n          \
+             without re-encoding: the image data is copied byte for\n          \
+             byte. A rotated photo keeps only its EXIF orientation.\n          \
+             --icc keep|strip   Embedded colour profile (default keep,\n          \
+                                or OXIMG_ICC). A CMYK JPEG's profile\n          \
+                                is never dropped.\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \
              pixel decode), plus frame count, duration and loop count\n          \
@@ -144,6 +152,76 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
         "oximg: wrote {output} ({} bytes, {w}x{h}, {})",
         bytes.len(),
         format.content_type()
+    );
+    Ok(())
+}
+
+/// `oximg strip <in> <out> [--icc keep|strip]`
+pub fn strip(args: &[String]) -> anyhow::Result<()> {
+    // OXIMG_ICC is the --icc default, so it is validated like resize's
+    // knobs: a typo must not silently keep (or drop) a profile.
+    if let Err(e) = oximg::config_validate() {
+        eprintln!("oximg: fatal: {e}");
+        std::process::exit(2);
+    }
+    const USAGE: &str = "usage: oximg strip <in> <out> [--icc keep|strip]";
+    let mut positional: Vec<&str> = Vec::new();
+    let mut params = pipeline::StripParams::default();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            "--icc" => {
+                let v = it
+                    .next()
+                    .unwrap_or_else(|| usage_error("--icc needs a value"));
+                params.icc = Some(match v.as_str() {
+                    "keep" => true,
+                    "strip" => false,
+                    _ => usage_error(&format!("unknown --icc {v:?} (keep|strip)")),
+                });
+            }
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                usage_error(&format!("unknown option {flag:?}"))
+            }
+            p => positional.push(p),
+        }
+    }
+    let [input, output] = positional[..] else {
+        usage_error(USAGE);
+    };
+    let bytes = std::fs::read(input).with_context(|| format!("read {input}"))?;
+    let stripped = pipeline::strip(&bytes, &params).with_context(|| format!("strip {input}"))?;
+    std::fs::write(output, &stripped.bytes).with_context(|| format!("write {output}"))?;
+    // Summary on stderr, like resize: what went, and what was kept back.
+    let removed = if stripped.removed.is_empty() {
+        "nothing to remove".to_string()
+    } else {
+        let names: Vec<String> = stripped
+            .removed
+            .iter()
+            .map(|r| match r.count {
+                1 => r.name.clone(),
+                n => format!("{} x{n}", r.name),
+            })
+            .collect();
+        format!(
+            "removed {} bytes: {}",
+            stripped.removed.iter().map(|r| r.bytes).sum::<usize>(),
+            names.join(", ")
+        )
+    };
+    let kept = match stripped.orientation {
+        Some(o) => format!("; kept orientation {o}"),
+        None => String::new(),
+    };
+    eprintln!(
+        "oximg: wrote {output} ({} bytes, {}; {removed}{kept})",
+        stripped.bytes.len(),
+        stripped.format.content_type(),
     );
     Ok(())
 }

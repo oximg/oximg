@@ -558,3 +558,162 @@ fn unknown_png_quantize_is_still_fatal() {
     );
     assert!(!out.exists(), "nothing may be written on a fatal config");
 }
+
+/// Every chunk of a PNG as (type, data).
+fn png_chunks(b: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    let mut v = Vec::new();
+    let mut i = 8;
+    while i + 12 <= b.len() {
+        let len = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        v.push((
+            b[i + 4..i + 8].try_into().unwrap(),
+            b[i + 8..i + 8 + len].to_vec(),
+        ));
+        i += 12 + len;
+    }
+    v
+}
+
+/// An APNG keeps its animation control and every frame's data, byte
+/// for byte, while its text goes; a second strip changes nothing.
+#[test]
+fn strip_keeps_every_apng_frame() {
+    let (w, h) = (16u32, 8u32);
+    let mut src_bytes = Vec::new();
+    {
+        let mut e = png::Encoder::new(&mut src_bytes, w, h);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.set_animated(3, 0).unwrap();
+        e.add_text_chunk("Comment".into(), "SECRET".into()).unwrap();
+        let mut wr = e.write_header().unwrap();
+        for f in 0..3u8 {
+            wr.set_frame_delay(f as u16 + 1, 10).unwrap();
+            let px: Vec<u8> = (0..w * h * 3)
+                .map(|i| (i as u8).wrapping_mul(f + 1))
+                .collect();
+            wr.write_image_data(&px).unwrap();
+        }
+    }
+    let src = tmp("strip-src.png");
+    let out = tmp("strip-out.png");
+    let again = tmp("strip-again.png");
+    std::fs::write(&src, &src_bytes).unwrap();
+    for (from, to) in [(&src, &out), (&out, &again)] {
+        let st = bin().arg("strip").arg(from).arg(to).status().unwrap();
+        assert!(st.success());
+    }
+    let (out_bytes, again_bytes) = (std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+    for p in [&src, &out, &again] {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(!out_bytes.windows(6).any(|w| w == b"SECRET"));
+    assert_eq!(again_bytes, out_bytes, "second strip changes nothing");
+    let expect: Vec<_> = png_chunks(&src_bytes)
+        .into_iter()
+        .filter(|(t, _)| t != b"tEXt")
+        .collect();
+    assert_eq!(png_chunks(&out_bytes), expect);
+    let types: Vec<[u8; 4]> = expect.iter().map(|c| c.0).collect();
+    for t in [b"acTL", b"fcTL", b"IDAT", b"fdAT"] {
+        assert!(types.contains(t), "{}", String::from_utf8_lossy(t));
+    }
+}
+
+/// `oximg strip`: a JPEG carrying an XMP block and a profile comes back
+/// without the XMP, the profile kept by default and dropped by
+/// `--icc strip` or `OXIMG_ICC=0` (the flag wins over the knob), and
+/// the summary names what went.
+#[test]
+fn strip_removes_metadata_and_honors_icc() {
+    let px = vec![128u8; 64 * 48 * 3];
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_size(64, 48);
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_marker(
+        mozjpeg::Marker::APP(1),
+        b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>SECRET</x:xmpmeta>",
+    );
+    started.write_marker(mozjpeg::Marker::APP(2), b"ICC_PROFILE\0\x01\x01PROFILE");
+    started.write_scanlines(&px).unwrap();
+    let src_bytes = started.finish().unwrap();
+    let src = tmp("strip-src.jpg");
+    std::fs::write(&src, &src_bytes).unwrap();
+    let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+
+    for (args, env_icc, keeps_icc) in [
+        (&[][..], None, true),
+        (&["--icc", "strip"][..], None, false),
+        (&["--icc", "keep"][..], Some("0"), true),
+        (&[][..], Some("0"), false),
+    ] {
+        let out = tmp("strip-out.jpg");
+        let mut cmd = bin();
+        cmd.arg("strip").arg(&src).arg(&out).args(args);
+        cmd.env_remove("OXIMG_ICC");
+        if let Some(v) = env_icc {
+            cmd.env("OXIMG_ICC", v);
+        }
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        let bytes = std::fs::read(&out).unwrap();
+        std::fs::remove_file(&out).ok();
+        assert!(!has(&bytes, b"SECRET"), "{args:?}");
+        assert_eq!(
+            has(&bytes, b"ICC_PROFILE"),
+            keeps_icc,
+            "{args:?} {env_icc:?}"
+        );
+        assert!(stderr.contains("image/jpeg; removed "), "{stderr}");
+        assert!(stderr.contains("XMP"), "{stderr}");
+    }
+    std::fs::remove_file(&src).ok();
+}
+
+#[test]
+fn strip_refusals_and_usage_errors() {
+    let out = tmp("strip-refused.out");
+    let run = |args: &[&str]| {
+        bin()
+            .arg("strip")
+            .args(args)
+            .env_remove("OXIMG_ICC")
+            .output()
+            .unwrap()
+    };
+    let o = out.to_str().unwrap();
+    let (jpg, gif, cmyk) = (
+        fixture("photo.jpg"),
+        fixture("still.gif"),
+        fixture("cmyk_icc.jpg"),
+    );
+    // Usage errors exit 2.
+    for args in [
+        &[][..],
+        &[&jpg[..]][..],
+        &[&jpg, o, "--icc", "maybe"][..],
+        &[&jpg, o, "--quality", "80"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    // Processing refusals exit 1 and write nothing.
+    for (args, says) in [
+        (&[&gif[..], o][..], "JPEG, PNG and WebP"),
+        (&[&cmyk, o, "--icc", "strip"][..], "CMYK"),
+    ] {
+        let output = run(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(!out.exists(), "{args:?} wrote output");
+    }
+    // Nothing to strip is not an error, and changes nothing.
+    let webp = fixture("photo.webp");
+    let output = run(&[&webp, o]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nothing to remove"));
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&webp).unwrap());
+    std::fs::remove_file(&out).ok();
+}

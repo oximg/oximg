@@ -114,12 +114,13 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
     Ok(())
 }
 
-/// Peak resident set of the `oximg resize` child just reaped. `resize`
-/// spawns exactly one child, so `RUSAGE_CHILDREN` is that child alone.
-/// This is what the decoded-bytes estimate is checked against (issue
-/// #130).
+/// Peak resident set of the `oximg resize` (or `strip`) child just
+/// reaped. Each command spawns exactly one child, so `RUSAGE_CHILDREN`
+/// is that child alone. This is what the decoded-bytes estimate (issue
+/// #130) and the strip's O(file) memory claim (#127) are checked
+/// against.
 #[cfg(unix)]
-fn peak_rss_bytes() -> Option<u64> {
+pub(crate) fn peak_rss_bytes() -> Option<u64> {
     // SAFETY: `rusage` is plain integers, valid zeroed; getrusage only
     // writes into the struct it is handed.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
@@ -136,7 +137,7 @@ fn peak_rss_bytes() -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn peak_rss_bytes() -> Option<u64> {
+pub(crate) fn peak_rss_bytes() -> Option<u64> {
     None
 }
 

@@ -488,7 +488,26 @@ oximg resize photo.jpg 750 0 out.jpg          # width-only: height follows the a
 oximg resize photo.jpg 0 0 out.webp           # 0 0 = re-encode at the source's own size
 oximg probe photo.webp                        # format + stored dimensions, header-only
 oximg probe loop.gif                           # animated sources also print frames, duration and loop count
+oximg strip upload.jpg clean.jpg              # drop EXIF/GPS, XMP, IPTC, comments; no re-encode
+oximg strip upload.png clean.png --icc strip  # ...and the colour profile too
 ```
+
+`oximg strip` removes metadata from a JPEG, PNG or WebP without
+decoding a pixel: the compressed image data is copied byte for byte,
+so it costs O(file size) in memory and nothing in quality, where a
+`0 0` re-encode costs a generation and the pipeline's largest buffers
+(a 21 MB 8000x8000 JPEG: 45 MB peak RSS and 0.02 s, against 602 MiB
+and 0.96 s for `resize 0 0` on a similar file, M2 Max). It keeps what
+rendering needs and drops everything else, unknown blocks included: JPEG keeps JFIF (minus any thumbnail), the
+ICC profile and Adobe APP14 (CMYK decoding needs its transform flag)
+and drops bytes after EOI, such as MPF secondary images; PNG keeps
+critical and colour/transparency/animation chunks; WebP keeps the
+image and animation chunks and fixes the VP8X flags. A rotated photo
+keeps an EXIF block holding only its orientation, so it still displays
+upright. `--icc keep|strip` defaults to `OXIMG_ICC` (keep); dropping a
+CMYK JPEG's profile is refused, since browsers would show wrong
+colours (`resize` converts it to sRGB instead). GIF and AVIF are not
+supported.
 
 The output format is `-f/--format`, else the `<out>` extension, else
 the source's own format — the same precedence idea as the server's

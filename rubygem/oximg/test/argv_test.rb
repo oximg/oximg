@@ -66,4 +66,18 @@ class Oximg::ArgvTest < Oximg::Test
     assert_raises(ArgumentError) { argv("", "/b.jpg") }
     assert_raises(ArgumentError) { argv("/a.jpg", "  ") }
   end
+
+  def test_maps_a_strip_onto_the_cli_grammar
+    assert_equal ["strip", "/src/a.jpg", "/dst/a.jpg"],
+      Oximg.strip_argv("/src/a.jpg", "/dst/a.jpg")
+    assert_equal ["strip", "/src/a.jpg", "/dst/a.jpg", "--icc", "strip"],
+      Oximg.strip_argv("/src/a.jpg", "/dst/a.jpg", icc: :strip)
+    assert_equal ["strip", "/src/a.jpg", "/dst/a.jpg", "--icc", "keep"],
+      Oximg.strip_argv("/src/a.jpg", "/dst/a.jpg", icc: "KEEP")
+  end
+
+  def test_strip_rejects_an_unknown_icc_mode
+    assert_raises(ArgumentError) { Oximg.strip_argv("/a.jpg", "/b.jpg", icc: :drop) }
+    assert_raises(ArgumentError) { Oximg.strip_argv("/a.jpg", "") }
+  end
 end
