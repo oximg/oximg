@@ -1,7 +1,10 @@
 # frozen_string_literal: true
 
+require "fcntl"
+require "tempfile"
 require_relative "oximg/version"
 require_relative "oximg/binary"
+require_relative "oximg/native"
 
 # Ruby bindings for oximg (https://github.com/oximg/oximg):
 # high-performance image compression and resizing, in-process work for a
@@ -137,9 +140,41 @@ module Oximg
     # Header-only inspection — no pixels are decoded. Returns
     # <tt>{content_type:, format:, width:, height:}</tt>, where the
     # dimensions are the stored ones (an EXIF rotation is not applied).
+    #
+    # +source+ is a path — a String, a Pathname, or anything with #path
+    # such as a Tempfile — an open File, or a stream read from its
+    # current position through #read(n): a StringIO, a pipe, a socket.
+    # A String is always a path, so bytes already in memory go in as
+    # <tt>StringIO.new(bytes)</tt>. An open File on a regular file is
+    # read from its start, its position untouched, and it is the file
+    # it holds that is read, whatever its name leads to by now. A closed
+    # or write-only File, which cannot be read through, is read by its
+    # name.
+    #
+    # With the probe library this runs in-process and reads only as much
+    # of the source as the header takes (see in_process_probe?). Without it,
+    # it spawns <tt>oximg probe</tt>, which reads the whole source, and an
+    # IO is copied to a tempfile first. The answer is the same.
     def probe(source)
-      out, = Binary.run("probe", expand(source, "source"))
+      return probe_open_file(source) if open_regular_file?(source)
+
+      if stream?(source)
+        return Native.available? ? Native.probe_io(source) : probe_spawned_io(source)
+      end
+
+      path = expand(source, "source")
+      return Native.probe_path(path) if Native.available?
+
+      out, = Binary.run("probe", path)
       parse_probe(out)
+    end
+
+    # True when probe runs in-process, through the probe library (see
+    # Native); false when it spawns the executable. Either way
+    # probe answers the same, and only its cost differs — this is for a
+    # boot-time log, or a test that must know which path it took.
+    def in_process_probe?
+      Native.available?
     end
 
     # The argv `resize` would run, minus the executable. Public because
@@ -161,6 +196,80 @@ module Oximg
 
     private
 
+    def open_regular_file?(source)
+      source.is_a?(File) && !source.closed? && source.stat.file?
+    end
+
+    # An open File is read through its descriptor, not by the name it
+    # was opened under: the name may lead to another file by now
+    # (replaced, renamed, or relative to a working directory the
+    # process has since left). Positioned reads leave its position
+    # alone. A write-only File cannot be read that way, and is read by
+    # its name.
+    def probe_open_file(file)
+      readable = (file.fcntl(Fcntl::F_GETFL) & Fcntl::O_ACCMODE) != Fcntl::O_WRONLY
+      return Native.probe_file(file) if readable && Native.available?
+
+      # A File made from a descriptor (File.for_fd) has no name.
+      name = file.path.to_s.empty? ? nil : File.expand_path(file.path)
+      if name && (!readable || File.identical?(file, name))
+        return Native.probe_path(name) if Native.available?
+
+        out, = Binary.run("probe", name)
+        return parse_probe(out)
+      end
+      raise IOError, "a write-only File with no name cannot be probed" unless readable
+
+      # The executable reads names only, and this one has moved on: it
+      # gets a copy, made with positioned reads.
+      Tempfile.create("oximg-probe") do |copy|
+        copy.binmode
+        offset = 0
+        loop do
+          chunk = file.pread(1 << 20, offset)
+          copy.write(chunk)
+          offset += chunk.bytesize
+        rescue EOFError
+          break
+        end
+        copy.flush
+        out, = Binary.run("probe", copy.path)
+        parse_probe(out)
+      end
+    end
+
+    # Whether probe reads +source+ through #read rather than opening it
+    # by name. Every IO answers #path since Ruby 3.2 — nil for a pipe,
+    # "" for a socket, "<STDIN>" for STDIN — so for an IO that proves
+    # nothing: an IO is a stream, except a closed File, which has
+    # nothing left to read but its name (an open one on a regular file
+    # never gets here). Anything else keeps the duck typing: #to_path
+    # or #path (a Pathname, a Tempfile, an upload) is a path.
+    def stream?(source)
+      case source
+      when String then false
+      when File then !source.closed?
+      when IO then true
+      else !source.respond_to?(:to_path) && !source.respond_to?(:path) && source.respond_to?(:read)
+      end
+    end
+
+    # The executable reads paths only, so without the library an IO
+    # goes through a tempfile. It is read through #read(n) alone, as the
+    # library reads it, so probe takes the same IO either way
+    # (IO.copy_stream would also pass #read a buffer).
+    def probe_spawned_io(io)
+      Tempfile.create("oximg-probe") do |file|
+        file.binmode
+        while (chunk = io.read(1 << 20)) && !chunk.empty?
+          file.write(chunk)
+        end
+        file.flush
+        out, = Binary.run("probe", file.path)
+        parse_probe(out)
+      end
+    end
+
     # The hash `probe` builds from the line the CLI printed. Separate
     # from `probe` so the parser can be tested against every line the
     # CLI can print — the still form, each loop spelling — without a
@@ -181,7 +290,11 @@ module Oximg
     # would otherwise reach the CLI's argument parser as a flag, and
     # the caller rarely controls what an uploaded file is called.
     def expand(path, name)
-      path = path.path if path.respond_to?(:path)
+      if path.respond_to?(:path)
+        path = path.path
+      elsif path.respond_to?(:to_path)
+        path = path.to_path
+      end
       path = path.to_s
       raise ArgumentError, "#{name} path is empty" if path.strip.empty?
 

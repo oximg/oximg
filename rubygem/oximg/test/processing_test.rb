@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "stringio"
 
 # End-to-end against a real binary: the argv tests pin what the gem
 # says, these pin that the CLI still answers it. Skipped when no
@@ -103,6 +104,61 @@ class Oximg::ProcessingTest < Oximg::Test
       assert_match(/CMYK/, error.message)
       assert_equal 1, error.status
     end
+  end
+
+  # Without the probe library, an IO reaches the executable through a
+  # tempfile, and the answer is the path's.
+  def test_probe_reads_an_io_through_the_executable
+    refute Oximg.in_process_probe?, "this suite drives the executable; NativeTest drives the library"
+    probed = Oximg.probe(StringIO.new(File.binread(fixture("photo.jpg"))))
+    assert_equal Oximg.probe(fixture("photo.jpg")), probed
+  end
+
+  # The same IO the library takes: one that answers #read(n) and no
+  # more (IO.copy_stream would pass it a buffer too).
+  def test_probe_reads_a_read_n_only_io_through_the_executable
+    source = StringIO.new(File.binread(fixture("photo.jpg")))
+    io = Object.new
+    io.define_singleton_method(:read) { |n| source.read(n) }
+    assert_equal Oximg.probe(fixture("photo.jpg")), Oximg.probe(io)
+  end
+
+  # Without the library an open File is still what it holds, not what
+  # its name leads to by now: the executable reads the name only while
+  # it is the same file, and a copy made with positioned reads
+  # otherwise. The position is untouched either way.
+  def test_probe_reads_an_open_file_through_the_executable
+    want = Oximg.probe(fixture("rgb.png"))
+    in_tmpdir do |dir|
+      path = File.join(dir, "x.png")
+      File.binwrite(path, File.binread(fixture("rgb.png")))
+      File.open(path, "rb") do |file|
+        file.read(100)
+        assert_equal want, Oximg.probe(file), "same file"
+        File.binwrite(File.join(dir, "new"), File.binread(fixture("photo.jpg")))
+        File.rename(File.join(dir, "new"), path)
+        assert_equal want, Oximg.probe(file), "name replaced"
+        assert_equal 100, file.pos
+      end
+    end
+  end
+
+  # A File made from a descriptor has no name; without the library it
+  # is copied with positioned reads.
+  def test_probe_reads_a_nameless_file_through_the_executable
+    file = File.for_fd(IO.sysopen(fixture("rgb.png"), "rb"))
+    assert_nil file.path
+    assert_equal Oximg.probe(fixture("rgb.png")), Oximg.probe(file)
+  ensure
+    file&.close
+  end
+
+  # An object that names its file only through #to_path.
+  def test_probe_takes_a_to_path_object
+    named = Object.new
+    path = fixture("photo.jpg")
+    named.define_singleton_method(:to_path) { path }
+    assert_equal Oximg.probe(path), Oximg.probe(named)
   end
 
   # The binary already names what it refused; the gem must surface that

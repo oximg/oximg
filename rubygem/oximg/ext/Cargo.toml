@@ -1,0 +1,35 @@
+# The in-process header read behind `Oximg.probe` (issue #134): a C
+# ABI over `oximg::pipeline::probe_reader`, loaded by the gem through
+# the `ffi` gem. A cdylib rather than an rb-sys extension, because a C
+# ABI is not tied to the Ruby ABI: one build per platform serves every
+# Ruby version, the way the bundled executable already does.
+#
+# Build with `rake compile` in rubygem/oximg, which starts from a copy
+# of the root Cargo.lock (see the Rakefile for why there is no lock
+# here).
+[package]
+name = "oximg-probe"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+
+[lib]
+name = "oximg_probe"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Library core only: no HTTP stack. No `avif` either, matching the
+# release executable, so a header the CLI refuses is refused here too.
+oximg = { path = "../../..", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+# Note: panic = "abort" must NOT be set; the libjpeg error handler
+# reports a fatal error by unwinding (src/panic_guard.rs), and the
+# entry points below catch what reaches them.
+
+# Standalone: not a member of the root package's (absent) workspace.
+[workspace]
