@@ -559,6 +559,67 @@ fn unknown_png_quantize_is_still_fatal() {
     assert!(!out.exists(), "nothing may be written on a fatal config");
 }
 
+/// Every chunk of a PNG as (type, data).
+fn png_chunks(b: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    let mut v = Vec::new();
+    let mut i = 8;
+    while i + 12 <= b.len() {
+        let len = u32::from_be_bytes(b[i..i + 4].try_into().unwrap()) as usize;
+        v.push((
+            b[i + 4..i + 8].try_into().unwrap(),
+            b[i + 8..i + 8 + len].to_vec(),
+        ));
+        i += 12 + len;
+    }
+    v
+}
+
+/// An APNG keeps its animation control and every frame's data, byte
+/// for byte, while its text goes; a second strip changes nothing.
+#[test]
+fn strip_keeps_every_apng_frame() {
+    let (w, h) = (16u32, 8u32);
+    let mut src_bytes = Vec::new();
+    {
+        let mut e = png::Encoder::new(&mut src_bytes, w, h);
+        e.set_color(png::ColorType::Rgb);
+        e.set_depth(png::BitDepth::Eight);
+        e.set_animated(3, 0).unwrap();
+        e.add_text_chunk("Comment".into(), "SECRET".into()).unwrap();
+        let mut wr = e.write_header().unwrap();
+        for f in 0..3u8 {
+            wr.set_frame_delay(f as u16 + 1, 10).unwrap();
+            let px: Vec<u8> = (0..w * h * 3)
+                .map(|i| (i as u8).wrapping_mul(f + 1))
+                .collect();
+            wr.write_image_data(&px).unwrap();
+        }
+    }
+    let src = tmp("strip-src.png");
+    let out = tmp("strip-out.png");
+    let again = tmp("strip-again.png");
+    std::fs::write(&src, &src_bytes).unwrap();
+    for (from, to) in [(&src, &out), (&out, &again)] {
+        let st = bin().arg("strip").arg(from).arg(to).status().unwrap();
+        assert!(st.success());
+    }
+    let (out_bytes, again_bytes) = (std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+    for p in [&src, &out, &again] {
+        let _ = std::fs::remove_file(p);
+    }
+    assert!(!out_bytes.windows(6).any(|w| w == b"SECRET"));
+    assert_eq!(again_bytes, out_bytes, "second strip changes nothing");
+    let expect: Vec<_> = png_chunks(&src_bytes)
+        .into_iter()
+        .filter(|(t, _)| t != b"tEXt")
+        .collect();
+    assert_eq!(png_chunks(&out_bytes), expect);
+    let types: Vec<[u8; 4]> = expect.iter().map(|c| c.0).collect();
+    for t in [b"acTL", b"fcTL", b"IDAT", b"fdAT"] {
+        assert!(types.contains(t), "{}", String::from_utf8_lossy(t));
+    }
+}
+
 /// `oximg strip`: a JPEG carrying an XMP block and a profile comes back
 /// without the XMP, the profile kept by default and dropped by
 /// `--icc strip` or `OXIMG_ICC=0` (the flag wins over the knob), and
