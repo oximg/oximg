@@ -121,6 +121,15 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # A closed File still names its file.
+  def test_reads_a_closed_file_by_its_name
+    file = File.open(fixture("rgb.png"), "rb")
+    file.close
+    with_library do
+      assert_equal({content_type: "image/png", format: :png, width: 200, height: 150}, Oximg.probe(file))
+    end
+  end
+
   def test_reports_a_missing_file
     with_library do
       error = assert_raises(Oximg::ProcessingError) { Oximg.probe(fixture("missing.jpg")) }

@@ -172,7 +172,7 @@ module Oximg
     def stream?(source)
       case source
       when String then false
-      when File then !(source.stat.file? && File.file?(source.path.to_s))
+      when File then !source.closed? && !(source.stat.file? && File.file?(source.path.to_s))
       when IO then true
       else !source.respond_to?(:to_path) && !source.respond_to?(:path) && source.respond_to?(:read)
       end
