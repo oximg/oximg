@@ -3,6 +3,7 @@
 require "test_helper"
 require "pathname"
 require "stringio"
+require "minitest/mock"
 
 # The in-process probe (Native): the library `rake compile` builds,
 # loaded through OXIMG_PROBE_LIB. Its contract is the executable's
@@ -322,13 +323,25 @@ class Oximg::NativeTest < Oximg::Test
 
   # A bare file name in OXIMG_PROBE_LIB is the file the check found in
   # the working directory, not whatever dlopen's search finds under
-  # that name.
+  # that name: the loader is handed that file's absolute path. (Where
+  # dlopen looks for a bare name differs by platform, so the path
+  # handed over is what is asserted.)
   def test_loads_a_relative_library_name_from_the_working_directory
     home = Dir.pwd
     Dir.chdir(File.dirname(probe_library))
+    loaded = []
+    open_library = Oximg::Native.method(:open_library)
+    record = lambda do |path|
+      loaded << path
+      open_library.call(path)
+    end
     with_env("OXIMG_PROBE_LIB", File.basename(probe_library)) do
       Oximg::Native.reset!
-      assert Oximg.in_process_probe?
+      Oximg::Native.stub(:open_library, record) do
+        assert Oximg.in_process_probe?
+      end
+      assert_equal [File.realpath(probe_library)], loaded.map { |path| File.realpath(path) }
+      assert_equal loaded.map { |path| File.absolute_path(path) }, loaded
       assert_equal 200, Oximg.probe(fixture("photo.jpg"))[:width]
     end
   ensure

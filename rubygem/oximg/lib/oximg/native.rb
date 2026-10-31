@@ -145,10 +145,12 @@ module Oximg
             raise LoadError, "OXIMG_PROBE_LIB is set to #{configured.inspect}, which is not a file"
           end
 
-          # Absolute, so the file loaded is the one just checked: dlopen
-          # does not look in the working directory for a bare name, and
-          # would search the system's library paths for it instead.
-          open_library(File.expand_path(configured))
+          # Absolute, so the file loaded is the one just checked. Where
+          # dlopen looks for a bare name depends on the platform (glibc
+          # never looks in the working directory; dyld does, after other
+          # places). absolute_path, unlike expand_path, leaves "~" alone,
+          # as File.file? did.
+          open_library(File.absolute_path(configured))
         end
       end
 
