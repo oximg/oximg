@@ -156,6 +156,36 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # A kill from another thread (a request timeout, a shutdown) is not
+  # an exception the callback can rescue: delivered inside IO#read it
+  # would jump out through the library's frames. It waits until the call
+  # returns, so the probe runs to its end — here, the further reads a
+  # header behind 128 KiB of APP2 needs — and the thread dies after.
+  def test_defers_a_kill_until_the_library_returns
+    jpeg = File.binread(fixture("photo.jpg"))
+    app2 = "\xFF\xE2".b + [0xFFFF].pack("n") + ("\0".b * 0xFFFD)
+    io = StringIO.new(jpeg[0, 2] + app2 + app2 + jpeg[2..])
+    reading = Queue.new
+    killed = Queue.new
+    reads = 0
+    io.define_singleton_method(:read) do |n|
+      reads += 1
+      if reads == 1
+        reading << true
+        killed.pop # a blocking point, where an unmasked kill would land
+      end
+      super(n)
+    end
+    with_library do
+      thread = Thread.new { Oximg.probe(io) }
+      reading.pop
+      thread.kill
+      killed << true
+      assert_nil thread.value, "the thread was killed"
+      assert_operator reads, :>, 1, "the probe ran to its end before the kill landed"
+    end
+  end
+
   def test_refuses_a_read_longer_than_asked
     io = Object.new
     io.define_singleton_method(:read) { |n| "x" * (n + 1) }

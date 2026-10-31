@@ -77,7 +77,18 @@ module Oximg
           failure = e
           -1
         end
-        result = call { |dims, msg| binding_module.oximg_probe_read(reader, nil, dims, msg, MESSAGE_BYTES) }
+        # Thread#kill and Thread#raise from another thread are not
+        # exceptions the reader above can rescue; delivered inside it,
+        # they too would jump through the library's frames. They wait
+        # until the call returns. The cost: a read that blocks forever
+        # cannot be interrupted, so give such an IO a timeout
+        # (IO#timeout=, Ruby 3.2+), whose IO::TimeoutError is an
+        # ordinary exception. #read must not `throw` or kill its own
+        # thread, for the same reason: both act at once, and no mask
+        # holds them back.
+        result = Thread.handle_interrupt(Object => :never) do
+          call { |dims, msg| binding_module.oximg_probe_read(reader, nil, dims, msg, MESSAGE_BYTES) }
+        end
         raise failure if failure
 
         result
