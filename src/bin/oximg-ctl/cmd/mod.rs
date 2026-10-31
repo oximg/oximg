@@ -7,3 +7,4 @@ pub mod probe;
 pub mod resize;
 pub mod serve;
 pub mod sign;
+pub mod strip;

@@ -46,6 +46,7 @@ fn main() {
         Cmd::Get(a) => cmd::get::run(&opts, a),
         Cmd::Probe(a) => cmd::probe::run(&opts, a),
         Cmd::Resize(a) => cmd::resize::run(&opts, a),
+        Cmd::Strip(a) => cmd::strip::run(&opts, a),
         Cmd::Sign(a) => cmd::sign::run(&opts, a),
         Cmd::Matrix(a) => cmd::matrix::run(&opts, a),
         Cmd::Parity(a) => cmd::parity::run(&opts, a),
@@ -69,6 +70,7 @@ Commands:
   get <path>                HTTP GET; auto-spawns unless --base is set
   probe <file>              Header probe (format, stored size, animation, JPEG frame)
   resize <in> <w> <h>       Shell out to `oximg resize`; probe the output
+  strip <in>                Shell out to `oximg strip`; compare pixels, list removals
   sign <path>               imgproxy-style HMAC over the decoded path
   matrix                    Walk fixture × box × format cells + negatives
   parity --against PATH     Same cells on two builds; bodies must match
@@ -101,6 +103,14 @@ resize:
   JSON adds `peak_rss_bytes` (the child's peak RSS; null off Unix) and,
   when oximg printed an estimate (`--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`),
   `decoded_bytes`: {{format, total, terms: {{staged, ...}}}}.
+
+strip:
+  --out PATH                Output file (default: a temp file)
+  --icc keep|strip          Passed through to `oximg strip`
+  JSON adds `removed` and `orientation` (what the library reports for the
+  input), `residue` (what a second strip of the output would still
+  remove: [] when clean), `pixels_identical` (decoded pixels of input
+  and output, stored orientation, compared), and `peak_rss_bytes`.
 
 sign:
   --key HEX                 OXIMG_KEY (else the env)

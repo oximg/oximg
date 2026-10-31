@@ -26,6 +26,7 @@ that picks the scan layout is proved.
 oximg-ctl probe tests/fixtures/photo.jpg
 oximg-ctl resize tests/fixtures/photo.jpg 100 100 --out /tmp/out.jpg
 oximg-ctl resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/out.webp
+oximg-ctl strip tests/fixtures/animated.webp --out /tmp/out.webp
 ```
 
 `resize` shells out to `oximg resize` (same argv a user types). Usage
@@ -36,6 +37,15 @@ RSS) and, under `--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`,
 `decoded_bytes.{format,total,terms}` — the estimate beside what the
 process held.
 
+`strip` shells out to `oximg strip <in> <out> [--icc keep|strip]`:
+lossless metadata removal for JPEG/PNG/WebP (GIF, AVIF: exit 1). Its
+JSON proves the result: `removed` (what went, per block kind),
+`orientation` (written back, 2-8, else null), `residue` (what a second
+strip would remove; must be `[]`), `pixels_identical` (decoded pixels
+of input and output compared), `peak_rss_bytes` (O(file size)). `ok`
+is false unless the residue is empty and the pixels match. A CMYK JPEG
+with `--icc strip` exits 1 (refused, never written).
+
 ## Library (`oximg::pipeline`)
 
 ```sh
@@ -44,6 +54,9 @@ cargo run --release --example probe -- tests/fixtures/photo.webp
 ```
 
 `process` / `process_path` take `Params` and return `(bytes, ImageFormat)`.
+`strip` takes `StripParams` (`icc: Option<bool>`, resolved like
+`Params::icc`) and returns `Stripped {bytes, format, removed,
+orientation}` without decoding pixels.
 `probe` is header-only stored size; `probe_reader` is the same answer
 from a reader, read 64 KiB at a time, doubling, until the header
 parses (errors only at EOF; AVIF reads through EOF);
