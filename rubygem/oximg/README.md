@@ -31,7 +31,8 @@ the name does not say, and `:gif` is not a `format:` you can ask for.
 
 ```ruby
 Oximg.resize(source, destination, width: 0, height: 0,
-             quality: nil, format: nil, preset: nil)
+             quality: nil, format: nil, preset: nil,
+             icc: nil, auto_rotate: nil)
 ```
 
 The source is fitted within `width` x `height` and **never enlarged**. A
@@ -50,6 +51,12 @@ Oximg.resize("photo.jpg", "smaller.jpg", quality: 70)
 | `quality` | 1–100, default 80. JPEG quality |
 | `format` | `:jpg`, `:jpeg`, `:png`, `:webp`, `:avif`. Defaults to the destination's extension, else the source's own format |
 | `preset` | `:jpegli` (default — maximum quality per byte), `:fast`, `:small` |
+| `icc` | `:keep` or `:strip` the source's colour profile. Default: `OXIMG_ICC`, else keep |
+| `auto_rotate` | `false` keeps the stored orientation, `true` applies the EXIF one. Default: `OXIMG_AUTO_ROTATE`, else true |
+
+`icc` and `auto_rotate` apply to that call only, and win over the
+environment, so a threaded job runner can treat one image differently
+without touching `ENV`.
 
 `resize` returns the destination path and raises `Oximg::ProcessingError`
 on failure, carrying the binary's own message and exit status. Paths are

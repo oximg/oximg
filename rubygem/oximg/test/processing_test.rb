@@ -61,6 +61,33 @@ class Oximg::ProcessingTest < Oximg::Test
     end
   end
 
+  # Issue #128, end to end: photo.jpg with an Exif orientation 6 and an
+  # ICC profile spliced in after SOI. The defaults rotate (150x200) and
+  # keep the profile; the overrides do neither, and beat the knobs.
+  def test_icc_and_auto_rotate_override_the_environment
+    in_tmpdir do |dir|
+      source = File.join(dir, "rotated-icc.jpg")
+      File.binwrite(source, tagged_photo)
+      out = File.join(dir, "out.jpg")
+
+      Oximg.resize(source, out)
+      assert_equal [150, 200], Oximg.probe(out).values_at(:width, :height)
+      assert_includes File.binread(out), "ICC_PROFILE"
+
+      Oximg.resize(source, out, icc: :strip, auto_rotate: false)
+      assert_equal [200, 150], Oximg.probe(out).values_at(:width, :height)
+      refute_includes File.binread(out), "ICC_PROFILE"
+
+      with_env("OXIMG_ICC", "0") do
+        with_env("OXIMG_AUTO_ROTATE", "0") do
+          Oximg.resize(source, out, icc: :keep, auto_rotate: true)
+        end
+      end
+      assert_equal [150, 200], Oximg.probe(out).values_at(:width, :height)
+      assert_includes File.binread(out), "ICC_PROFILE"
+    end
+  end
+
   def test_probe_reads_headers_only
     probed = Oximg.probe(fixture("photo.jpg"))
     assert_equal "image/jpeg", probed[:content_type]
@@ -159,6 +186,17 @@ class Oximg::ProcessingTest < Oximg::Test
     path = fixture("photo.jpg")
     named.define_singleton_method(:to_path) { path }
     assert_equal Oximg.probe(path), Oximg.probe(named)
+  end
+
+  # photo.jpg with an APP1 Exif (big-endian TIFF, one IFD entry:
+  # Orientation = 6) and an APP2 ICC_PROFILE (one chunk of opaque
+  # bytes; pass-through never parses it) right after SOI.
+  def tagged_photo
+    tiff = ["MM", 42, 8, 1, 0x0112, 3, 1, 6, 0, 0].pack("a2nNnnnNnnN")
+    segment = ->(marker, body) { [0xFF, marker, body.bytesize + 2].pack("CCn") + body }
+    jpeg = File.binread(fixture("photo.jpg"))
+    jpeg[0, 2] + segment.call(0xE1, "Exif\0\0".b + tiff) +
+      segment.call(0xE2, "ICC_PROFILE\0".b + [1, 1].pack("CC") + ("\x5A".b * 600)) + jpeg[2..]
   end
 
   # The binary already names what it refused; the gem must surface that

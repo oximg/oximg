@@ -45,7 +45,7 @@ module Oximg
   # mozjpeg's fast/small trade differently.
   PRESETS = %i[jpegli fast small].freeze
 
-  # What `strip` may do with an embedded colour profile.
+  # What `resize` and `strip` may do with an embedded colour profile.
   ICC_MODES = %i[keep strip].freeze
 
   CONTENT_TYPE_FORMATS = {
@@ -106,10 +106,17 @@ module Oximg
     # The output format follows +format:+, else +destination+'s
     # extension, else the source's own format. Returns the destination
     # path.
-    def resize(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil)
+    #
+    # +icc:+ (:keep or :strip) and +auto_rotate:+ (true or false)
+    # override the binary's OXIMG_ICC and OXIMG_AUTO_ROTATE for this
+    # call only; nil leaves them to the environment (default: keep the
+    # profile, apply the EXIF orientation).
+    def resize(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
+      icc: nil, auto_rotate: nil)
       output = expand(destination, "destination")
       Binary.run(*resize_argv(source, output,
-        width: width, height: height, quality: quality, format: format, preset: preset))
+        width: width, height: height, quality: quality, format: format, preset: preset,
+        icc: icc, auto_rotate: auto_rotate))
       output
     end
 
@@ -180,7 +187,8 @@ module Oximg
     # The argv `resize` would run, minus the executable. Public because
     # it is the honest way to see what a call turns into — and the way
     # to test that without a binary present.
-    def resize_argv(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil)
+    def resize_argv(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
+      icc: nil, auto_rotate: nil)
       argv = [
         "resize",
         expand(source, "source"),
@@ -191,6 +199,8 @@ module Oximg
       argv.push("-q", bounded(quality, "quality", 1, 100).to_s) unless quality.nil?
       argv.push("-f", token(format, FORMATS, "format")) unless format.nil?
       argv.push("--preset", token(preset, PRESETS, "preset")) unless preset.nil?
+      argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
+      argv.push(boolean(auto_rotate, "auto_rotate") ? "--auto-rotate" : "--no-auto-rotate") unless auto_rotate.nil?
       argv
     end
 
@@ -314,6 +324,16 @@ module Oximg
     def bounded(value, name, min, max)
       unless value.is_a?(Integer) && value >= min && value <= max
         raise ArgumentError, "#{name} must be an Integer in #{min}..#{max}, got #{value.inspect}"
+      end
+
+      value
+    end
+
+    # Strictly true or false: a truthy "0" or "false" read as true would
+    # rotate exactly the images the caller asked not to.
+    def boolean(value, name)
+      unless value == true || value == false
+        raise ArgumentError, "#{name} must be true or false, got #{value.inspect}"
       end
 
       value
