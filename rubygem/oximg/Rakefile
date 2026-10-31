@@ -9,21 +9,13 @@ Rake::TestTask.new(:test) do |t|
 end
 
 # The probe library a platform gem bundles (ext/), built into the
-# repo's target/ where the tests look for it. Release, as it ships: the
-# tests compare its answers with the executable's.
-#
-# ext/ has no lock of its own: each build starts from a copy of the
-# root Cargo.lock, which cargo prunes to what the library uses, so the
-# library always builds the decoders the executable ships. A committed
-# lock would drift from the root one, and would refuse --locked builds
-# on every version bump.
+# repo's target/oximg-probe/release/ where the tests look for it.
+# Release, as it ships: the tests compare its answers with the
+# executable's. ext/build.sh is the one recipe, shared with CI and the
+# release, and says why it is built the way it is.
 desc "Build the in-process probe library from ext/"
 task :compile do
-  root = File.expand_path("../..", __dir__)
-  cp File.join(root, "Cargo.lock"), File.join(__dir__, "ext", "Cargo.lock")
-  sh "cargo", "build", "--release",
-    "--manifest-path", File.join(__dir__, "ext", "Cargo.toml"),
-    "--target-dir", File.join(root, "target", "oximg-probe")
+  sh "sh", File.join(__dir__, "ext", "build.sh")
 end
 
 task default: :test

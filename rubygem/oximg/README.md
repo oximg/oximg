@@ -109,18 +109,21 @@ where a spawn costs milliseconds. `resize` is not affected and still
 runs in a child process, which keeps a full decode's memory and crashes
 out of your process.
 
-The library comes from `OXIMG_PROBE_LIB`, or from the gem itself when
-it bundles one; the released gems do not bundle it yet. Build it with
-`rake compile` in this directory, which leaves it under the repo's
-`target/oximg-probe/release/`. Like `OXIMG_BIN`, an `OXIMG_PROBE_LIB`
-that does not load raises rather than falling back.
+The platform gems bundle the library beside the executable (x86_64 and
+aarch64 Linux, glibc and musl, and arm64 macOS), so they also depend
+on `ffi`; beyond that it needs only libc and libgcc_s, which Ruby
+itself needs, and not libstdc++.
+`OXIMG_PROBE_LIB` points at another one; like `OXIMG_BIN`, one that
+does not load raises rather than falling back. To build it from this
+checkout, run `rake compile` here: it leaves the library under the
+repo's `target/oximg-probe/release/`.
 
-Without the library — the gems as released today, or a bundled one
-that cannot load — `probe` spawns `oximg probe` instead, copying an IO
-to a tempfile first. The answer is the same; only the cost differs.
+Without the library — the plain-Ruby gem, or a bundled one that cannot
+load — `probe` spawns `oximg probe` instead, copying an IO to a
+tempfile first. The answer is the same; only the cost differs.
 
 ```ruby
-Oximg.in_process_probe?  #=> true when the library is loaded
+Oximg.in_process_probe?  #=> true on a platform gem
 ```
 
 ## Where the binary comes from
