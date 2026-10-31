@@ -108,9 +108,11 @@ strip:
   --out PATH                Output file (default: a temp file)
   --icc keep|strip          Passed through to `oximg strip`
   JSON adds `removed` and `orientation` (what the library reports for the
-  input), `residue` (what a second strip of the output would still
-  remove: [] when clean), `pixels_identical` (decoded pixels of input
-  and output, stored orientation, compared), and `peak_rss_bytes`.
+  input), `residue` (what a second strip of the output, same ICC policy,
+  would still remove: [] when clean), `pixels_identical` (decoded pixels
+  of input and output, stored orientation, compared), `frames_identical`
+  (animated WebP: every frame's bitstream compared, else null), and
+  `peak_rss_bytes`.
 
 sign:
   --key HEX                 OXIMG_KEY (else the env)

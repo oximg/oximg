@@ -1559,3 +1559,93 @@ fn get_exact_size_jpeg_matches_the_staged_encode() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `photo.jpg` with an APP2 ICC profile and a comment spliced in after
+/// SOI, so `strip` has something of each kind to remove.
+fn jpeg_with_meta(path: &std::path::Path) {
+    let src = std::fs::read(fixture("photo.jpg")).unwrap();
+    let mut b = src[..2].to_vec();
+    let icc = [&b"ICC_PROFILE\0\x01\x01"[..], &[0u8; 128]].concat();
+    for (marker, body) in [(0xE2u8, &icc[..]), (0xFE, &b"SECRET comment"[..])] {
+        b.extend_from_slice(&[0xFF, marker]);
+        b.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+        b.extend_from_slice(body);
+    }
+    b.extend_from_slice(&src[2..]);
+    std::fs::write(path, b).unwrap();
+}
+
+/// PR #146 review: ctl reads the input before the child runs, so an
+/// in-place strip still reports what it removed and compares pixels
+/// against the original; a padded `OXIMG_ICC` is trimmed as oximg
+/// trims it, and the residue check uses that same policy.
+#[test]
+fn strip_proves_in_place_and_mirrors_the_icc_policy() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-strip-{}.jpg", std::process::id()));
+    jpeg_with_meta(&path);
+    let p = path.to_str().unwrap();
+    let (code, v) = run(&["--env", "OXIMG_ICC= 0 ", "strip", p, "--out", p]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["icc"], "strip", "{v}");
+    let names: Vec<&str> = v["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["APP2 ICC_PROFILE", "COM"], "{v}");
+    assert_eq!(v["residue"], serde_json::json!([]), "{v}");
+    assert_eq!(v["pixels_identical"], true, "{v}");
+    assert!(v["in_bytes"].as_u64() > v["bytes"].as_u64(), "{v}");
+}
+
+/// A private chunk inside every animation frame is removed, and the
+/// frames' bitstreams are compared, not just the first frame's pixels.
+#[test]
+fn strip_checks_every_animation_frame() {
+    let b = std::fs::read(fixture("animated.webp")).unwrap();
+    let mut out = b[..12].to_vec();
+    let mut i = 12;
+    while i < b.len() {
+        let size = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+        let end = (i + 8 + size + (size & 1)).min(b.len());
+        if &b[i..i + 4] == b"ANMF" {
+            let frame = [&b[i + 8..end], &b"PRVT\x07\0\0\0SECRET!\0"[..]].concat();
+            out.extend_from_slice(b"ANMF");
+            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame);
+        } else {
+            out.extend_from_slice(&b[i..end]);
+        }
+        i = end;
+    }
+    let riff = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&riff.to_le_bytes());
+    let path = std::env::temp_dir().join(format!("oximg-ctl-strip-{}.webp", std::process::id()));
+    std::fs::write(&path, out).unwrap();
+    let (code, v) = run(&["strip", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["frames_identical"], true, "{v}");
+    assert_eq!(v["removed"][0]["name"], "PRVT", "{v}");
+    assert_eq!(v["removed"][0]["count"], 2, "{v}");
+}
+
+/// Pixels that cannot be decoded for the comparison fail the proof
+/// rather than pass it unchecked.
+#[test]
+fn strip_fails_when_pixels_cannot_be_compared() {
+    let output = ctl()
+        .env("OXIMG_MAX_SRC_PIXELS", "1")
+        .args(["strip", &fixture("photo.jpg")])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(
+        v["error"], "pixels could not be decoded for comparison",
+        "{v}"
+    );
+}

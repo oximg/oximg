@@ -1,6 +1,7 @@
 //! `strip`: shell out to `oximg strip`, then prove what it wrote: the
-//! decoded pixels match the input's, and a second strip of the output
-//! finds nothing left to remove.
+//! decoded pixels match the input's (every frame's bitstream, for an
+//! animated WebP), and a second strip of the output under the same ICC
+//! policy finds nothing left to remove.
 
 use crate::args::{Opts, StripArgs};
 use crate::cmd::resize::peak_rss_bytes;
@@ -48,6 +49,11 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         }
     }
     let _ephemeral = RemoveOnDrop(ephemeral.then(|| out_path.clone()));
+    let read = |p: &Path| {
+        std::fs::read(p).map_err(|e| CtlError::fail(format!("read {}: {e}", p.display()), None))
+    };
+    // Before the child runs: `--out` may be the input itself.
+    let src = read(&a.input)?;
     let t0 = Instant::now();
     let mut cmd = Command::new(&bin);
     cmd.args(&argv[1..]);
@@ -71,15 +77,11 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             CtlError::fail(msg, None)
         });
     }
-    let read = |p: &Path| {
-        std::fs::read(p).map_err(|e| CtlError::fail(format!("read {}: {e}", p.display()), None))
-    };
-    let src = read(&a.input)?;
     let bytes = read(&out_path)?;
 
     // The child resolved --icc against its own environment; mirror that
-    // (flag, else the OXIMG_ICC it was given, else ours) so `removed`
-    // describes the run that happened.
+    // (flag, else the OXIMG_ICC it was given, else ours, trimmed as
+    // config::var does) so `removed` describes the run that happened.
     let keep_icc = match a.icc.as_deref() {
         Some(v) => v == "keep",
         None => {
@@ -90,6 +92,7 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
                 .map(|(_, v)| v.clone())
                 .or_else(|| std::env::var("OXIMG_ICC").ok())
                 .as_deref()
+                .map(str::trim)
                 != Some("0")
         }
     };
@@ -99,8 +102,17 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             icc: Some(keep_icc),
         },
     );
-    let residue = pipeline::strip(&bytes, &StripParams { icc: Some(true) });
+    let residue = pipeline::strip(
+        &bytes,
+        &StripParams {
+            icc: Some(keep_icc),
+        },
+    );
     let (pin, pout) = (pixels(&src), pixels(&bytes));
+    let frames_identical = match (webp_frames(&src), webp_frames(&bytes)) {
+        (None, None) => None,
+        (i, o) => Some(i == o),
+    };
     let mut report = json!({
         "ok": true,
         "in_bytes": src.len(),
@@ -122,6 +134,7 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             (Ok(i), Ok(o)) => json!(i == o),
             (Err(e), _) | (_, Err(e)) => json!({ "error": e }),
         },
+        "frames_identical": frames_identical,
         "peak_rss_bytes": peak_rss_bytes(),
         "stderr": stderr,
     });
@@ -129,15 +142,22 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         report["out"] = json!(out_path.display().to_string());
     }
     let clean = matches!(&residue, Ok(s) if s.removed.is_empty());
-    if report["probe"].get("error").is_some() || !clean || pin.is_ok() && pin != pout {
+    let failure = if !clean {
+        Some("output still carries removable metadata")
+    } else if report["probe"].get("error").is_some() {
+        Some("output did not probe as an image")
+    } else if pin.is_err() || pout.is_err() {
+        Some("pixels could not be decoded for comparison")
+    } else if pin != pout {
+        Some("decoded pixels differ")
+    } else if frames_identical == Some(false) {
+        Some("animation frames differ")
+    } else {
+        None
+    };
+    if let Some(failure) = failure {
         report["ok"] = json!(false);
-        report["error"] = json!(if !clean {
-            "output still carries removable metadata"
-        } else if report["probe"].get("error").is_some() {
-            "output did not probe as an image"
-        } else {
-            "decoded pixels differ"
-        });
+        report["error"] = json!(failure);
         return Err(CtlError::from_value(1, report));
     }
     emit(&report, opts.pretty);
@@ -158,11 +178,50 @@ fn pixels(bytes: &[u8]) -> Result<String, String> {
         output: Some(ImageFormat::Png),
         auto_rotate: Some(false),
         icc: Some(false),
+        png_quantize: Some(false),
         ..Default::default()
     };
     pipeline::process(bytes, &p)
         .map(|(png, _)| sha256_hex(&png))
         .map_err(|e| e.to_string())
+}
+
+/// For an animated WebP, the `ANIM` chunk and each frame's 16-byte
+/// header and `ALPH`/`VP8 `/`VP8L` subchunks: everything that renders.
+/// `pixels` sees only the first frame, and strip must copy these byte
+/// for byte, so equality here proves the animation untouched. `None`
+/// for anything else (or a container too broken to walk).
+fn webp_frames(b: &[u8]) -> Option<Vec<&[u8]>> {
+    fn chunks(b: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let size = u32::from_le_bytes(b.get(i + 4..i + 8)?.try_into().ok()?) as usize;
+            let data = b.get(i + 8..(i + 8).checked_add(size)?)?;
+            v.push((&b[i..i + 4], data));
+            i += 8 + size + (size & 1);
+        }
+        Some(v)
+    }
+    if b.len() < 12 || &b[..4] != b"RIFF" || &b[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (fourcc, data) in chunks(&b[12..])? {
+        match fourcc {
+            b"ANIM" => out.push(data),
+            b"ANMF" => {
+                out.push(data.get(..16)?);
+                for (sub, payload) in chunks(&data[16..])? {
+                    if matches!(sub, b"ALPH" | b"VP8 " | b"VP8L") {
+                        out.push(payload);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn strip_argv(input: &Path, out: &Path, icc: Option<&str>) -> Vec<String> {
