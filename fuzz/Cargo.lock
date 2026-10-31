@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "oximg"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "cc",

@@ -10,6 +10,28 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-31
+
+Per-call ICC and orientation, from the CLI and the Ruby gem ([#128]).
+Every output is byte-identical to 0.18.0 at the defaults.
+
+### Added
+
+- **`oximg resize --icc keep|strip` and `--no-auto-rotate`** ([#128]).
+  The per-call overrides the library already had (`Params::icc`,
+  `Params::auto_rotate`) reach the CLI, so one image can keep or drop
+  its profile, or keep its stored orientation, without setting
+  `OXIMG_ICC` / `OXIMG_AUTO_ROTATE`. The flag wins over the knob;
+  `--auto-rotate` forces rotation on under `OXIMG_AUTO_ROTATE=0`. An
+  unknown `--icc` value is a usage error (exit 2).
+- **The Ruby gem takes per-call settings** ([#128]).
+  `Oximg.resize(..., icc: :keep | :strip, auto_rotate: true | false)`
+  maps onto those flags, and `env:` on `resize` and `strip` sets any
+  other pipeline knob for that call only (`Binary.run(*args, env:)`):
+  it reaches the one child process the call spawns, never `ENV`, so it
+  is safe across threads. Names are checked against `Oximg::KNOBS`,
+  which a test pins to the binary's own inventory.
+
 ## [0.18.0] - 2026-10-31
 
 Lossless metadata removal, memory, and the Ruby gem's header reads.
@@ -51,20 +73,6 @@ no fixture is that large.
   profile is refused, and
   GIF and AVIF are not supported (exit 1). `oximg-ctl strip` proves a
   run: removed blocks, residue, pixel identity, and peak RSS.
-- **`oximg resize --icc keep|strip` and `--no-auto-rotate`** ([#128]).
-  The per-call overrides the library already had (`Params::icc`,
-  `Params::auto_rotate`) reach the CLI, so one image can keep or drop
-  its profile, or keep its stored orientation, without setting
-  `OXIMG_ICC` / `OXIMG_AUTO_ROTATE`. The flag wins over the knob;
-  `--auto-rotate` forces rotation on under `OXIMG_AUTO_ROTATE=0`. An
-  unknown `--icc` value is a usage error (exit 2).
-- **The Ruby gem takes per-call settings** ([#128]).
-  `Oximg.resize(..., icc: :keep | :strip, auto_rotate: true | false)`
-  maps onto those flags, and `env:` on `resize` and `strip` sets any
-  other pipeline knob for that call only (`Binary.run(*args, env:)`):
-  it reaches the one child process the call spawns, never `ENV`, so it
-  is safe across threads. Names are checked against `Oximg::KNOBS`,
-  which a test pins to the binary's own inventory.
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
   file gets `probe.jpeg.{sof,progressive}` (the SOFn number: 0
   baseline, 1 extended sequential, 2 progressive), so a proof of which
@@ -2114,7 +2122,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.18.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/oximg/oximg/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/oximg/oximg/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/oximg/oximg/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/oximg/oximg/compare/v0.15.0...v0.16.0
