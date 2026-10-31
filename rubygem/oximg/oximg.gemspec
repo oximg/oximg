@@ -42,13 +42,14 @@ Gem::Specification.new do |spec|
   # platform gems — and there is deliberately no spec.executables, since
   # RubyGems would wrap a native binary in a Ruby binstub. Ask
   # Oximg.executable for the path instead.
-  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + Dir["lib/oximg/native/liboximg_probe.*"] +
-    ["README.md", "LICENSE"]
+  #
+  # lib/oximg/native/ is the same: empty here, and holding the probe
+  # library built from ext/ when a gem bundles one.
+  # Oximg.probe calls it through ffi, so ffi is a dependency exactly
+  # when the library is in the gem. Without one, ffi would be a native
+  # build on install for nothing.
+  library = Dir["lib/oximg/native/liboximg_probe.*"]
+  spec.files = Dir["lib/**/*.rb"] + Dir["exe/oximg*"] + library + ["README.md", "LICENSE"]
   spec.require_paths = ["lib"]
-
-  # A platform gem also bundles the probe library (lib/oximg/native/,
-  # built from ext/), which Oximg.probe calls through ffi. Only those
-  # gems depend on ffi: the plain-Ruby gem ships no library, and ffi
-  # would be a native build on install for nothing.
-  spec.add_dependency "ffi", "~> 1.17" unless platform.empty?
+  spec.add_dependency "ffi", "~> 1.17" unless library.empty?
 end

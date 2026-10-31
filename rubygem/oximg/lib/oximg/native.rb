@@ -15,17 +15,17 @@ module Oximg
   #
   #   1. +OXIMG_PROBE_LIB+ — an explicit path always wins, and a wrong
   #      one raises rather than falling back, as +OXIMG_BIN+ does.
-  #   2. the library bundled in this gem, beside this file — platform
-  #      gems ship one. If it cannot load (no +ffi+ gem, a missing
+  #   2. the library bundled in this gem, beside this file, when the
+  #      gem ships one. If it cannot load (no +ffi+ gem, a missing
   #      system library), probe falls back to spawning the executable:
   #      slower, same answer.
   #
-  # The plain-Ruby gem ships no library and always spawns.
+  # A gem without a library, as released gems are today, always spawns.
   module Native
     LIBRARY = "liboximg_probe.#{RbConfig::CONFIG["SOEXT"]}"
 
-    # Populated by the platform gems at package time; absent in the
-    # plain-Ruby gem.
+    # Populated at package time when a gem bundles the library; absent
+    # otherwise.
     BUNDLED = File.expand_path("native/#{LIBRARY}", __dir__)
 
     # The library's oximg_probe_abi_version this code was written for.

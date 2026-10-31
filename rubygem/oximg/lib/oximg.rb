@@ -120,9 +120,9 @@ module Oximg
     # position untouched, while that name still leads to a regular
     # file; otherwise it is a stream too.
     #
-    # Platform gems run this in-process and read only as much of the
-    # source as the header takes (see in_process_probe?). Otherwise it
-    # spawns <tt>oximg probe</tt>, which reads the whole source, and an
+    # With the probe library this runs in-process and reads only as much
+    # of the source as the header takes (see in_process_probe?). Without it,
+    # it spawns <tt>oximg probe</tt>, which reads the whole source, and an
     # IO is copied to a tempfile first. The answer is the same.
     def probe(source)
       if stream?(source)
@@ -136,8 +136,8 @@ module Oximg
       parse_probe(out)
     end
 
-    # True when probe runs in-process, through the library a platform
-    # gem bundles; false when it spawns the executable. Either way
+    # True when probe runs in-process, through the probe library (see
+    # Native); false when it spawns the executable. Either way
     # probe answers the same, and only its cost differs — this is for a
     # boot-time log, or a test that must know which path it took.
     def in_process_probe?

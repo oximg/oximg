@@ -76,23 +76,27 @@ its name, its position untouched. Other IO — a `StringIO`, a pipe, a
 socket — is read from its current position through `#read(n)` and
 left where the read stopped.
 
-Platform gems run `probe` in-process: oximg's own probe, compiled into
-a small library the gem calls through [`ffi`](https://github.com/ffi/ffi).
-It reads only as much of the source as the header takes, typically the
-first 64 KiB, and costs microseconds where a spawn costs milliseconds.
-`resize` is not affected and still runs in a child process, which keeps
-a full decode's memory and crashes out of your process.
+With the probe library, `probe` runs in-process: oximg's own probe,
+compiled into a small library (`ext/`) the gem calls through
+[`ffi`](https://github.com/ffi/ffi). It reads only as much of the source
+as the header takes, typically the first 64 KiB, and costs microseconds
+where a spawn costs milliseconds. `resize` is not affected and still
+runs in a child process, which keeps a full decode's memory and crashes
+out of your process.
 
-Without the library — the plain-Ruby gem, or a platform gem whose
-library cannot load — `probe` spawns `oximg probe` instead, copying an
-IO to a tempfile first. The answer is the same; only the cost differs.
+The library comes from `OXIMG_PROBE_LIB`, or from the gem itself when
+it bundles one; the released gems do not bundle it yet. Build it with
+`rake compile` in this directory, which leaves it under the repo's
+`target/oximg-probe/release/`. Like `OXIMG_BIN`, an `OXIMG_PROBE_LIB`
+that does not load raises rather than falling back.
+
+Without the library — the gems as released today, or a bundled one
+that cannot load — `probe` spawns `oximg probe` instead, copying an IO
+to a tempfile first. The answer is the same; only the cost differs.
 
 ```ruby
-Oximg.in_process_probe?  #=> true on a platform gem
+Oximg.in_process_probe?  #=> true when the library is loaded
 ```
-
-`OXIMG_PROBE_LIB` points at a library explicitly; like `OXIMG_BIN`, a
-wrong one raises rather than falling back.
 
 ## Where the binary comes from
 
