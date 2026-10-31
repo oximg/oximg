@@ -322,7 +322,11 @@ const CELLS: &[Cell] = &[
         &[],
         2.4,
     ),
-    ("png exact to png", "noise.png", "0", "0", "png", &[], 1.5),
+    // The exact-size hand-off (issue #129) took a frame out of both the
+    // estimate and the peak, which moved this from 1.21x to 1.41x M2
+    // Max and 1.50-1.51x on CI's Linux amd64 and arm64 runners, where
+    // 1.5 failed by noise (issue #149).
+    ("png exact to png", "noise.png", "0", "0", "png", &[], 1.8),
     ("png exact to jpeg", "noise.png", "0", "0", "jpg", &[], 1.5),
     (
         "png rgba resize",
