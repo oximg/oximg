@@ -31,18 +31,18 @@ pub fn print_help() {
              -q, --quality N    JPEG quality, 1-100 (default 80)\n          \
              -f, --format FMT   {}\n          \
              --preset P         jpegli (default) | fast | small\n          \
-             --icc keep|strip   Embedded colour profile (default keep,\n          \
+             --icc keep|strip   Embedded colour profile (default keep,\n                             \
                                 or OXIMG_ICC)\n          \
-             --no-auto-rotate   Keep the stored orientation instead of\n          \
-                                applying EXIF/irot (--auto-rotate forces\n          \
+             --no-auto-rotate   Keep the stored orientation instead of\n                             \
+                                applying EXIF/irot (--auto-rotate forces\n                             \
                                 it on; default OXIMG_AUTO_ROTATE, else on)\n  \
            oximg strip <in> <out> [--icc keep|strip]\n          \
              Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
              and other non-rendering metadata from a JPEG, PNG or WebP\n          \
              without re-encoding: the image data is copied byte for\n          \
              byte. A rotated photo keeps only its EXIF orientation.\n          \
-             --icc keep|strip   Embedded colour profile (default keep,\n          \
-                                or OXIMG_ICC). A CMYK JPEG's profile\n          \
+             --icc keep|strip   Embedded colour profile (default keep,\n                             \
+                                or OXIMG_ICC). A CMYK JPEG's profile\n                             \
                                 is never dropped.\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \

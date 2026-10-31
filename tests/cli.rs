@@ -189,6 +189,34 @@ fn probe_prints_the_animation_summary_after_the_fields_the_gem_reads() {
     );
 }
 
+/// A wrapped option description lines up under its first line. A `\`
+/// continuation in a Rust string literal drops the next line's leading
+/// whitespace, which is how the wrapped `--icc` text once printed flush
+/// with the option names.
+#[test]
+fn help_aligns_wrapped_option_descriptions() {
+    let output = bin().arg("--help").output().unwrap();
+    let help = String::from_utf8(output.stdout).unwrap();
+    let mut in_options = false;
+    let mut wrapped = 0;
+    for line in help.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if indent == 10 && line.trim_start().starts_with('-') {
+            // "          -q, --quality N    JPEG quality ..." : the
+            // description starts at column 29.
+            assert_eq!(&line[27..29], "  ", "{line:?}");
+            assert_ne!(&line[29..30], " ", "{line:?}");
+            in_options = true;
+        } else if in_options && indent >= 10 {
+            assert_eq!(indent, 29, "wrapped option text misaligned: {line:?}");
+            wrapped += 1;
+        } else {
+            in_options = false;
+        }
+    }
+    assert!(wrapped >= 4, "expected wrapped option lines:\n{help}");
+}
+
 /// Usage errors are exit 2 (distinct from processing failures, exit 1),
 /// with a message on stderr and nothing written.
 #[test]
