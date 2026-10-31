@@ -119,8 +119,9 @@ module Oximg
     # A String is always a path, so bytes already in memory go in as
     # <tt>StringIO.new(bytes)</tt>. An open File on a regular file is
     # read from its start, its position untouched, and it is the file
-    # it holds that is read, whatever its name leads to by now; a closed
-    # one is read by its name.
+    # it holds that is read, whatever its name leads to by now. A closed
+    # or write-only File, which cannot be read through, is read by its
+    # name.
     #
     # With the probe library this runs in-process and reads only as much
     # of the source as the header takes (see in_process_probe?). Without it,
@@ -181,13 +182,15 @@ module Oximg
       readable = (file.fcntl(Fcntl::F_GETFL) & Fcntl::O_ACCMODE) != Fcntl::O_WRONLY
       return Native.probe_file(file) if readable && Native.available?
 
-      name = File.expand_path(file.path)
-      if !readable || File.identical?(file, name)
+      # A File made from a descriptor (File.for_fd) has no name.
+      name = file.path.to_s.empty? ? nil : File.expand_path(file.path)
+      if name && (!readable || File.identical?(file, name))
         return Native.probe_path(name) if Native.available?
 
         out, = Binary.run("probe", name)
         return parse_probe(out)
       end
+      raise IOError, "a write-only File with no name cannot be probed" unless readable
 
       # The executable reads names only, and this one has moved on: it
       # gets a copy, made with positioned reads.

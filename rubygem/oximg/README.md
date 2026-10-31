@@ -75,10 +75,10 @@ the stored ones, before any EXIF rotation. A String is always a path,
 so bytes already in memory go in as a `StringIO`. An open `File` is
 read from its start, its position untouched, and it is the file you
 hold that is read, even if its name has since been replaced, renamed,
-or was relative to a directory the process has left; a closed one is
-read by its name. Other IO — a `StringIO`, a pipe, a socket — is read
-from its current position through `#read(n)` and left where the read
-stopped.
+or was relative to a directory the process has left. A closed or
+write-only `File`, which cannot be read through, is read by its name.
+Other IO — a `StringIO`, a pipe, a socket — is read from its current
+position through `#read(n)` and left where the read stopped.
 
 The gem does that reading itself, in Ruby, between calls into the
 library, so `#read` behaves as it would anywhere: whatever it raises

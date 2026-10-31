@@ -124,6 +124,16 @@ class Oximg::ProcessingTest < Oximg::Test
     end
   end
 
+  # A File made from a descriptor has no name; without the library it
+  # is copied with positioned reads.
+  def test_probe_reads_a_nameless_file_through_the_executable
+    file = File.for_fd(IO.sysopen(fixture("rgb.png"), "rb"))
+    assert_nil file.path
+    assert_equal Oximg.probe(fixture("rgb.png")), Oximg.probe(file)
+  ensure
+    file&.close
+  end
+
   # An object that names its file only through #to_path.
   def test_probe_takes_a_to_path_object
     named = Object.new

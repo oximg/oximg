@@ -75,17 +75,23 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
-  # A Pathname answers #read too, and a File both #read and #path: both
-  # are paths, never streams.
-  def test_treats_pathname_and_file_as_paths
+  # A Pathname answers #read too, and a File both #read and #path:
+  # neither is read as a stream from its position. A Pathname is a
+  # path; an open File is read through its descriptor, from the start.
+  def test_reads_neither_pathname_nor_file_as_a_stream
     with_library do
       want = {content_type: "image/png", format: :png, width: 200, height: 150}
       assert_equal want, Oximg.probe(Pathname(fixture("rgb.png")))
       File.open(fixture("rgb.png"), "rb") do |file|
         file.read(100)
         assert_equal want, Oximg.probe(file)
-        assert_equal 100, file.pos, "a File is probed by path, its position untouched"
+        assert_equal 100, file.pos, "a File is read from its start, its position untouched"
       end
+      # A File made from a descriptor has no name at all.
+      nameless = File.for_fd(IO.sysopen(fixture("rgb.png"), "rb"))
+      assert_equal want, Oximg.probe(nameless)
+    ensure
+      nameless&.close
     end
   end
 
