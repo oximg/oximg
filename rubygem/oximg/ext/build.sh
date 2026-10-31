@@ -7,10 +7,13 @@
 #
 # It starts from a copy of the root Cargo.lock, which cargo prunes to
 # what the library uses, so the library builds the decoders the
-# executable ships (ext/ keeps no lock of its own).
+# executable ships. ext/ keeps no lock of its own: a committed one
+# would drift from the root lock, and would refuse --locked builds on
+# every version bump, since it pins oximg itself.
 #
-# The library must load wherever the platform gem installs, with
-# nothing beyond libc. jpegli's build script links libstdc++ by name
+# The library must load wherever the platform gem installs, needing
+# only libc and libgcc_s (Rust's unwinder; Ruby needs it too, so it is
+# there wherever Ruby is). jpegli's build script links libstdc++ by name
 # although nothing the probe keeps comes from it, and a linker that
 # does not drop unused libraries (Debian's, Alpine's) leaves the
 # library needing libstdc++.so.6, which a bare Alpine or slim image

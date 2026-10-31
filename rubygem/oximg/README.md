@@ -95,7 +95,8 @@ out of your process.
 
 The platform gems bundle the library beside the executable (x86_64 and
 aarch64 Linux, glibc and musl, and arm64 macOS), so they also depend
-on `ffi`; it needs nothing else on the box, not even libstdc++.
+on `ffi`; beyond that it needs only libc and libgcc_s, which Ruby
+itself needs, and not libstdc++.
 `OXIMG_PROBE_LIB` points at another one; like `OXIMG_BIN`, one that
 does not load raises rather than falling back. To build it from this
 checkout, run `rake compile` here: it leaves the library under the

@@ -348,7 +348,10 @@ jobs:
             # a platform gem without one would quietly spawn again.
             rm -f lib/oximg/native/liboximg_probe.*
             set -- "$dist/probe/probe-$target"/liboximg_probe.*
-            test "$#" -eq 1 && test -f "$1"
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+              echo "::error::want one probe library for $target, got: $*"
+              exit 1
+            fi
             install -m 0644 "$1" lib/oximg/native/
             OXIMG_GEM_PLATFORM="$platform" gem build oximg.gemspec -o "$dist/oximg-$platform.gem"
             gem spec "$dist/oximg-$platform.gem" files | grep -q 'lib/oximg/native/liboximg_probe\.'

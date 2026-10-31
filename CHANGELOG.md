@@ -39,8 +39,9 @@ HTTP interface without notice.
   | Apple M2 Max | 3–39 µs | 3.7–7.2 ms | 148–455 µs |
   | AMD Ryzen 7 8745HS | 4.5–24 µs | 1.3–5.6 ms | 115–247 µs |
 
-  The library needs nothing beyond libc: it loads on Alpine without
-  libstdc++ and on glibc 2.36 (Debian bookworm). `Oximg.probe` also
+  The library needs only libc and libgcc_s, which Ruby itself needs: it
+  loads on Alpine without libstdc++ and on glibc 2.36 (Debian
+  bookworm). `Oximg.probe` also
   takes an open File (read through its descriptor, its position
   untouched) and any IO (a StringIO, a pipe, a socket), so bytes in
   memory go in as `StringIO.new(bytes)`; a String is still a path. The
