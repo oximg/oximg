@@ -33,7 +33,10 @@ module Oximg
 
     # Statuses (ext/src/lib.rs).
     OK = 0
-    READ_FAILED = 3
+    READ = 3
+
+    # The byte count READ gives for "to the end".
+    READ_ALL = 2**64 - 1
 
     # Room for an error message; the library cuts a longer one at a
     # character boundary.
@@ -54,44 +57,27 @@ module Oximg
       end
 
       # Header of +io+, read from its current position through
-      # IO#read(n) — a File, a socket, a StringIO. Only what the header
-      # needs is read, and the IO is left where the read stopped. An
-      # exception IO#read raises comes out of here unchanged.
+      # IO#read(n) — a pipe, a socket, a StringIO. Only what the header
+      # needs is read, and the IO is left where the read stopped.
+      #
+      # The library decides how much to read and the reading happens
+      # here, between calls, so the IO's code never runs under the
+      # library's frames: whatever it raises, a Timeout or a Thread#kill
+      # included, leaves the way it would leave any Ruby method.
       def probe_io(io)
-        failure = nil
-        reader = proc do |_ctx, buf, cap|
-          # Nothing may raise through the library's frames: it is not
-          # Ruby code, and unwinding across it is undefined behavior.
-          # Every exception, Interrupt included, is held and re-raised
-          # once the call is back in Ruby.
-          chunk = io.read(cap)
-          if chunk.nil? || chunk.empty?
-            0
-          elsif chunk.bytesize > cap
-            raise IOError, "#{io.class}#read(#{cap}) returned #{chunk.bytesize} bytes"
-          else
-            buf.put_bytes(0, chunk)
-            chunk.bytesize
+        prefix = String.new(encoding: Encoding::BINARY)
+        eof = false
+        loop do
+          want = nil
+          result = call do |dims, msg|
+            status = binding_module.oximg_probe_step(prefix, prefix.bytesize, eof ? 1 : 0, dims, msg, MESSAGE_BYTES)
+            want = dims.read_uint64 if status == READ
+            status
           end
-        rescue Exception => e
-          failure = e
-          -1
-        end
-        # Thread#kill and Thread#raise from another thread are not
-        # exceptions the reader above can rescue; delivered inside it,
-        # they too would jump through the library's frames. They wait
-        # until the call returns. The cost: a read that blocks forever
-        # cannot be interrupted, so give such an IO a timeout
-        # (IO#timeout=, Ruby 3.2+), whose IO::TimeoutError is an
-        # ordinary exception. #read must not `throw` or kill its own
-        # thread, for the same reason: both act at once, and no mask
-        # holds them back.
-        result = Thread.handle_interrupt(Object => :never) do
-          call { |dims, msg| binding_module.oximg_probe_read(reader, nil, dims, msg, MESSAGE_BYTES) }
-        end
-        raise failure if failure
+          return result unless want
 
-        result
+          eof = read_to(io, prefix, want)
+        end
       end
 
       # Forgets the loaded library. For tests, and for a process that
@@ -102,11 +88,25 @@ module Oximg
 
       private
 
+      # Reads +io+ onto +prefix+ until it holds +want+ bytes; true if the
+      # source ended first. READ_ALL asks for everything, which is read
+      # a MiB at a time: a length that large would be allocated up
+      # front, and an IO need only answer #read(n).
+      def read_to(io, prefix, want)
+        while want == READ_ALL || prefix.bytesize < want
+          chunk = io.read(want == READ_ALL ? 1 << 20 : want - prefix.bytesize)
+          return true if chunk.nil? || chunk.empty?
+
+          prefix << chunk.b
+        end
+        false
+      end
+
       def call
         dims = FFI::MemoryPointer.new(:uint64, 2)
         msg = FFI::MemoryPointer.new(:char, MESSAGE_BYTES)
         status = yield(dims, msg)
-        return if status == READ_FAILED
+        return if status == READ
 
         text = msg.read_string.force_encoding(Encoding::UTF_8)
         raise ProcessingError.new(text, 1) unless status == OK
@@ -149,10 +149,10 @@ module Oximg
           ffi_lib path
           attach_function :oximg_probe_abi_version, [], :uint32
           # A path read blocks on the filesystem, so it runs without the
-          # GVL; the IO variant calls back into Ruby and keeps it.
+          # GVL. A step only parses bytes already in memory and keeps
+          # it, which also keeps the prefix String where it is.
           attach_function :oximg_probe_path, %i[pointer size_t pointer pointer size_t], :int, blocking: true
-          callback :oximg_read_fn, %i[pointer pointer size_t], :ssize_t
-          attach_function :oximg_probe_read, %i[oximg_read_fn pointer pointer pointer size_t], :int
+          attach_function :oximg_probe_step, %i[buffer_in size_t uint8 pointer pointer size_t], :int
         end
         abi = mod.oximg_probe_abi_version
         unless abi == ABI_VERSION

@@ -153,8 +153,9 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
-  # An exception IO#read raises must not unwind through the library;
-  # it is held, and the same object comes out of probe.
+  # The library does no reading: IO#read runs in Ruby between steps,
+  # never under the library. Whatever leaves it, leaves probe as from
+  # any Ruby method, and the library is usable after.
   def test_reraises_what_the_io_raises
     boom = Class.new(StandardError)
     io = Object.new
@@ -162,46 +163,79 @@ class Oximg::NativeTest < Oximg::Test
     with_library do
       error = assert_raises(boom) { Oximg.probe(io) }
       assert_equal "disk went away", error.message
+      assert_equal 200, Oximg.probe(fixture("photo.jpg"))[:width]
     end
   end
 
-  # A kill from another thread (a request timeout, a shutdown) is not
-  # an exception the callback can rescue: delivered inside IO#read it
-  # would jump out through the library's frames. It waits until the call
-  # returns, so the probe runs to its end — here, the further reads a
-  # header behind 128 KiB of APP2 needs — and the thread dies after.
-  def test_defers_a_kill_until_the_library_returns
-    jpeg = File.binread(fixture("photo.jpg"))
-    app2 = "\xFF\xE2".b + [0xFFFF].pack("n") + ("\0".b * 0xFFFD)
-    io = StringIO.new(jpeg[0, 2] + app2 + app2 + jpeg[2..])
+  # A kill from another thread (a request timeout, a shutdown) lands in
+  # the read at once, rather than once a probe finishes.
+  def test_lets_a_kill_land_in_the_read
     reading = Queue.new
-    killed = Queue.new
-    reads = 0
-    io.define_singleton_method(:read) do |n|
-      reads += 1
-      if reads == 1
-        reading << true
-        killed.pop # a blocking point, where an unmasked kill would land
-      end
-      super(n)
+    io = Object.new
+    io.define_singleton_method(:read) do |_n|
+      reading << true
+      sleep 5
+      ""
     end
     with_library do
       thread = Thread.new { Oximg.probe(io) }
       reading.pop
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       thread.kill
-      killed << true
       assert_nil thread.value, "the thread was killed"
-      assert_operator reads, :>, 1, "the probe ran to its end before the kill landed"
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
+      assert_equal 200, Oximg.probe(fixture("photo.jpg"))[:width]
     end
   end
 
-  def test_refuses_a_read_longer_than_asked
+  # A Timeout.timeout the source's own #read sets up fires inside it.
+  def test_lets_a_timeout_inside_the_read_fire
+    require "timeout"
     io = Object.new
-    io.define_singleton_method(:read) { |n| "x" * (n + 1) }
+    io.define_singleton_method(:read) { |_n| Timeout.timeout(0.05) { sleep 5 } }
     with_library do
-      error = assert_raises(IOError) { Oximg.probe(io) }
-      assert_match(/returned \d+ bytes/, error.message)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(Timeout::Error) { Oximg.probe(io) }
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
     end
+  end
+
+  # So does a Thread#raise from outside, as an outer Timeout.timeout
+  # sends.
+  def test_lets_an_outer_raise_land_in_the_read
+    reading = Queue.new
+    io = Object.new
+    io.define_singleton_method(:read) do |_n|
+      reading << true
+      sleep 5
+      ""
+    end
+    with_library do
+      thread = Thread.new { Oximg.probe(io) }
+      reading.pop
+      thread.report_on_exception = false
+      thread.raise(ArgumentError, "from outside")
+      error = assert_raises(ArgumentError) { thread.value }
+      assert_equal "from outside", error.message
+    end
+  end
+
+  # "To the end" (an AVIF answer, pipeline::probe_step) is read in
+  # bounded chunks: the library built here has no AVIF, so this calls the
+  # loop directly, with an IO that answers #read(n) only.
+  def test_reads_to_the_end_in_chunks
+    bytes = "x".b * ((3 << 20) + 5)
+    source = StringIO.new(bytes)
+    lengths = []
+    io = Object.new
+    io.define_singleton_method(:read) do |n|
+      lengths << n
+      source.read(n)
+    end
+    prefix = String.new(encoding: Encoding::BINARY)
+    assert Oximg::Native.send(:read_to, io, prefix, Oximg::Native::READ_ALL), "reports the end"
+    assert_equal bytes, prefix
+    assert_equal [1 << 20], lengths.uniq
   end
 
   # Path reads run without the GVL; concurrent probes must not trip on

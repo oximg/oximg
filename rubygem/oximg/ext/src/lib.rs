@@ -7,15 +7,15 @@
 //! and cut at a UTF-8 boundary to fit `msg_cap`.
 //!
 //! Nothing may unwind into the caller: Ruby's frames are C frames, and
-//! a panic crossing them is undefined behavior. `probe_reader` already
+//! a panic crossing them is undefined behavior. The pipeline already
 //! turns the libjpeg handler's deliberate panics into errors; anything
 //! else is caught at the boundary and reported as [`PANICKED`].
 
 use std::ffi::c_int;
-use std::io::Read;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use oximg::pipeline::{self, ImageFormat};
+use std::panic::catch_unwind;
+
+use oximg::pipeline::{self, ImageFormat, ProbeStep};
 
 /// The header parsed.
 pub const OK: c_int = 0;
@@ -23,10 +23,9 @@ pub const OK: c_int = 0;
 pub const FAILED: c_int = 1;
 /// A panic reached the boundary: `msg` holds its text.
 pub const PANICKED: c_int = 2;
-/// The caller's read callback reported a failure. Nothing is written to
-/// `msg`: the caller holds the real error (in Ruby, the exception its
-/// `IO#read` raised).
-pub const READ_FAILED: c_int = 3;
+/// [`oximg_probe_step`] needs more of the source: `dims[0]` says how
+/// much. Nothing is written to `msg`.
+pub const READ: c_int = 3;
 
 /// Bumped on any change to a signature or a status's meaning. The gem
 /// refuses a library whose version it does not know, rather than
@@ -65,59 +64,43 @@ pub unsafe extern "C" fn oximg_probe_path(
     unsafe { finish(result, dims, msg, msg_cap) }
 }
 
-/// `read(ctx, buf, cap)` fills up to `cap` bytes of `buf` and returns
-/// how many it wrote, 0 at end of input, or a negative number on
-/// failure.
-pub type ReadFn =
-    unsafe extern "C" fn(ctx: *mut std::ffi::c_void, buf: *mut u8, cap: usize) -> isize;
-
-/// Probe a stream the caller reads for us through `read`, pulling only
-/// as much of it as the header takes. `read` is called on this thread,
-/// and never after this function returns.
+/// One step of a header read the caller drives (`pipeline::probe_step`):
+/// `prefix[..len]` is everything read from the source so far, `eof`
+/// nonzero once it has ended. Returns [`READ`] with `dims[0]` set to the
+/// byte count to read on to (`u64::MAX`: to the end), then call again
+/// with all of it; or the answer, as [`oximg_probe_path`] gives it.
+///
+/// The caller does the reading, so none of its code runs under these
+/// frames: an exception, a thread kill or a timeout in the caller's
+/// I/O never has a Rust frame to cross.
 ///
 /// # Safety
-/// `read` honors the [`ReadFn`] contract for `ctx`; `dims` is writable
-/// for two `u64`s and `msg` for `msg_cap` bytes.
+/// `prefix` is readable for `len` bytes (it may be null when `len` is
+/// 0), `dims` writable for two `u64`s, and `msg` for `msg_cap` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oximg_probe_read(
-    read: ReadFn,
-    ctx: *mut std::ffi::c_void,
+pub unsafe extern "C" fn oximg_probe_step(
+    prefix: *const u8,
+    len: usize,
+    eof: u8,
     dims: *mut u64,
     msg: *mut u8,
     msg_cap: usize,
 ) -> c_int {
-    let mut source = Callback {
-        read,
-        ctx,
-        failed: false,
+    let prefix = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(prefix, len) }
     };
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        pipeline::probe_reader(&mut source).map_err(|e| format!("{e:#}"))
-    }));
-    if source.failed {
-        return READ_FAILED;
-    }
-    unsafe { finish(result, dims, msg, msg_cap) }
-}
-
-struct Callback {
-    read: ReadFn,
-    ctx: *mut std::ffi::c_void,
-    failed: bool,
-}
-
-impl Read for Callback {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = unsafe { (self.read)(self.ctx, buf.as_mut_ptr(), buf.len()) };
-        // A count past `cap` would claim bytes nobody wrote.
-        match usize::try_from(n) {
-            Ok(n) if n <= buf.len() => Ok(n),
-            _ => {
-                self.failed = true;
-                Err(std::io::Error::other("read callback failed"))
-            }
+    let step = catch_unwind(|| pipeline::probe_step(prefix, eof != 0));
+    let result = match step {
+        Ok(ProbeStep::Read(want)) => {
+            unsafe { *dims = u64::try_from(want).unwrap_or(u64::MAX) };
+            return READ;
         }
-    }
+        Ok(ProbeStep::Done(result)) => Ok(result.map_err(|e| format!("{e:#}"))),
+        Err(payload) => Err(payload),
+    };
+    unsafe { finish(result, dims, msg, msg_cap) }
 }
 
 type Probed = Result<(ImageFormat, usize, usize), String>;

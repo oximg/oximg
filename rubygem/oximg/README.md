@@ -72,9 +72,15 @@ Oximg.probe(StringIO.new(bytes))               # an IO: bytes in memory
 `probe` reads the header only and decodes no pixels. The dimensions are
 the stored ones, before any EXIF rotation. A String is always a path,
 so bytes already in memory go in as a `StringIO`. A `File` is read by
-its name, its position untouched. Other IO — a `StringIO`, a pipe, a
-socket — is read from its current position through `#read(n)` and
-left where the read stopped.
+its name, its position untouched, while that name still leads to a
+regular file. Other IO — a `StringIO`, a pipe, a socket, or a `File`
+whose name no longer leads to it — is read from its current position
+through `#read(n)` and left where the read stopped.
+
+The gem does that reading itself, in Ruby, between calls into the
+library, so `#read` behaves as it would anywhere: whatever it raises
+comes out of `probe` unchanged, and a `Timeout.timeout` or a
+`Thread#kill` lands in it as usual.
 
 With the probe library, `probe` runs in-process: oximg's own probe,
 compiled into a small library (`ext/`) the gem calls through
