@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "devDependencies": {
-    "cf": "1.0.0-beta.14",
-    "wrangler": "4.151.3"
+    "cf": "1.0.0-beta.26",
+    "wrangler": "4.156.0"
   }
 }
