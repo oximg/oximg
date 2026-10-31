@@ -139,6 +139,37 @@ jobs:
           "$bin" resize tests/fixtures/photo.jpg 100 100 /tmp/smoke.webp
           "$bin" probe /tmp/smoke.webp | grep -q image/webp
           echo "ok: resize + probe round-trip"
+      # The probe library the platform gem bundles (rubygem/oximg/ext),
+      # by the recipe CI uses. build.sh fails a Linux build that still
+      # needs libstdc++.
+      - name: Build the probe library
+        run: sh rubygem/oximg/ext/build.sh
+      # On a bare image of the platform, with glibc 2.36 (Debian
+      # bookworm, the official Ruby images' base), older than this
+      # runner's: the library must load there.
+      - name: Smoke test the probe library (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD":/src:ro ruby:3.4-slim-bookworm sh -c '
+            set -e
+            gem install ffi --no-document >/dev/null
+            ruby -I /src/rubygem/oximg/lib /src/rubygem/oximg/ext/smoke.rb \
+              /src/target/oximg-probe/release/liboximg_probe.so /src/tests/fixtures'
+      - uses: ruby/setup-ruby@v1
+        if: runner.os == 'macOS'
+        with:
+          ruby-version: "3.4"
+      - name: Smoke test the probe library (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          gem install ffi --no-document >/dev/null
+          ruby -I rubygem/oximg/lib rubygem/oximg/ext/smoke.rb \
+            target/oximg-probe/release/liboximg_probe.dylib tests/fixtures
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.target }}
+          path: target/oximg-probe/release/liboximg_probe.${{ runner.os == 'macOS' && 'dylib' || 'so' }}
+          if-no-files-found: error
       - name: Package and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -189,7 +220,8 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src rust:alpine sh -c '
             apk add --no-cache build-base cmake nasm >/dev/null &&
             cargo build --release --locked &&
-            strip target/release/oximg'
+            strip target/release/oximg &&
+            sh rubygem/oximg/ext/build.sh'
           # The container builds as root into the mounted workspace, so
           # every artifact it leaves behind is root-owned. Hand the
           # whole tree back before any host-side step touches it.
@@ -203,6 +235,21 @@ jobs:
             ./target/release/oximg resize tests/fixtures/photo.jpg 100 100 /tmp/smoke.webp
             ./target/release/oximg probe /tmp/smoke.webp | grep -q image/webp'
           echo "ok: runs on bare Alpine, no runtime dependencies"
+      # The probe library loads on Alpine with only ruby installed: no
+      # libstdc++, no toolchain (ffi installs a prebuilt musl gem).
+      - name: Smoke test the probe library
+        run: |
+          docker run --rm -v "$PWD":/src:ro alpine:latest sh -c '
+            set -e
+            apk add --no-cache ruby >/dev/null
+            gem install ffi --no-document >/dev/null
+            ruby -I /src/rubygem/oximg/lib /src/rubygem/oximg/ext/smoke.rb \
+              /src/target/oximg-probe/release/liboximg_probe.so /src/tests/fixtures'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.target }}
+          path: target/oximg-probe/release/liboximg_probe.so
+          if-no-files-found: error
       - name: Package and upload
         env:
           GH_TOKEN: ${{ github.token }}
@@ -220,7 +267,10 @@ jobs:
   # per released binary. The platform gems bundle the executable the
   # `binaries` jobs just uploaded, which is the whole point: `bundle
   # install` and a Rails app has image processing, with no libvips or
-  # ImageMagick on the box. Platforms with no build (Intel macOS) fall
+  # ImageMagick on the box. They also bundle the probe library those
+  # jobs built and smoke-tested, so Oximg.probe runs in-process (and
+  # they depend on ffi, which the plain gem does not). Platforms with
+  # no build (Intel macOS) fall
   # back to the plain gem, which resolves a binary from OXIMG_BIN or
   # PATH.
   #
@@ -262,13 +312,22 @@ jobs:
           mkdir -p dist
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
             --pattern 'oximg-*.tar.gz' --dir dist
+      # The probe libraries the build jobs smoke-tested, one directory
+      # per target (dist/probe/probe-<target>/). Workflow artifacts, not
+      # release assets: they are gem contents, not downloads of their own.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: probe-*
+          path: dist/probe
       - name: Build the gems
         working-directory: rubygem/oximg
         run: |
           set -euo pipefail
           dist="$GITHUB_WORKSPACE/dist"
-          mkdir -p exe && rm -f exe/oximg
-          # Plain-Ruby gem first, while exe/ is still empty.
+          mkdir -p exe lib/oximg/native
+          rm -f exe/oximg lib/oximg/native/liboximg_probe.*
+          # Plain-Ruby gem first, while exe/ and lib/oximg/native/ are
+          # still empty: it bundles neither, so it does not depend on ffi.
           gem build oximg.gemspec -o "$dist/oximg-ruby.gem"
           # The Linux platforms are spelled out per libc: an
           # unqualified `x86_64-linux` gem installs on musl too, where a
@@ -285,9 +344,16 @@ jobs:
             name="oximg-${GITHUB_REF_NAME}-${target}"
             tar xzf "$dist/$name.tar.gz" -C "$dist"
             install -m 0755 "$dist/$name/oximg" exe/oximg
+            # Exactly one library per platform gem, or the build fails:
+            # a platform gem without one would quietly spawn again.
+            rm -f lib/oximg/native/liboximg_probe.*
+            set -- "$dist/probe/probe-$target"/liboximg_probe.*
+            test "$#" -eq 1 && test -f "$1"
+            install -m 0644 "$1" lib/oximg/native/
             OXIMG_GEM_PLATFORM="$platform" gem build oximg.gemspec -o "$dist/oximg-$platform.gem"
+            gem spec "$dist/oximg-$platform.gem" files | grep -q 'lib/oximg/native/liboximg_probe\.'
           done
-          rm -f exe/oximg
+          rm -f exe/oximg lib/oximg/native/liboximg_probe.*
       - uses: rubygems/configure-rubygems-credentials@v2.1.0
       - name: Publish
         run: |

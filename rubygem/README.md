@@ -4,7 +4,7 @@ Two gems, split the way `imgproxy` and `imgproxy-rails` are:
 
 | Gem | What it is |
 |---|---|
-| [`oximg`](oximg) | The engine. Drives the oximg executable from Ruby — `Oximg.resize`, `Oximg.probe` — so an app can compress and resize without libvips or ImageMagick. Platform gems bundle the binary |
+| [`oximg`](oximg) | The engine. Drives the oximg executable from Ruby — `Oximg.resize`, `Oximg.probe` — so an app can compress and resize without libvips or ImageMagick. Platform gems bundle the binary, and a library that runs `probe` in-process |
 | [`oximg-rails`](oximg-rails) | The Rails-facing half. Today: `Oximg::Server`, which builds and HMAC-signs URLs for a remote oximg server. Next: the ActiveStorage glue |
 
 Both track the oximg release they belong to, the same convention the npm
@@ -14,13 +14,22 @@ package uses.
 
 ```
 rubygem/oximg/         lib/, test/, exe/ (empty; filled at package time)
+rubygem/oximg/ext/     the probe library (Rust, C ABI) and its build.sh
 rubygem/oximg-rails/   lib/, test/
 ```
 
-`rubygem/oximg/exe/` is empty in the repo. The release workflow drops
-the matching binary in and builds one platform gem per released target,
-then a plain-Ruby gem with an empty `exe/` for everything else — those
-resolve a binary from `OXIMG_BIN` or PATH.
+`rubygem/oximg/exe/` and `lib/oximg/native/` are empty in the repo. The
+release workflow drops the matching binary and probe library in and
+builds one platform gem per released target, then a plain-Ruby gem with
+both empty for everything else — those resolve a binary from
+`OXIMG_BIN` or PATH, and spawn it to probe. A platform gem depends on
+`ffi`, to call the library; the plain gem does not.
+
+The probe library is built by `ext/build.sh` everywhere (`rake compile`,
+CI, the release), which links the C++ runtime statically and fails a
+build whose library still needs libstdc++; each release build job
+loads it on a bare image of its platform (`ext/smoke.rb`) before it
+goes into a gem.
 
 | Gem platform | From release target | Notes |
 |---|---|---|
@@ -35,7 +44,8 @@ Alpine is the one platform where "it works on Linux" is not an answer —
 a glibc binary does not run there — so CI proves it end to end on every
 push (`rubygem-musl`): build in Alpine, run both suites there, then
 build the platform gem, install it into an empty `GEM_HOME` with only
-`ruby` present, and resize a real image through it. If that needs a
+`ruby` present, resize a real image through it, and probe in-process
+through the library it bundles. If that needs a
 build toolchain, the gem is not self-contained and the premise of
 shipping one has failed.
 
