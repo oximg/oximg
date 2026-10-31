@@ -10,6 +10,31 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-31
+
+Lossless metadata removal, memory, and the Ruby gem's header reads.
+
+- `oximg strip` removes EXIF, XMP, IPTC and comments from a JPEG, PNG
+  or WebP without re-encoding ([#127]); also `pipeline::strip` and
+  `Oximg.strip`.
+- Large images hold far less ([#129], [#133]): PNG sources decode
+  from the file without a heap copy; unscaled requests pass the
+  decoded frame to the encoder; JPEG at its own size and JPEG output
+  above 16 MP stream; PNG output streams into IDAT chunks. The
+  decoded-bytes estimate now prices the path that runs, including
+  the encoder ([#130]), so a cap calibrated on 0.17.0's figures may
+  admit or refuse differently.
+- The Ruby platform gems probe in-process through a bundled library
+  ([#134]): microseconds per header read instead of a millisecond
+  spawn. They now depend on `ffi`.
+
+Output against 0.17.0, by `oximg-ctl parity` on both architectures
+(Apple M2 Max and AMD Ryzen 7 8745HS): 117 of 132 fixture cells are
+byte-identical, and the other 15 are PNG outputs whose deflate stream
+changed while every decoded pixel matches (see Changed). JPEG outputs
+above 16 MP change layout by design (`OXIMG_JPEG_STREAMING_PIXELS`);
+no fixture is that large.
+
 ### Added
 
 - **`oximg strip`: lossless metadata removal** ([#127]). `oximg strip
@@ -21,8 +46,9 @@ HTTP interface without notice.
   JPEG strips in 0.02 s at 45 MB peak RSS. The `resize 0 0` workaround
   took 0.96 s and 602 MiB on a similar file (M2 Max). What survives is
   an allowlist of what rendering needs. A rotated photo keeps an EXIF
-  block with only its orientation, so it still displays upright. `--icc` defaults to
-  `OXIMG_ICC` (keep). Dropping a CMYK JPEG's profile is refused, and
+  block with only its orientation, so it still displays upright.
+  `--icc` defaults to `OXIMG_ICC` (keep). Dropping a CMYK JPEG's
+  profile is refused, and
   GIF and AVIF are not supported (exit 1). `oximg-ctl strip` proves a
   run: removed blocks, residue, pixel identity, and peak RSS.
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
@@ -54,14 +80,13 @@ HTTP interface without notice.
 
   The library needs only libc and libgcc_s, which Ruby itself needs: it
   loads on Alpine without libstdc++ and on glibc 2.36 (Debian
-  bookworm). `Oximg.probe` also
-  takes an open File (read through its descriptor, its position
-  untouched) and any IO (a StringIO, a pipe, a socket), so bytes in
-  memory go in as `StringIO.new(bytes)`; a String is still a path. The
-  plain-Ruby gem, or a platform gem whose library cannot load, spawns
-  as before and answers the same; `Oximg.in_process_probe?` says which.
-  `OXIMG_PROBE_LIB` points at another library. `resize` still runs in a
-  child process.
+  bookworm). `Oximg.probe` also takes an open File (read through its
+  descriptor, its position untouched) and any IO (a StringIO, a pipe,
+  a socket), so bytes in memory go in as `StringIO.new(bytes)`; a
+  String is still a path. The plain-Ruby gem, or a platform gem whose
+  library cannot load, spawns as before and answers the same;
+  `Oximg.in_process_probe?` says which. `OXIMG_PROBE_LIB` points at
+  another library. `resize` still runs in a child process.
 
 ### Changed
 
@@ -132,11 +157,12 @@ HTTP interface without notice.
   incompressible content. It now writes 256 KiB IDAT chunks as it
   deflates: peak RSS -22 to -27% on photos and -49 to -50% on noise
   (2000² and 4000² re-encodes, M2 Max), and the decoded-bytes estimate
-  prices the PNG encoder at half what it did. At the default effort
-  the deflate stream is unchanged (the zlib levels add a few bytes), so
-  files differ only by the extra chunk framing (+0.01%) and decode to
-  the same pixels; output that fdeflate would expand still falls back
-  to stored blocks.
+  prices the PNG encoder at half what it did. The bytes change and the
+  pixels do not: on the 15 PNG cells of `oximg-ctl parity` against
+  0.17.0 (64–333 px outputs, one IDAT each) every decoded pixel and
+  the filtered scanlines match, and the deflate stream comes out 0–38
+  B smaller; a larger output adds a 12-byte chunk header per 256 KiB.
+  Output that fdeflate would expand still falls back to stored blocks.
 - **A PNG probe no longer inflates pixel data** ([#134]). It decoded
   the first row and discarded it, which was 85–98% of its time: 1 µs
   instead of 6–83 µs on the fixtures (Apple M2 Max; 5–66 µs on a Ryzen
@@ -204,7 +230,7 @@ us-east-1 through the compiled server:
 
 Remote fetches of every kind now keep to one deadline (see Fixed).
 Every other response is byte-identical to 0.16.0. Checked on
-starship (Zen 4):
+an AMD Zen 4 machine:
 - all 330 local fixture cells;
 - 42 fixture cells through an HTTP origin, statuses included;
 - 120 DIV2K resizes.
@@ -251,8 +277,8 @@ A security and maintenance release.
 - **The Ruby gems now require Ruby 3.2** (3.1 is end of life). This is
   the reason for a minor version rather than a patch.
 
-Every response is byte-identical to 0.15.0. Checked on starship (Zen
-4): all 330 fixture cells (every fixture, 5 boxes, bare / `@webp` /
+Every response is byte-identical to 0.15.0. Checked on an AMD Zen 4
+machine: all 330 fixture cells (every fixture, 5 boxes, bare / `@webp` /
 `@jpg`) and 120 DIV2K resizes (40 photographs at fit 1024, 512 and 128).
 Library and HTTP APIs are unchanged. No code path that the published
 benchmarks run changed, and they were not re-run.
@@ -2073,7 +2099,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.17.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/oximg/oximg/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/oximg/oximg/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/oximg/oximg/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/oximg/oximg/compare/v0.14.0...v0.15.0
