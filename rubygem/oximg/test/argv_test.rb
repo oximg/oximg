@@ -45,6 +45,20 @@ class Oximg::ArgvTest < Oximg::Test
     assert_raises(ArgumentError) { argv("/a.jpg", "/b.jpg", auto_rotate: 0) }
   end
 
+  def test_env_is_validated_against_the_known_knobs
+    assert_equal({}, Oximg.knob_env(nil))
+    assert_equal({"OXIMG_ICC" => "0", "OXIMG_WEBP_QUALITY" => "70", "OXIMG_AUTO_ROTATE" => nil},
+      Oximg.knob_env(OXIMG_ICC: "0", "OXIMG_WEBP_QUALITY" => 70, "OXIMG_AUTO_ROTATE" => nil))
+    # A typo fails closed instead of being passed along and ignored.
+    error = assert_raises(ArgumentError) { Oximg.knob_env("OXIMG_ICCC" => "0") }
+    assert_match(/OXIMG_ICCC/, error.message)
+    # Server-startup and non-OXIMG names are not per-call knobs.
+    assert_raises(ArgumentError) { Oximg.knob_env("OXIMG_KEY" => "k") }
+    assert_raises(ArgumentError) { Oximg.knob_env("PATH" => "/tmp") }
+    assert_raises(ArgumentError) { Oximg.knob_env("OXIMG_ICC" => false) }
+    assert_raises(ArgumentError) { Oximg.knob_env([["OXIMG_ICC", "0"]]) }
+  end
+
   def test_accepts_string_and_symbol_tokens
     assert_includes argv("/a.jpg", "/b.png", format: "PNG"), "png"
     assert_includes argv("/a.jpg", "/b.jpg", preset: "jpegli"), "jpegli"

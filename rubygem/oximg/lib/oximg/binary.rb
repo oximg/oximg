@@ -60,8 +60,14 @@ module Oximg
       # nothing in a filename can be interpreted as syntax. Returns
       # [stdout, stderr]; a non-zero exit raises with the binary's own
       # stderr, which already names what it refused.
-      def run(*args)
-        out, err, status = Open3.capture3(path, *args)
+      #
+      # +env+ is merged into the child's environment only (a nil value
+      # unsets that name there): one process per call means one call's
+      # knobs never reach another's, even across threads, and the
+      # parent's ENV is never touched. Validate it first; Oximg.resize
+      # and Oximg.strip do.
+      def run(*args, env: {})
+        out, err, status = Open3.capture3(env, path, *args)
         unless status.success?
           message = err.strip
           message = "oximg exited #{status.exitstatus}" if message.empty?

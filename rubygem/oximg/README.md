@@ -66,7 +66,7 @@ cannot be read as a flag.
 ## Stripping metadata
 
 ```ruby
-Oximg.strip(source, destination, icc: nil)
+Oximg.strip(source, destination, icc: nil, env: nil)
 ```
 
 Removes EXIF (GPS, camera, timestamps), XMP, IPTC and comments from a
@@ -78,9 +78,25 @@ still displays upright. `icc: :strip` also drops the colour profile.
 The default is `:keep`, or `OXIMG_ICC`. Dropping a CMYK JPEG's profile
 raises `Oximg::ProcessingError`, as do GIF and AVIF sources.
 
+## Knobs, per process or per call
+
 Everything the server tunes through `OXIMG_*` environment variables
 applies here too, and is validated the same fail-closed way: a typo'd
 knob is a startup error, never a silent default.
+
+To set one for a single call, pass `env:` to `resize` or `strip`:
+
+```ruby
+Oximg.resize("in.jpg", "out.jpg", width: 750, env: {"OXIMG_JPEG_PROGRESSIVE" => "0"})
+```
+
+Each call spawns its own process, and `env:` reaches that process
+only: `ENV` is never touched, so concurrent calls in a threaded job
+runner each get their own settings. Names must be in `Oximg::KNOBS`
+(the pipeline knobs; server settings such as `OXIMG_KEY` are refused),
+values are Strings or Integers, and `nil` unsets a name for that call.
+An unknown name raises `ArgumentError` before anything runs; a bad
+value is refused by the binary (`ProcessingError`, status 2).
 
 ## Probing
 

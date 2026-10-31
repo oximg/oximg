@@ -88,6 +88,47 @@ class Oximg::ProcessingTest < Oximg::Test
     end
   end
 
+  # env: reaches the binary, and only for that call: four threads at
+  # once, alternating OXIMG_ICC=0, each get their own answer.
+  def test_env_applies_to_one_call_only
+    in_tmpdir do |dir|
+      source = File.join(dir, "rotated-icc.jpg")
+      File.binwrite(source, tagged_photo)
+      outs = 8.times.map { |i| File.join(dir, "out#{i}.jpg") }
+      outs.each_slice(4).each do |batch|
+        batch.each_with_index.map do |out, i|
+          Thread.new { Oximg.resize(source, out, env: i.even? ? {"OXIMG_ICC" => "0"} : {}) }
+        end.each(&:join)
+      end
+      outs.each_with_index do |out, i|
+        assert_equal i.odd?, File.binread(out).include?("ICC_PROFILE"), "call #{i}"
+      end
+      assert_nil ENV["OXIMG_ICC"]
+    end
+  end
+
+  # The binary validates knob values the same fail-closed way it does at
+  # startup: a bad one is a usage error, exit 2.
+  def test_env_values_are_validated_by_the_binary
+    in_tmpdir do |dir|
+      error = assert_raises(Oximg::ProcessingError) do
+        Oximg.resize(fixture("photo.jpg"), File.join(dir, "out.jpg"), env: {"OXIMG_WEBP_QUALITY" => "lots"})
+      end
+      assert_equal 2, error.status
+      assert_match(/OXIMG_WEBP_QUALITY/, error.message)
+    end
+  end
+
+  def test_strip_takes_env
+    in_tmpdir do |dir|
+      source = File.join(dir, "rotated-icc.jpg")
+      File.binwrite(source, tagged_photo)
+      out = File.join(dir, "out.jpg")
+      Oximg.strip(source, out, env: {"OXIMG_ICC" => "0"})
+      refute_includes File.binread(out), "ICC_PROFILE"
+    end
+  end
+
   def test_probe_reads_headers_only
     probed = Oximg.probe(fixture("photo.jpg"))
     assert_equal "image/jpeg", probed[:content_type]

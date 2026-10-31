@@ -32,6 +32,13 @@ HTTP interface without notice.
   `OXIMG_ICC` / `OXIMG_AUTO_ROTATE`. The flag wins over the knob;
   `--auto-rotate` forces rotation on under `OXIMG_AUTO_ROTATE=0`. An
   unknown `--icc` value is a usage error (exit 2).
+- **The Ruby gem takes per-call settings** ([#128]).
+  `Oximg.resize(..., icc: :keep | :strip, auto_rotate: true | false)`
+  maps onto those flags, and `env:` on `resize` and `strip` sets any
+  other pipeline knob for that call only (`Binary.run(*args, env:)`):
+  it reaches the one child process the call spawns, never `ENV`, so it
+  is safe across threads. Names are checked against `Oximg::KNOBS`,
+  which a test pins to the binary's own inventory.
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
   file gets `probe.jpeg.{sof,progressive}` (the SOFn number: 0
   baseline, 1 extended sequential, 2 progressive), so a proof of which
