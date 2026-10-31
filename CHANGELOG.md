@@ -20,7 +20,9 @@ HTTP interface without notice.
   bytes; an AVIF is read through EOF, since a size-0 box can make a
   prefix parse where the whole file does not. A failing reader is
   `SourceUnreadable` (or `SourceNotFound` / `SourceTooLarge`), never
-  `Undecodable`.
+  `Undecodable`. `pipeline::probe_step` is the same read one step at a
+  time, for a caller that does its own I/O: it says how many bytes to
+  read next, or gives the answer.
 - **The Ruby gem can probe in-process** ([#134]). Given the probe
   library (`rubygem/oximg/ext`, loaded with the `ffi` gem, from
   `OXIMG_PROBE_LIB` or bundled in the gem), `Oximg.probe` calls oximg's
