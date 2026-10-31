@@ -19,10 +19,19 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
         format,
         quality,
         preset,
+        icc,
+        auto_rotate,
     } = a;
     let format = format.as_deref();
     let quality = quality.as_deref();
     let preset = preset.as_deref();
+    let flags = Flags {
+        format,
+        quality,
+        preset,
+        icc: icc.as_deref(),
+        auto_rotate: *auto_rotate,
+    };
     let bin = resolve_bin(opts.bin.as_deref())?;
     let ephemeral = out.is_none();
     let tmp;
@@ -56,14 +65,14 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
                 "ok": true,
                 "dry_run": true,
                 "bin": bin.display().to_string(),
-                "argv": resize_argv(input, w, h, out_path, format, quality, preset),
+                "argv": resize_argv(input, w, h, out_path, &flags),
             }),
             opts.pretty,
         );
         return Ok(());
     }
     let _ephemeral = RemoveOnDrop(ephemeral.then(|| out_path.to_path_buf()));
-    let argv = resize_argv(input, w, h, out_path, format, quality, preset);
+    let argv = resize_argv(input, w, h, out_path, &flags);
     let t0 = Instant::now();
     let mut cmd = Command::new(&bin);
     cmd.args(&argv[1..]);
@@ -96,6 +105,7 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
         "sha256": sha256_hex(&bytes),
         "ms": (ms * 10.0).round() / 10.0,
         "probe": probe,
+        "icc_bytes": icc_bytes(&bytes),
         "peak_rss_bytes": peak_rss_bytes(),
         "stderr": stderr,
     });
@@ -168,15 +178,37 @@ fn decoded_bytes(stderr: &str) -> Option<Value> {
     }))
 }
 
-fn resize_argv(
-    input: &Path,
-    w: &str,
-    h: &str,
-    out: &Path,
-    format: Option<&str>,
-    quality: Option<&str>,
-    preset: Option<&str>,
-) -> Vec<String> {
+/// Size of the colour profile embedded in an output, or null when there
+/// is none: what proves `--icc` and `OXIMG_ICC`. Read back through the
+/// library's strip, whose profile-only removal names exactly the
+/// profile block (APP2 ICC_PROFILE chain, `iCCP`, `ICCP`); payload plus
+/// container framing, so compare against null, not the source's length.
+fn icc_bytes(bytes: &[u8]) -> Option<usize> {
+    let keep = |icc| oximg::pipeline::StripParams { icc: Some(icc) };
+    let with = oximg::pipeline::strip(bytes, &keep(true)).ok()?;
+    let without = oximg::pipeline::strip(bytes, &keep(false)).ok()?;
+    let n = with.bytes.len().checked_sub(without.bytes.len())?;
+    (n > 0).then_some(n)
+}
+
+/// The optional flags, in the order `resize_argv` emits them.
+#[derive(Default)]
+struct Flags<'a> {
+    format: Option<&'a str>,
+    quality: Option<&'a str>,
+    preset: Option<&'a str>,
+    icc: Option<&'a str>,
+    auto_rotate: Option<bool>,
+}
+
+fn resize_argv(input: &Path, w: &str, h: &str, out: &Path, f: &Flags) -> Vec<String> {
+    let Flags {
+        format,
+        quality,
+        preset,
+        icc,
+        auto_rotate,
+    } = *f;
     let mut v = vec![
         "oximg".into(),
         "resize".into(),
@@ -197,6 +229,15 @@ fn resize_argv(
         v.push("--preset".into());
         v.push(p.into());
     }
+    if let Some(i) = icc {
+        v.push("--icc".into());
+        v.push(i.into());
+    }
+    match auto_rotate {
+        Some(true) => v.push("--auto-rotate".into()),
+        Some(false) => v.push("--no-auto-rotate".into()),
+        None => {}
+    }
     v
 }
 
@@ -211,9 +252,7 @@ mod tests {
             "100",
             "0",
             Path::new("o.jpg"),
-            None,
-            None,
-            None,
+            &Flags::default(),
         );
         assert_eq!(argv, ["oximg", "resize", "in.jpg", "100", "0", "o.jpg"]);
     }
@@ -225,9 +264,13 @@ mod tests {
             "64",
             "64",
             Path::new("/tmp/o.webp"),
-            Some("webp"),
-            Some("70"),
-            Some("fast"),
+            &Flags {
+                format: Some("webp"),
+                quality: Some("70"),
+                preset: Some("fast"),
+                icc: Some("strip"),
+                auto_rotate: Some(false),
+            },
         );
         assert_eq!(
             argv,
@@ -243,7 +286,10 @@ mod tests {
                 "-q",
                 "70",
                 "--preset",
-                "fast"
+                "fast",
+                "--icc",
+                "strip",
+                "--no-auto-rotate"
             ]
         );
     }
