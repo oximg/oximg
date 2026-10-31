@@ -58,7 +58,11 @@ out="$target_dir/release/$library"
 test -f "$out" || { echo "build.sh: cargo produced no $library" >&2; exit 1; }
 
 if [ "$(uname -s)" = Linux ]; then
-  needed=$(readelf -d "$out" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+  # Its own assignment, so a missing or failing readelf stops the build
+  # (set -e) rather than passing an empty list through the check.
+  dynamic=$(readelf -d "$out")
+  needed=$(printf '%s\n' "$dynamic" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+  test -n "$needed" || { echo "build.sh: readelf found no NEEDED entries in $library" >&2; exit 1; }
   echo "build.sh: $library needs: $(echo $needed)" >&2
   if echo "$needed" | grep -q 'libstdc++'; then
     echo "build.sh: $library still needs libstdc++" >&2
