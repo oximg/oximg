@@ -28,6 +28,16 @@ HTTP interface without notice.
   EC2, IMDS needs a hop limit of 2. The `~/.aws` files, SSO and
   `credential_process` are not read. No new dependency.
 
+### Changed
+
+- **On AWS, `s3://` follows a bucket to its region** ([#11]).
+  `AWS_REGION` now means what it means in the AWS SDKs: the default
+  region. ECS and EKS set it to the region they run in, which can differ
+  from the bucket's. When S3 answers 301 with the bucket's region, oximg
+  sends that bucket's requests there and logs it once at boot. Before,
+  boot stopped and asked to check `AWS_REGION`. STS uses `AWS_REGION`. A
+  custom `OXIMG_S3_ENDPOINT` is not affected.
+
 ## [0.21.0] - 2026-11-12
 
 Animated GIF sources get an optional budget for the decode half

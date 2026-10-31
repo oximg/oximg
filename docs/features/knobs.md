@@ -46,7 +46,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `GCE_METADATA_HOST` | Google metadata | GCS auth emulator / PSC; read when fetching or refreshing the metadata token (including the startup credential probe) |
 | `OXIMG_S3_ENDPOINT` | AWS for `AWS_REGION` (China uses `.amazonaws.com.cn`) | `scheme://host[:port]` of an S3-compatible store (R2, MinIO) |
 | `OXIMG_S3_PATH_STYLE` | `1` with a custom endpoint or for a bucket name with a `.`, else `0` | `0`/`1`: bucket in the path or in the host name |
-| `AWS_REGION` | unset | Required for `s3://`; signed into every request. R2 accepts `auto` |
+| `AWS_REGION` | unset | Required for `s3://`; the default region, as in the AWS SDKs. On AWS, a bucket in another region is found from S3's 301 at boot. R2 accepts `auto` |
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` static key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` static key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` temporary keys only |
