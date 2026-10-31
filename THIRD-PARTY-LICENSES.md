@@ -448,7 +448,7 @@ Used by:
 ## Apache License 2.0
 
 Used by:
-- [oximg 0.17.0](https://github.com/oximg/oximg)
+- [oximg 0.18.0](https://github.com/oximg/oximg)
 - [cmov 0.5.4](https://github.com/RustCrypto/utils)
 - [ctutils 0.4.6](https://github.com/RustCrypto/utils)
 - [utf8_iter 1.0.4](https://github.com/hsivonen/utf8_iter)

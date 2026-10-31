@@ -1,6 +1,6 @@
 [package]
 name = "oximg"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 # The fuzz harness, the website, the local gate, and the agent
 # instructions are repo tools, not crate content.
