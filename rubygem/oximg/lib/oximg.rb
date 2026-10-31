@@ -181,11 +181,15 @@ module Oximg
     end
 
     # The executable reads paths only, so without the library an IO
-    # goes through a tempfile.
+    # goes through a tempfile. It is read through #read(n) alone, as the
+    # library reads it, so probe takes the same IO either way
+    # (IO.copy_stream would also pass #read a buffer).
     def probe_spawned_io(io)
       Tempfile.create("oximg-probe") do |file|
         file.binmode
-        IO.copy_stream(io, file)
+        while (chunk = io.read(1 << 20)) && !chunk.empty?
+          file.write(chunk)
+        end
         file.flush
         out, = Binary.run("probe", file.path)
         parse_probe(out)

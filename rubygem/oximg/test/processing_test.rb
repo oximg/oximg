@@ -95,6 +95,16 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_equal Oximg.probe(fixture("photo.jpg")), probed
   end
 
+  # The same IO the library takes: one that answers #read(n) and no
+  # more (IO.copy_stream would pass it a buffer too).
+  def test_probe_reads_a_read_n_only_io_through_the_executable
+    source = StringIO.new(File.binread(fixture("photo.jpg")))
+    io = Object.new
+    io.define_singleton_method(:read) { |n| source.read(n) }
+    assert_equal Oximg.probe(fixture("photo.jpg")), Oximg.probe(io)
+  end
+
+
   # The binary already names what it refused; the gem must surface that
   # rather than a bare exit status.
   def test_surfaces_the_binarys_own_error
