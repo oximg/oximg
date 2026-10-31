@@ -82,6 +82,12 @@ fn probe_photo_jpg() {
     assert_eq!(v["probe"]["content_type"], "image/jpeg");
     assert_eq!(v["probe"]["width"], 200);
     assert_eq!(v["probe"]["height"], 150);
+    assert_eq!(v["probe"]["jpeg"]["sof"], 0);
+    assert_eq!(v["probe"]["jpeg"]["progressive"], false);
+    let (code, v) = run(&["probe", &fixture("cmyk_prog.jpg")]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["jpeg"]["sof"], 2);
+    assert_eq!(v["probe"]["jpeg"]["progressive"], true);
 }
 
 #[test]
@@ -1474,4 +1480,82 @@ fn parity_dry_run_is_the_plan_and_needs_against() {
         v["cells"],
         serde_json::json!(["/resize/64/0/photo.jpg", "/resize/64/0/photo.jpg@webp"])
     );
+}
+
+/// The segments of a JPEG up to SOS, minus every APP2, then the rest.
+fn without_app2(jpeg: &[u8]) -> Vec<u8> {
+    let mut out = jpeg[..2].to_vec();
+    let mut i = 2;
+    while jpeg[i] == 0xFF && jpeg[i + 1] != 0xDA {
+        let end = i + 2 + u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        if jpeg[i + 1] != 0xE2 {
+            out.extend_from_slice(&jpeg[i..end]);
+        }
+        i = end;
+    }
+    out.extend_from_slice(&jpeg[i..]);
+    out
+}
+
+/// A box at least the source's size re-encodes the JPEG at its own
+/// size, which streams decoder rows into the encoder instead of
+/// staging the frame (issue #129). Over HTTP the body is the bytes the
+/// library's staged decode + encode makes, and a source profile still
+/// lands ahead of the scan: the profiled body minus its APP2 chain is
+/// the unprofiled one.
+#[test]
+fn get_exact_size_jpeg_matches_the_staged_encode() {
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-exact-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo = std::fs::read(fixture("photo.jpg")).unwrap();
+    let icc: Vec<u8> = (0..900usize).map(|i| ((i * 131 + 7) % 251) as u8).collect();
+    let mut app2 = vec![0xFF, 0xE2];
+    app2.extend_from_slice(&((2 + 14 + icc.len()) as u16).to_be_bytes());
+    app2.extend_from_slice(b"ICC_PROFILE\0\x01\x01");
+    app2.extend_from_slice(&icc);
+    let mut profiled = photo[..2].to_vec();
+    profiled.extend_from_slice(&app2);
+    profiled.extend_from_slice(&photo[2..]);
+    std::fs::write(dir.join("photo.jpg"), &photo).unwrap();
+    std::fs::write(dir.join("icc.jpg"), &profiled).unwrap();
+
+    let body = |name: &str| {
+        let out = dir.join(format!("{name}.out"));
+        let (code, v) = run(&[
+            "--images-dir",
+            dir.to_str().unwrap(),
+            "get",
+            &format!("/resize/1000/1000/{name}"),
+            "--expect",
+            "200",
+            "--write",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["content_type"], "image/jpeg", "{v}");
+        assert_eq!(
+            (&v["probe"]["width"], &v["probe"]["height"]),
+            (&200.into(), &150.into())
+        );
+        std::fs::read(out).unwrap()
+    };
+    let plain = body("photo.jpg");
+    let (rgb, w, h) = oximg::pipeline::decode_and_resize(&photo, 1000, 1000, 1).unwrap();
+    assert_eq!((w, h), (200, 150));
+    let staged = oximg::pipeline::encode(&rgb, w, h, &oximg::pipeline::Params::default()).unwrap();
+    assert!(
+        plain == staged,
+        "streamed body differs from the staged encode"
+    );
+
+    let with_icc = body("icc.jpg");
+    assert!(
+        with_icc.windows(icc.len()).any(|w| w == icc),
+        "profile dropped"
+    );
+    assert!(
+        without_app2(&with_icc) == plain,
+        "profile changed more than APP2"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

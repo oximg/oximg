@@ -383,16 +383,10 @@ pub(super) fn fused_resize_encode<R: std::io::BufRead>(
             let back = back_lut();
             let mut row8 = vec![0u8; dst_w * 3];
 
-            // Mirrors encode_jpegli (including the progressive knob).
-            let mut enc = JpegliEncoder::new(dst_w, dst_h, quality, jpegli_mode(dst_w, dst_h));
-            // Same chunker, same position as encode_jpegli: the profile
-            // precedes the scanlines, so fused output stays
-            // byte-identical to the serial encoder.
-            if let Some(icc) = icc {
-                for chunk in icc_app2_chunks(icc) {
-                    enc.write_marker(JPEG_APP2, &chunk);
-                }
-            }
+            // The serial encoder's own start (scan-layout knobs, profile
+            // chunks ahead of the scanlines), so fused output stays
+            // byte-identical to it.
+            let mut enc = start_jpegli(dst_w, dst_h, quality, icc);
 
             chunks.for_each_row(|row| {
                 let mut enc_result = Ok(());

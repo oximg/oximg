@@ -1251,18 +1251,12 @@ thread_local! {
 
 #[derive(Default)]
 struct Scratch {
-    /// Set by the JPEG paths from the header scan before decode_resize
-    /// runs: whether libjpeg will buffer whole-image coefficients for
-    /// this source. Carried here rather than as a ninth parameter, and
-    /// reset per request by its setters (both JPEG entry points assign
-    /// it unconditionally).
-    jpeg_progressive: bool,
     /// Compressed source bytes the *caller* holds resident for this
     /// request (a buffered remote source, or any `process(&bytes, ..)`
-    /// input); zero on the streaming entry points. Carried here like
-    /// `jpeg_progressive` — set unconditionally by `process_reader` —
-    /// so the per-format cost sites can count it without a new
-    /// parameter on every decode path.
+    /// input); zero on the streaming entry points. Carried here — set
+    /// unconditionally by `process_reader` — so the per-format cost
+    /// sites can count it without a new parameter on every decode
+    /// path.
     held_source_bytes: usize,
     chunk8: Vec<u8>,
     src16: Vec<u16>,
@@ -1917,15 +1911,6 @@ pub(crate) fn record_fetch_time(seconds: f64) {
 #[cfg(feature = "server")]
 pub fn last_fetch_seconds() -> Option<f64> {
     FETCH_SECS.get()
-}
-
-/// Whether an `OXIMG_MAX_DECODED_BYTES` cap is configured. The JPEG
-/// header scan is normally skipped when neither rotation nor ICC needs
-/// it; it also carries the progressive flag, and omitting that flag
-/// under-estimates by the whole coefficient term — the dangerous
-/// direction for a limit — so the scan runs whenever the cap is on.
-pub(crate) fn decoded_bytes_cap_set() -> bool {
-    crate::config::config().max_decoded_bytes.is_some()
 }
 
 /// Bucketed lifetime counts of the decoded-bytes estimate, exposed as

@@ -926,27 +926,64 @@ pub(super) fn encode_with_icc(
     p: &Resolved,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
-    if p.encoder == Encoder::Jpegli {
-        return encode_jpegli(rgb, w, h, p.quality, icc);
-    }
-    let mut comp = Compress::new(ColorSpace::JCS_RGB);
-    if p.encoder == Encoder::MozFast {
-        comp.set_fastest_defaults();
-        // The fastest profile disables even Huffman optimization, making
-        // output ~2% larger than plain turbo; turning it back on costs one
-        // extra coefficient-statistics pass, negligible at thumbnail sizes.
-        comp.set_optimize_coding(true);
-    }
-    comp.set_size(w, h);
-    comp.set_quality(p.quality);
-    let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
-    if let Some(icc) = icc {
-        for chunk in icc_app2_chunks(icc) {
-            started.write_marker(mozjpeg::Marker::APP(2), &chunk);
+    let mut sink = JpegSink::start(w, h, p, icc)?;
+    sink.write_rows(rgb)?;
+    sink.finish()
+}
+
+/// A started JPEG encoder for `p`'s preset, its profile already
+/// written: RGB rows go in, in as many calls as the caller likes, and
+/// [`Self::finish`] returns the file. Both libraries consume scanlines
+/// one row group at a time whatever the call boundaries, so a frame fed
+/// in bands encodes to the same bytes as one fed whole — which is what
+/// lets the exact-size JPEG path stream from the decoder with no frame
+/// buffer (see `stream_exact_jpeg`).
+pub(super) enum JpegSink {
+    Jpegli(JpegliEncoder),
+    // Boxed: mozjpeg's cinfo is inline (~540 bytes) against jpegli's
+    // already-boxed one.
+    Moz(Box<mozjpeg::compress::CompressStarted<Vec<u8>>>),
+}
+
+impl JpegSink {
+    pub(super) fn start(w: usize, h: usize, p: &Resolved, icc: Option<&[u8]>) -> Result<JpegSink> {
+        if p.encoder == Encoder::Jpegli {
+            return Ok(JpegSink::Jpegli(start_jpegli(w, h, p.quality, icc)));
         }
+        let mut comp = Compress::new(ColorSpace::JCS_RGB);
+        if p.encoder == Encoder::MozFast {
+            comp.set_fastest_defaults();
+            // The fastest profile disables even Huffman optimization, making
+            // output ~2% larger than plain turbo; turning it back on costs one
+            // extra coefficient-statistics pass, negligible at thumbnail sizes.
+            comp.set_optimize_coding(true);
+        }
+        comp.set_size(w, h);
+        comp.set_quality(p.quality);
+        let mut started = comp.start_compress(Vec::with_capacity(64 * 1024))?;
+        if let Some(icc) = icc {
+            for chunk in icc_app2_chunks(icc) {
+                started.write_marker(mozjpeg::Marker::APP(2), &chunk);
+            }
+        }
+        Ok(JpegSink::Moz(Box::new(started)))
     }
-    started.write_scanlines(rgb)?;
-    Ok(started.finish()?)
+
+    /// Whole RGB rows, continuing where the last call stopped.
+    pub(super) fn write_rows(&mut self, rows: &[u8]) -> Result<()> {
+        match self {
+            JpegSink::Jpegli(enc) => enc.write_scanlines(rows)?,
+            JpegSink::Moz(started) => started.write_scanlines(rows)?,
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> Result<Vec<u8>> {
+        Ok(match self {
+            JpegSink::Jpegli(enc) => enc.finish(),
+            JpegSink::Moz(started) => started.finish()?,
+        })
+    }
 }
 
 /// Chunk a profile into standard APP2 `ICC_PROFILE` payloads with
@@ -993,13 +1030,9 @@ pub(super) fn jpegli_mode(w: usize, h: usize) -> JpegMode {
     }
 }
 
-pub(super) fn encode_jpegli(
-    rgb: &[u8],
-    w: usize,
-    h: usize,
-    quality: f32,
-    icc: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+/// A jpegli encoder for a `w` x `h` frame with its profile written:
+/// what [`JpegSink`] and the fused path's encoder both start from.
+pub(super) fn start_jpegli(w: usize, h: usize, quality: f32, icc: Option<&[u8]>) -> JpegliEncoder {
     // cjpegli emits progressive by default; the libjpeg-compat layer does
     // not. Progressive is worth several percent at these sizes; the scan
     // script is oximg's own (see jpegli_enc.rs), not jpegli's level 2.
@@ -1009,6 +1042,5 @@ pub(super) fn encode_jpegli(
             enc.write_marker(JPEG_APP2, &chunk);
         }
     }
-    enc.write_scanlines(rgb)?;
-    Ok(enc.finish())
+    enc
 }

@@ -175,6 +175,15 @@ impl<R> Decompress<R> {
         }
     }
 
+    /// Whether the source has more than one scan (progressive, or
+    /// sequential with its components in separate scans): libjpeg then
+    /// holds the whole image's coefficients until the last scan is in.
+    pub(crate) fn has_multiple_scans(&self) -> bool {
+        // SAFETY: valid between jpeg_read_header and the start of the
+        // decode, which is where every `Decompress` is.
+        unsafe { ffi::jpeg_has_multiple_scans(&self.cinfo) != 0 }
+    }
+
     /// DCT-domain scaling by `numerator / 8`.
     #[track_caller]
     pub(crate) fn scale(&mut self, numerator: u8) {

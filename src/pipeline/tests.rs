@@ -13,6 +13,17 @@ fn rbox(max_w: u32, max_h: u32) -> Resolved {
 
 /// Deterministic RGB test frame encoded to a real JPEG source.
 fn make_test_jpeg(w: usize, h: usize, gray: bool) -> Vec<u8> {
+    make_jpeg(w, h, gray, false)
+}
+
+/// [`make_test_jpeg`]'s pixels in a single scan: mozjpeg's defaults
+/// write progressive, which libjpeg decodes by buffering every
+/// coefficient first.
+fn make_baseline_jpeg(w: usize, h: usize, gray: bool) -> Vec<u8> {
+    make_jpeg(w, h, gray, true)
+}
+
+fn make_jpeg(w: usize, h: usize, gray: bool, baseline: bool) -> Vec<u8> {
     let ch = if gray { 1 } else { 3 };
     let mut seed = 0x9E3779B9u32;
     let mut px = Vec::with_capacity(w * h * ch);
@@ -30,6 +41,9 @@ fn make_test_jpeg(w: usize, h: usize, gray: bool) -> Vec<u8> {
     } else {
         ColorSpace::JCS_RGB
     });
+    if baseline {
+        comp.set_fastest_defaults();
+    }
     comp.set_size(w, h);
     comp.set_quality(90.0);
     let mut started = comp.start_compress(Vec::new()).unwrap();
@@ -1467,8 +1481,25 @@ fn decode_cost_prices_each_jpeg_arm() {
     let jpeg = make_test_jpeg(320, 240, false);
     let (src, dst) = (320 * 240, 200 * 150);
 
-    // Exact size: libjpeg writes straight into `out8`.
+    // Exact size to JPEG from a single scan: one band of rows goes from
+    // the decoder to the encoder at a time.
+    let c = cost_of(&make_baseline_jpeg(320, 240, false), sized(320, 240));
+    assert_eq!(
+        (c.staged_bytes, c.resize_input_bytes, c.output_bytes),
+        (0, 0, 320 * 16 * 3)
+    );
+    // From a multi-scan source (this one), or to anything else, libjpeg
+    // writes straight into `out8`.
     let c = cost_of(&jpeg, sized(320, 240));
+    assert_eq!(
+        (c.staged_bytes, c.resize_input_bytes, c.output_bytes),
+        (0, 0, src * 3)
+    );
+    let png = Params {
+        output: Some(ImageFormat::Png),
+        ..sized(320, 240)
+    };
+    let c = cost_of(&jpeg, png);
     assert_eq!(
         (c.staged_bytes, c.resize_input_bytes, c.output_bytes),
         (0, 0, src * 3)
@@ -1552,6 +1583,29 @@ fn decode_cost_prices_each_jpeg_arm() {
     }
 }
 
+/// A multi-scan source's coefficient arrays are priced from libjpeg's
+/// own header read, so they are counted even where the header pre-scan
+/// does not run (no rotation, no profile wanted): the term must not
+/// depend on which knobs are on.
+#[test]
+fn decode_cost_prices_coefficients_without_the_header_scan() {
+    let bare = |p: Params| Params {
+        auto_rotate: Some(false),
+        icc: Some(false),
+        ..p
+    };
+    for (jpeg, multi) in [
+        (make_test_jpeg(320, 240, false), true),
+        (make_baseline_jpeg(320, 240, false), false),
+    ] {
+        for p in [sized(320, 240), sized(200, 200)] {
+            let c = cost_of(&jpeg, bare(p));
+            let want = if multi { 320 * 240 * 3 * 2 } else { 0 };
+            assert_eq!(c.whole_source_bytes, want, "multi={multi}");
+        }
+    }
+}
+
 /// `decode_and_resize` hands back its pixels in a Vec of their own, a
 /// second output frame next to `out8`; an encoding caller does not.
 #[test]
@@ -1562,8 +1616,13 @@ fn decode_cost_counts_the_frame_a_pixel_caller_keeps() {
     let (c, _) = LAST_COST.get().expect("a decode just ran");
     assert_eq!(c.output_bytes, 320 * 240 * 3 * 2);
     assert_eq!(c.encode_bytes, 0, "nothing is encoded");
-    // The same request encoding to JPEG keeps `out8` alone.
-    let c = cost_of(&jpeg, sized(320, 240));
+    // The same request encoding to PNG keeps `out8` alone (to JPEG it
+    // streams; see `decode_cost_prices_each_jpeg_arm`).
+    let png = Params {
+        output: Some(ImageFormat::Png),
+        ..sized(320, 240)
+    };
+    let c = cost_of(&jpeg, png);
     assert_eq!(c.output_bytes, 320 * 240 * 3);
 }
 
@@ -2022,6 +2081,214 @@ fn truncated_in_memory_source_is_still_too_short() {
         format!("{e:#}").contains("source too short"),
         "unexpected error: {e:#}"
     );
+}
+
+/// The exact-size JPEG branch both ways: a JPEG target streams decoder
+/// bands into the encoder (`Decoded::Encoded`), while the staged
+/// reference leaves the frame in out8 for the separate encode that
+/// `process_jpeg` used to run on every exact-size JPEG. Returns
+/// (streamed, staged); either side's decode error comes back as Err.
+fn exact_jpeg_both_ways(
+    jpeg: &[u8],
+    encoder: Encoder,
+    orientation: crate::meta::Orientation,
+    icc: Option<&[u8]>,
+) -> (Result<Decoded>, Result<Vec<u8>>) {
+    let p = Resolved::new(&Params {
+        encoder,
+        ..Params::default()
+    });
+    let run = |target: Option<ImageFormat>| -> Result<(Decoded, Scratch)> {
+        crate::panic_guard::catch_unwind_as_error("test decode", || {
+            let mut s = Scratch::default();
+            let dec = Decompress::new_mem(jpeg)?;
+            let d = decode_resize(&mut s, dec, &p, orientation, Fuse::Off, icc, target)?;
+            Ok((d, s))
+        })?
+    };
+    let staged = run(None).and_then(|(d, s)| match d {
+        Decoded::Pixels { dst_w, dst_h } => {
+            encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, &p, icc)
+        }
+        _ => panic!("staged exact decode did not leave pixels"),
+    });
+    (run(Some(ImageFormat::Jpeg)).map(|(d, _)| d), staged)
+}
+
+fn encoded(d: Decoded) -> Vec<u8> {
+    match d {
+        Decoded::Encoded(out) => out,
+        _ => panic!("exact-size JPEG did not stream"),
+    }
+}
+
+/// Streaming the exact-size frame of a single-scan source into the
+/// encoder writes the bytes the staged frame encodes to: every preset, sequential jpegli (100 x
+/// 100 is under the default 12k-pixel sequential ceiling) and
+/// progressive (799 x 601), a frame shorter than one band, RGB and
+/// grayscale sources, and a profile spanning two APP2 chunks written
+/// ahead of the first scanline.
+#[test]
+fn exact_size_jpeg_streams_the_staged_bytes() {
+    let icc: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+    for (w, h) in [(100, 100), (799, 601), (17, 1)] {
+        for gray in [false, true] {
+            let jpeg = make_baseline_jpeg(w, h, gray);
+            for encoder in [Encoder::Jpegli, Encoder::MozFast, Encoder::MozSmall] {
+                for icc in [None, Some(&icc[..])] {
+                    let (streamed, staged) = exact_jpeg_both_ways(
+                        &jpeg,
+                        encoder,
+                        crate::meta::Orientation::UPRIGHT,
+                        icc,
+                    );
+                    let out = encoded(streamed.unwrap());
+                    let case = format!("{w}x{h} gray={gray} {encoder:?} icc={}", icc.is_some());
+                    assert!(out == staged.unwrap(), "{case}");
+                    assert_eq!(
+                        crate::meta::scan_jpeg_meta(&mut &out[..], &mut Vec::new(), true)
+                            .icc
+                            .as_deref(),
+                        icc,
+                        "{case}: profile"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// What has work to do between decode and encode keeps the staged
+/// frame: an oriented source (the rotation needs the whole frame) and
+/// CMYK/YCCK (converted in a 4-channel buffer) come back as pixels
+/// even with a JPEG target, and a resize is not the exact branch.
+#[test]
+fn exact_size_jpeg_streams_only_upright_rgb_frames() {
+    let rotated = crate::meta::Orientation::from_rot_mirror(1, None);
+    assert!(!rotated.is_upright());
+    let jpeg = make_baseline_jpeg(64, 48, false);
+    let (streamed, _) = exact_jpeg_both_ways(&jpeg, Encoder::Jpegli, rotated, None);
+    assert!(matches!(
+        streamed.unwrap(),
+        Decoded::Pixels {
+            dst_w: 64,
+            dst_h: 48
+        }
+    ));
+    for ycck in [false, true] {
+        let cmyk = make_cmyk_jpeg(64, 48, ycck);
+        let (streamed, _) = exact_jpeg_both_ways(
+            &cmyk,
+            Encoder::Jpegli,
+            crate::meta::Orientation::UPRIGHT,
+            None,
+        );
+        assert!(
+            matches!(
+                streamed.unwrap(),
+                Decoded::Pixels {
+                    dst_w: 64,
+                    dst_h: 48
+                }
+            ),
+            "ycck={ycck}"
+        );
+    }
+    let mut s = Scratch::default();
+    let dec = Decompress::new_mem(&jpeg).unwrap();
+    let d = decode_resize(
+        &mut s,
+        dec,
+        &rbox(32, 32),
+        crate::meta::Orientation::UPRIGHT,
+        Fuse::Off,
+        None,
+        Some(ImageFormat::Jpeg),
+    )
+    .unwrap();
+    assert!(matches!(
+        d,
+        Decoded::Pixels {
+            dst_w: 32,
+            dst_h: 24
+        }
+    ));
+}
+
+/// A multi-scan (progressive) source keeps the staged frame for every
+/// encoder that holds whole-image state, which is all of them below
+/// OXIMG_JPEG_STREAMING_PIXELS: the decoder's coefficients would
+/// otherwise overlap the encoder's. Staged, the bytes are the ones the
+/// separate encode writes.
+#[test]
+fn exact_size_jpeg_stages_a_multi_scan_source() {
+    let jpeg = make_test_jpeg(320, 240, false);
+    let dec = Decompress::new_mem(&jpeg).unwrap();
+    assert!(dec.has_multiple_scans());
+    assert!(
+        !Decompress::new_mem(&make_baseline_jpeg(320, 240, false))
+            .unwrap()
+            .has_multiple_scans()
+    );
+    for encoder in [Encoder::Jpegli, Encoder::MozFast, Encoder::MozSmall] {
+        let (streamed, _) =
+            exact_jpeg_both_ways(&jpeg, encoder, crate::meta::Orientation::UPRIGHT, None);
+        assert!(
+            matches!(
+                streamed.unwrap(),
+                Decoded::Pixels {
+                    dst_w: 320,
+                    dst_h: 240
+                }
+            ),
+            "{encoder:?}"
+        );
+    }
+}
+
+/// A source cut mid-scan completes with libjpeg's fill data on both
+/// paths, to the same bytes; one whose bytes after the scan hold a
+/// malformed marker (read once the last row is decoded, so after the
+/// streaming encoder has taken every row) fails on both with the
+/// libjpeg message, and the streamed JPEG is discarded.
+#[test]
+fn exact_size_jpeg_streaming_keeps_truncation_and_error_behavior() {
+    let jpeg = make_baseline_jpeg(799, 601, false);
+    let cut = &jpeg[..jpeg.len() * 3 / 5];
+    let (streamed, staged) = exact_jpeg_both_ways(
+        cut,
+        Encoder::Jpegli,
+        crate::meta::Orientation::UPRIGHT,
+        None,
+    );
+    assert!(encoded(streamed.unwrap()) == staged.unwrap(), "truncated");
+
+    // A single-scan (baseline) source, so libjpeg decodes it lazily as
+    // rows are read, with a DHT of impossible length (3) before EOI.
+    let mut comp = Compress::new(ColorSpace::JCS_RGB);
+    comp.set_fastest_defaults();
+    comp.set_size(64, 48);
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_scanlines(&vec![128u8; 64 * 48 * 3]).unwrap();
+    let mut bad = started.finish().unwrap();
+    assert_eq!(bad[bad.len() - 2..], [0xFF, 0xD9]);
+    let eoi = bad.len() - 2;
+    bad.splice(eoi..eoi, [0xFF, 0xC4, 0x00, 0x03, 0x00]);
+    let (streamed, staged) = exact_jpeg_both_ways(
+        &bad,
+        Encoder::Jpegli,
+        crate::meta::Orientation::UPRIGHT,
+        None,
+    );
+    for (side, e) in [
+        ("streamed", streamed.err().expect("streamed must fail")),
+        ("staged", staged.expect_err("staged must fail")),
+    ] {
+        assert!(
+            format!("{e:#}").contains("libjpeg fatal error"),
+            "{side}: {e:#}"
+        );
+    }
 }
 
 // ---- Streamed RGB8 PNG resize (issue #129) ----
