@@ -9,6 +9,7 @@ require_relative "oximg/binary"
 #
 #   Oximg.resize("in.jpg", "out.jpg", width: 750)
 #   Oximg.resize("in.jpg", "out.webp", width: 750, height: 500, quality: 80)
+#   Oximg.strip("upload.jpg", "clean.jpg")  # drop EXIF/GPS, XMP, IPTC; no re-encode
 #   Oximg.probe("in.jpg")  #=> {content_type: "image/jpeg", format: :jpeg, ...}
 #
 # Rails/ActiveStorage integration, and URL building for a remote oximg
@@ -40,6 +41,9 @@ module Oximg
   # Encoder profiles: jpegli maximizes quality per byte (the default),
   # mozjpeg's fast/small trade differently.
   PRESETS = %i[jpegli fast small].freeze
+
+  # What `strip` may do with an embedded colour profile.
+  ICC_MODES = %i[keep strip].freeze
 
   CONTENT_TYPE_FORMATS = {
     "image/jpeg" => :jpeg,
@@ -104,6 +108,30 @@ module Oximg
       Binary.run(*resize_argv(source, output,
         width: width, height: height, quality: quality, format: format, preset: preset))
       output
+    end
+
+    # Removes metadata — EXIF (GPS, camera, timestamps), XMP, IPTC,
+    # comments — from a JPEG, PNG or WebP without re-encoding, and
+    # writes the result to +destination+. Decoded pixels are identical;
+    # a rotated photo keeps only its EXIF orientation, so it still
+    # displays upright. +icc:+ is :keep or :strip (default: the
+    # binary's OXIMG_ICC, else keep); dropping a CMYK JPEG's profile is
+    # refused with a ProcessingError. Returns the destination path.
+    #
+    # This is what <tt>saver(strip: true)</tt> / <tt>-strip</tt> did
+    # under libvips or ImageMagick, minus the re-encode.
+    def strip(source, destination, icc: nil)
+      output = expand(destination, "destination")
+      Binary.run(*strip_argv(source, output, icc: icc))
+      output
+    end
+
+    # The argv `strip` would run, minus the executable; public for the
+    # same reason as resize_argv.
+    def strip_argv(source, destination, icc: nil)
+      argv = ["strip", expand(source, "source"), expand(destination, "destination")]
+      argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
+      argv
     end
 
     # Header-only inspection — no pixels are decoded. Returns

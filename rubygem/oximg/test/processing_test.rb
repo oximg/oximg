@@ -86,6 +86,25 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_equal({content_type: "image/gif", format: :gif, width: 240, height: 180}, probed)
   end
 
+  # Nothing in the fixture to strip: the bytes come back unchanged.
+  def test_strip_writes_the_source_without_its_metadata
+    in_tmpdir do |dir|
+      out = File.join(dir, "out.webp")
+      assert_equal out, Oximg.strip(fixture("photo.webp"), out)
+      assert_equal File.binread(fixture("photo.webp")), File.binread(out)
+    end
+  end
+
+  def test_strip_refuses_to_drop_a_cmyk_profile
+    in_tmpdir do |dir|
+      error = assert_raises(Oximg::ProcessingError) do
+        Oximg.strip(fixture("cmyk_icc.jpg"), File.join(dir, "out.jpg"), icc: :strip)
+      end
+      assert_match(/CMYK/, error.message)
+      assert_equal 1, error.status
+    end
+  end
+
   # The binary already names what it refused; the gem must surface that
   # rather than a bare exit status.
   def test_surfaces_the_binarys_own_error
