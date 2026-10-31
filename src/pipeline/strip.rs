@@ -21,6 +21,7 @@
 use super::{Error, ImageFormat};
 use crate::meta::Orientation;
 use anyhow::{Result, bail, ensure};
+use std::collections::HashMap;
 
 /// What [`strip`] may keep besides the image data.
 #[derive(Clone, Copy, Debug, Default)]
@@ -110,26 +111,36 @@ fn strip_inner(bytes: &[u8], keep_icc: bool) -> Result<Stripped> {
     Ok(Stripped {
         bytes: out,
         format,
-        removed: log.0,
+        removed: log.removed,
         orientation: (!orientation.is_upright()).then_some(orientation.value()),
     })
 }
 
+/// Removals aggregated by name in first-seen order. Names carry up to
+/// 24 bytes of the source (a JPEG APP identifier), so a hostile file
+/// can make every block a new name: the index keeps that linear.
 #[derive(Default)]
-struct Log(Vec<Removed>);
+struct Log {
+    removed: Vec<Removed>,
+    index: HashMap<String, usize>,
+}
 
 impl Log {
     fn add(&mut self, name: &str, bytes: usize) {
-        match self.0.iter_mut().find(|r| r.name == name) {
-            Some(r) => {
+        match self.index.get(name) {
+            Some(&at) => {
+                let r = &mut self.removed[at];
                 r.count += 1;
                 r.bytes += bytes;
             }
-            None => self.0.push(Removed {
-                name: name.to_string(),
-                count: 1,
-                bytes,
-            }),
+            None => {
+                self.index.insert(name.to_string(), self.removed.len());
+                self.removed.push(Removed {
+                    name: name.to_string(),
+                    count: 1,
+                    bytes,
+                });
+            }
         }
     }
 }
@@ -379,7 +390,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// WebP chunks that make up the image: kept, `ICCP` aside. `EXIF`,
 /// `XMP ` and unknown chunks are dropped.
-const WEBP_IMAGE: &[&[u8; 4]] = &[b"VP8X", b"VP8 ", b"VP8L", b"ALPH", b"ANIM", b"ANMF"];
+const WEBP_IMAGE: &[&[u8; 4]] = &[b"VP8X", b"VP8 ", b"VP8L", b"ALPH", b"ANIM"];
 
 /// VP8X feature flags (WebP container spec, "Extended File Format").
 const VP8X_ICC: u8 = 0x20;
@@ -388,7 +399,7 @@ const VP8X_XMP: u8 = 0x04;
 
 /// Filter the top-level RIFF chunks, then make the VP8X flags agree
 /// with what is left and fix the RIFF size. Animation frames (`ANMF`)
-/// are kept whole, so an animated WebP strips the same way as a still.
+/// are filtered too ([`strip_anmf`]) and rewritten with their new size.
 fn strip_webp(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orientation)> {
     ensure!(
         b.len() >= 12 && &b[..4] == b"RIFF" && &b[8..12] == b"WEBP",
@@ -444,6 +455,18 @@ fn strip_webp(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
                 }
                 false
             }
+            b"ANMF" => {
+                let frame = strip_anmf(data, log)?;
+                out.extend_from_slice(b"ANMF");
+                out.extend_from_slice(&u32::try_from(frame.len())?.to_le_bytes());
+                out.extend_from_slice(&frame);
+                if frame.len() & 1 == 1 {
+                    out.push(0);
+                }
+                // Written above; what it dropped is logged per subchunk.
+                rewrote = true;
+                false
+            }
             t => WEBP_IMAGE.contains(&t),
         };
         if keep {
@@ -476,6 +499,40 @@ fn strip_webp(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
     let riff_size = u32::try_from(out.len() - 8)?;
     out[4..8].copy_from_slice(&riff_size.to_le_bytes());
     Ok((out, orientation))
+}
+
+/// An `ANMF` payload is a 16-byte frame header, then subchunks: `ALPH`
+/// and `VP8 `/`VP8L` are the frame, and the spec lets a writer append
+/// unknown chunks after them, so private data can hide in a frame as
+/// well as at the top level.
+fn strip_anmf(data: &[u8], log: &mut Log) -> Result<Vec<u8>> {
+    ensure!(data.len() >= 16, "truncated WebP ANMF chunk");
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(&data[..16]);
+    let mut i = 16;
+    while i < data.len() {
+        ensure!(i + 8 <= data.len(), "truncated WebP frame chunk header");
+        let fourcc: [u8; 4] = data[i..i + 4].try_into().unwrap();
+        let size = u32::from_le_bytes(data[i + 4..i + 8].try_into().unwrap()) as usize;
+        let data_end = (i + 8).checked_add(size).filter(|&e| e <= data.len());
+        let Some(data_end) = data_end else {
+            bail!(
+                "truncated WebP frame chunk {}",
+                String::from_utf8_lossy(&fourcc)
+            );
+        };
+        let end = (data_end + (size & 1)).min(data.len());
+        if matches!(&fourcc, b"ALPH" | b"VP8 " | b"VP8L") {
+            out.extend_from_slice(&data[i..end]);
+            if (end - i) & 1 == 1 {
+                out.push(0);
+            }
+        } else {
+            log.add(&String::from_utf8_lossy(&fourcc), end - i);
+        }
+        i = end;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

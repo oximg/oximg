@@ -27,6 +27,7 @@ fn pixels(b: &[u8]) -> Vec<u8> {
         output: Some(ImageFormat::Png),
         auto_rotate: Some(false),
         icc: Some(false),
+        png_quantize: Some(false),
         ..Default::default()
     };
     pipeline::process(b, &p).unwrap().0
@@ -403,8 +404,32 @@ fn webp_drops_exif_xmp_and_unknown_chunks() {
     assert_eq!(out.bytes[20] & 0x20, 0, "ICC flag cleared");
 }
 
-/// Chunk filtering is frame-agnostic: an animated WebP comes back with
-/// every frame, byte for byte.
+/// Rebuild a WebP with a private chunk appended inside every animation
+/// frame, where the spec allows unknown chunks after the bitstream.
+fn plant_in_frames(b: &[u8]) -> Vec<u8> {
+    let mut out = b[..12].to_vec();
+    let mut i = 12;
+    while i < b.len() {
+        let size = u32::from_le_bytes(b[i + 4..i + 8].try_into().unwrap()) as usize;
+        let end = (i + 8 + size + (size & 1)).min(b.len());
+        if &b[i..i + 4] == b"ANMF" {
+            let mut frame = b[i + 8..end].to_vec();
+            frame.extend_from_slice(b"PRVT\x07\0\0\0SECRET!\0");
+            out.extend_from_slice(b"ANMF");
+            out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            out.extend_from_slice(&frame);
+        } else {
+            out.extend_from_slice(&b[i..end]);
+        }
+        i = end;
+    }
+    let riff = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&riff.to_le_bytes());
+    out
+}
+
+/// An animated WebP comes back with every frame, byte for byte, and
+/// metadata hidden inside a frame goes like top-level metadata.
 #[test]
 fn animated_webp_keeps_every_frame() {
     let anim = fixture("animated.webp");
@@ -423,6 +448,15 @@ fn animated_webp_keeps_every_frame() {
             .frames,
         pipeline::probe_animation(&anim).unwrap().unwrap().frames
     );
+
+    let frames = pipeline::probe_animation(&anim).unwrap().unwrap().frames;
+    let src = plant_in_frames(&anim);
+    assert!(contains(&src, b"SECRET"));
+    let out = strip_clean(&src, &keep_icc());
+    assert_eq!(out.bytes, anim);
+    assert_eq!(out.removed.len(), 1);
+    assert_eq!(out.removed[0].name, "PRVT");
+    assert_eq!(out.removed[0].count, frames);
 }
 
 #[test]
