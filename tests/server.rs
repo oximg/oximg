@@ -2747,6 +2747,112 @@ fn fake_s3(
     (s3, hits)
 }
 
+/// EKS IRSA: the OIDC token from its file goes to STS in a POST form,
+/// and STS's keys sign the request. Web identity comes before the
+/// container endpoint in the chain, so it wins when both are set.
+#[test]
+fn s3_keys_from_web_identity() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: sts-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        "/test-bucket/rotated.jpg" if req.contains("x-amz-security-token: sts-token-2") => {
+            Some("photo".into())
+        }
+        "/test-bucket/rotated.jpg" => Some(s3_error("400 Bad Request", "ExpiredToken")),
+        _ => None,
+    });
+    let sts = S3::spawn_unsigned(|path, req| {
+        let form = req.rsplit("\r\n\r\n").next().unwrap_or("");
+        let session = if form.contains("webidentitytoken=rotated-token") {
+            "sts-token-2"
+        } else {
+            "sts-token"
+        };
+        if path == "/"
+            && req.starts_with("post ")
+            && form.contains("action=assumerolewithwebidentity")
+            && form.contains("rolearn=arn%3aaws%3aiam%3a%3a123456789012%3arole%2foximg")
+            && (form.contains("webidentitytoken=oidc-token")
+                || form.contains("webidentitytoken=rotated-token"))
+            && !req.lines().next().unwrap_or("").contains("-token")
+        {
+            let xml = format!("<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult><Credentials><AccessKeyId>AKIDTEST</AccessKeyId><SecretAccessKey>test-secret</SecretAccessKey><SessionToken>{session}</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>");
+            Reply::raw(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                xml.len()
+            ))
+        } else {
+            let xml =
+                "<ErrorResponse><Error><Code>InvalidIdentityToken</Code></Error></ErrorResponse>";
+            Reply::raw(format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                xml.len()
+            ))
+        }
+    })
+    .unwrap();
+    let token_file = std::env::temp_dir().join(format!("oximg-oidc-token-{}", std::process::id()));
+    std::fs::write(&token_file, "oidc-token\n").unwrap();
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.extend([
+        (
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            token_file.display().to_string(),
+        ),
+        (
+            "AWS_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/oximg".into(),
+        ),
+        (
+            "AWS_ENDPOINT_URL_STS",
+            format!("http://127.0.0.1:{}", sts.port()),
+        ),
+        // Set too, and unused: web identity comes first.
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "http://127.0.0.1:9/never".into(),
+        ),
+    ]);
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    // EKS rotates the token file. When the keys run out, the next fetch
+    // reads the new token: STS gives other keys only for it.
+    std::fs::write(&token_file, "rotated-token\n").unwrap();
+    assert_eq!(s.status_of("/resize/100/100/rotated.jpg"), 200);
+    drop(s);
+
+    // A plain-HTTP STS endpoint warns at boot.
+    std::fs::write(&token_file, "oidc-token\n").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(
+        stderr.contains("AWS_ENDPOINT_URL_STS uses http://"),
+        "{stderr}"
+    );
+    // Boot names the source that gave the keys.
+    assert!(
+        stderr.contains("s3:// credentials: web identity"),
+        "{stderr}"
+    );
+
+    // A token STS refuses stops the boot with STS's answer.
+    std::fs::write(&token_file, "other-token").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(stderr.contains("web identity"), "{stderr}");
+    assert!(stderr.contains("InvalidIdentityToken"), "{stderr}");
+    std::fs::remove_file(&token_file).unwrap();
+
+    // Half a web identity is a setting error, not a fall-through.
+    let mut half = s3_env_without_keys(s3.port());
+    half.push(("AWS_ROLE_ARN", "arn:aws:iam::1:role/x".into()));
+    let stderr = s3_boot_stderr(&half);
+    assert!(
+        stderr.contains("needs both AWS_WEB_IDENTITY_TOKEN_FILE"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn s3_error_body_failures_preserve_transport_errors() {
     let s3 = S3::spawn(|path, _| {
@@ -3173,6 +3279,158 @@ fn s3_session_token_is_signed() {
     assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
 }
 
+/// Start the server with `envs` and return what it printed on stderr,
+/// up to the listening line or until it exits.
+fn s3_boot_stderr(envs: &[(&str, String)]) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
+    cmd.env("PORT", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn oximg");
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut seen = String::new();
+    let mut line = String::new();
+    while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
+        seen.push_str(&line);
+        if line.starts_with("oximg listening on :") {
+            break;
+        }
+        line.clear();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    seen
+}
+
+/// The env for keys from a credential endpoint: the static keys of
+/// `s3_env` cleared, so the chain moves past them.
+fn s3_env_without_keys(endpoint_port: u16) -> Vec<(&'static str, String)> {
+    let mut envs = s3_env(endpoint_port);
+    envs.extend([
+        ("AWS_ACCESS_KEY_ID", String::new()),
+        ("AWS_SECRET_ACCESS_KEY", String::new()),
+        ("OXIMG_SOURCE_BASE_URL", "s3://test-bucket".into()),
+    ]);
+    envs
+}
+
+/// ECS and EKS Pod Identity: keys come from the container endpoint,
+/// with the authorization token read from its file. The fake S3 answers
+/// 200 only when the endpoint's session token is signed in.
+#[test]
+fn s3_keys_from_the_container_endpoint() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: container-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let agent = S3::spawn_unsigned(|path, req| match path {
+        "/v1/credentials" if req.contains("authorization: pod-token") => Reply::json(
+            "200 OK",
+            r#"{"AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"container-token","Expiration":"2099-01-01T00:00:00Z"}"#,
+        ),
+        _ => Reply::json("401 Unauthorized", r#"{"code":"denied"}"#),
+    })
+    .unwrap();
+    let token_file = std::env::temp_dir().join(format!("oximg-pod-token-{}", std::process::id()));
+    std::fs::write(&token_file, "pod-token\n").unwrap();
+    let full_uri = format!("http://127.0.0.1:{}/v1/credentials", agent.port());
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.extend([
+        ("AWS_CONTAINER_CREDENTIALS_FULL_URI", full_uri.clone()),
+        (
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            token_file.display().to_string(),
+        ),
+    ]);
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    // One fetch for the boot probe and the request: the keys are cached.
+    assert_eq!(agent.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(s);
+
+    // A proxy in the env does not see the credential requests. The
+    // agent is named `localhost` and S3 `127.0.0.1`, and NO_PROXY covers
+    // only the latter, so only a client that ignores the proxy works.
+    let mut proxied = envs.clone();
+    proxied.extend([
+        (
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            format!("http://localhost:{}/v1/credentials", agent.port()),
+        ),
+        ("HTTP_PROXY", "http://127.0.0.1:9".into()),
+        ("http_proxy", "http://127.0.0.1:9".into()),
+        ("NO_PROXY", "127.0.0.1".into()),
+        ("no_proxy", "127.0.0.1".into()),
+    ]);
+    let s = Server::start(&proxied);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    drop(s);
+
+    // A wrong token fails at boot and names the source.
+    std::fs::write(&token_file, "wrong").unwrap();
+    let stderr = s3_boot_stderr(&envs);
+    assert!(stderr.contains("oximg: fatal:"), "{stderr}");
+    assert!(stderr.contains("container credential endpoint"), "{stderr}");
+    assert!(stderr.contains("401"), "{stderr}");
+    std::fs::remove_file(&token_file).unwrap();
+
+    // A full URI over http to any other host is refused before a request.
+    let mut far = s3_env_without_keys(s3.port());
+    far.push((
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "http://creds.example.com/v1".into(),
+    ));
+    let stderr = s3_boot_stderr(&far);
+    assert!(stderr.contains("must use https://"), "{stderr}");
+}
+
+/// Keys that S3 reports as expired are fetched again once. The agent
+/// hands out an old token first and a new one after; the cache would
+/// keep the old one (it does not expire for years), so only the forced
+/// fetch after `ExpiredToken` can get the request through.
+#[test]
+fn s3_expired_keys_are_fetched_again_once() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: new-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" | "/test-bucket/always.jpg" => {
+            Some(s3_error("400 Bad Request", "ExpiredToken"))
+        }
+        _ => None,
+    });
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = served.clone();
+    let agent = S3::spawn_unsigned(move |_, _| {
+        let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let token = if n == 0 { "old-token" } else { "new-token" };
+        Reply::json(
+            "200 OK",
+            &format!(
+                r#"{{"AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"{token}","Expiration":"2099-01-01T00:00:00Z"}}"#
+            ),
+        )
+    })
+    .unwrap();
+    let mut envs = s3_env_without_keys(s3.port());
+    envs.push((
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        format!("http://127.0.0.1:{}/v1/credentials", agent.port()),
+    ));
+    let s = Server::start(&envs);
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    // Still expired after the new keys: one more fetch, then 500.
+    assert_eq!(s.status_of("/resize/100/100/always.jpg"), 500);
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+}
+
 /// Keys with characters that the HTTP mode, SigV4 and the URL parser
 /// each treat differently. The fake answers 200 only for the exact
 /// SigV4 path, and only with a valid signature over what arrived, so
@@ -3207,6 +3465,99 @@ fn s3_sends_the_path_it_signs() {
     }
 }
 
+/// EC2 instance profiles: with nothing else set, keys come from IMDSv2.
+/// The fake requires the session token from the PUT on both GETs, as
+/// IMDS does when v1 is off.
+#[test]
+fn s3_keys_from_imds_v2() {
+    let (s3, _) = fake_s3(|path, req| match path {
+        "/test-bucket/photo.jpg" if req.contains("x-amz-security-token: imds-token") => {
+            Some("photo".into())
+        }
+        "/test-bucket/photo.jpg" => Some(s3_error("400 Bad Request", "InvalidToken")),
+        _ => None,
+    });
+    let imds = S3::spawn_unsigned(|path, req| {
+        let session = req.contains("x-aws-ec2-metadata-token: session-1");
+        match path {
+            "/latest/api/token"
+                if req.starts_with("put ")
+                    && req.contains("x-aws-ec2-metadata-token-ttl-seconds: 21600") =>
+            {
+                Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsession-1")
+            }
+            "/latest/meta-data/iam/security-credentials/" if session => Reply::raw(
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nweb-role",
+            ),
+            "/latest/meta-data/iam/security-credentials/web-role" if session => Reply::json(
+                "200 OK",
+                r#"{"Code":"Success","Type":"AWS-HMAC","AccessKeyId":"AKIDTEST","SecretAccessKey":"test-secret","Token":"imds-token","Expiration":"2099-01-01T00:00:00Z"}"#,
+            ),
+            _ => Reply::json("401 Unauthorized", "{}"),
+        }
+    })
+    .unwrap();
+    // Nothing but IMDS, at `port`.
+    let imds_env = |port: u16| {
+        let mut envs = s3_env_without_keys(s3.port());
+        envs.push((
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+            format!("http://127.0.0.1:{port}"),
+        ));
+        envs
+    };
+    let s = Server::start(&imds_env(imds.port()));
+    assert_eq!(s.status_of("/resize/100/100/photo.jpg"), 200);
+    assert_eq!(imds.hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    drop(s);
+
+    // Off EC2: IMDS does not answer, and the boot error says what to set.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let off = imds_env(dead_port);
+    let stderr = s3_boot_stderr(&off);
+    assert!(stderr.contains("IMDSv2"), "{stderr}");
+    assert!(stderr.contains("set static keys"), "{stderr}");
+    assert!(!stderr.contains("hop limit"), "{stderr}");
+
+    // Another cloud's metadata service answers, but not the IMDSv2 call:
+    // no word about EC2 hop limits.
+    let other = S3::spawn_unsigned(|_, _| Reply::json("404 Not Found", "{}")).unwrap();
+    let stderr = s3_boot_stderr(&imds_env(other.port()));
+    assert!(stderr.contains("404"), "{stderr}");
+    assert!(!stderr.contains("hop limit"), "{stderr}");
+
+    // An instance without a profile: IMDS gives a session, then 404 for
+    // the role name.
+    let no_role = S3::spawn_unsigned(|path, _| match path {
+        "/latest/api/token" => {
+            Reply::raw("HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsession-1")
+        }
+        _ => Reply::json("404 Not Found", "{}"),
+    })
+    .unwrap();
+    let stderr = s3_boot_stderr(&imds_env(no_role.port()));
+    assert!(stderr.contains("has no IAM role"), "{stderr}");
+
+    // In a container with hop limit 1 the token answer never arrives:
+    // a listener that accepts nothing stands in for it.
+    let stalled = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let stderr = s3_boot_stderr(&imds_env(stalled.local_addr().unwrap().port()));
+    assert!(stderr.contains("hop limit of 2"), "{stderr}");
+    drop(stalled);
+
+    // Turned off, and nothing else set: the error lists every source.
+    let mut none = off.clone();
+    none.push(("AWS_EC2_METADATA_DISABLED", "true".into()));
+    let stderr = s3_boot_stderr(&none);
+    assert!(stderr.contains("s3:// needs credentials"), "{stderr}");
+    assert!(
+        stderr.contains("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"),
+        "{stderr}"
+    );
+}
+
 /// s3:// refuses to boot when the settings are missing or wrong, with
 /// a message that names the cause. The boot probe catches what the
 /// store reports. 403 `AccessDenied` is the one exception: AWS sends it
@@ -3234,31 +3585,9 @@ fn s3_boot_is_fail_closed() {
     drop(dead);
 
     let boot = |extra: &[(&str, &str)]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximg"));
-        cmd.env("PORT", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        for (k, v) in s3_env(s3.port()) {
-            cmd.env(k, v);
-        }
-        for (k, v) in extra {
-            cmd.env(k, v);
-        }
-        let mut child = cmd.spawn().expect("spawn oximg");
-        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
-        // Read until the listening line or until stderr closes.
-        let mut seen = String::new();
-        let mut line = String::new();
-        while std::io::BufRead::read_line(&mut stderr, &mut line).unwrap_or(0) > 0 {
-            seen.push_str(&line);
-            if line.starts_with("oximg listening on :") {
-                break;
-            }
-            line.clear();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        seen
+        let mut envs: Vec<(&str, String)> = s3_env(s3.port());
+        envs.extend(extra.iter().map(|(k, v)| (*k, v.to_string())));
+        s3_boot_stderr(&envs)
     };
 
     let dead_endpoint = format!("http://127.0.0.1:{dead_port}");

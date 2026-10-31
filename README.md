@@ -372,9 +372,15 @@ filename is taken literally on this route (no `@fmt` token).
   `service_account` JSON keys are not supported — on GCP use Workload
   Identity, off GCP use the HTTP mode.
 - `s3://bucket[/prefix]` — a **private S3 or S3-compatible bucket**
-  (AWS S3, Cloudflare R2, MinIO), read with static keys from
-  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (plus
-  `AWS_SESSION_TOKEN` for temporary keys). `AWS_REGION` is required.
+  (AWS S3, Cloudflare R2, MinIO). Keys come from the first of these that
+  is set, as in the AWS SDKs: static keys (`AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`, plus `AWS_SESSION_TOKEN` for temporary keys);
+  web identity (EKS IRSA); the container endpoint (ECS task roles, EKS
+  Pod Identity); EC2 instance metadata (IMDSv2). `AWS_REGION` is
+  required. As in the AWS SDKs, it is the default region, and ECS and
+  EKS set it to the region they run in. STS uses it, and so does the
+  first request to S3. If S3 answers that the bucket is in another
+  region, oximg sends that bucket's requests there and logs it once.
   AWS China regions use the `.amazonaws.com.cn` endpoint automatically.
   For R2 and MinIO, set `OXIMG_S3_ENDPOINT` too. An `http://` endpoint
   logs a warning at boot, because session tokens and images then
@@ -385,10 +391,21 @@ filename is taken literally on this route (no `@fmt` token).
   AWS sends it when the key lacks `s3:ListBucket`, and R2 when the
   bucket does not exist. The probe therefore does not prove that objects
   are readable; missing `s3:GetObject` can still fail at request time.
-  Temporary keys are not refreshed: when
-  `AWS_SESSION_TOKEN` expires, every fetch answers 500 until the
-  process restarts with new keys. The `~/.aws` profile files are not
-  read. To use a profile, export it with
+  Keys from web identity, the container endpoint and IMDS are cached and
+  fetched again five minutes before they expire. When S3 says they have
+  expired, oximg fetches new keys once and tries again. A failed refresh
+  keeps the cached keys until they expire and does not ask again for a
+  minute. A credential source that does not answer in time is a 504, one
+  that is down or throttled a 502, and one that rejects the settings a
+  500. Requests to IMDS and the ECS and EKS agents skip the proxy; STS
+  and an `https://` container endpoint on another host honor
+  `HTTPS_PROXY`. With nothing else set, boot asks IMDS on any host, so a
+  host off EC2 can wait up to two seconds before it fails;
+  `AWS_EC2_METADATA_DISABLED=true` skips that. Static keys are not
+  refreshed: when `AWS_SESSION_TOKEN` expires, every fetch answers 500
+  until the process restarts with new keys. The `~/.aws` profile files,
+  SSO, `credential_process` and role chaining are not supported. To use
+  a profile, export it with
   `aws configure export-credentials --format env`.
 
 For `s3://` on AWS, give the key `s3:GetObject` on the objects and
@@ -564,6 +581,16 @@ never silently falls back to a default.
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` access key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` secret key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` session token, for temporary keys only |
+| `AWS_WEB_IDENTITY_TOKEN_FILE` | unset | `s3://` keys from EKS IAM roles for service accounts (IRSA, which sets it): an OIDC token that STS exchanges for keys. Read again on every fetch, since EKS rotates it. Needs `AWS_ROLE_ARN` |
+| `AWS_ROLE_ARN` | unset | The role to assume with the web identity token |
+| `AWS_ROLE_SESSION_NAME` | `oximg-<unix time>` | Session name for that role, shown in CloudTrail |
+| `AWS_ENDPOINT_URL_STS` | `https://sts.<AWS_REGION>.amazonaws.com` (`.amazonaws.com.cn` for `cn-*`) | STS endpoint for web identity, e.g. a VPC endpoint |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role, used when neither static keys nor web identity are set. ECS sets it |
+| `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity (which sets it) or another credential agent. Over `http://` only loopback, `169.254.170.2`, `169.254.170.23` and `fd00:ec2::23` are allowed |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | `Authorization` value for the container endpoint, read from this file on every fetch (EKS rotates it). Wins over the next row |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | `Authorization` value for the container endpoint |
+| `AWS_EC2_METADATA_DISABLED` | `false` | `true` stops `s3://` from asking EC2 instance metadata (IMDSv2) for keys. IMDS is the last source and is tried when nothing else is set; off EC2 that can cost up to two seconds at boot before it fails |
+| `AWS_EC2_METADATA_SERVICE_ENDPOINT` | `http://169.254.169.254` | IMDS address, `scheme://host[:port]`. Use `http://[fd00:ec2::254]` on IPv6-only subnets |
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Seconds for the whole origin fetch, including credentials, retries/backoff and body download (fetch-slot queueing is excluded) — bounds how long a stalled upstream can hold a fetch slot (and its buffer); timeouts answer 504, distinct from other upstream failures' 502 |
 | `OXIMG_UPSTREAM_CONNECT_TIMEOUT` | `5` | Seconds to establish the origin connection |
 | `OXIMG_MAX_SOURCE_BYTES` | 64 MiB | Compressed-size cap; over-limit remote sources answer 413 |
@@ -724,9 +751,6 @@ drain.
 
 ## Not yet implemented (out of PoC scope)
 
-- The AWS credential chain for `s3://` (container, instance and web
-  identity roles). Static keys work today
-  ([#11](https://github.com/oximg/oximg/issues/11))
 - JXL output (the `@jxl` token is reserved and returns a clear error)
 - Animated output from an animated **AVIF or WebP** source (those render
   their first frame; animated GIF sources do animate — see
@@ -739,9 +763,6 @@ drain.
 
 Rough order, subject to change (experimental PoC):
 
-- **The AWS credential chain for `s3://`** — static keys are in. The
-  container provider, IMDSv2 and web identity are next
-  ([#11](https://github.com/oximg/oximg/issues/11)).
 - **Per-image output format selection** — choose quantized-PNG vs
   WebP per image rather than per deployment
   ([#6](https://github.com/oximg/oximg/issues/6)).

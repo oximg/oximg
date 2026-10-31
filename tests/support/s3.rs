@@ -47,6 +47,14 @@ impl Reply {
         self
     }
 
+    /// A JSON body, for the credential endpoints (container, IMDS).
+    pub fn json(status: &str, body: &str) -> Self {
+        Self::raw(format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ))
+    }
+
     pub fn delay_headers(mut self, delay: Duration) -> Self {
         self.parts[0].0 = delay;
         self
@@ -88,6 +96,22 @@ pub struct S3 {
 
 impl S3 {
     pub fn spawn(route: impl Fn(&str, &str) -> Reply + Send + Sync + 'static) -> io::Result<Self> {
+        Self::spawn_checked(true, route)
+    }
+
+    /// The same server without the signature check, to stand in for the
+    /// unsigned credential endpoints: container, IMDS and STS. The route
+    /// gets the path and the whole request in lower case, as with `spawn`.
+    pub fn spawn_unsigned(
+        route: impl Fn(&str, &str) -> Reply + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_checked(false, route)
+    }
+
+    fn spawn_checked(
+        check_signature: bool,
+        route: impl Fn(&str, &str) -> Reply + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -114,7 +138,7 @@ impl S3 {
                             let path = req.split_whitespace().nth(1).unwrap_or("/");
                             seen.lock().unwrap().push(path.to_string());
                             let lower = req.to_ascii_lowercase();
-                            let response = if signed_with_test_keys(&req) {
+                            let response = if !check_signature || signed_with_test_keys(&req) {
                                 route(path, &lower)
                             } else {
                                 Reply::error("403 Forbidden", "SignatureDoesNotMatch")
@@ -181,9 +205,19 @@ fn read_request(stream: &mut TcpStream, stop: &Shutdown) -> io::Result<String> {
             Ok(0) => break,
             Ok(n) => {
                 bytes.extend_from_slice(&buf[..n]);
-                if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
-                    return String::from_utf8(bytes)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    // A body, for the STS fake, arrives after the headers
+                    // and may need more reads.
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let body_len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + body_len {
+                        return String::from_utf8(bytes)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+                    }
                 }
             }
             Err(e)
@@ -243,6 +277,27 @@ fn fragmented_headers_are_read_before_rejecting_an_unsigned_request() {
     assert!(reply.starts_with("HTTP/1.1 403 Forbidden"), "{reply}");
     assert!(reply.contains("SignatureDoesNotMatch"));
     assert_eq!(s3.requests(), ["/test-bucket/x"]);
+}
+
+#[test]
+fn a_body_split_from_its_headers_is_read_whole() {
+    let fake = S3::spawn_unsigned(|_, req| {
+        assert!(req.ends_with("a=1&b=2"), "{req}");
+        Reply::json("200 OK", "{}")
+    })
+    .unwrap();
+    let mut stream = TcpStream::connect(("127.0.0.1", fake.port())).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 7\r\nConnection: close\r\n\r\na=1")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    stream.write_all(b"&b=2").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK"), "{reply}");
 }
 
 /// Check a SigV4 signature against the request as it arrived: the
@@ -346,10 +401,27 @@ fn sigv4_verifier_accepts_the_aws_example() {
     assert!(!sigv4_is_valid(req, "another-secret"));
 }
 
+/// AWS settings the credential chain reads besides the static keys.
+/// `s3_env` blanks them, so a test that runs on an EC2, ECS or EKS
+/// runner does not pick up the runner's own role.
+const CHAIN_VARS: [&str; 10] = [
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+];
+
 /// The env every s3:// test starts from. Blank values read as unset,
-/// so this also clears whatever the developer's shell has exported.
+/// so this also clears whatever the developer's shell or the CI runner
+/// has exported.
 pub fn s3_env(endpoint_port: u16) -> Vec<(&'static str, String)> {
-    vec![
+    let mut env = vec![
         (
             "OXIMG_S3_ENDPOINT",
             format!("http://127.0.0.1:{endpoint_port}"),
@@ -359,5 +431,7 @@ pub fn s3_env(endpoint_port: u16) -> Vec<(&'static str, String)> {
         ("AWS_SECRET_ACCESS_KEY", "test-secret".into()),
         ("AWS_SESSION_TOKEN", String::new()),
         ("OXIMG_S3_PATH_STYLE", String::new()),
-    ]
+    ];
+    env.extend(CHAIN_VARS.map(|name| (name, String::new())));
+    env
 }

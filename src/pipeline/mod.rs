@@ -1123,7 +1123,7 @@ pub fn gcs_startup() -> Result<(), String> {
 }
 
 /// S3-source variant (`s3://` mode): fetch `key` from `bucket` with
-/// static AWS keys from the environment into a bounded buffer, then
+/// keys from the AWS credential chain into a bounded buffer, then
 /// decode. Same contract as [`process_url`]. `key` must already be
 /// percent-encoded segment-wise. Requires the `server` feature.
 #[cfg(feature = "server")]
@@ -1185,10 +1185,10 @@ pub fn fetch_gcs(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// Buffered S3 fetch: [`fetch_url`]'s contract for the `s3://` mode,
-/// signed with static AWS keys, with the same caps and classification
-/// as [`process_s3`]. `key` must already be percent-encoded
-/// segment-wise. Sync bridge over [`fetch_s3_async`]. Requires the
-/// `server` feature.
+/// signed with keys from the AWS credential chain, with the same caps
+/// and classification as [`process_s3`]. `key` must already be
+/// percent-encoded segment-wise. Sync bridge over [`fetch_s3_async`].
+/// Requires the `server` feature.
 #[cfg(feature = "server")]
 pub fn fetch_s3(bucket: &str, key: &str) -> Result<Vec<u8>, Error> {
     clear_fetch_time();

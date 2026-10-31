@@ -205,6 +205,16 @@ const PROCESS: &[&str] = &[
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_ENDPOINT_URL_STS",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_EC2_METADATA_DISABLED",
+    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
     "GLIBC_TUNABLES",
 ];
 
@@ -489,7 +499,7 @@ mod tests {
             }
         }
         // Do not scan config.rs: PROCESS names appear in the inventory
-        // itself. Always include gcs.rs and s3.rs so
+        // itself. Always include gcs.rs and the s3 files so
         // --no-default-features still sees GCE_METADATA_HOST and the
         // AWS_* names.
         let process_sources = [
@@ -497,6 +507,10 @@ mod tests {
             include_str!("cli.rs"),
             include_str!("pipeline/gcs.rs"),
             include_str!("pipeline/s3.rs"),
+            include_str!("pipeline/s3/creds.rs"),
+            include_str!("pipeline/s3/web_identity.rs"),
+            include_str!("pipeline/s3/container.rs"),
+            include_str!("pipeline/s3/imds.rs"),
         ];
         let mut reads: HashSet<&str> = HashSet::new();
         for src in process_sources {
