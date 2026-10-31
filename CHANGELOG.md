@@ -25,6 +25,13 @@ HTTP interface without notice.
   `OXIMG_ICC` (keep). Dropping a CMYK JPEG's profile is refused, and
   GIF and AVIF are not supported (exit 1). `oximg-ctl strip` proves a
   run: removed blocks, residue, pixel identity, and peak RSS.
+- **`oximg resize --icc keep|strip` and `--no-auto-rotate`** ([#128]).
+  The per-call overrides the library already had (`Params::icc`,
+  `Params::auto_rotate`) reach the CLI, so one image can keep or drop
+  its profile, or keep its stored orientation, without setting
+  `OXIMG_ICC` / `OXIMG_AUTO_ROTATE`. The flag wins over the knob;
+  `--auto-rotate` forces rotation on under `OXIMG_AUTO_ROTATE=0`. An
+  unknown `--icc` value is a usage error (exit 2).
 - **`oximg-ctl` probes report a JPEG's frame type.** A JPEG body or
   file gets `probe.jpeg.{sof,progressive}` (the SOFn number: 0
   baseline, 1 extended sequential, 2 progressive), so a proof of which
@@ -182,6 +189,7 @@ HTTP interface without notice.
   an animation still degrades to a still rather than answering 413.
 
 [#127]: https://github.com/oximg/oximg/issues/127
+[#128]: https://github.com/oximg/oximg/issues/128
 [#129]: https://github.com/oximg/oximg/issues/129
 [#130]: https://github.com/oximg/oximg/issues/130
 [#133]: https://github.com/oximg/oximg/issues/133

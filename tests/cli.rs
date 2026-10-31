@@ -2,6 +2,8 @@
 //! probe`) and verify outputs, format selection precedence, exit
 //! codes, and that the `serve` subcommand still boots the server.
 
+mod common;
+
 use std::process::Command;
 
 fn bin() -> Command {
@@ -205,6 +207,18 @@ fn usage_errors_exit_2() {
             "resize", "in.jpg", "100", "100", "out.jpg", "--preset", "bogus",
         ][..],
         &["resize", "in.jpg", "100", "100", "out.jpg", "--bogus"][..],
+        &[
+            "resize", "in.jpg", "100", "100", "out.jpg", "--icc", "maybe",
+        ][..],
+        &["resize", "in.jpg", "100", "100", "out.jpg", "--icc"][..],
+        &[
+            "resize",
+            "in.jpg",
+            "100",
+            "100",
+            "out.jpg",
+            "--no-auto-rotate=1",
+        ][..],
         &["probe"][..],
         &["frobnicate"][..],
         &["serve", "extra"][..],
@@ -716,4 +730,99 @@ fn strip_refusals_and_usage_errors() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("nothing to remove"));
     assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&webp).unwrap());
     std::fs::remove_file(&out).ok();
+}
+/// Issue #128: `--icc keep|strip` overrides `OXIMG_ICC` per call, the
+/// same precedence as `strip` (flag > knob > keep), and the default
+/// keeps a source profile.
+#[test]
+fn resize_icc_flag_overrides_the_knob() {
+    let icc = common::fake_icc(900);
+    let app2 = common::app2_icc_payloads(&icc, 60_000);
+    let px = vec![128u8; 64 * 48 * 3];
+    let src = tmp("icc-src.jpg");
+    std::fs::write(
+        &src,
+        common::jpeg_with_markers(&px, 64, 48, &[(2, &app2[0])]),
+    )
+    .unwrap();
+    for (args, env_icc, keeps) in [
+        (&[][..], None, true),
+        (&["--icc", "strip"][..], None, false),
+        (&["--icc", "keep"][..], Some("0"), true),
+        (&["--icc", "strip"][..], Some("1"), false),
+        (&[][..], Some("0"), false),
+    ] {
+        let out = tmp("icc-out.jpg");
+        let mut cmd = bin();
+        cmd.arg("resize").arg(&src).args(["0", "0"]).arg(&out);
+        cmd.args(args).env_remove("OXIMG_ICC");
+        if let Some(v) = env_icc {
+            cmd.env("OXIMG_ICC", v);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        std::fs::remove_file(&out).ok();
+        let want = keeps.then_some(&icc[..]);
+        assert_eq!(
+            common::jpeg_icc(&bytes).as_deref(),
+            want,
+            "{args:?} {env_icc:?}"
+        );
+    }
+    std::fs::remove_file(&src).ok();
+}
+
+/// Issue #128: `--no-auto-rotate` keeps an orientation-6 source's
+/// stored layout (64x48 stays 64x48, corners where they were stored),
+/// and `--auto-rotate` forces the upright 48x64 even under
+/// `OXIMG_AUTO_ROTATE=0`.
+#[test]
+fn resize_auto_rotate_flags_override_the_knob() {
+    let display = common::corner_base(48, 64, 16);
+    let (stored, sw, sh) = common::store_for_orientation(&display, 48, 64, 6);
+    assert_eq!((sw, sh), (64, 48));
+    let src = tmp("rot-src.jpg");
+    std::fs::write(
+        &src,
+        common::jpeg_with_orientation(&stored, sw, sh, Some(6)),
+    )
+    .unwrap();
+    let (_, _, stored_corners) =
+        common::corner_classes(&common::jpeg_with_orientation(&stored, sw, sh, None));
+    for (args, env, upright) in [
+        (&[][..], None, true),
+        (&["--no-auto-rotate"][..], None, false),
+        (&["--no-auto-rotate"][..], Some("1"), false),
+        (&["--auto-rotate"][..], Some("0"), true),
+        (&[][..], Some("0"), false),
+    ] {
+        let out = tmp("rot-out.jpg");
+        let mut cmd = bin();
+        cmd.arg("resize").arg(&src).args(["0", "0"]).arg(&out);
+        cmd.args(args).env_remove("OXIMG_AUTO_ROTATE");
+        if let Some(v) = env {
+            cmd.env("OXIMG_AUTO_ROTATE", v);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = std::fs::read(&out).unwrap();
+        std::fs::remove_file(&out).ok();
+        let got = common::corner_classes(&bytes);
+        let want = if upright {
+            (48, 64, ['R', 'G', 'B', 'W'])
+        } else {
+            (64, 48, stored_corners)
+        };
+        assert_eq!(got, want, "{args:?} {env:?}");
+    }
+    std::fs::remove_file(&src).ok();
 }
