@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
+require "tempfile"
 require_relative "oximg/version"
 require_relative "oximg/binary"
+require_relative "oximg/native"
 
 # Ruby bindings for oximg (https://github.com/oximg/oximg):
 # high-performance image compression and resizing, in-process work for a
@@ -109,9 +111,35 @@ module Oximg
     # Header-only inspection — no pixels are decoded. Returns
     # <tt>{content_type:, format:, width:, height:}</tt>, where the
     # dimensions are the stored ones (an EXIF rotation is not applied).
+    #
+    # +source+ is a path — a String, a Pathname, or anything with #path
+    # such as a File or Tempfile — or an IO without one, read from its
+    # current position: a StringIO, a socket, any object with #read(n).
+    # A String is always a path, so bytes already in memory go in as
+    # <tt>StringIO.new(bytes)</tt>.
+    #
+    # Platform gems run this in-process and read only as much of the
+    # source as the header takes (see in_process_probe?). Otherwise it
+    # spawns <tt>oximg probe</tt>, which reads the whole source, and an
+    # IO is copied to a tempfile first. The answer is the same.
     def probe(source)
-      out, = Binary.run("probe", expand(source, "source"))
+      if !source.respond_to?(:path) && !source.respond_to?(:to_path) && source.respond_to?(:read)
+        return Native.available? ? Native.probe_io(source) : probe_spawned_io(source)
+      end
+
+      path = expand(source, "source")
+      return Native.probe_path(path) if Native.available?
+
+      out, = Binary.run("probe", path)
       parse_probe(out)
+    end
+
+    # True when probe runs in-process, through the library a platform
+    # gem bundles; false when it spawns the executable. Either way
+    # probe answers the same, and only its cost differs — this is for a
+    # boot-time log, or a test that must know which path it took.
+    def in_process_probe?
+      Native.available?
     end
 
     # The argv `resize` would run, minus the executable. Public because
@@ -132,6 +160,18 @@ module Oximg
     end
 
     private
+
+    # The executable reads paths only, so without the library an IO
+    # goes through a tempfile.
+    def probe_spawned_io(io)
+      Tempfile.create("oximg-probe") do |file|
+        file.binmode
+        IO.copy_stream(io, file)
+        file.flush
+        out, = Binary.run("probe", file.path)
+        parse_probe(out)
+      end
+    end
 
     # The hash `probe` builds from the line the CLI printed. Separate
     # from `probe` so the parser can be tested against every line the

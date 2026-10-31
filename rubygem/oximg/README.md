@@ -59,6 +59,40 @@ Everything the server tunes through `OXIMG_*` environment variables
 applies here too, and is validated the same fail-closed way: a typo'd
 knob is a startup error, never a silent default.
 
+## Probing
+
+```ruby
+Oximg.probe("in.jpg")                          # a path
+Oximg.probe(Pathname("in.jpg"))                # also a path
+Oximg.probe(upload.tempfile)                   # anything with #path
+Oximg.probe(StringIO.new(bytes))               # an IO: bytes in memory
+#=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
+```
+
+`probe` reads the header only and decodes no pixels. The dimensions are
+the stored ones, before any EXIF rotation. A String is always a path,
+so bytes already in memory go in as a `StringIO`. An IO without `#path`
+is read from its current position through `#read(n)` and left where
+the read stopped.
+
+Platform gems run `probe` in-process: oximg's own probe, compiled into
+a small library the gem calls through [`ffi`](https://github.com/ffi/ffi).
+It reads only as much of the source as the header takes, typically the
+first 64 KiB, and costs microseconds where a spawn costs milliseconds.
+`resize` is not affected and still runs in a child process, which keeps
+a full decode's memory and crashes out of your process.
+
+Without the library — the plain-Ruby gem, or a platform gem whose
+library cannot load — `probe` spawns `oximg probe` instead, copying an
+IO to a tempfile first. The answer is the same; only the cost differs.
+
+```ruby
+Oximg.in_process_probe?  #=> true on a platform gem
+```
+
+`OXIMG_PROBE_LIB` points at a library explicitly; like `OXIMG_BIN`, a
+wrong one raises rather than falling back.
+
 ## Where the binary comes from
 
 `Oximg.executable` resolves, first hit wins:
@@ -75,10 +109,10 @@ Oximg.executable  #=> "/…/gems/oximg-0.17.0-arm64-darwin/exe/oximg"
 Oximg.version     #=> "0.17.0"   # the binary's version, not the gem's
 ```
 
-The gem shells out to that binary — one process per image, which is
+`resize` shells out to that binary — one process per image, which is
 noise next to the encode itself and invisible inside the background job
-where variants are generated anyway. An in-process native extension is a
-later option; it would not change the API above.
+where variants are generated anyway. Only `probe`, where the spawn was
+the whole cost, runs in-process (see [Probing](#probing)).
 
 ## Rails
 

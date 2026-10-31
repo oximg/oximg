@@ -7,6 +7,7 @@ bench/quality/package*.json
 rubygem/*/Gemfile.lock
 rubygem/*/*.gem
 rubygem/oximg/exe/
+rubygem/oximg/lib/oximg/native/
 # Claude Code: per-machine settings and agent worktrees
 .claude/settings.local.json
 .claude/worktrees/

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "stringio"
 
 # End-to-end against a real binary: the argv tests pin what the gem
 # says, these pin that the CLI still answers it. Skipped when no
@@ -84,6 +85,14 @@ class Oximg::ProcessingTest < Oximg::Test
   def test_probe_names_gif_as_a_format
     probed = Oximg.probe(fixture("still.gif"))
     assert_equal({content_type: "image/gif", format: :gif, width: 240, height: 180}, probed)
+  end
+
+  # Without the probe library, an IO reaches the executable through a
+  # tempfile, and the answer is the path's.
+  def test_probe_reads_an_io_through_the_executable
+    refute Oximg.in_process_probe?, "this suite drives the executable; NativeTest drives the library"
+    probed = Oximg.probe(StringIO.new(File.binread(fixture("photo.jpg"))))
+    assert_equal Oximg.probe(fixture("photo.jpg")), probed
   end
 
   # The binary already names what it refused; the gem must surface that

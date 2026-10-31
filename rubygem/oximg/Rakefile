@@ -8,4 +8,15 @@ Rake::TestTask.new(:test) do |t|
   t.warning = true
 end
 
+# The probe library a platform gem bundles (ext/), built into the
+# repo's target/ where the tests look for it. Release, as it ships: the
+# tests compare its answers with the executable's.
+desc "Build the in-process probe library from ext/"
+task :compile do
+  root = File.expand_path("../..", __dir__)
+  sh "cargo", "build", "--release", "--locked",
+    "--manifest-path", File.join(__dir__, "ext", "Cargo.toml"),
+    "--target-dir", File.join(root, "target", "oximg-probe")
+end
+
 task default: :test

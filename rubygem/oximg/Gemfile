@@ -4,5 +4,9 @@ source "https://rubygems.org"
 
 gemspec
 
+# The in-process probe's binding, for the tests that load a locally
+# built library (`rake compile`). A runtime dependency of the platform
+# gems only; see oximg.gemspec.
+gem "ffi", "~> 1.17"
 gem "minitest", "~> 5.0"
 gem "rake", "~> 13.0"

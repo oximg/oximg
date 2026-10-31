@@ -185,11 +185,15 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
+      # The in-process probe: NativeTest checks its answer against the
+      # binary's on every fixture, and must run rather than skip here.
       - name: Test oximg
         working-directory: rubygem/oximg
+        env:
+          OXIMG_TEST_REQUIRE_PROBE_LIB: "1"
         run: |
           bundle install --jobs 4
-          bundle exec rake test
+          bundle exec rake compile test
       - name: Test oximg-rails
         working-directory: rubygem/oximg-rails
         run: |

@@ -21,6 +21,16 @@ HTTP interface without notice.
   prefix parse where the whole file does not. A failing reader is
   `SourceUnreadable` (or `SourceNotFound` / `SourceTooLarge`), never
   `Undecodable`.
+- **The Ruby gem probes in-process** ([#134]). `Oximg.probe` calls
+  oximg's own probe through a small C library (`rubygem/oximg/ext`,
+  loaded with the `ffi` gem) instead of spawning `oximg probe`: 26–55
+  µs per path instead of 4.3–9.4 ms on the fixtures and an 8 MB JPEG
+  (Apple M2 Max, Ruby 3.4). It also takes an IO, so bytes in memory go
+  in as `StringIO.new(bytes)` with no tempfile; a String is still a
+  path. Without the library (the plain-Ruby gem, or one that cannot
+  load) it spawns as before and answers the same;
+  `Oximg.in_process_probe?` says which. `resize` still runs in a child
+  process.
 
 ### Changed
 
