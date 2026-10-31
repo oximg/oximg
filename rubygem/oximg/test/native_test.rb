@@ -89,6 +89,38 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # Every IO answers #path since Ruby 3.2: nil for a pipe, "" for a
+  # socket. Those are streams, not paths.
+  def test_reads_a_pipe_and_a_socket
+    require "socket"
+    bytes = File.binread(fixture("photo.jpg"))
+    want = {content_type: "image/jpeg", format: :jpeg, width: 200, height: 150}
+    with_library do
+      [IO.pipe, UNIXSocket.pair].each do |reader, writer|
+        writer.write(bytes)
+        writer.close
+        assert_equal want, Oximg.probe(reader), reader.class.name
+      ensure
+        reader&.close
+      end
+    end
+  end
+
+  # A File whose name no longer leads to it is read as the stream it
+  # still is.
+  def test_reads_an_unlinked_file_as_a_stream
+    with_library do
+      in_tmpdir do |dir|
+        path = File.join(dir, "gone.png")
+        File.binwrite(path, File.binread(fixture("rgb.png")))
+        File.open(path, "rb") do |file|
+          File.delete(path)
+          assert_equal({content_type: "image/png", format: :png, width: 200, height: 150}, Oximg.probe(file))
+        end
+      end
+    end
+  end
+
   def test_reports_a_missing_file
     with_library do
       error = assert_raises(Oximg::ProcessingError) { Oximg.probe(fixture("missing.jpg")) }

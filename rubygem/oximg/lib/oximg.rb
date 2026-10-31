@@ -112,18 +112,20 @@ module Oximg
     # <tt>{content_type:, format:, width:, height:}</tt>, where the
     # dimensions are the stored ones (an EXIF rotation is not applied).
     #
-    # +source+ is a path — a String, a Pathname, or anything with #path
-    # such as a File or Tempfile — or an IO without one, read from its
-    # current position: a StringIO, a socket, any object with #read(n).
+    # +source+ is a path — a String, a Pathname, a File, or anything
+    # else with #path such as a Tempfile — or a stream read from its
+    # current position through #read(n): a StringIO, a pipe, a socket.
     # A String is always a path, so bytes already in memory go in as
-    # <tt>StringIO.new(bytes)</tt>.
+    # <tt>StringIO.new(bytes)</tt>. A File is read by its name, its
+    # position untouched, while that name still leads to a regular
+    # file; otherwise it is a stream too.
     #
     # Platform gems run this in-process and read only as much of the
     # source as the header takes (see in_process_probe?). Otherwise it
     # spawns <tt>oximg probe</tt>, which reads the whole source, and an
     # IO is copied to a tempfile first. The answer is the same.
     def probe(source)
-      if !source.respond_to?(:path) && !source.respond_to?(:to_path) && source.respond_to?(:read)
+      if stream?(source)
         return Native.available? ? Native.probe_io(source) : probe_spawned_io(source)
       end
 
@@ -160,6 +162,21 @@ module Oximg
     end
 
     private
+
+    # Whether probe reads +source+ through #read rather than opening it
+    # by name. Every IO answers #path since Ruby 3.2 — nil for a pipe,
+    # "" for a socket, "<STDIN>" for STDIN — so for an IO that alone
+    # proves nothing: only a File whose name still leads to a regular
+    # file is a path. Anything else keeps the duck typing: #to_path or
+    # #path (a Pathname, a Tempfile, an upload) is a path.
+    def stream?(source)
+      case source
+      when String then false
+      when File then !(source.stat.file? && File.file?(source.path.to_s))
+      when IO then true
+      else !source.respond_to?(:to_path) && !source.respond_to?(:path) && source.respond_to?(:read)
+      end
+    end
 
     # The executable reads paths only, so without the library an IO
     # goes through a tempfile.
