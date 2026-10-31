@@ -558,3 +558,101 @@ fn unknown_png_quantize_is_still_fatal() {
     );
     assert!(!out.exists(), "nothing may be written on a fatal config");
 }
+
+/// `oximg strip`: a JPEG carrying an XMP block and a profile comes back
+/// without the XMP, the profile kept by default and dropped by
+/// `--icc strip` or `OXIMG_ICC=0` (the flag wins over the knob), and
+/// the summary names what went.
+#[test]
+fn strip_removes_metadata_and_honors_icc() {
+    let px = vec![128u8; 64 * 48 * 3];
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_size(64, 48);
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_marker(
+        mozjpeg::Marker::APP(1),
+        b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta>SECRET</x:xmpmeta>",
+    );
+    started.write_marker(mozjpeg::Marker::APP(2), b"ICC_PROFILE\0\x01\x01PROFILE");
+    started.write_scanlines(&px).unwrap();
+    let src_bytes = started.finish().unwrap();
+    let src = tmp("strip-src.jpg");
+    std::fs::write(&src, &src_bytes).unwrap();
+    let has = |b: &[u8], n: &[u8]| b.windows(n.len()).any(|w| w == n);
+
+    for (args, env_icc, keeps_icc) in [
+        (&[][..], None, true),
+        (&["--icc", "strip"][..], None, false),
+        (&["--icc", "keep"][..], Some("0"), true),
+        (&[][..], Some("0"), false),
+    ] {
+        let out = tmp("strip-out.jpg");
+        let mut cmd = bin();
+        cmd.arg("strip").arg(&src).arg(&out).args(args);
+        cmd.env_remove("OXIMG_ICC");
+        if let Some(v) = env_icc {
+            cmd.env("OXIMG_ICC", v);
+        }
+        let output = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        let bytes = std::fs::read(&out).unwrap();
+        std::fs::remove_file(&out).ok();
+        assert!(!has(&bytes, b"SECRET"), "{args:?}");
+        assert_eq!(
+            has(&bytes, b"ICC_PROFILE"),
+            keeps_icc,
+            "{args:?} {env_icc:?}"
+        );
+        assert!(stderr.contains("image/jpeg; removed "), "{stderr}");
+        assert!(stderr.contains("XMP"), "{stderr}");
+    }
+    std::fs::remove_file(&src).ok();
+}
+
+#[test]
+fn strip_refusals_and_usage_errors() {
+    let out = tmp("strip-refused.out");
+    let run = |args: &[&str]| {
+        bin()
+            .arg("strip")
+            .args(args)
+            .env_remove("OXIMG_ICC")
+            .output()
+            .unwrap()
+    };
+    let o = out.to_str().unwrap();
+    let (jpg, gif, cmyk) = (
+        fixture("photo.jpg"),
+        fixture("still.gif"),
+        fixture("cmyk_icc.jpg"),
+    );
+    // Usage errors exit 2.
+    for args in [
+        &[][..],
+        &[&jpg[..]][..],
+        &[&jpg, o, "--icc", "maybe"][..],
+        &[&jpg, o, "--quality", "80"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+    }
+    // Processing refusals exit 1 and write nothing.
+    for (args, says) in [
+        (&[&gif[..], o][..], "JPEG, PNG and WebP"),
+        (&[&cmyk, o, "--icc", "strip"][..], "CMYK"),
+    ] {
+        let output = run(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(says), "{stderr}");
+        assert!(!out.exists(), "{args:?} wrote output");
+    }
+    // Nothing to strip is not an error, and changes nothing.
+    let webp = fixture("photo.webp");
+    let output = run(&[&webp, o]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("nothing to remove"));
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&webp).unwrap());
+    std::fs::remove_file(&out).ok();
+}

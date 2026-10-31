@@ -250,6 +250,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some("resize") => return cli::resize(&args[1..]),
+        Some("strip") => return cli::strip(&args[1..]),
         Some("probe") => return cli::probe(&args[1..]),
         Some("-V" | "--version") => {
             println!("oximg {}", env!("CARGO_PKG_VERSION"));
