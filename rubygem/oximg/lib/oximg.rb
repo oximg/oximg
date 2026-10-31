@@ -118,7 +118,8 @@ module Oximg
     # A String is always a path, so bytes already in memory go in as
     # <tt>StringIO.new(bytes)</tt>. A File is read by its name, its
     # position untouched, while that name still leads to a regular
-    # file; otherwise it is a stream too.
+    # file, and always once it is closed; an open one whose name no
+    # longer leads to it is a stream too.
     #
     # With the probe library this runs in-process and reads only as much
     # of the source as the header takes (see in_process_probe?). Without it,
@@ -167,7 +168,8 @@ module Oximg
     # by name. Every IO answers #path since Ruby 3.2 — nil for a pipe,
     # "" for a socket, "<STDIN>" for STDIN — so for an IO that alone
     # proves nothing: only a File whose name still leads to a regular
-    # file is a path. Anything else keeps the duck typing: #to_path or
+    # file is a path, and a closed File, which has nothing left to read
+    # but its name. Anything else keeps the duck typing: #to_path or
     # #path (a Pathname, a Tempfile, an upload) is a path.
     def stream?(source)
       case source

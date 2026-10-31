@@ -73,9 +73,10 @@ Oximg.probe(StringIO.new(bytes))               # an IO: bytes in memory
 the stored ones, before any EXIF rotation. A String is always a path,
 so bytes already in memory go in as a `StringIO`. A `File` is read by
 its name, its position untouched, while that name still leads to a
-regular file. Other IO — a `StringIO`, a pipe, a socket, or a `File`
-whose name no longer leads to it — is read from its current position
-through `#read(n)` and left where the read stopped.
+regular file, and always once it is closed. Other IO — a `StringIO`, a
+pipe, a socket, or an open `File` whose name no longer leads to it — is
+read from its current position through `#read(n)` and left where the
+read stopped.
 
 The gem does that reading itself, in Ruby, between calls into the
 library, so `#read` behaves as it would anywhere: whatever it raises

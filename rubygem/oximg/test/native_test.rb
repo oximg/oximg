@@ -214,9 +214,12 @@ class Oximg::NativeTest < Oximg::Test
       thread = Thread.new { Oximg.probe(io) }
       reading.pop
       thread.report_on_exception = false
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       thread.raise(ArgumentError, "from outside")
       error = assert_raises(ArgumentError) { thread.value }
       assert_equal "from outside", error.message
+      # Now, not once the 5 s read is over.
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 2
     end
   end
 
