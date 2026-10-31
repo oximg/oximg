@@ -1636,16 +1636,21 @@ fn strip_checks_every_animation_frame() {
 /// rather than pass it unchecked.
 #[test]
 fn strip_fails_when_pixels_cannot_be_compared() {
-    let output = ctl()
-        .env("OXIMG_MAX_SRC_PIXELS", "1")
-        .args(["strip", &fixture("photo.jpg")])
-        .output()
-        .unwrap();
-    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(output.status.code(), Some(1), "{v}");
-    assert_eq!(v["ok"], false, "{v}");
-    assert_eq!(
-        v["error"], "pixels could not be decoded for comparison",
-        "{v}"
-    );
+    // PNG too: its native-depth hash must not bypass the source limit.
+    for name in ["photo.jpg", "rgb16.png"] {
+        let output = ctl()
+            .env("OXIMG_MAX_SRC_PIXELS", "1")
+            .args(["strip", &fixture(name)])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{name}: {v}");
+        assert_eq!(v["ok"], false, "{name}: {v}");
+        assert_eq!(
+            v["error"], "pixels could not be decoded for comparison",
+            "{name}: {v}"
+        );
+        let why = v["pixels_identical"]["error"].as_str().unwrap_or_default();
+        assert!(why.contains("OXIMG_MAX_SRC_PIXELS"), "{name}: {v}");
+    }
 }

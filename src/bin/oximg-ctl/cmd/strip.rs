@@ -190,9 +190,6 @@ fn removed_value(removed: &[pipeline::Removed]) -> Value {
 /// PNG is decoded at its native depth: the pipeline strips 16-bit
 /// samples to 8, which would hide a change in a low byte.
 fn pixels(bytes: &[u8]) -> Result<String, String> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return png_native(bytes).map(|px| sha256_hex(&px));
-    }
     let p = Params {
         output: Some(ImageFormat::Png),
         auto_rotate: Some(false),
@@ -200,9 +197,15 @@ fn pixels(bytes: &[u8]) -> Result<String, String> {
         png_quantize: Some(false),
         ..Default::default()
     };
-    pipeline::process(bytes, &p)
+    // The pipeline runs first even for a PNG: it enforces the source
+    // limits (OXIMG_MAX_SRC_PIXELS) before the native decode allocates.
+    let hash = pipeline::process(bytes, &p)
         .map(|(png, _)| sha256_hex(&png))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return png_native(bytes).map(|px| sha256_hex(&px));
+    }
+    Ok(hash)
 }
 
 /// Every sample of a PNG's first image at its stored bit depth (palette
