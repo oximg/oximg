@@ -7,6 +7,9 @@ bench/quality/package*.json
 rubygem/*/Gemfile.lock
 rubygem/*/*.gem
 rubygem/oximg/exe/
+rubygem/oximg/lib/oximg/native/
+# Copied from the root lock by `rake compile` (see rubygem/oximg/Rakefile).
+rubygem/oximg/ext/Cargo.lock
 # Claude Code: per-machine settings and agent worktrees
 .claude/settings.local.json
 .claude/worktrees/

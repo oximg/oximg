@@ -13,10 +13,12 @@ module Oximg
 
     def setup
       Oximg::Binary.reset!
+      Oximg::Native.reset!
     end
 
     def teardown
       Oximg::Binary.reset!
+      Oximg::Native.reset!
     end
 
     def fixture(name)
@@ -40,6 +42,23 @@ module Oximg
       skip "no oximg executable (cargo build, or install one)" unless executable
 
       Oximg.executable = executable
+    end
+
+    # The probe library `rake compile` builds. Its tests skip without
+    # one, like the executable's — unless OXIMG_TEST_REQUIRE_PROBE_LIB
+    # is set, as CI sets it, where a missing library is a failure: a
+    # suite that skipped every in-process test would otherwise pass.
+    def probe_library
+      @probe_library ||= File.expand_path("../../../target/oximg-probe/release/#{Oximg::Native::LIBRARY}", __dir__)
+      File.file?(@probe_library) ? @probe_library : nil
+    end
+
+    def require_probe_library!
+      return if probe_library
+
+      message = "no probe library (rake compile)"
+      flunk message if ENV["OXIMG_TEST_REQUIRE_PROBE_LIB"]
+      skip message
     end
 
     def with_env(name, value)

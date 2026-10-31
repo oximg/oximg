@@ -481,27 +481,70 @@ const PROBE_FIRST_READ: usize = 64 << 10;
 pub fn probe_reader<R: std::io::Read>(mut reader: R) -> Result<(ImageFormat, usize, usize), Error> {
     use std::io::Read as _;
     let mut buf = Vec::new();
-    let mut want = PROBE_FIRST_READ;
+    let mut eof = false;
     loop {
-        let missing = (want - buf.len()) as u64;
-        // A read failure is the source's, never bad image data, so it is
-        // classified apart from the parser's errors.
-        reader
-            .by_ref()
-            .take(missing)
-            .read_to_end(&mut buf)
-            .map_err(Error::source_read)?;
-        let eof = buf.len() < want;
-        match probe_inner(&buf) {
-            Err(_) if !eof => want *= 2,
-            // A prefix's AVIF answer is not final: an ISOBMFF box of
-            // size 0 runs to EOF, so bytes past the prefix can still
-            // break the walk `probe` makes over the whole file. The
-            // dimensions sit in item data `iloc` points at, usually
-            // the bulk of the file, so reading the rest costs little.
-            Ok((ImageFormat::Avif, ..)) if !eof => want = usize::MAX,
-            result => return result.map_err(|e| Error::classify(e, false)),
+        match probe_step(&buf, eof) {
+            ProbeStep::Done(result) => return result,
+            ProbeStep::Read(want) => {
+                let missing = (want - buf.len()) as u64;
+                // A read failure is the source's, never bad image data,
+                // so it is classified apart from the parser's errors.
+                reader
+                    .by_ref()
+                    .take(missing)
+                    .read_to_end(&mut buf)
+                    .map_err(Error::source_read)?;
+                eof = buf.len() < want;
+            }
         }
+    }
+}
+
+/// What [`probe_step`] needs next.
+#[derive(Debug)]
+pub enum ProbeStep {
+    /// The answer: [`probe`]'s on the whole source.
+    Done(Result<(ImageFormat, usize, usize), Error>),
+    /// Read on until the prefix holds this many bytes or the source
+    /// ends, then call [`probe_step`] again with all of it.
+    /// `usize::MAX` means read to the end.
+    Read(usize),
+}
+
+/// One step of [`probe_reader`], for a caller that does its own reads:
+/// an event loop, or a host language whose I/O must not run under
+/// these frames (the Ruby gem's in-process probe). Start with an empty
+/// `prefix`, read what [`ProbeStep::Read`] asks for, and call again
+/// with everything read so far, `eof` once the source has ended. The
+/// answer and the bytes read are exactly [`probe_reader`]'s.
+///
+/// ```
+/// use oximg::pipeline::{self, ProbeStep};
+///
+/// let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rgb.png"))?;
+/// let mut prefix: &[u8] = &[];
+/// let answer = loop {
+///     match pipeline::probe_step(prefix, prefix.len() == bytes.len()) {
+///         ProbeStep::Done(result) => break result?,
+///         ProbeStep::Read(want) => prefix = &bytes[..want.min(bytes.len())],
+///     }
+/// };
+/// assert_eq!((answer.1, answer.2), (200, 150));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn probe_step(prefix: &[u8], eof: bool) -> ProbeStep {
+    if !eof && prefix.len() < PROBE_FIRST_READ {
+        return ProbeStep::Read(PROBE_FIRST_READ);
+    }
+    match probe_inner(prefix) {
+        Err(_) if !eof => ProbeStep::Read(prefix.len().saturating_mul(2)),
+        // A prefix's AVIF answer is not final: an ISOBMFF box of size 0
+        // runs to EOF, so bytes past the prefix can still break the
+        // walk `probe` makes over the whole file. The dimensions sit in
+        // item data `iloc` points at, usually the bulk of the file, so
+        // reading the rest costs little.
+        Ok((ImageFormat::Avif, ..)) if !eof => ProbeStep::Read(usize::MAX),
+        result => ProbeStep::Done(result.map_err(|e| Error::classify(e, false))),
     }
 }
 
