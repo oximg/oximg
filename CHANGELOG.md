@@ -40,17 +40,28 @@ HTTP interface without notice.
   `Undecodable`. `pipeline::probe_step` is the same read one step at a
   time, for a caller that does its own I/O: it says how many bytes to
   read next, or gives the answer.
-- **The Ruby gem can probe in-process** ([#134]). Given the probe
-  library (`rubygem/oximg/ext`, loaded with the `ffi` gem, from
-  `OXIMG_PROBE_LIB` or bundled in the gem), `Oximg.probe` calls oximg's
-  own probe instead of spawning `oximg probe`: 26–55 µs per path
-  instead of 4.3–9.4 ms on the fixtures and an 8 MB JPEG (Apple M2 Max,
-  Ruby 3.4). The released gems do not bundle the library yet; without
-  it, probe spawns as before and answers the same, and
-  `Oximg.in_process_probe?` says which. `Oximg.probe` also takes an IO
-  (a StringIO, a pipe, a socket), so bytes in memory go in as
-  `StringIO.new(bytes)`; a String is still a path. `resize` still runs
-  in a child process.
+- **The Ruby gem probes in-process** ([#134]). The platform gems
+  bundle a small probe library (`rubygem/oximg/ext`, loaded with the
+  `ffi` gem, which they now depend on), and `Oximg.probe` calls oximg's
+  own probe through it instead of spawning `oximg probe`. Per header
+  read on the fixtures and an 8 MB JPEG (`bench/ruby/probe.rb`,
+  interleaved, median of 7 rounds):
+
+  | | in-process | spawn | ruby-vips `new_from_file` |
+  |---|---|---|---|
+  | Apple M2 Max | 3–39 µs | 3.7–7.2 ms | 148–455 µs |
+  | AMD Ryzen 7 8745HS | 4.5–24 µs | 1.3–5.6 ms | 115–247 µs |
+
+  The library needs only libc and libgcc_s, which Ruby itself needs: it
+  loads on Alpine without libstdc++ and on glibc 2.36 (Debian
+  bookworm). `Oximg.probe` also
+  takes an open File (read through its descriptor, its position
+  untouched) and any IO (a StringIO, a pipe, a socket), so bytes in
+  memory go in as `StringIO.new(bytes)`; a String is still a path. The
+  plain-Ruby gem, or a platform gem whose library cannot load, spawns
+  as before and answers the same; `Oximg.in_process_probe?` says which.
+  `OXIMG_PROBE_LIB` points at another library. `resize` still runs in a
+  child process.
 
 ### Changed
 
