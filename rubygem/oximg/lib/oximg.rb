@@ -216,7 +216,11 @@ module Oximg
     # would otherwise reach the CLI's argument parser as a flag, and
     # the caller rarely controls what an uploaded file is called.
     def expand(path, name)
-      path = path.path if path.respond_to?(:path)
+      if path.respond_to?(:path)
+        path = path.path
+      elsif path.respond_to?(:to_path)
+        path = path.to_path
+      end
       path = path.to_s
       raise ArgumentError, "#{name} path is empty" if path.strip.empty?
 

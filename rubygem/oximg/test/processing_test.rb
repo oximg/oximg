@@ -104,6 +104,13 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_equal Oximg.probe(fixture("photo.jpg")), Oximg.probe(io)
   end
 
+  # An object that names its file only through #to_path.
+  def test_probe_takes_a_to_path_object
+    named = Object.new
+    path = fixture("photo.jpg")
+    named.define_singleton_method(:to_path) { path }
+    assert_equal Oximg.probe(path), Oximg.probe(named)
+  end
 
   # The binary already names what it refused; the gem must surface that
   # rather than a bare exit status.
