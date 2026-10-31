@@ -125,7 +125,7 @@ fn jpeg_drops_every_metadata_segment_and_keeps_pixels() {
             "XMP",
             "APP13 Photoshop 3.0",
             "APP2 MPF",
-            "APP5 SECRET-APP5",
+            "APP5",
             "COM",
             "trailer"
         ]
@@ -195,6 +195,33 @@ fn rotated_photos_keep_only_their_orientation() {
             .count();
         assert_eq!(app1s, usize::from(o != 1), "o={o}");
     }
+}
+
+/// A JFIF thumbnail is a second picture (possibly of what a crop cut
+/// away): it goes, and the JFIF header stays with its density.
+#[test]
+fn jfif_thumbnail_is_dropped() {
+    let photo = fixture("photo.jpg");
+    let app0 = jpeg_markers(&photo)[0].clone();
+    assert_eq!(app0.0, 0xE0);
+    assert!(app0.1.starts_with(b"JFIF\0"));
+    let header = &app0.1[..12];
+    // A 2x1 thumbnail: 6 bytes of RGB after the dimensions.
+    let mut body = header.to_vec();
+    body.extend_from_slice(&[2, 1]);
+    body.extend_from_slice(b"SECRET");
+    let mut src = photo[..2].to_vec();
+    src.extend_from_slice(&[0xFF, 0xE0]);
+    src.extend_from_slice(&(body.len() as u16 + 2).to_be_bytes());
+    src.extend_from_slice(&body);
+    src.extend_from_slice(&photo[4 + app0.1.len() + 2..]);
+
+    let out = strip_clean(&src, &keep_icc());
+    assert_eq!(removed_names(&out), ["JFIF thumbnail"]);
+    assert_eq!(out.removed[0].bytes, 6);
+    let kept = &jpeg_markers(&out.bytes)[0];
+    assert_eq!(kept.0, 0xE0);
+    assert_eq!(kept.1, [header, &[0, 0]].concat());
 }
 
 /// The first Exif segment decides orientation, as in the decode path;

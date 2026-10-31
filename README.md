@@ -498,7 +498,7 @@ so it costs O(file size) in memory and nothing in quality, where a
 `0 0` re-encode costs a generation and the pipeline's largest buffers
 (a 21 MB 8000x8000 JPEG: 45 MB peak RSS and 0.02 s, against 602 MiB
 and 0.96 s for `resize 0 0` on a similar file, M2 Max). It keeps what
-rendering needs and drops everything else, unknown blocks included: JPEG keeps JFIF, the
+rendering needs and drops everything else, unknown blocks included: JPEG keeps JFIF (minus any thumbnail), the
 ICC profile and Adobe APP14 (CMYK decoding needs its transform flag)
 and drops bytes after EOI, such as MPF secondary images; PNG keeps
 critical and colour/transparency/animation chunks; WebP keeps the

@@ -193,6 +193,21 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
         // already-stripped orientation): nothing was removed.
         let mut rewrote = false;
         let keep = match marker {
+            // JFIF may carry an RGB thumbnail after its 14-byte header:
+            // a second picture, possibly of what a crop removed. Keep
+            // the version and density, drop the thumbnail.
+            0xE0 if body.starts_with(b"JFIF\0") && body.len() >= 14 => {
+                if body.len() == 14 && body[12..14] == [0, 0] {
+                    true
+                } else {
+                    out.extend_from_slice(&[0xFF, 0xE0, 0, 16]);
+                    out.extend_from_slice(&body[..12]);
+                    out.extend_from_slice(&[0, 0]);
+                    log.add("JFIF thumbnail", body.len() - 14);
+                    rewrote = true;
+                    false
+                }
+            }
             0xE0 => body.starts_with(b"JFIF\0"),
             0xE1 => {
                 if !exif_seen && body.starts_with(b"Exif\0\0") {
@@ -268,8 +283,25 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
     Ok((out, orientation))
 }
 
+/// Registered APPn identifiers a removal may be named after.
+const JPEG_APP_IDS: &[&str] = &[
+    "Exif",
+    "ICC_PROFILE",
+    "MPF",
+    "Photoshop 3.0",
+    "Adobe",
+    "Adobe_CM",
+    "Ducky",
+    "JFIF",
+    "JFXX",
+    "FPXR",
+    "Meta",
+];
+
 /// `APP1 Exif`, `XMP`, `APP13 Photoshop 3.0`, `COM`, ...: the marker
-/// plus the segment's identifier string where it has one.
+/// plus the segment's identifier when it is a registered one. Anything
+/// else is just `APPn`: an unknown segment may start with the very data
+/// being stripped, and the name ends up in logs.
 fn jpeg_segment_name(marker: u8, body: &[u8]) -> String {
     if marker == 0xFE {
         return "COM".into();
@@ -280,16 +312,11 @@ fn jpeg_segment_name(marker: u8, body: &[u8]) -> String {
     if body.starts_with(b"http://ns.adobe.com/xmp/extension/\0") {
         return "XMP extension".into();
     }
-    let ident: String = body
-        .iter()
-        .take_while(|&&c| c != 0 && c.is_ascii_graphic() || c == b' ')
-        .take(24)
-        .map(|&c| c as char)
-        .collect();
     let app = format!("APP{}", marker - 0xE0);
-    match ident.trim() {
-        "" => app,
-        id => format!("{app} {id}"),
+    let ident = body.split(|&c| c == 0).next().unwrap_or_default();
+    match JPEG_APP_IDS.iter().find(|id| id.as_bytes() == ident) {
+        Some(id) => format!("{app} {id}"),
+        None => app,
     }
 }
 
@@ -559,5 +586,7 @@ mod tests {
         );
         assert_eq!(jpeg_segment_name(0xFE, b"hello"), "COM");
         assert_eq!(jpeg_segment_name(0xE5, b"\x01\x02"), "APP5");
+        // An unregistered identifier may be the private data itself.
+        assert_eq!(jpeg_segment_name(0xE5, b"GPS 25.03N 121.56E\0"), "APP5");
     }
 }
