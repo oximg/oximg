@@ -193,6 +193,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gif"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee8cfcc411d9adbbaba82fb72661cc1bcca13e8bba98b364e62b2dba8f960159"
+dependencies = [
+ "weezl",
+]
+
+[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,18 +221,6 @@ checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
 dependencies = [
  "getrandom",
  "libc",
-]
-
-[[package]]
-name = "jpegli"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ebb4c6197fc2ce2750101b0dda667c055d35bf88a624088b30056cf04ad0fbb"
-dependencies = [
- "arrayvec",
- "jpegli-sys",
- "libc",
- "rgb",
 ]
 
 [[package]]
@@ -377,14 +374,17 @@ dependencies = [
 
 [[package]]
 name = "oximg"
-version = "0.7.4"
+version = "0.17.0"
 dependencies = [
  "anyhow",
+ "cc",
  "fast_image_resize",
- "jpegli",
+ "gif",
+ "jpegli-sys",
  "libwebp-sys",
  "moxcms",
  "mozjpeg",
+ "mozjpeg-sys",
  "pic-scale",
  "png",
  "quantette",
@@ -616,6 +616,12 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "weezl"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wide"

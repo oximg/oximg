@@ -6,7 +6,7 @@
 #   scripts/check.sh quick [-- <cargo test args>]   # the edit loop
 #   scripts/check.sh full                           # before a PR
 #
-# quick: fmt, clippy, and tests on the `agent` profile (release codegen
+# quick: fmt, the fuzz lockfile, clippy, and tests on the `agent` profile (release codegen
 # without fat LTO). Args after `--` go to `cargo test`, e.g.
 # `-- --test ctl`.
 # full: what CI's amd64 test job runs, on the release profile. The AVIF
@@ -107,6 +107,9 @@ examples_smoke_avif() {
 }
 
 step fmt any cargo fmt --check
+# fuzz/ is its own crate with its own lockfile, which no other step
+# builds: without this a dependency change leaves it stale (#148).
+step fuzz-lock any cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml
 if [[ "$mode" == quick ]]; then
   step clippy any cargo clippy --profile agent --all-targets -- -D warnings
   step test any cargo test --profile agent ${test_args[@]+"${test_args[@]}"}

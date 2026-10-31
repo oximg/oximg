@@ -62,6 +62,11 @@ jobs:
       - name: Format
         if: matrix.arch == 'amd64'
         run: cargo fmt --check
+      # fuzz/ is its own crate with its own lockfile, which nothing else
+      # here builds: fail the PR that leaves it stale (#148).
+      - name: Fuzz lockfile is current
+        if: matrix.arch == 'amd64'
+        run: cargo metadata --locked --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
       - name: Clippy (default features)
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Clippy (avif)

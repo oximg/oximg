@@ -100,7 +100,7 @@ cargo clippy --release --all-targets -- -D warnings
 cargo test --release
 ```
 
-`scripts/check.sh quick` runs the same three on the `agent` profile
+`scripts/check.sh quick` runs the same three, plus a check that the fuzz lockfile is current, on the `agent` profile
 (release codegen without fat LTO, so an edit relinks in seconds instead
 of ~100 s); `scripts/check.sh full` runs everything CI's amd64 test job
 does, on release. Both print one JSON summary.
