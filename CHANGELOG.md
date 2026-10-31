@@ -107,6 +107,13 @@ HTTP interface without notice.
   - The NEON RGBA pass is faster: its four chains no longer wait on one
     FMA's latency. Apple M2 Max, interleaved: −12% for 2040×1356 into
     512×340, −36% for 4000×3000 into 400×300.
+- **On AWS, `s3://` follows a bucket to its region** ([#11]).
+  `AWS_REGION` now means what it means in the AWS SDKs: the default
+  region. ECS and EKS set it to the region they run in, which can differ
+  from the bucket's. When S3 answers 301 with the bucket's region, oximg
+  sends that bucket's requests there and logs it once at boot. Before,
+  boot stopped and asked to check `AWS_REGION`. STS uses `AWS_REGION`. A
+  custom `OXIMG_S3_ENDPOINT` is not affected.
 
 ## [0.19.0] - 2026-11-02
 
