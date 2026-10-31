@@ -116,9 +116,9 @@ fn strip_inner(bytes: &[u8], keep_icc: bool) -> Result<Stripped> {
     })
 }
 
-/// Removals aggregated by name in first-seen order. Names carry up to
-/// 24 bytes of the source (a JPEG APP identifier), so a hostile file
-/// can make every block a new name: the index keeps that linear.
+/// Removals aggregated by name in first-seen order. PNG chunk types and
+/// WebP FourCCs come from the source, so a hostile file can make every
+/// block a new name: the index keeps that linear.
 #[derive(Default)]
 struct Log {
     removed: Vec<Removed>,
@@ -189,8 +189,9 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
         let body = &b[i + 2..i + len];
         let seg = (i - 2)..(i + len);
         i += len;
-        // Set when a dropped block is replaced by identical bytes (an
-        // already-stripped orientation): nothing was removed.
+        // Set when the arm wrote its own replacement and logged what it
+        // removed, if anything (an already-stripped orientation removes
+        // nothing): the segment is not logged as removed whole.
         let mut rewrote = false;
         let keep = match marker {
             // JFIF may carry an RGB thumbnail after its 14-byte header:
