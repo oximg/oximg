@@ -379,7 +379,10 @@ filename is taken literally on this route (no `@fmt` token).
   `AWS_SECRET_ACCESS_KEY`, plus `AWS_SESSION_TOKEN` for temporary keys);
   web identity (EKS IRSA); the container endpoint (ECS task roles, EKS
   Pod Identity); EC2 instance metadata (IMDSv2). `AWS_REGION` is
-  required.
+  required. As in the AWS SDKs, it is the default region, and ECS and
+  EKS set it to the region they run in. STS uses it, and so does the
+  first request to S3. If S3 answers that the bucket is in another
+  region, oximg sends that bucket's requests there and logs it once.
   AWS China regions use the `.amazonaws.com.cn` endpoint automatically.
   For R2 and MinIO, set `OXIMG_S3_ENDPOINT` too. An `http://` endpoint
   logs a warning at boot, because session tokens and images then

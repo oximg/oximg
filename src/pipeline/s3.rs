@@ -23,7 +23,11 @@
 //! it. `.` and `..` segments are refused before signing: reqwest would
 //! remove them from the URL, and the signature would no longer match.
 //!
-//! Settings are read once, on first use. `AWS_REGION` is required.
+//! Settings are read once, on first use. `AWS_REGION` is required. It
+//! is the default region, as in the AWS SDKs, not always the bucket's:
+//! ECS and EKS set it to the region they run in. When AWS answers 301
+//! with `x-amz-bucket-region`, that bucket's requests go to its region
+//! from then on (`Settings::learn_region`).
 //! `OXIMG_S3_ENDPOINT` defaults to the regional AWS endpoint, with
 //! `.amazonaws.com.cn` for China regions and `.amazonaws.com` otherwise.
 //! `OXIMG_S3_PATH_STYLE` is explained at `Settings::path_style`.
@@ -36,7 +40,8 @@ use anyhow::Result;
 use hmac::Mac;
 use hmac::digest::KeyInit;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{SourceRejected, UpstreamFault};
@@ -207,6 +212,9 @@ struct Settings {
     /// path style.
     custom_endpoint: bool,
     credentials: creds::Chain,
+    /// Buckets that S3 placed in another region than `region`, from the
+    /// `x-amz-bucket-region` of a 301. Only for the AWS endpoint.
+    moved: Mutex<HashMap<String, String>>,
 }
 
 impl Settings {
@@ -220,6 +228,59 @@ impl Settings {
         self.path_style
             .unwrap_or(self.custom_endpoint || bucket.contains('.'))
     }
+
+    /// The region `bucket` is in: the one S3 reported, or `region`.
+    fn region_of(&self, bucket: &str) -> String {
+        let moved = self.moved.lock().unwrap_or_else(PoisonError::into_inner);
+        moved.get(bucket).unwrap_or(&self.region).clone()
+    }
+
+    /// The endpoint host for `region`. A custom endpoint has only one.
+    fn endpoint_host(&self, region: &str) -> String {
+        if self.custom_endpoint || region == self.region {
+            self.host.clone()
+        } else {
+            format!("s3.{region}.{}", aws_domain(region))
+        }
+    }
+
+    /// Use `region` for `bucket` from now on. The first time, say so:
+    /// the operator may want to set it.
+    fn learn_region(&self, bucket: &str, region: &str) {
+        let mut moved = self.moved.lock().unwrap_or_else(PoisonError::into_inner);
+        if moved
+            .insert(bucket.to_string(), region.to_string())
+            .as_deref()
+            != Some(region)
+        {
+            eprintln!(
+                "oximg: s3:// bucket {bucket:?} is in {region}, not AWS_REGION={:?}; \
+                 requests for it go to {region}",
+                self.region
+            );
+        }
+    }
+}
+
+/// AWS region names are lowercase letters, digits and `-`. The region
+/// goes into the host name and the signature scope.
+fn is_region_name(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The bucket's region from a 301, when S3 says the bucket is not in
+/// `t.region`. AWS answers this way for any key and any permission, so
+/// the boot probe always learns it. A custom endpoint is one host, so
+/// there is nowhere else to go.
+fn moved_region(s: &Settings, t: &Target, resp: &reqwest::Response) -> Option<String> {
+    if s.custom_endpoint || resp.status() != reqwest::StatusCode::MOVED_PERMANENTLY {
+        return None;
+    }
+    let region = resp.headers().get("x-amz-bucket-region")?.to_str().ok()?;
+    (is_region_name(region) && region != t.region).then(|| region.to_string())
 }
 
 /// Read an `AWS_*` variable the way `config::var` reads ours: trimmed,
@@ -234,22 +295,16 @@ fn aws_var(value: Result<String, std::env::VarError>) -> Option<String> {
 }
 
 fn load_settings() -> Result<Settings, String> {
-    let region = aws_var(std::env::var("AWS_REGION")).ok_or(
-        "s3:// needs AWS_REGION, the bucket's region (R2 accepts `auto`). \
-             AWS_DEFAULT_REGION is not read",
-    )?;
-    // The region goes into the host name and the signature scope.
-    if !region
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    let region = aws_var(std::env::var("AWS_REGION"))
+        .ok_or("s3:// needs AWS_REGION (R2 accepts `auto`). AWS_DEFAULT_REGION is not read")?;
+    if !is_region_name(&region) {
         return Err(format!("AWS_REGION={region:?} is not a region name"));
     }
     let custom = crate::config::var("OXIMG_S3_ENDPOINT");
     if custom.is_none() && region == "auto" {
         return Err(
             "AWS_REGION=auto is for R2. Set OXIMG_S3_ENDPOINT to the R2 endpoint, \
-                    or set AWS_REGION to the AWS bucket's region"
+                    or set AWS_REGION to an AWS region"
                 .into(),
         );
     }
@@ -280,6 +335,7 @@ fn load_settings() -> Result<Settings, String> {
         path_style,
         custom_endpoint: custom.is_some(),
         credentials,
+        moved: Mutex::default(),
     })
 }
 
@@ -363,20 +419,25 @@ struct Target {
     url: String,
     host: String,
     path: String,
+    /// The region we sign for.
+    region: String,
 }
 
 impl Target {
     fn new(s: &Settings, bucket: &str, raw_key: &[u8]) -> Self {
         let key = uri_encode_path(raw_key);
+        let region = s.region_of(bucket);
+        let endpoint = s.endpoint_host(&region);
         let (host, path) = if s.path_style(bucket) {
-            (s.host.clone(), format!("/{bucket}/{key}"))
+            (endpoint, format!("/{bucket}/{key}"))
         } else {
-            (format!("{bucket}.{}", s.host), format!("/{key}"))
+            (format!("{bucket}.{endpoint}"), format!("/{key}"))
         };
         Self {
             url: format!("{}://{host}{path}", s.scheme),
             host,
             path,
+            region,
         }
     }
 }
@@ -389,11 +450,7 @@ fn unix_now() -> u64 {
 
 /// Sign and send one GET. Every attempt is signed again, so a retry
 /// carries a fresh `x-amz-date`.
-async fn send_signed(
-    s: &Settings,
-    creds: &Credentials,
-    t: &Target,
-) -> reqwest::Result<reqwest::Response> {
+async fn send_signed(creds: &Credentials, t: &Target) -> reqwest::Result<reqwest::Response> {
     let datetime = amz_datetime(unix_now());
     let mut headers = vec![
         ("host", t.host.as_str()),
@@ -410,7 +467,7 @@ async fn send_signed(
         headers: &headers,
         payload_hash: EMPTY_SHA256,
     };
-    let auth = authorization(&req, creds, &s.region, "s3", &datetime);
+    let auth = authorization(&req, creds, &t.region, "s3", &datetime);
     // reqwest sets `Host` from the URL. We signed the same value.
     let mut builder = super::fetch_client()
         .get(&t.url)
@@ -499,8 +556,10 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
     let s = settings().map_err(|e| {
         anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
     })?;
-    let target = Target::new(s, bucket, &raw_key);
+    let mut target = Target::new(s, bucket, &raw_key);
     let refreshes = s.credentials.refreshes();
+    // Whether S3 already sent us to the bucket's region once.
+    let mut moved = false;
     // The keys the store refused as expired, and its code. Keys from a
     // credential source get one more try with new keys.
     let mut expired: Option<(Arc<Credentials>, String)> = None;
@@ -517,10 +576,17 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
                     None => e,
                 })
             })?;
-        let resp = send_with_retry(s, &creds, &target).await?;
+        let resp = send_with_retry(&creds, &target).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
+        }
+        if !moved && let Some(region) = moved_region(s, &target, &resp) {
+            drop(resp);
+            moved = true;
+            s.learn_region(bucket, &region);
+            target = Target::new(s, bucket, &raw_key);
+            continue;
         }
         let body = read_error_body(resp).await?;
         match body.code {
@@ -535,12 +601,8 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
 
 /// Send once, and once more on connection transients and on
 /// `retryable_status`. Unlike `gs://`, a 401 is not retried.
-async fn send_with_retry(
-    s: &Settings,
-    creds: &Credentials,
-    target: &Target,
-) -> Result<reqwest::Response> {
-    let first = send_signed(s, creds, target).await;
+async fn send_with_retry(creds: &Credentials, target: &Target) -> Result<reqwest::Response> {
+    let first = send_signed(creds, target).await;
     let retry = match &first {
         Ok(resp) => retryable_status(resp.status().as_u16()),
         Err(e) => !e.is_timeout() && (e.is_connect() || e.is_request()),
@@ -552,9 +614,7 @@ async fn send_with_retry(
     drop(first);
     super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    send_signed(s, creds, target)
-        .await
-        .map_err(map_transport_err)
+    send_signed(creds, target).await.map_err(map_transport_err)
 }
 
 /// A credential failure, classed as a store failure would be: our
@@ -848,23 +908,22 @@ pub(crate) fn startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> 
         eprintln!("oximg: warning: {warning}");
     }
     let key = probe_key(prefix)?;
-    let target = Target::new(s, bucket, key.as_bytes());
     // `block_on_fetch` runs the future on another thread, so it must
     // own what it uses.
-    super::block_on_fetch(probe(s, bucket.to_string(), target))?;
+    super::block_on_fetch(probe(s, bucket.to_string(), key))?;
     // With more than one source configured (IRSA and Pod Identity on
     // one pod), this is the only place that says which one won.
     eprintln!("oximg: s3:// credentials: {}", s.credentials.source_name());
     Ok(())
 }
 
-async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(), String> {
+async fn probe(s: &'static Settings, bucket: String, key: String) -> Result<(), String> {
     let fail = |what: String| {
+        let region = s.region_of(&bucket);
         format!(
-            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {:?}, {}) {what}",
+            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {region:?}, {}) {what}",
             s.scheme,
-            s.host,
-            s.region,
+            s.endpoint_host(&region),
             s.credentials.source_name()
         )
     };
@@ -873,12 +932,21 @@ async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(
         .current(None)
         .await
         .map_err(|e| fail(e.to_string()))?;
-    let resp = send_signed(s, &creds, &target).await.map_err(|e| {
+    let unreachable = |e: reqwest::Error| {
         fail(format!(
             "could not reach the endpoint: {:#}",
             anyhow::Error::new(e)
         ))
-    })?;
+    };
+    let target = Target::new(s, &bucket, key.as_bytes());
+    let mut resp = send_signed(&creds, &target).await.map_err(unreachable)?;
+    // A bucket in another region: go there once, as `fetch` does.
+    if let Some(region) = moved_region(s, &target, &resp) {
+        drop(resp);
+        s.learn_region(&bucket, &region);
+        let target = Target::new(s, &bucket, key.as_bytes());
+        resp = send_signed(&creds, &target).await.map_err(unreachable)?;
+    }
     let status = resp.status();
     if status.is_success() {
         return Ok(());
@@ -1109,6 +1177,7 @@ mod tests {
             path_style,
             custom_endpoint: false,
             credentials: creds::fixed(creds(None)),
+            moved: Mutex::default(),
         }
     }
 
@@ -1305,6 +1374,64 @@ mod tests {
         assert!(is_ip_literal("[::1]:9000"));
         assert!(!is_ip_literal("s3.us-east-1.amazonaws.com"));
         assert!(!is_ip_literal("minio.internal:9000"));
+    }
+
+    /// A 301 with `x-amz-bucket-region` names the bucket's region. AWS
+    /// sends it for any key, with or without `s3:ListBucket`.
+    #[test]
+    fn a_301_names_the_buckets_region() {
+        let aws = settings_for("https", "s3.us-east-1.amazonaws.com", None);
+        let target = Target::new(&aws, "pics", b"x.jpg");
+        let resp = |status: u16, region: Option<&str>| {
+            let mut b = axum::http::Response::builder().status(status);
+            if let Some(r) = region {
+                b = b.header("x-amz-bucket-region", r);
+            }
+            reqwest::Response::from(b.body(String::new()).unwrap())
+        };
+        assert_eq!(
+            moved_region(&aws, &target, &resp(301, Some("ap-northeast-1"))).as_deref(),
+            Some("ap-northeast-1")
+        );
+        // Not a move: another status, no header, the same region, or a
+        // value that is not a region name.
+        assert!(moved_region(&aws, &target, &resp(400, Some("ap-northeast-1"))).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, None)).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, Some("us-east-1"))).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, Some("evil.com/x"))).is_none());
+        // A custom endpoint is one host: nowhere else to go.
+        let custom = Settings {
+            custom_endpoint: true,
+            ..settings_for("https", "minio.example.com", None)
+        };
+        let target = Target::new(&custom, "pics", b"x.jpg");
+        assert!(moved_region(&custom, &target, &resp(301, Some("ap-northeast-1"))).is_none());
+    }
+
+    /// After S3 names another region, requests for that bucket go to its
+    /// regional endpoint and are signed for it. Other buckets do not.
+    #[test]
+    fn a_learned_region_moves_only_that_bucket() {
+        let aws = settings_for("https", "s3.us-east-1.amazonaws.com", None);
+        aws.learn_region("pics", "ap-northeast-1");
+        let moved = Target::new(&aws, "pics", b"photo.jpg");
+        assert_eq!(
+            moved.url,
+            "https://pics.s3.ap-northeast-1.amazonaws.com/photo.jpg"
+        );
+        assert_eq!(moved.region, "ap-northeast-1");
+        let other = Target::new(&aws, "other", b"photo.jpg");
+        assert_eq!(
+            other.url,
+            "https://other.s3.us-east-1.amazonaws.com/photo.jpg"
+        );
+        assert_eq!(other.region, "us-east-1");
+        // China regions keep their partition's domain.
+        aws.learn_region("cn-pics", "cn-northwest-1");
+        assert_eq!(
+            Target::new(&aws, "cn-pics", b"x.jpg").host,
+            "cn-pics.s3.cn-northwest-1.amazonaws.com.cn"
+        );
     }
 
     fn kind_of(status: u16, code: Option<&str>) -> crate::pipeline::ErrorKind {
