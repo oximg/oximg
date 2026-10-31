@@ -35,7 +35,10 @@ unconstrained; `0 0` re-encodes at native size (CLI only — the server
 refuses `0/0`). Its JSON carries `peak_rss_bytes` (the child's peak
 RSS) and, under `--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`,
 `decoded_bytes.{format,total,terms}` — the estimate beside what the
-process held.
+process held. `--icc keep|strip` and `--[no-]auto-rotate` pass through
+in the CLI's spelling; `icc_bytes` is the output's embedded profile
+block (payload plus framing), null when there is none, and
+`probe.{width,height}` shows whether the orientation was applied.
 
 `strip` shells out to `oximg strip <in> <out> [--icc keep|strip]`:
 lossless metadata removal for JPEG/PNG/WebP (GIF, AVIF: exit 1). Its

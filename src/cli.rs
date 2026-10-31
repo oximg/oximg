@@ -30,14 +30,19 @@ pub fn print_help() {
              which have no encoder here, become WebP).\n          \
              -q, --quality N    JPEG quality, 1-100 (default 80)\n          \
              -f, --format FMT   {}\n          \
-             --preset P         jpegli (default) | fast | small\n  \
+             --preset P         jpegli (default) | fast | small\n          \
+             --icc keep|strip   Embedded colour profile (default keep,\n                             \
+                                or OXIMG_ICC)\n          \
+             --no-auto-rotate   Keep the stored orientation instead of\n                             \
+                                applying EXIF/irot (--auto-rotate forces\n                             \
+                                it on; default OXIMG_AUTO_ROTATE, else on)\n  \
            oximg strip <in> <out> [--icc keep|strip]\n          \
              Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
              and other non-rendering metadata from a JPEG, PNG or WebP\n          \
              without re-encoding: the image data is copied byte for\n          \
              byte. A rotated photo keeps only its EXIF orientation.\n          \
-             --icc keep|strip   Embedded colour profile (default keep,\n          \
-                                or OXIMG_ICC). A CMYK JPEG's profile\n          \
+             --icc keep|strip   Embedded colour profile (default keep,\n                             \
+                                or OXIMG_ICC). A CMYK JPEG's profile\n                             \
                                 is never dropped.\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \
@@ -54,7 +59,22 @@ fn usage_error(msg: &str) -> ! {
     std::process::exit(2);
 }
 
-/// `oximg resize <in> <max_w> <max_h> <out> [-q N] [-f fmt] [--preset P]`
+const RESIZE_USAGE: &str = "usage: oximg resize <in> <max_w> <max_h> <out> [-q N] [-f fmt] \
+     [--preset P] [--icc keep|strip] [--[no-]auto-rotate]";
+
+/// `--icc keep|strip`, shared by resize and strip: `Some(true)` keeps.
+fn icc_flag(it: &mut std::slice::Iter<'_, String>) -> Option<bool> {
+    let v = it
+        .next()
+        .unwrap_or_else(|| usage_error("--icc needs a value"));
+    Some(match v.as_str() {
+        "keep" => true,
+        "strip" => false,
+        _ => usage_error(&format!("unknown --icc {v:?} (keep|strip)")),
+    })
+}
+
+/// `oximg resize <in> <max_w> <max_h> <out> [options]`
 pub fn resize(args: &[String]) -> anyhow::Result<()> {
     // Same fail-closed startup contract as the server: a set-but-invalid
     // OXIMG_* knob is a fatal configuration error, never a silent default.
@@ -66,6 +86,11 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     let mut quality = 80.0f32;
     let mut explicit: Option<ImageFormat> = None;
     let mut encoder = Encoder::Jpegli;
+    // Per-call overrides of OXIMG_ICC / OXIMG_AUTO_ROTATE (the library
+    // resolves flag > env > default), so one image can be treated
+    // differently without touching the process environment.
+    let mut icc = None;
+    let mut auto_rotate = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -108,6 +133,9 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
                     _ => usage_error(&format!("unknown preset {v:?} (jpegli|fast|small)")),
                 };
             }
+            "--icc" => icc = icc_flag(&mut it),
+            "--auto-rotate" => auto_rotate = Some(true),
+            "--no-auto-rotate" => auto_rotate = Some(false),
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 usage_error(&format!("unknown option {flag:?}"))
             }
@@ -115,7 +143,7 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let [input, max_w, max_h, output] = positional[..] else {
-        usage_error("usage: oximg resize <in> <max_w> <max_h> <out> [-q N] [-f fmt] [--preset P]");
+        usage_error(RESIZE_USAGE);
     };
     // 0 = unconstrained axis, spelled u32::MAX in Params (the library's
     // "no downscale bound"). Unlike the server, 0 0 is allowed here:
@@ -136,6 +164,8 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
         // Precedence mirrors the server URL grammar: explicit flag >
         // output extension > source format.
         output: explicit.or_else(|| format_from_ext(output)),
+        icc,
+        auto_rotate,
         ..Default::default()
     };
     let (bytes, format) = pipeline::process_path(std::path::Path::new(input), &params)
@@ -174,16 +204,7 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
                 print_help();
                 return Ok(());
             }
-            "--icc" => {
-                let v = it
-                    .next()
-                    .unwrap_or_else(|| usage_error("--icc needs a value"));
-                params.icc = Some(match v.as_str() {
-                    "keep" => true,
-                    "strip" => false,
-                    _ => usage_error(&format!("unknown --icc {v:?} (keep|strip)")),
-                });
-            }
+            "--icc" => params.icc = icc_flag(&mut it),
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 usage_error(&format!("unknown option {flag:?}"))
             }

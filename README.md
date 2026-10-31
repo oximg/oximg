@@ -514,6 +514,12 @@ the source's own format — the same precedence idea as the server's
 `@fmt` grammar. The `OXIMG_*` encode knobs below apply to CLI encodes
 the same way. Usage errors exit 2; processing failures exit 1.
 
+Two of those knobs also have per-call flags on `resize`, which win over
+the environment: `--icc keep|strip` (`OXIMG_ICC`) and
+`--no-auto-rotate` (`OXIMG_AUTO_ROTATE=0`; `--auto-rotate` forces it
+back on). A caller that treats one image differently passes a flag
+rather than changing the process environment.
+
 ## Library
 
 The `oximg::pipeline` module is usable without the HTTP server —

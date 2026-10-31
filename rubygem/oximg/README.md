@@ -31,7 +31,8 @@ the name does not say, and `:gif` is not a `format:` you can ask for.
 
 ```ruby
 Oximg.resize(source, destination, width: 0, height: 0,
-             quality: nil, format: nil, preset: nil)
+             quality: nil, format: nil, preset: nil,
+             icc: nil, auto_rotate: nil)
 ```
 
 The source is fitted within `width` x `height` and **never enlarged**. A
@@ -50,6 +51,12 @@ Oximg.resize("photo.jpg", "smaller.jpg", quality: 70)
 | `quality` | 1–100, default 80. JPEG quality |
 | `format` | `:jpg`, `:jpeg`, `:png`, `:webp`, `:avif`. Defaults to the destination's extension, else the source's own format |
 | `preset` | `:jpegli` (default — maximum quality per byte), `:fast`, `:small` |
+| `icc` | `:keep` or `:strip` the source's colour profile. Default: `OXIMG_ICC`, else keep |
+| `auto_rotate` | `false` keeps the stored orientation, `true` applies the EXIF one. Default: `OXIMG_AUTO_ROTATE`, else true |
+
+`icc` and `auto_rotate` apply to that call only, and win over the
+environment, so a threaded job runner can treat one image differently
+without touching `ENV`.
 
 `resize` returns the destination path and raises `Oximg::ProcessingError`
 on failure, carrying the binary's own message and exit status. Paths are
@@ -59,7 +66,7 @@ cannot be read as a flag.
 ## Stripping metadata
 
 ```ruby
-Oximg.strip(source, destination, icc: nil)
+Oximg.strip(source, destination, icc: nil, env: nil)
 ```
 
 Removes EXIF (GPS, camera, timestamps), XMP, IPTC and comments from a
@@ -71,9 +78,25 @@ still displays upright. `icc: :strip` also drops the colour profile.
 The default is `:keep`, or `OXIMG_ICC`. Dropping a CMYK JPEG's profile
 raises `Oximg::ProcessingError`, as do GIF and AVIF sources.
 
+## Knobs, per process or per call
+
 Everything the server tunes through `OXIMG_*` environment variables
 applies here too, and is validated the same fail-closed way: a typo'd
 knob is a startup error, never a silent default.
+
+To set one for a single call, pass `env:` to `resize` or `strip`:
+
+```ruby
+Oximg.resize("in.jpg", "out.jpg", width: 750, env: {"OXIMG_JPEG_PROGRESSIVE" => "0"})
+```
+
+Each call spawns its own process, and `env:` reaches that process
+only: `ENV` is never touched, so concurrent calls in a threaded job
+runner each get their own settings. Names must be in `Oximg::KNOBS`
+(the pipeline knobs; server settings such as `OXIMG_KEY` are refused),
+values are Strings or Integers, and `nil` unsets a name for that call.
+An unknown name raises `ArgumentError` before anything runs; a bad
+value is refused by the binary (`ProcessingError`, status 2).
 
 ## Probing
 

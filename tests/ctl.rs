@@ -1,6 +1,8 @@
 //! Drive the `oximg-ctl` binary the way an agent does: JSON on stdout,
 //! the real `oximg` binary underneath, committed fixtures, no network.
 
+mod common;
+
 use serde_json::Value;
 use std::process::Command;
 
@@ -472,6 +474,67 @@ fn resize_usage_errors_exit_2() {
     ]);
     assert_eq!(code, 2, "{v}");
     assert_eq!(v["ok"], false);
+}
+
+/// Issue #128: `resize --icc` and `--[no-]auto-rotate` reach the CLI in
+/// its own spelling, and the JSON proves them: `icc_bytes` (null when
+/// the output carries no profile) and the probed, stored dimensions.
+#[test]
+fn resize_forwards_icc_and_auto_rotate() {
+    let icc = common::fake_icc(900);
+    let app2 = common::app2_icc_payloads(&icc, 60_000);
+    let exif = common::app1_orientation(6);
+    let px = vec![128u8; 64 * 48 * 3];
+    let jpeg = common::jpeg_with_markers(&px, 64, 48, &[(1, &exif), (2, &app2[0])]);
+    let src = std::env::temp_dir().join(format!("oximg-ctl-icc-rot-{}.jpg", std::process::id()));
+    std::fs::write(&src, jpeg).unwrap();
+    let s = src.to_str().unwrap();
+
+    let (code, v) = run(&["resize", s, "0", "0"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["icc_bytes"].as_u64().unwrap() > 900, "{v}");
+    assert_eq!(
+        (&v["probe"]["width"], &v["probe"]["height"]),
+        (&48.into(), &64.into())
+    );
+
+    let (code, v) = run(&["resize", s, "0", "0", "--icc", "strip", "--no-auto-rotate"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["icc_bytes"].is_null(), "{v}");
+    assert_eq!(
+        (&v["probe"]["width"], &v["probe"]["height"]),
+        (&64.into(), &48.into())
+    );
+
+    // The flags beat the knobs.
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_ICC=0",
+        "--env",
+        "OXIMG_AUTO_ROTATE=0",
+        "resize",
+        s,
+        "0",
+        "0",
+        "--icc",
+        "keep",
+        "--auto-rotate",
+    ]);
+    assert_eq!(code, 0, "{v}");
+    assert!(v["icc_bytes"].as_u64().is_some(), "{v}");
+    assert_eq!(v["probe"]["width"], 48, "{v}");
+
+    // The CLI, not ctl, refuses a bad value: that refusal is the proof.
+    let (code, v) = run(&["resize", s, "0", "0", "--icc", "maybe"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("--icc"), "{v}");
+
+    let (_, v) = run(&["--dry-run", "resize", s, "0", "0", "--no-auto-rotate"]);
+    assert_eq!(
+        v["argv"].as_array().unwrap().last().unwrap(),
+        "--no-auto-rotate"
+    );
+    let _ = std::fs::remove_file(&src);
 }
 
 #[test]

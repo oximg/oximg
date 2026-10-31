@@ -69,7 +69,7 @@ Commands:
   serve                     Spawn oximg, print {{port,pid,base}}, wait
   get <path>                HTTP GET; auto-spawns unless --base is set
   probe <file>              Header probe (format, stored size, animation, JPEG frame)
-  resize <in> <w> <h>       Shell out to `oximg resize`; probe the output
+  resize <in> <w> <h>       Shell out to `oximg resize`; probe the output, report icc_bytes
   strip <in>                Shell out to `oximg strip`; compare pixels, list removals
   sign <path>               imgproxy-style HMAC over the decoded path
   matrix                    Walk fixture × box × format cells + negatives

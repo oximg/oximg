@@ -45,8 +45,51 @@ module Oximg
   # mozjpeg's fast/small trade differently.
   PRESETS = %i[jpegli fast small].freeze
 
-  # What `strip` may do with an embedded colour profile.
+  # What `resize` and `strip` may do with an embedded colour profile.
   ICC_MODES = %i[keep strip].freeze
+
+  # The OXIMG_* pipeline knobs an +env:+ may set for one call. Pinned to
+  # the binary's own inventory (KNOBS in src/config.rs) by a test there,
+  # so a knob the binary gains or drops cannot drift from this list.
+  # Server-startup settings (OXIMG_KEY, OXIMG_BIND, ...) are not here:
+  # a one-shot never reads them.
+  KNOBS = %w[
+    OXIMG_TIMING
+    OXIMG_RESIZE
+    OXIMG_RESIZE_BACKEND
+    OXIMG_AUTO_ROTATE
+    OXIMG_ICC
+    OXIMG_DCT_MARGIN
+    OXIMG_LINEAR_SHRINK
+    OXIMG_JPEG_PROGRESSIVE
+    OXIMG_JPEG_SEQUENTIAL_PIXELS
+    OXIMG_JPEG_STREAMING_PIXELS
+    OXIMG_FLATTEN_BG
+    OXIMG_PNG_EFFORT
+    OXIMG_PNG_QUANTIZE
+    OXIMG_PNG_QUANTIZE_COLORS
+    OXIMG_WEBP_QUALITY
+    OXIMG_WEBP_EFFORT
+    OXIMG_WEBP_DECODE_THREADS
+    OXIMG_AVIF_QUALITY
+    OXIMG_AVIF_ALPHA_QUALITY
+    OXIMG_AVIF_SPEED
+    OXIMG_AVIF_DECODE_THREADS
+    OXIMG_MAX_SOURCE_BYTES
+    OXIMG_MAX_SRC_PIXELS
+    OXIMG_GIF_ANIMATION
+    OXIMG_MAX_ANIM_FRAMES
+    OXIMG_MAX_ANIM_WORK
+    OXIMG_ANIM_FRAME_STEP
+    OXIMG_MAX_DECODED_BYTES
+    OXIMG_LOG_DECODED_BYTES_ABOVE
+    OXIMG_UPSTREAM_CONNECT_TIMEOUT
+    OXIMG_UPSTREAM_TIMEOUT
+    OXIMG_GCS_ENDPOINT
+    OXIMG_S3_ENDPOINT
+    OXIMG_S3_PATH_STYLE
+    OXIMG_OVERLAP
+  ].freeze
 
   CONTENT_TYPE_FORMATS = {
     "image/jpeg" => :jpeg,
@@ -106,10 +149,24 @@ module Oximg
     # The output format follows +format:+, else +destination+'s
     # extension, else the source's own format. Returns the destination
     # path.
-    def resize(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil)
+    #
+    # +icc:+ (:keep or :strip) and +auto_rotate:+ (true or false)
+    # override the binary's OXIMG_ICC and OXIMG_AUTO_ROTATE for this
+    # call only; nil leaves them to the environment (default: keep the
+    # profile, apply the EXIF orientation).
+    #
+    # +env:+ sets any other pipeline knob for this call only, e.g.
+    # <tt>env: {"OXIMG_JPEG_PROGRESSIVE" => "0"}</tt>: it reaches the
+    # one child process this call spawns, never ENV, so it is safe in a
+    # threaded job runner. Names must be in KNOBS; nil unsets a name
+    # for the call. The binary validates the values, fail-closed.
+    def resize(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
+      icc: nil, auto_rotate: nil, env: nil)
       output = expand(destination, "destination")
-      Binary.run(*resize_argv(source, output,
-        width: width, height: height, quality: quality, format: format, preset: preset))
+      argv = resize_argv(source, output,
+        width: width, height: height, quality: quality, format: format, preset: preset,
+        icc: icc, auto_rotate: auto_rotate)
+      Binary.run(*argv, env: knob_env(env))
       output
     end
 
@@ -123,10 +180,35 @@ module Oximg
     #
     # This is what <tt>saver(strip: true)</tt> / <tt>-strip</tt> did
     # under libvips or ImageMagick, minus the re-encode.
-    def strip(source, destination, icc: nil)
+    #
+    # +env:+ is per-call knobs, as for resize.
+    def strip(source, destination, icc: nil, env: nil)
       output = expand(destination, "destination")
-      Binary.run(*strip_argv(source, output, icc: icc))
+      argv = strip_argv(source, output, icc: icc)
+      Binary.run(*argv, env: knob_env(env))
       output
+    end
+
+    # The child environment an +env:+ turns into: String names and
+    # values, each name a known knob. A typo raises here rather than
+    # being passed along and ignored, which is the same fail-closed
+    # promise the binary makes about the values. Public for the same
+    # reason as resize_argv.
+    def knob_env(env)
+      return {} if env.nil?
+      raise ArgumentError, "env must be a Hash, got #{env.inspect}" unless env.is_a?(Hash)
+
+      env.each_with_object({}) do |(name, value), out|
+        key = name.to_s
+        unless KNOBS.include?(key)
+          raise ArgumentError, "unknown knob #{name.inspect} in env (one of Oximg::KNOBS)"
+        end
+        unless value.nil? || value.is_a?(String) || value.is_a?(Integer)
+          raise ArgumentError, "#{key} must be a String, an Integer or nil, got #{value.inspect}"
+        end
+
+        out[key] = value&.to_s
+      end
     end
 
     # The argv `strip` would run, minus the executable; public for the
@@ -180,7 +262,8 @@ module Oximg
     # The argv `resize` would run, minus the executable. Public because
     # it is the honest way to see what a call turns into — and the way
     # to test that without a binary present.
-    def resize_argv(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil)
+    def resize_argv(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
+      icc: nil, auto_rotate: nil)
       argv = [
         "resize",
         expand(source, "source"),
@@ -191,6 +274,8 @@ module Oximg
       argv.push("-q", bounded(quality, "quality", 1, 100).to_s) unless quality.nil?
       argv.push("-f", token(format, FORMATS, "format")) unless format.nil?
       argv.push("--preset", token(preset, PRESETS, "preset")) unless preset.nil?
+      argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
+      argv.push(boolean(auto_rotate, "auto_rotate") ? "--auto-rotate" : "--no-auto-rotate") unless auto_rotate.nil?
       argv
     end
 
@@ -314,6 +399,16 @@ module Oximg
     def bounded(value, name, min, max)
       unless value.is_a?(Integer) && value >= min && value <= max
         raise ArgumentError, "#{name} must be an Integer in #{min}..#{max}, got #{value.inspect}"
+      end
+
+      value
+    end
+
+    # Strictly true or false: a truthy "0" or "false" read as true would
+    # rotate exactly the images the caller asked not to.
+    def boolean(value, name)
+      unless value == true || value == false
+        raise ArgumentError, "#{name} must be true or false, got #{value.inspect}"
       end
 
       value

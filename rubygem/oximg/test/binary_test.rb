@@ -40,6 +40,25 @@ class Oximg::BinaryTest < Oximg::Test
     end
   end
 
+  # The env reaches the child and only the child: a fake executable
+  # prints what it sees, and the parent's ENV is unchanged afterwards.
+  def test_run_passes_env_to_the_child_only
+    in_tmpdir do |dir|
+      fake = File.join(dir, "oximg")
+      File.write(fake, "#!/bin/sh\nprintf '%s|%s' \"${OXIMG_ICC-unset}\" \"${OXIMG_AUTO_ROTATE-unset}\"\n")
+      File.chmod(0o755, fake)
+      Oximg.executable = fake
+      with_env("OXIMG_AUTO_ROTATE", "1") do
+        out, = Oximg::Binary.run("x", env: {"OXIMG_ICC" => "0", "OXIMG_AUTO_ROTATE" => nil})
+        assert_equal "0|unset", out
+        assert_nil ENV["OXIMG_ICC"]
+        assert_equal "1", ENV["OXIMG_AUTO_ROTATE"]
+        out, = Oximg::Binary.run("x")
+        assert_equal "unset|1", out
+      end
+    end
+  end
+
   def test_reports_the_executables_own_version
     require_executable!
     assert_match(/\A\d+\.\d+\.\d+/, Oximg.version)

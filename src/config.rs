@@ -514,6 +514,26 @@ mod tests {
         );
     }
 
+    /// The Ruby gem's `Oximg::KNOBS` (what `env:` may set per call) is
+    /// exactly KNOBS: a knob added here and not there would be refused
+    /// by the gem, and one dropped here would be passed along and
+    /// silently ignored.
+    #[test]
+    fn gem_knobs_match_the_inventory() {
+        let gem = include_str!("../rubygem/oximg/lib/oximg.rb");
+        let start = gem.find("KNOBS = %w[").expect("Oximg::KNOBS in oximg.rb") + 11;
+        let end = start + gem[start..].find(']').unwrap();
+        let in_gem: HashSet<&str> = gem[start..end].split_whitespace().collect();
+        let inventory: HashSet<&str> = KNOBS.iter().copied().collect();
+        assert_eq!(
+            in_gem,
+            inventory,
+            "Oximg::KNOBS != KNOBS\nextra in gem: {:?}\nmissing from gem: {:?}",
+            in_gem.difference(&inventory).collect::<Vec<_>>(),
+            inventory.difference(&in_gem).collect::<Vec<_>>(),
+        );
+    }
+
     /// HTTP statuses and ErrorKind names in docs/features/errors.md
     /// must match the server/library contract. A missing row is how
     /// `@avif` without the feature drifted to "422" in the map.
