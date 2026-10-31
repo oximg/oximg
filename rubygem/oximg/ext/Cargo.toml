@@ -4,9 +4,9 @@
 # ABI is not tied to the Ruby ABI: one build per platform serves every
 # Ruby version, the way the bundled executable already does.
 #
-# Build (from the repo root):
-#   cargo build --release --manifest-path rubygem/oximg/ext/Cargo.toml \
-#     --target-dir target/oximg-probe
+# Build with `rake compile` in rubygem/oximg, which starts from a copy
+# of the root Cargo.lock (see the Rakefile for why there is no lock
+# here).
 [package]
 name = "oximg-probe"
 version = "0.0.0"
@@ -32,6 +32,4 @@ codegen-units = 1
 # entry points below catch what reaches them.
 
 # Standalone: not a member of the root package's (absent) workspace.
-# Its Cargo.lock started as a copy of the root one, so it resolves the
-# decoders to the versions the executable ships.
 [workspace]
