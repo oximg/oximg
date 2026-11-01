@@ -31,7 +31,7 @@ Deploy-time settings, read by `cloudflare.config.ts`:
 | `OXIMG_SOURCE_BASE_URL` | required | `https://…` origin for sources |
 | `INSTANCES` | 1 | instances to spread URL paths over; also `maxInstances` |
 | `INSTANCE_TYPE` | `standard-2` | 1 vCPU / 6 GiB, the measured size; `basic` and `standard-1` are cheaper and unmeasured |
-| `IMAGE` | `docker.io/oximg/oximg:0.17.0` | pin a version, as with any deployment |
+| `IMAGE` | `docker.io/oximg/oximg:0.18.1` | pin a version, as with any deployment |
 | `OXIMG_METRICS` | unset | `1` serves `/metrics`, which sits outside URL signing |
 
 The image comes straight from Docker Hub (`image.reference`), so no
