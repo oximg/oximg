@@ -751,6 +751,27 @@ fn webp_flags_exif(bytes: &[u8]) -> bool {
 }
 
 fn probe_header_inner(bytes: &[u8]) -> Result<Header> {
+    // A PNG's size and its eXIf come from one `read_info`: parsing the
+    // header twice also inflated any iCCP profile twice, and doubled
+    // the probe (0.66 -> 1.3 µs on a 4000x3000 PNG, M2 Max). The checks
+    // ahead of it are `probe_inner`'s, so the errors stay `probe`'s.
+    if bytes.len() >= 12 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        let r = png::Decoder::new(std::io::Cursor::new(bytes))
+            .read_info()
+            .context("parse PNG")?;
+        let info = r.info();
+        let orientation = info
+            .exif_metadata
+            .as_ref()
+            .and_then(|d| crate::meta::Orientation::from_exif_payload(d))
+            .unwrap_or(crate::meta::Orientation::UPRIGHT);
+        return Ok(Header {
+            format: ImageFormat::Png,
+            width: info.width as usize,
+            height: info.height as usize,
+            orientation: orientation.value(),
+        });
+    }
     let (format, width, height) = probe_inner(bytes)?;
     Ok(Header {
         format,
