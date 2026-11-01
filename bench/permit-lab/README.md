@@ -46,7 +46,7 @@ bash fixtures.sh && bash sweep.sh
 
 ## Measured, 2026-08-05
 
-starship (Ryzen 7 8745HS, 16T, Arch, cgroup v2), released image
+AMD Ryzen 7 8745HS (16T, Arch, cgroup v2), released image
 `ghcr.io/oximg/oximg:0.8.1`, `--cpus=1 --cpuset-cpus=0`, burst=8,
 12 rounds x 2 interleaved repeats, 2000x1500 JPEG source:
 

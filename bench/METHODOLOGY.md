@@ -71,5 +71,5 @@ profile stand in for release on behaviour; rerun it on both
 architectures when the profiles or the SIMD kernels change. Measured
 2026-10-14, 0 differing in every run: amd64 with avif, 192 compared;
 amd64 default features, 132; aarch64 default features under QEMU on
-starship, 132 (AVIF there unchecked: bookworm's SVT-AV1 is below the
-4.1 floor).
+an AMD Ryzen 7 8745HS host, 132 (AVIF there unchecked: bookworm's
+SVT-AV1 is below the 4.1 floor).
