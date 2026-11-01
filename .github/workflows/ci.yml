@@ -259,7 +259,7 @@ jobs:
           require "oximg"
           puts "executable: #{Oximg.executable}"
           Oximg.resize("/src/tests/fixtures/photo.jpg", "/tmp/o.webp", width: 120)
-          raise "unexpected output" unless Oximg.probe("/tmp/o.webp") == {content_type: "image/webp", format: :webp, width: 120, height: 90}
+          raise "unexpected output" unless Oximg.probe("/tmp/o.webp") == {content_type: "image/webp", format: :webp, width: 120, height: 90, orientation: 1, display_width: 120, display_height: 90}
           raise "probe spawns: the bundled library did not load" unless Oximg.in_process_probe?
           puts "ok: the platform gem resized and probed in-process on bare Alpine"
           RUBY
