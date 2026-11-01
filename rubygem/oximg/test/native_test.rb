@@ -139,6 +139,26 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # A FIFO is a path that cannot seek: it is read forward, as before
+  # the path probe learned to seek over a WebP's image data.
+  def test_probes_a_fifo_path
+    with_library do
+      Dir.mktmpdir do |dir|
+        fifo = File.join(dir, "in.webp")
+        File.mkfifo(fifo)
+        bytes = webp_with_far_exif(6)
+        writer = Thread.new do
+          File.open(fifo, "wb") { |f| f.write(bytes) }
+        rescue Errno::EPIPE
+          nil # the probe stopped reading
+        end
+        probed = Oximg.probe(fifo)
+        writer.join
+        assert_equal [200, 150, 6], probed.values_at(:width, :height, :orientation)
+      end
+    end
+  end
+
   # Only the header is read: 64 KiB of a 4 MiB stream, and the IO is
   # left where the read stopped.
   def test_reads_only_the_header_from_an_io

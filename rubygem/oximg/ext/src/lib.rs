@@ -62,7 +62,16 @@ pub unsafe extern "C" fn oximg_probe_path(
         // The same leading context the CLI gives a failed read.
         let file =
             std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        pipeline::probe_header_seek(file).map_err(|e| format!("{}: {e:#}", path.display()))
+        // Seek only where seeking works: a FIFO or a pipe-backed
+        // /dev/stdin is a path too, and lseek fails on it (ESPIPE), so
+        // anything but a regular file keeps the forward-only read.
+        let regular = file.metadata().is_ok_and(|m| m.is_file());
+        let header = if regular {
+            pipeline::probe_header_seek(file)
+        } else {
+            pipeline::probe_header_reader(file)
+        };
+        header.map_err(|e| format!("{}: {e:#}", path.display()))
     });
     unsafe { finish(result, dims, msg, msg_cap) }
 }
