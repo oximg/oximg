@@ -142,17 +142,17 @@ class Oximg::ProcessingTest < Oximg::Test
   # ProbeTest.
   def test_probe_reads_an_animated_source
     probed = Oximg.probe(fixture("anim.gif"))
-    assert_equal({content_type: "image/gif", format: :gif, width: 120, height: 90}, probed)
+    assert_equal(upright("image/gif", :gif, 120, 90), probed)
 
     probed = Oximg.probe(fixture("animated.webp"))
-    assert_equal({content_type: "image/webp", format: :webp, width: 64, height: 48}, probed)
+    assert_equal(upright("image/webp", :webp, 64, 48), probed)
   end
 
   # GIF is decode-only, but it is still a content type the CLI emits,
   # so probe has to name it.
   def test_probe_names_gif_as_a_format
     probed = Oximg.probe(fixture("still.gif"))
-    assert_equal({content_type: "image/gif", format: :gif, width: 240, height: 180}, probed)
+    assert_equal(upright("image/gif", :gif, 240, 180), probed)
   end
 
   # Nothing in the fixture to strip: the bytes come back unchanged.

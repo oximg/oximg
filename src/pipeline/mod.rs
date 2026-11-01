@@ -478,12 +478,21 @@ const PROBE_FIRST_READ: usize = 64 << 10;
 /// assert_eq!((w, h), (200, 150));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-pub fn probe_reader<R: std::io::Read>(mut reader: R) -> Result<(ImageFormat, usize, usize), Error> {
+pub fn probe_reader<R: std::io::Read>(reader: R) -> Result<(ImageFormat, usize, usize), Error> {
+    read_steps(reader, probe_step)
+}
+
+/// The read loop behind [`probe_reader`] and [`probe_header_reader`]:
+/// feed `step` the prefix read so far until it answers.
+fn read_steps<R: std::io::Read, T>(
+    mut reader: R,
+    step: impl Fn(&[u8], bool) -> ProbeStep<T>,
+) -> Result<T, Error> {
     use std::io::Read as _;
     let mut buf = Vec::new();
     let mut eof = false;
     loop {
-        match probe_step(&buf, eof) {
+        match step(&buf, eof) {
             ProbeStep::Done(result) => return result,
             ProbeStep::Read(want) => {
                 let missing = (want - buf.len()) as u64;
@@ -500,11 +509,13 @@ pub fn probe_reader<R: std::io::Read>(mut reader: R) -> Result<(ImageFormat, usi
     }
 }
 
-/// What [`probe_step`] needs next.
+/// What [`probe_step`] (or [`probe_header_step`], with `T` =
+/// [`Header`]) needs next.
 #[derive(Debug)]
-pub enum ProbeStep {
-    /// The answer: [`probe`]'s on the whole source.
-    Done(Result<(ImageFormat, usize, usize), Error>),
+pub enum ProbeStep<T = (ImageFormat, usize, usize)> {
+    /// The answer: [`probe`]'s (or [`probe_header`]'s) on the whole
+    /// source.
+    Done(Result<T, Error>),
     /// Read on until the prefix holds this many bytes or the source
     /// ends, then call [`probe_step`] again with all of it.
     /// `usize::MAX` means read to the end.
@@ -533,19 +544,126 @@ pub enum ProbeStep {
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn probe_step(prefix: &[u8], eof: bool) -> ProbeStep {
+    // A prefix's AVIF answer is not final: an ISOBMFF box of size 0
+    // runs to EOF, so bytes past the prefix can still break the walk
+    // `probe` makes over the whole file. The dimensions sit in item
+    // data `iloc` points at, usually the bulk of the file, so reading
+    // the rest costs little.
+    step_with(prefix, eof, probe_inner, |&(format, ..), _| {
+        format == ImageFormat::Avif
+    })
+}
+
+/// One step of a prefix-driven header read: the answer of `inner` once
+/// the prefix holds it, else how much to read on. `read_on` names the
+/// answers a prefix cannot settle, which are then read through EOF.
+fn step_with<T>(
+    prefix: &[u8],
+    eof: bool,
+    inner: impl Fn(&[u8]) -> Result<T>,
+    read_on: impl Fn(&T, &[u8]) -> bool,
+) -> ProbeStep<T> {
     if !eof && prefix.len() < PROBE_FIRST_READ {
         return ProbeStep::Read(PROBE_FIRST_READ);
     }
-    match probe_inner(prefix) {
+    match inner(prefix) {
         Err(_) if !eof => ProbeStep::Read(prefix.len().saturating_mul(2)),
-        // A prefix's AVIF answer is not final: an ISOBMFF box of size 0
-        // runs to EOF, so bytes past the prefix can still break the
-        // walk `probe` makes over the whole file. The dimensions sit in
-        // item data `iloc` points at, usually the bulk of the file, so
-        // reading the rest costs little.
-        Ok((ImageFormat::Avif, ..)) if !eof => ProbeStep::Read(usize::MAX),
+        Ok(answer) if !eof && read_on(&answer, prefix) => ProbeStep::Read(usize::MAX),
         result => ProbeStep::Done(result.map_err(|e| Error::classify(e, false))),
     }
+}
+
+/// What a header read learns about a source: [`probe`]'s answer plus
+/// the orientation the source asks to be displayed in.
+///
+/// `#[non_exhaustive]`: later releases may add fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Header {
+    pub format: ImageFormat,
+    /// Stored width, before any rotation: [`probe`]'s.
+    pub width: usize,
+    /// Stored height, before any rotation: [`probe`]'s.
+    pub height: usize,
+    /// The EXIF orientation, 1..=8: JPEG EXIF, PNG `eXIf`, WebP `EXIF`,
+    /// AVIF `irot`/`imir` composed into the EXIF value. A missing or
+    /// invalid tag is 1, by the same parser and rule `process` applies
+    /// under auto-rotate (and `strip` keeps). GIF is always 1.
+    pub orientation: u8,
+}
+
+impl Header {
+    /// Width as displayed by a viewer that honors the orientation —
+    /// and as `process` emits it with auto-rotate on (the default).
+    /// Orientations 5–8 exchange the axes.
+    pub fn display_width(&self) -> usize {
+        if self.orientation >= 5 {
+            self.height
+        } else {
+            self.width
+        }
+    }
+
+    /// Height as displayed; see [`display_width`](Self::display_width).
+    pub fn display_height(&self) -> usize {
+        if self.orientation >= 5 {
+            self.width
+        } else {
+            self.height
+        }
+    }
+}
+
+/// Like [`probe`], plus the source's orientation: what a caller needs
+/// to lay out a stored-as-rotated image (one `strip` kept the tag on)
+/// without decoding it. Unlike [`probe_display`], the answer does not
+/// depend on `OXIMG_AUTO_ROTATE`: the orientation is the file's.
+///
+/// ```
+/// use oximg::pipeline;
+///
+/// let bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/photo.jpg"))?;
+/// let h = pipeline::probe_header(&bytes)?;
+/// assert_eq!((h.width, h.height, h.orientation), (200, 150, 1));
+/// assert_eq!((h.display_width(), h.display_height()), (200, 150));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn probe_header(bytes: &[u8]) -> Result<Header, Error> {
+    probe_header_inner(bytes).map_err(|e| Error::classify(e, false))
+}
+
+/// [`probe_header`] from a reader, reading as [`probe_reader`] does,
+/// except where the orientation sits past the header: a WebP that flags
+/// an `EXIF` chunk (which follows the image data) is read through EOF.
+pub fn probe_header_reader<R: std::io::Read>(reader: R) -> Result<Header, Error> {
+    read_steps(reader, probe_header_step)
+}
+
+/// [`probe_header_reader`] one step at a time, as [`probe_step`] is to
+/// [`probe_reader`]. The answer and the bytes read are exactly
+/// [`probe_header_reader`]'s.
+pub fn probe_header_step(prefix: &[u8], eof: bool) -> ProbeStep<Header> {
+    step_with(prefix, eof, probe_header_inner, |h, prefix| {
+        h.format == ImageFormat::Avif || (h.format == ImageFormat::Webp && webp_flags_exif(prefix))
+    })
+}
+
+/// Whether a WebP's `VP8X` header flags an `EXIF` chunk. libwebp's mux,
+/// which `process` reads the orientation through, refuses a file
+/// carrying one unflagged, so only a flagged file has an orientation a
+/// prefix can miss: the chunk follows the image data.
+fn webp_flags_exif(bytes: &[u8]) -> bool {
+    bytes.get(12..16) == Some(b"VP8X") && bytes.get(20).is_some_and(|f| f & 0x08 != 0)
+}
+
+fn probe_header_inner(bytes: &[u8]) -> Result<Header> {
+    let (format, width, height) = probe_inner(bytes)?;
+    Ok(Header {
+        format,
+        width,
+        height,
+        orientation: peek_orientation(format, bytes).value(),
+    })
 }
 
 /// Like [`probe`], but width/height are the **displayed** frame after
@@ -567,12 +685,11 @@ pub fn probe_display_with(
 }
 
 fn probe_display_inner(bytes: &[u8], auto_rotate: bool) -> Result<(ImageFormat, usize, usize)> {
-    let (fmt, w, h) = probe_inner(bytes)?;
     if !auto_rotate {
-        return Ok((fmt, w, h));
+        return probe_inner(bytes);
     }
-    let (dw, dh) = peek_orientation(fmt, bytes).display_dims(w, h);
-    Ok((fmt, dw, dh))
+    let h = probe_header_inner(bytes)?;
+    Ok((h.format, h.display_width(), h.display_height()))
 }
 
 fn peek_orientation(fmt: ImageFormat, bytes: &[u8]) -> crate::meta::Orientation {

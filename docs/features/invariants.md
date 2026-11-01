@@ -42,7 +42,11 @@ Every source format auto-rotates (JPEG EXIF, PNG `eXIf`, WebP `EXIF`,
 AVIF `irot`/`imir`). Output pixels are upright; the metadata is not
 forwarded. `OXIMG_AUTO_ROTATE=0` serves the stored orientation.
 `probe` reports **stored** size, so orientations 5–8 disagree with
-`process` output axes.
+`process` output axes. `probe_header` (and `oximg probe`, `oximg-ctl
+probe`, the gem's `Oximg.probe`) also reports the orientation, 1–8 (1
+when missing or invalid, as auto-rotate reads it), and the displayed
+size, which is `process`'s output axes under auto-rotate whatever
+`OXIMG_AUTO_ROTATE` says.
 
 ## ICC
 

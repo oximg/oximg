@@ -23,7 +23,7 @@ that picks the scan layout is proved.
 ## CLI (one-shot, no HTTP)
 
 ```sh
-oximg-ctl probe tests/fixtures/photo.jpg
+oximg-ctl probe tests/fixtures/photo.jpg   # probe.{orientation,display_width,display_height}
 oximg-ctl resize tests/fixtures/photo.jpg 100 100 --out /tmp/out.jpg
 oximg-ctl resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/out.webp
 oximg-ctl strip tests/fixtures/animated.webp --out /tmp/out.webp
@@ -71,7 +71,10 @@ orientation}` without decoding pixels.
 from a reader, read 64 KiB at a time, doubling, until the header
 parses (errors only at EOF; AVIF reads through EOF), and
 `probe_step` is that loop one step at a time for callers doing their
-own reads; `probe_animation` reports frames for GIF/WebP. Embedders set
+own reads; `probe_header` / `probe_header_reader` / `probe_header_step`
+add the orientation (`Header {format, width, height, orientation}`,
+`display_width()`/`display_height()`), reading a WebP that flags an
+`EXIF` chunk through EOF; `probe_animation` reports frames for GIF/WebP. Embedders set
 `default-features = false` to drop the HTTP stack. Failures are
 `pipeline::Error`; match `kind()`, wildcard arm required (`ErrorKind`
 is `#[non_exhaustive]`).

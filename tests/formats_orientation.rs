@@ -409,3 +409,176 @@ fn avif_irot_imir_match_libheif_rendering() {
         "profile survives alongside the rotation"
     );
 }
+
+/// Params that keep the source's size and emit PNG, so an output's
+/// dimensions are the displayed frame.
+fn native_png() -> Params {
+    Params {
+        max_width: 4096,
+        max_height: 4096,
+        output: Some(ImageFormat::Png),
+        ..params(120)
+    }
+}
+
+/// A JPEG, PNG and WebP storing `display` rotated by `o` and tagged
+/// with it.
+fn oriented_sources(display: &[u8], w: usize, h: usize, o: u8) -> Vec<(&'static str, Vec<u8>)> {
+    let (stored, sw, sh) = common::store_for_orientation(display, w, h, o);
+    let bare = {
+        let p = Params {
+            output: Some(ImageFormat::Webp),
+            ..native_png()
+        };
+        let png = common::png_with_orientation(&stored, sw, sh, 1);
+        pipeline::process(&png, &p).unwrap().0
+    };
+    let exif = common::tiff_orientation(o as u16);
+    vec![
+        (
+            "jpeg",
+            common::jpeg_with_orientation(&stored, sw, sh, Some(o as u16)),
+        ),
+        (
+            "png",
+            common::png_with_orientation(&stored, sw, sh, o as u16),
+        ),
+        ("webp", common::webp_with_exif(&bare, sw, sh, &exif)),
+    ]
+}
+
+/// `probe_header` reports the tag, and its display size is the frame
+/// `process` emits under auto-rotate: checked against the output's own
+/// dimensions, not recomputed (#163).
+#[test]
+fn probe_header_reports_the_orientation_resize_applies() {
+    let (w, h, block) = (240usize, 180usize, 60usize);
+    let display = common::corner_base(w, h, block);
+    for o in 1..=8u8 {
+        for (label, src) in oriented_sources(&display, w, h, o) {
+            let hdr = pipeline::probe_header(&src).unwrap();
+            assert_eq!(hdr.orientation, o, "{label} o={o}");
+            assert_eq!((hdr.width, hdr.height), dims_of(&src), "{label} o={o}");
+            let (out, _) = pipeline::process(&src, &native_png()).unwrap();
+            let shown = (hdr.display_width(), hdr.display_height());
+            assert_eq!(shown, dims_of(&out), "{label} o={o}: what resize emits");
+            assert_eq!(shown, (w, h), "{label} o={o}");
+            assert_eq!(
+                pipeline::probe_header_reader(&src[..]).unwrap(),
+                hdr,
+                "{label} o={o}: the reader agrees"
+            );
+        }
+    }
+}
+
+/// Formats without an orientation, a missing tag and an invalid value
+/// all report 1, as resize treats them.
+#[test]
+fn probe_header_reports_one_without_a_valid_tag() {
+    for name in [
+        "photo.jpg",
+        "rgb.png",
+        "photo.webp",
+        "anim.gif",
+        "still.gif",
+    ] {
+        let hdr = pipeline::probe_header(&common::fixture(name)).unwrap();
+        assert_eq!(hdr.orientation, 1, "{name}");
+        let shown = (hdr.display_width(), hdr.display_height());
+        assert_eq!(shown, (hdr.width, hdr.height), "{name}");
+    }
+    let (w, h) = (64usize, 48usize);
+    let px = vec![128u8; w * h * 3];
+    let no_tag = common::jpeg_with_app1s(&px, w, h, &[&common::app1_exif_no_orientation()]);
+    assert_eq!(pipeline::probe_header(&no_tag).unwrap().orientation, 1);
+    let invalid = common::jpeg_with_orientation(&px, w, h, Some(9));
+    assert_eq!(pipeline::probe_header(&invalid).unwrap().orientation, 1);
+}
+
+/// A reader over `bytes` that counts what it handed out.
+struct Counting<'a> {
+    bytes: &'a [u8],
+    read: usize,
+}
+
+impl std::io::Read for Counting<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut &self.bytes[self.read..], buf)?;
+        self.read += n;
+        Ok(n)
+    }
+}
+
+/// How many bytes `probe` reads from `bytes` through `read`.
+fn bytes_read<T>(bytes: &[u8], read: impl Fn(&mut Counting<'_>) -> T) -> (T, usize) {
+    let mut r = Counting { bytes, read: 0 };
+    let answer = read(&mut r);
+    (answer, r.read)
+}
+
+/// A WebP whose image data alone outgrows the first 64 KiB read.
+fn big_bare_webp() -> (Vec<u8>, usize, usize) {
+    let (w, h) = (400usize, 300usize);
+    // Deterministic noise, which no encoder shrinks much.
+    let mut x = 0x2545_f491u32;
+    let px: Vec<u8> = (0..w * h * 3)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        webp_quality: Some(100.0),
+        ..native_png()
+    };
+    let png = common::png_with_orientation(&px, w, h, 1);
+    let webp = pipeline::process(&png, &p).unwrap().0;
+    assert!(webp.len() > 2 * (64 << 10), "{} bytes", webp.len());
+    (webp, w, h)
+}
+
+/// A WebP's `EXIF` chunk follows the image data, so the header reader
+/// reads a WebP that flags one through EOF, where `probe_reader` stops
+/// at the first 64 KiB. Without the flag it stops there too: libwebp's
+/// mux refuses an unflagged chunk, so resize does not rotate either,
+/// and the prefix's answer (1) is the whole file's.
+#[test]
+fn probe_header_reader_reads_a_flagged_webp_through_its_exif() {
+    let (bare, w, h) = big_bare_webp();
+    let flagged = common::webp_with_exif(&bare, w, h, &common::tiff_orientation(6));
+    assert_eq!(flagged[20] & 0x08, 0x08);
+
+    let (hdr, read) = bytes_read(&flagged, |r| pipeline::probe_header_reader(r).unwrap());
+    assert_eq!(hdr.orientation, 6);
+    assert_eq!(read, flagged.len());
+    let (_, read) = bytes_read(&flagged, |r| pipeline::probe_reader(r).unwrap());
+    assert_eq!(read, 64 << 10, "probe_reader reads what it always has");
+
+    let mut unflagged = flagged.clone();
+    unflagged[20] &= !0x08;
+    let (hdr, read) = bytes_read(&unflagged, |r| pipeline::probe_header_reader(r).unwrap());
+    assert_eq!(hdr.orientation, 1);
+    assert_eq!(read, 64 << 10);
+    assert_eq!(pipeline::probe_header(&unflagged).unwrap().orientation, 1);
+    let (out, _) = pipeline::process(&unflagged, &native_png()).unwrap();
+    assert_eq!(dims_of(&out), (w, h), "an unflagged EXIF does not rotate");
+}
+
+/// A JPEG's Exif APP1 behind more metadata than the first read holds
+/// is still found: the header is done only once the frame header is.
+#[test]
+fn probe_header_reader_finds_an_exif_behind_large_metadata() {
+    let (w, h) = (64usize, 48usize);
+    let px = vec![128u8; w * h * 3];
+    let pad = vec![0u8; 0xFFFF - 2];
+    let app1 = common::app1_orientation(6);
+    let jpeg = common::jpeg_with_markers(&px, w, h, &[(2, &pad), (2, &pad), (1, &app1)]);
+    let (hdr, read) = bytes_read(&jpeg, |r| pipeline::probe_header_reader(r).unwrap());
+    assert_eq!(hdr.orientation, 6);
+    assert_eq!((hdr.display_width(), hdr.display_height()), (h, w));
+    assert!(read > 128 << 10 && read <= 256 << 10, "{read}");
+}

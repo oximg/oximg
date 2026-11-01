@@ -10,6 +10,36 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`probe` reports the EXIF orientation and the displayed size**
+  ([#163]). A photo `strip` left rotated (stored pixels plus a minimal
+  EXIF orientation) can now be laid out without decoding it or asking
+  libvips: `pipeline::probe_header` (and `probe_header_reader` /
+  `probe_header_step`) returns `Header {format, width, height,
+  orientation}` with `display_width()` / `display_height()`, the axes
+  exchanged for orientations 5–8. The orientation is read by the same
+  parser `resize`'s auto-rotate uses (JPEG EXIF, PNG `eXIf`, WebP
+  `EXIF`, AVIF `irot`/`imir`), so a missing or invalid tag is 1, and it
+  does not depend on `OXIMG_AUTO_ROTATE`. A WebP that flags an `EXIF`
+  chunk is read through EOF, since the chunk follows the image data;
+  `probe` / `probe_reader` / `probe_step` read what they always have.
+  - `oximg probe` adds `, orientation 6 (displayed 2000x3000)` after
+    the pixel count for a non-upright source; an upright one prints the
+    same line as before.
+  - `oximg-ctl probe` (and every `probe` object in its JSON) adds
+    `orientation`, `display_width` and `display_height`.
+  - The Ruby gem's `Oximg.probe` hash adds `orientation:`,
+    `display_width:` and `display_height:`, in-process and spawned. The
+    probe library's C ABI is version 2 (`dims` holds three values); a
+    gem refuses a library of the other version and spawns instead.
+
+### Changed
+
+- `pipeline::ProbeStep` takes a type parameter, defaulting to
+  `probe_step`'s answer, so `probe_header_step` can share it. Code that
+  names `ProbeStep` without one compiles unchanged.
+
 ## [0.18.1] - 2026-10-31
 
 Per-call ICC and orientation, from the CLI and the Ruby gem ([#128]).
@@ -235,6 +265,7 @@ no fixture is that large.
 [#130]: https://github.com/oximg/oximg/issues/130
 [#133]: https://github.com/oximg/oximg/issues/133
 [#134]: https://github.com/oximg/oximg/issues/134
+[#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26
 
