@@ -693,8 +693,47 @@ fn big_alpha_webp() -> (Vec<u8>, usize, usize) {
     (webp, w, h)
 }
 
+/// A lossless WebP (`VP8L`) of noise, large enough that its image data
+/// outgrows the first 64 KiB read: the layout of the 2.6 MB WebP behind
+/// the sparse read's measured gain, whose size the mux reads through
+/// `VP8LGetInfo` rather than `VP8GetInfo`. Encoded with libwebp
+/// directly, since the pipeline writes lossless WebP only for alpha.
+fn big_lossless_webp() -> (Vec<u8>, usize, usize) {
+    let (w, h) = (400usize, 300usize);
+    let mut x = 0x85eb_ca6bu32;
+    let px: Vec<u8> = (0..w * h * 3)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let mut out: *mut u8 = std::ptr::null_mut();
+    // SAFETY: `px` holds w*h RGB pixels at stride 3*w; libwebp writes a
+    // buffer it allocates to `out` and returns its length (0 on failure),
+    // which is copied out before WebPFree releases it.
+    let webp = unsafe {
+        let n = libwebp_sys::WebPEncodeLosslessRGB(
+            px.as_ptr(),
+            w as i32,
+            h as i32,
+            (w * 3) as i32,
+            &mut out,
+        );
+        assert!(n > 0 && !out.is_null(), "lossless encode failed");
+        let v = std::slice::from_raw_parts(out, n).to_vec();
+        libwebp_sys::WebPFree(out.cast());
+        v
+    };
+    assert_eq!(&webp[12..16], b"VP8L");
+    assert!(webp.len() > 2 * (64 << 10), "{} bytes", webp.len());
+    (webp, w, h)
+}
+
 /// Every WebP shape the sparse read must answer exactly as the whole
-/// file does: around a lossy, an alpha and an animated image, the EXIF
+/// file does: around a lossy, a lossless, an alpha and an animated
+/// image, the EXIF
 /// flagged, unflagged, doubled, odd-sized, missing, or cut off; the
 /// file padded, truncated, or its sizes lying. `probe_header_seek`
 /// gives `probe_header`'s answer (or error) on every one.
@@ -703,6 +742,7 @@ fn probe_header_seek_answers_as_the_whole_webp_does() {
     let exif = |o: u16| (*b"EXIF", common::tiff_orientation(o));
     let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
     let (lossy, w, h) = big_bare_webp();
+    let (lossless, lw, lh) = big_lossless_webp();
     let (alpha, aw, ah) = big_alpha_webp();
     let alpha_chunks: Vec<_> = webp_chunks(&alpha)
         .into_iter()
@@ -710,6 +750,7 @@ fn probe_header_seek_answers_as_the_whole_webp_does() {
         .collect();
     let images: Vec<(&str, Vec<Chunk>, u8, usize, usize)> = vec![
         ("lossy", webp_chunks(&lossy), 0, w, h),
+        ("lossless", webp_chunks(&lossless), 0, lw, lh),
         ("alpha", alpha_chunks, 0x10, aw, ah),
     ];
     for (name, image, base, w, h) in &images {
@@ -797,7 +838,7 @@ fn probe_header_seek_answers_as_the_whole_webp_does() {
     // odd-sized and trailing-bytes cases carry an orientation (the mux
     // takes none from two EXIF chunks or a cut file), and so does the
     // animation.
-    assert_eq!(rotated, 2 * 5 + 1, "cases that reported an orientation");
+    assert_eq!(rotated, 3 * 5 + 1, "cases that reported an orientation");
 
     // And the point: past the first read, only chunk headers, the EXIF
     // and a little of each image chunk are read.
