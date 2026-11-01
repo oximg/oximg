@@ -13,7 +13,7 @@ set -euo pipefail
 : "${GCP_PROJECT:?}" "${BUCKET:?}"
 REGION=${REGION:-us-south1}
 SERVICE=${SERVICE:-oximg}
-IMAGE=${IMAGE:-docker.io/oximg/oximg:0.17.0}
+IMAGE=${IMAGE:-docker.io/oximg/oximg:0.18.1}
 
 if ! gcloud storage buckets describe "gs://$BUCKET" --project="$GCP_PROJECT" >/dev/null 2>&1; then
   gcloud storage buckets create "gs://$BUCKET" --project="$GCP_PROJECT" \

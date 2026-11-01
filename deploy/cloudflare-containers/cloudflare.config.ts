@@ -6,7 +6,7 @@ import { bindings, defineConfig, defineContainer, defineWorker, exports } from "
 //   OXIMG_METRICS          "1" exposes /metrics (bench/platforms needs it)
 //   INSTANCES              container instances to spread URLs over (default 1)
 //   INSTANCE_TYPE          lite | basic | standard-1..4 (default standard-2, the measured one)
-//   IMAGE                  default docker.io/oximg/oximg:0.17.0
+//   IMAGE                  default docker.io/oximg/oximg:0.18.1
 const source = process.env.OXIMG_SOURCE_BASE_URL;
 if (!source) throw new Error("set OXIMG_SOURCE_BASE_URL before cf deploy");
 const instances = process.env.INSTANCES ?? "1";
@@ -14,7 +14,7 @@ const instances = process.env.INSTANCES ?? "1";
 // The released native image, unchanged.
 const oximg = defineContainer({
 	name: "oximg",
-	image: { reference: process.env.IMAGE ?? "docker.io/oximg/oximg:0.17.0" },
+	image: { reference: process.env.IMAGE ?? "docker.io/oximg/oximg:0.18.1" },
 	instanceType: (process.env.INSTANCE_TYPE ?? "standard-2") as "standard-2",
 	maxInstances: Number(instances),
 });

@@ -35,7 +35,7 @@ and point `OXIMG_SOURCE_BASE_URL` at where the originals live:
 
 ```sh
 gcloud run deploy oximg \
-  --image=docker.io/oximg/oximg:0.17.0 \
+  --image=docker.io/oximg/oximg:0.18.1 \
   --set-env-vars=OXIMG_SOURCE_BASE_URL=https://storage.googleapis.com/my-bucket \
   --cpu=2 --memory=1Gi \
   --concurrency=8 \
