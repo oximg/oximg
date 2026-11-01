@@ -24,6 +24,22 @@ const N: u32 = 2048;
 /// dominant buffer the estimate prices exactly.
 const UNCOUNTED: u64 = 2 << 20;
 
+/// How far an estimate may sit above the bytes held before its ratio
+/// counts. `held` is one process's peak RSS minus another's (the
+/// tiny-input baseline), so below a megabyte it is mostly the noise of
+/// those two reads: the fused PNG thumbnail, estimated at 744 KB, held
+/// 197 to 463 KB on CI's Linux arm64 runner across runs of the same
+/// code (3.78x to 1.6x) and 0.81x on an M2 Max. An over-estimate this
+/// small cannot over-refuse a request; the ratio still binds every
+/// cell that holds megabytes.
+const OVER_FLOOR: u64 = 1 << 20;
+
+/// Whether `est` over-prices `held` past `max_ratio` by more than
+/// [`OVER_FLOOR`].
+fn over_estimates(est: u64, held: u64, max_ratio: f64) -> bool {
+    est as f64 / held as f64 > max_ratio && est > held + OVER_FLOOR
+}
+
 fn ctl() -> Command {
     let oximg = Path::new(env!("CARGO_BIN_EXE_oximg"));
     let ctl = oximg.with_file_name(if cfg!(windows) {
@@ -456,7 +472,7 @@ fn estimate_covers_peak_rss_on_every_arm() {
         // cell over it is measured twice more and keeps its highest
         // peak; a real over-estimate stays over.
         for _ in 0..2 {
-            if est as f64 / peak.saturating_sub(baseline) as f64 <= max_ratio {
+            if !over_estimates(est, peak.saturating_sub(baseline), max_ratio) {
                 break;
             }
             peak = peak.max(measure(&inputs.path(input), w, h, &out, env).1);
@@ -469,9 +485,10 @@ fn estimate_covers_peak_rss_on_every_arm() {
                 "{label}: estimate {est} under the {held} bytes held"
             ));
         }
-        if ratio > max_ratio {
+        if over_estimates(est, held, max_ratio) {
             failures.push(format!(
-                "{label}: estimate {est} is {ratio:.2}x the {held} bytes held (max {max_ratio})"
+                "{label}: estimate {est} is {ratio:.2}x the {held} bytes held (max {max_ratio}, \
+                 and more than {OVER_FLOOR} over)"
             ));
         }
     }
