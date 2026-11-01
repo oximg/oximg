@@ -20,7 +20,8 @@ Oximg.resize("in.jpg", "out.jpg", width: 750)
 Oximg.resize("in.jpg", "out.webp", width: 750, height: 500, quality: 80)
 Oximg.strip("upload.jpg", "clean.jpg")
 Oximg.probe("in.jpg")
-#=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
+#=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000,
+#    orientation: 1, display_width: 4000, display_height: 3000}
 ```
 
 A GIF source is read and probed like the others (`format: :gif`), but
@@ -106,12 +107,21 @@ Oximg.probe(Pathname("in.jpg"))                # also a path
 Oximg.probe(upload.tempfile)                   # anything with #path
 Oximg.probe(File.open("in.jpg", "rb"))         # an open File
 Oximg.probe(StringIO.new(bytes))               # an IO: bytes in memory
-#=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000}
+#=> {content_type: "image/jpeg", format: :jpeg, width: 4000, height: 3000,
+#    orientation: 1, display_width: 4000, display_height: 3000}
 ```
 
-`probe` reads the header only and decodes no pixels. The dimensions are
-the stored ones, before any EXIF rotation. A String is always a path,
-so bytes already in memory go in as a `StringIO`. An open `File` is
+`probe` reads the header only and decodes no pixels. `width` and
+`height` are the stored ones, before any EXIF rotation. `orientation`
+is the EXIF value, 1..8 (1 when there is none or it is invalid, as
+`resize` reads it), and `display_width` / `display_height` are what a
+viewer honoring it shows: the axes exchanged for 5..8. A portrait
+phone photo stored 4000x3000 with orientation 6, as `strip` leaves it,
+lays out at 3000x4000. A WebP keeps its EXIF after the image data, so
+probing one that has it reads the whole source. An `oximg` executable
+older than this gem reports every source as orientation 1.
+
+A String is always a path, so bytes already in memory go in as a `StringIO`. An open `File` is
 read from its start, its position untouched, and it is the file you
 hold that is read, even if its name has since been replaced, renamed,
 or was relative to a directory the process has left. A closed or

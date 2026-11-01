@@ -488,6 +488,7 @@ oximg resize photo.jpg 750 0 out.jpg          # width-only: height follows the a
 oximg resize photo.jpg 0 0 out.webp           # 0 0 = re-encode at the source's own size
 oximg probe photo.webp                        # format + stored dimensions, header-only
 oximg probe loop.gif                           # animated sources also print frames, duration and loop count
+oximg probe portrait.jpg                       # a rotated source also prints its orientation and displayed size
 oximg strip upload.jpg clean.jpg              # drop EXIF/GPS, XMP, IPTC, comments; no re-encode
 oximg strip upload.png clean.png --icc strip  # ...and the colour profile too
 ```
@@ -524,7 +525,8 @@ rather than changing the process environment.
 
 The `oximg::pipeline` module is usable without the HTTP server —
 `process`/`process_path` take a `Params` and return the re-encoded
-bytes plus their format, `probe` reads just the header, and
+bytes plus their format, `probe` reads just the header (`probe_header`
+adds the EXIF orientation and the displayed size), and
 `probe_animation` reports frame count, play time and loop count for an
 animated source (GIF and WebP) without decoding pixels. Depend on it
 with `default-features = false` to drop the entire HTTP stack (axum,

@@ -3,7 +3,9 @@
 # What one header read costs from Ruby (issue #134): Oximg.probe
 # in-process through the probe library — by path, by open File, by
 # StringIO — against the spawned `oximg probe` it replaces, and
-# ruby-vips' header read where ruby-vips is installed.
+# ruby-vips' header read where ruby-vips is installed. Every mode
+# answers the stored size and the EXIF orientation (#163), and every
+# answer is checked against the executable's before anything is timed.
 #
 # Every source is read once per round in each mode, the modes
 # interleaved within the round, over several rounds; the median per
@@ -68,10 +70,19 @@ images.each do |path|
       stringio: -> { Oximg.probe(StringIO.new(bytes)) },
       spawn: -> { spawned(path) }
     }
-    modes[:vips] = -> { Vips::Image.new_from_file(path).then { |i| [i.width, i.height] } } if defined?(Vips)
+    # libvips answers what Oximg.probe does: stored size and the EXIF
+    # orientation (#163), 1 when the field is absent.
+    if defined?(Vips)
+      modes[:vips] = lambda do
+        image = Vips::Image.new_from_file(path)
+        orientation = image.get_typeof("orientation").zero? ? 1 : image.get("orientation")
+        [image.width, image.height, orientation]
+      end
+    end
     modes.each do |name, run|
-      next if name == :vips
-      raise "#{name} answered #{run.call.inspect} for #{path}, want #{want.inspect}" unless run.call == want
+      got = run.call
+      got = want.values_at(:width, :height, :orientation) == got ? want : got if name == :vips
+      raise "#{name} answered #{got.inspect} for #{path}, want #{want.inspect}" unless got == want
     end
 
     times = Hash.new { |h, k| h[k] = [] }

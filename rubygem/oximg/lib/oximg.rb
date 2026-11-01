@@ -102,8 +102,12 @@ module Oximg
   # The line `oximg probe` prints (src/cli.rs):
   #
   #   in.gif: image/gif 120x90 (10800 stored pixels), 3 frames, 1500ms, looping forever
+  #   in.jpg: image/jpeg 3000x2000 (6000000 stored pixels), orientation 6 (displayed 2000x3000)
   #
-  # The three fields the gem reports are pinned exactly. Everything after
+  # The three fields the gem reports are pinned exactly, and so is the
+  # orientation, which a non-upright source prints first after the
+  # comma (its absence means 1; the displayed size is derived here from
+  # it, not read). Everything after
   # the comma — the animation summary, printed for an animated source
   # only — is information the gem does not expose, and is deliberately
   # left unparsed rather than matched: a pattern that stopped at
@@ -113,7 +117,25 @@ module Oximg
   # a field missing, a continuation without the comma, or anything
   # printed before or after it. stderr is captured separately, so a
   # warning never lands here.
-  PROBE_LINE = /\A[^\n]*: (\S+) (\d+)x(\d+) \(\d+ stored pixels\)(?:,[^\n]*)?\n?\z/
+  PROBE_LINE = /\A[^\n]*: (\S+) (\d+)x(\d+) \(\d+ stored pixels\)(?:, orientation ([1-8]) \(displayed \d+x\d+\))?(?:,[^\n]*)?\n?\z/
+
+  # The hash probe returns, built in one place for both of its paths
+  # (the in-process library and the spawned executable).
+  module Header # :nodoc:
+    def self.build(content_type, width, height, orientation)
+      # Orientations 5-8 exchange the axes on display.
+      swapped = orientation >= 5
+      {
+        content_type: content_type,
+        format: CONTENT_TYPE_FORMATS[content_type],
+        width: width,
+        height: height,
+        orientation: orientation,
+        display_width: swapped ? height : width,
+        display_height: swapped ? width : height
+      }
+    end
+  end
 
   class << self
     # Absolute path to the executable in use; raises
@@ -220,8 +242,12 @@ module Oximg
     end
 
     # Header-only inspection — no pixels are decoded. Returns
-    # <tt>{content_type:, format:, width:, height:}</tt>, where the
-    # dimensions are the stored ones (an EXIF rotation is not applied).
+    # <tt>{content_type:, format:, width:, height:, orientation:,
+    # display_width:, display_height:}</tt>. +width+ and +height+ are the
+    # stored ones; +orientation+ is the EXIF value, 1..8 (1 when there is
+    # none: the rule resize's auto-rotate applies and strip keeps), and
+    # the display size is what a viewer honoring it shows, with the axes
+    # exchanged for 5..8.
     #
     # +source+ is a path — a String, a Pathname, or anything with #path
     # such as a Tempfile — an open File, or a stream read from its
@@ -363,12 +389,7 @@ module Oximg
       match = output.match(PROBE_LINE)
       raise ProcessingError, "unparsable probe output: #{output.inspect}" unless match
 
-      {
-        content_type: match[1],
-        format: CONTENT_TYPE_FORMATS[match[1]],
-        width: Integer(match[2]),
-        height: Integer(match[3])
-      }
+      Header.build(match[1], Integer(match[2]), Integer(match[3]), match[4] ? Integer(match[4]) : 1)
     end
 
     # Absolute paths throughout: a relative name beginning with "-"

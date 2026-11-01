@@ -257,7 +257,20 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let bytes = std::fs::read(input).with_context(|| format!("read {input}"))?;
-    let (format, w, h) = pipeline::probe(&bytes)?;
+    let header = pipeline::probe_header(&bytes)?;
+    let (format, w, h) = (header.format, header.width, header.height);
+    // A non-upright source names its orientation and the frame a viewer
+    // shows. First after the comma, ahead of the animation summary, so
+    // the gem reads it at a fixed place; omitted at 1, so an upright
+    // source prints the line it always has.
+    let orientation = match header.orientation {
+        1 => String::new(),
+        o => format!(
+            ", orientation {o} (displayed {}x{})",
+            header.display_width(),
+            header.display_height()
+        ),
+    };
     // Frame count and duration are what the animation budgets
     // (OXIMG_MAX_ANIM_FRAMES / OXIMG_MAX_ANIM_WORK) are spent against,
     // so an operator can price a source here before serving it.
@@ -275,7 +288,7 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
         None => String::new(),
     };
     println!(
-        "{input}: {} {w}x{h} ({} stored pixels){anim}",
+        "{input}: {} {w}x{h} ({} stored pixels){orientation}{anim}",
         format.content_type(),
         w as u64 * h as u64
     );

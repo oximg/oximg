@@ -13,8 +13,10 @@ metadata). Catalog: [docs/features/paths.md](../../../../docs/features/paths.md)
 - Output format: `-f` / `--format`, else `<out>` extension, else
   source format (GIF → WebP).
 - Usage errors exit 2; processing failures exit 1.
-- `oximg probe <file>` prints format, stored dimensions, and
-  animation frames/duration/loop when present.
+- `oximg probe <file>` prints format, stored dimensions, a non-upright
+  source's orientation and displayed size (`, orientation 6 (displayed
+  WxH)`, first after the comma), and animation frames/duration/loop
+  when present.
 
 ## How to get to it (user POV)
 
@@ -39,7 +41,14 @@ probe is what changed, also run `./target/agent/oximg probe` or
 CTL=./target/agent/oximg-ctl
 
 $CTL probe tests/fixtures/photo.jpg
-# expect: ok true, probe.content_type image/jpeg, width 200, height 150
+# expect: ok true, probe.content_type image/jpeg, width 200, height 150,
+#         orientation 1, display_width 200, display_height 150
+
+# No committed fixture is rotated: tag one (tests/ctl.rs builds an
+# orientation-6 JPEG with tests/common's jpeg_with_orientation).
+# expect for orientation 6 on 200x150: width 200, height 150,
+#         orientation 6, display_width 150, display_height 200 — the
+#         axes `resize ... 0 0` emits for the same file
 
 $CTL probe tests/fixtures/anim.gif
 # expect: content_type image/gif, animation.frames 3, duration_ms 1500

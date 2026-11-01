@@ -189,6 +189,29 @@ fn probe_prints_the_animation_summary_after_the_fields_the_gem_reads() {
     );
 }
 
+/// A non-upright source prints its orientation and displayed size
+/// first after the comma, where the gem reads it (#163); an upright one
+/// prints the line above, unchanged.
+#[test]
+fn probe_prints_a_non_upright_orientation() {
+    let px = vec![128u8; 64 * 48 * 3];
+    for o in [2u16, 6] {
+        let path = tmp(&format!("o{o}.jpg"));
+        std::fs::write(&path, common::jpeg_with_orientation(&px, 64, 48, Some(o))).unwrap();
+        let output = bin().arg("probe").arg(&path).output().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(output.status.success());
+        let shown = if o == 6 { "48x64" } else { "64x48" };
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}: image/jpeg 64x48 (3072 stored pixels), orientation {o} (displayed {shown})\n",
+                path.display()
+            )
+        );
+    }
+}
+
 /// A wrapped option description lines up under its first line. A `\`
 /// continuation in a Rust string literal drops the next line's leading
 /// whitespace, which is how the wrapped `--icc` text once printed flush

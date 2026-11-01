@@ -25,6 +25,18 @@ module Oximg
       File.join(FIXTURES, name)
     end
 
+    # What probe answers for a source with no orientation: 1, displayed
+    # as stored. A class method too, for hashes a test class holds as a
+    # constant.
+    def self.upright(content_type, format, width, height)
+      {content_type: content_type, format: format, width: width, height: height,
+       orientation: 1, display_width: width, display_height: height}
+    end
+
+    def upright(...)
+      Test.upright(...)
+    end
+
     # The integration tests run the real binary when one is around —
     # a `cargo build` in this checkout, a platform gem, or PATH — and
     # skip when there is none, so the unit suite stays runnable on a

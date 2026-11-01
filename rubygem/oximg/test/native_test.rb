@@ -4,6 +4,8 @@ require "test_helper"
 require "pathname"
 require "stringio"
 require "minitest/mock"
+require "tempfile"
+require "zlib"
 
 # The in-process probe (Native): the library `rake compile` builds,
 # loaded through OXIMG_PROBE_LIB. Its contract is the executable's
@@ -66,12 +68,53 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # A big-endian TIFF whose IFD0 holds only orientation +o+.
+  def tiff_orientation(o)
+    ["MM", 42, 8, 1, 0x0112, 3, 1, o, 0, 0].pack("a2nNnnnNnnN")
+  end
+
+  # photo.jpg with an Exif APP1, rgb.png with an eXIf chunk after IHDR,
+  # each carrying orientation +o+: built here, independent of oximg.
+  def oriented(o)
+    jpeg = File.binread(fixture("photo.jpg"))
+    exif = "Exif\0\0".b + tiff_orientation(o)
+    app1 = [0xFF, 0xE1, exif.bytesize + 2].pack("CCn") + exif
+    png = File.binread(fixture("rgb.png"))
+    body = tiff_orientation(o)
+    chunk = [body.bytesize].pack("N") + "eXIf" + body + [Zlib.crc32("eXIf" + body)].pack("N")
+    {"jpg" => jpeg.byteslice(0, 2) + app1 + jpeg.byteslice(2..), "png" => png.byteslice(0, 33) + chunk + png.byteslice(33..)}
+  end
+
+  # The orientation and displayed size reach the hash on every path, and
+  # in-process answers as the executable does (#163).
+  def test_reports_the_orientation_like_the_executable
+    require_executable!
+    with_library do
+      [6, 3].each do |o|
+        oriented(o).each do |ext, bytes|
+          Tempfile.create(["oximg-o#{o}", ".#{ext}"]) do |file|
+            file.binmode
+            file.write(bytes)
+            file.flush
+            probed = Oximg.probe(file.path)
+            shown = (o == 6) ? [150, 200] : [200, 150]
+            assert_equal [200, 150, o, *shown],
+              probed.values_at(:width, :height, :orientation, :display_width, :display_height), "#{ext} o=#{o}"
+            assert_equal spawned(file.path), probed, "#{ext} o=#{o}: like the executable"
+            assert_equal probed, Oximg.probe(StringIO.new(bytes)), "#{ext} o=#{o}: an IO"
+            File.open(file.path, "rb") { |f| assert_equal probed, Oximg.probe(f), "#{ext} o=#{o}: a File" }
+          end
+        end
+      end
+    end
+  end
+
   # Only the header is read: 64 KiB of a 4 MiB stream, and the IO is
   # left where the read stopped.
   def test_reads_only_the_header_from_an_io
     with_library do
       io = StringIO.new(File.binread(fixture("photo.jpg")) + ("\0".b * (4 << 20)))
-      assert_equal({content_type: "image/jpeg", format: :jpeg, width: 200, height: 150}, Oximg.probe(io))
+      assert_equal(upright("image/jpeg", :jpeg, 200, 150), Oximg.probe(io))
       assert_equal 64 << 10, io.pos
     end
   end
@@ -81,7 +124,7 @@ class Oximg::NativeTest < Oximg::Test
   # path; an open File is read through its descriptor, from the start.
   def test_reads_neither_pathname_nor_file_as_a_stream
     with_library do
-      want = {content_type: "image/png", format: :png, width: 200, height: 150}
+      want = upright("image/png", :png, 200, 150)
       assert_equal want, Oximg.probe(Pathname(fixture("rgb.png")))
       File.open(fixture("rgb.png"), "rb") do |file|
         file.read(100)
@@ -101,7 +144,7 @@ class Oximg::NativeTest < Oximg::Test
   def test_reads_a_pipe_and_a_socket
     require "socket"
     bytes = File.binread(fixture("photo.jpg"))
-    want = {content_type: "image/jpeg", format: :jpeg, width: 200, height: 150}
+    want = upright("image/jpeg", :jpeg, 200, 150)
     with_library do
       [IO.pipe, UNIXSocket.pair].each do |reader, writer|
         writer.write(bytes)
@@ -113,7 +156,7 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
-  PNG = {content_type: "image/png", format: :png, width: 200, height: 150}.freeze
+  PNG = upright("image/png", :png, 200, 150).freeze
 
   # An open File is read through its descriptor, from the start: what
   # it holds, whatever its name leads to by now, and wherever it was
@@ -196,7 +239,7 @@ class Oximg::NativeTest < Oximg::Test
     file = File.open(fixture("rgb.png"), "rb")
     file.close
     with_library do
-      assert_equal({content_type: "image/png", format: :png, width: 200, height: 150}, Oximg.probe(file))
+      assert_equal(upright("image/png", :png, 200, 150), Oximg.probe(file))
     end
   end
 

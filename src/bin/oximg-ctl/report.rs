@@ -6,13 +6,17 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub fn probe_value(bytes: &[u8]) -> Value {
-    match pipeline::probe(bytes) {
-        Ok((fmt, w, h)) => {
+    match pipeline::probe_header(bytes) {
+        Ok(header) => {
+            let (w, h) = (header.width, header.height);
             let mut v = json!({
-                "content_type": fmt.content_type(),
+                "content_type": header.format.content_type(),
                 "width": w,
                 "height": h,
                 "stored_pixels": w as u64 * h as u64,
+                "orientation": header.orientation,
+                "display_width": header.display_width(),
+                "display_height": header.display_height(),
             });
             match pipeline::probe_animation(bytes) {
                 Ok(Some(Animation {

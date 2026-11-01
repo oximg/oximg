@@ -640,6 +640,37 @@ fn probe_reader_agrees_with_probe_on_every_fixture() {
     assert!(seen >= 30, "only {seen} fixtures probed");
 }
 
+/// The header reader's answer is `probe_header`'s on every fixture, and
+/// its stored size is `probe`'s.
+#[test]
+fn probe_header_reader_agrees_with_probe_header_on_every_fixture() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "jpg" | "png" | "webp" | "gif" | "avif") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let outcome = |r: Result<Header, Error>| r.map_err(|e| format!("{:?}: {:#}", e.kind(), e));
+        assert_eq!(
+            outcome(probe_header_reader(&bytes[..])),
+            outcome(probe_header(&bytes)),
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            probe_outcome(probe_header(&bytes).map(|h| (h.format, h.width, h.height))),
+            probe_outcome(probe(&bytes)),
+            "{}",
+            path.display()
+        );
+        seen += 1;
+    }
+    assert!(seen >= 30, "only {seen} fixtures probed");
+}
+
 /// photo.jpg with `segments` maximum-size APP2 segments ahead of its
 /// frame header and `trailing` bytes after its EOI.
 fn jpeg_with_padding(segments: usize, trailing: usize) -> Vec<u8> {

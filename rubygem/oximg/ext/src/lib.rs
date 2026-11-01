@@ -2,9 +2,10 @@
 //!
 //! Every entry point returns a status and writes text into the caller's
 //! `msg` buffer: the content type on success (`image/jpeg`, exactly as
-//! `oximg probe` prints it), the error message on failure. Dimensions
-//! go to `dims[0..2]` as width and height. The text is NUL-terminated
-//! and cut at a UTF-8 boundary to fit `msg_cap`.
+//! `oximg probe` prints it), the error message on failure. The header
+//! goes to `dims[0..3]`: stored width, stored height, and the EXIF
+//! orientation (1..=8; 1 when there is none). The text is
+//! NUL-terminated and cut at a UTF-8 boundary to fit `msg_cap`.
 //!
 //! Nothing may unwind into the caller: Ruby's frames are C frames, and
 //! a panic crossing them is undefined behavior. The pipeline already
@@ -15,7 +16,7 @@ use std::ffi::c_int;
 
 use std::panic::catch_unwind;
 
-use oximg::pipeline::{self, ImageFormat, ProbeStep};
+use oximg::pipeline::{self, Header, ProbeStep};
 
 /// The header parsed.
 pub const OK: c_int = 0;
@@ -30,9 +31,11 @@ pub const READ: c_int = 3;
 /// Bumped on any change to a signature or a status's meaning. The gem
 /// refuses a library whose version it does not know, rather than
 /// calling it with the wrong arguments.
+///
+/// 2: `dims` grew a third slot, the orientation (#163).
 #[unsafe(no_mangle)]
 pub extern "C" fn oximg_probe_abi_version() -> u32 {
-    1
+    2
 }
 
 /// Probe the file at `path[..path_len]` (raw bytes, as the OS spells the
@@ -40,7 +43,7 @@ pub extern "C" fn oximg_probe_abi_version() -> u32 {
 /// takes.
 ///
 /// # Safety
-/// `path` is readable for `path_len` bytes, `dims` writable for two
+/// `path` is readable for `path_len` bytes, `dims` writable for three
 /// `u64`s, and `msg` writable for `msg_cap` bytes.
 #[cfg(unix)]
 #[unsafe(no_mangle)]
@@ -59,7 +62,7 @@ pub unsafe extern "C" fn oximg_probe_path(
         // The same leading context the CLI gives a failed read.
         let file =
             std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        pipeline::probe_reader(file).map_err(|e| format!("{}: {e:#}", path.display()))
+        pipeline::probe_header_reader(file).map_err(|e| format!("{}: {e:#}", path.display()))
     });
     unsafe { finish(result, dims, msg, msg_cap) }
 }
@@ -73,7 +76,7 @@ pub unsafe extern "C" fn oximg_probe_path(
 ///
 /// # Safety
 /// `fd` is an open descriptor for the duration of the call; `dims`
-/// writable for two `u64`s and `msg` for `msg_cap` bytes.
+/// writable for three `u64`s and `msg` for `msg_cap` bytes.
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oximg_probe_fd(
@@ -98,7 +101,7 @@ pub unsafe extern "C" fn oximg_probe_fd(
     let result = catch_unwind(|| {
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let file = std::fs::File::from(fd.try_clone_to_owned().map_err(|e| format!("read: {e}"))?);
-        pipeline::probe_reader(At { file, offset: 0 }).map_err(|e| format!("{e:#}"))
+        pipeline::probe_header_reader(At { file, offset: 0 }).map_err(|e| format!("{e:#}"))
     });
     unsafe { finish(result, dims, msg, msg_cap) }
 }
@@ -115,7 +118,7 @@ pub unsafe extern "C" fn oximg_probe_fd(
 ///
 /// # Safety
 /// `prefix` is readable for `len` bytes (it may be null when `len` is
-/// 0), `dims` writable for two `u64`s, and `msg` for `msg_cap` bytes.
+/// 0), `dims` writable for three `u64`s, and `msg` for `msg_cap` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oximg_probe_step(
     prefix: *const u8,
@@ -130,7 +133,7 @@ pub unsafe extern "C" fn oximg_probe_step(
     } else {
         unsafe { std::slice::from_raw_parts(prefix, len) }
     };
-    let step = catch_unwind(|| pipeline::probe_step(prefix, eof != 0));
+    let step = catch_unwind(|| pipeline::probe_header_step(prefix, eof != 0));
     let result = match step {
         Ok(ProbeStep::Read(want)) => {
             unsafe { *dims = u64::try_from(want).unwrap_or(u64::MAX) };
@@ -142,7 +145,7 @@ pub unsafe extern "C" fn oximg_probe_step(
     unsafe { finish(result, dims, msg, msg_cap) }
 }
 
-type Probed = Result<(ImageFormat, usize, usize), String>;
+type Probed = Result<Header, String>;
 
 unsafe fn finish(
     result: std::thread::Result<Probed>,
@@ -151,12 +154,13 @@ unsafe fn finish(
     msg_cap: usize,
 ) -> c_int {
     let (status, text) = match result {
-        Ok(Ok((format, w, h))) => {
+        Ok(Ok(header)) => {
             unsafe {
-                *dims = w as u64;
-                *dims.add(1) = h as u64;
+                *dims = header.width as u64;
+                *dims.add(1) = header.height as u64;
+                *dims.add(2) = u64::from(header.orientation);
             }
-            (OK, format.content_type().to_string())
+            (OK, header.format.content_type().to_string())
         }
         Ok(Err(e)) => (FAILED, e),
         Err(payload) => {

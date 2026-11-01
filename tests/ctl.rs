@@ -92,6 +92,29 @@ fn probe_photo_jpg() {
     assert_eq!(v["probe"]["jpeg"]["progressive"], true);
 }
 
+/// The orientation and the displayed size a layout needs (#163): 1 and
+/// the stored size for an upright source, swapped for orientation 6.
+#[test]
+fn probe_reports_orientation_and_display_size() {
+    let (code, v) = run(&["probe", &fixture("photo.jpg")]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["orientation"], 1);
+    assert_eq!(v["probe"]["display_width"], 200);
+    assert_eq!(v["probe"]["display_height"], 150);
+
+    let px = vec![128u8; 64 * 48 * 3];
+    let path = std::env::temp_dir().join(format!("oximg-ctl-{}-o6.jpg", std::process::id()));
+    std::fs::write(&path, common::jpeg_with_orientation(&px, 64, 48, Some(6))).unwrap();
+    let (code, v) = run(&["probe", path.to_str().unwrap()]);
+    std::fs::remove_file(&path).ok();
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["width"], 64);
+    assert_eq!(v["probe"]["height"], 48);
+    assert_eq!(v["probe"]["orientation"], 6);
+    assert_eq!(v["probe"]["display_width"], 48);
+    assert_eq!(v["probe"]["display_height"], 64);
+}
+
 #[test]
 fn probe_anim_gif_reports_frames() {
     let (code, v) = run(&["probe", &fixture("anim.gif")]);

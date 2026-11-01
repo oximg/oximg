@@ -29,7 +29,7 @@ module Oximg
     BUNDLED = File.expand_path("native/#{LIBRARY}", __dir__)
 
     # The library's oximg_probe_abi_version this code was written for.
-    ABI_VERSION = 1
+    ABI_VERSION = 2
 
     # Statuses (ext/src/lib.rs).
     OK = 0
@@ -110,7 +110,8 @@ module Oximg
       end
 
       def call
-        dims = FFI::MemoryPointer.new(:uint64, 2)
+        # Stored width, stored height, orientation (ext/src/lib.rs).
+        dims = FFI::MemoryPointer.new(:uint64, 3)
         msg = FFI::MemoryPointer.new(:char, MESSAGE_BYTES)
         status = yield(dims, msg)
         return if status == READ
@@ -118,8 +119,8 @@ module Oximg
         text = msg.read_string.force_encoding(Encoding::UTF_8)
         raise ProcessingError.new(text, 1) unless status == OK
 
-        width, height = dims.read_array_of_uint64(2)
-        {content_type: text, format: CONTENT_TYPE_FORMATS[text], width: width, height: height}
+        width, height, orientation = dims.read_array_of_uint64(3)
+        Header.build(text, width, height, orientation)
       end
 
       # nil when there is no library to use. Memoized either way, so a
