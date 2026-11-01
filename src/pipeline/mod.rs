@@ -648,6 +648,100 @@ pub fn probe_header_step(prefix: &[u8], eof: bool) -> ProbeStep<Header> {
     })
 }
 
+/// [`probe_header_reader`] for a source that can seek, such as a file:
+/// the same answer, read from the reader's current position. Where the
+/// reader would read through EOF for a WebP's `EXIF` chunk, this one
+/// walks the RIFF chunk headers instead and reads only what libwebp's
+/// mux looks at, so the cost no longer grows with the image data.
+pub fn probe_header_seek<R: std::io::Read + std::io::Seek>(mut reader: R) -> Result<Header, Error> {
+    use std::io::Read as _;
+    let start = reader.stream_position().map_err(Error::source_read)?;
+    let mut buf = Vec::new();
+    let mut eof = false;
+    loop {
+        match probe_header_step(&buf, eof) {
+            ProbeStep::Done(result) => return result,
+            ProbeStep::Read(usize::MAX) if webp_flags_exif(&buf) => {
+                let sparse = webp_sparse(&mut reader, start, &buf).map_err(Error::source_read)?;
+                return probe_header(&sparse);
+            }
+            ProbeStep::Read(want) => {
+                let missing = (want - buf.len()) as u64;
+                reader
+                    .by_ref()
+                    .take(missing)
+                    .read_to_end(&mut buf)
+                    .map_err(Error::source_read)?;
+                eof = buf.len() < want;
+            }
+        }
+    }
+}
+
+/// How much of an image chunk (`VP8 `, `VP8L`, `ALPH`) [`webp_sparse`]
+/// reads. The mux reads a bitstream's first 10 bytes (`VP8GetInfo`) or
+/// 5 (`VP8LGetInfo`) for its size, and `WebPGetFeatures` its frame
+/// header; 4 KiB leaves a wide margin, and the equivalence tests pin it.
+const WEBP_IMAGE_HEAD: u64 = 4 << 10;
+
+/// The whole WebP as [`probe_header`] would read it, except the bulk of
+/// its image data: a buffer of the source's full length holding
+/// `prefix`, every chunk header, every non-image chunk body, and the
+/// first [`WEBP_IMAGE_HEAD`] bytes of each image chunk, zero elsewhere.
+/// The zeros are never read: chunk sizes are kept, so the mux walks the
+/// same chunks it walks on the real bytes. The buffer is allocated
+/// zeroed, which the allocator serves with untouched pages for a large
+/// one, so its untouched part costs no memory traffic.
+fn webp_sparse<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    start: u64,
+    prefix: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    use std::io::SeekFrom;
+    let end = reader.seek(SeekFrom::End(0))?;
+    let len = usize::try_from(end.saturating_sub(start))
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::FileTooLarge))?;
+    let mut buf = vec![0u8; len.max(prefix.len())];
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let len = buf.len() as u64;
+    let have = prefix.len() as u64;
+    // Copy `[at, at + n)` of the source in, clamped to its end; what the
+    // prefix holds is already there.
+    let mut fill = |buf: &mut [u8], at: u64, n: u64| -> std::io::Result<()> {
+        let from = at.max(have);
+        let to = at.saturating_add(n).min(len);
+        if from < to {
+            reader.seek(SeekFrom::Start(start + from))?;
+            reader.read_exact(&mut buf[from as usize..to as usize])?;
+        }
+        Ok(())
+    };
+    let le32 = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+    // The mux walks no further than the RIFF header says.
+    let limit = (u64::from(le32(&buf, 4)) + 8).min(len);
+    let mut pos = 12u64;
+    while pos + 8 <= limit {
+        fill(&mut buf, pos, 8)?;
+        let size = u64::from(le32(&buf, pos as usize + 4));
+        let image = matches!(
+            &buf[pos as usize..pos as usize + 4],
+            b"VP8 " | b"VP8L" | b"ALPH"
+        );
+        let body = pos + 8;
+        fill(
+            &mut buf,
+            body,
+            if image {
+                size.min(WEBP_IMAGE_HEAD)
+            } else {
+                size
+            },
+        )?;
+        pos = body + size + (size & 1);
+    }
+    Ok(buf)
+}
+
 /// Whether a WebP's `VP8X` header flags an `EXIF` chunk. libwebp's mux,
 /// which `process` reads the orientation through, refuses a file
 /// carrying one unflagged, so only a flagged file has an orientation a

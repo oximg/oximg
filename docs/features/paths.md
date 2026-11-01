@@ -74,7 +74,9 @@ parses (errors only at EOF; AVIF reads through EOF), and
 own reads; `probe_header` / `probe_header_reader` / `probe_header_step`
 add the orientation (`Header {format, width, height, orientation}`,
 `display_width()`/`display_height()`), reading a WebP that flags an
-`EXIF` chunk through EOF; `probe_animation` reports frames for GIF/WebP. Embedders set
+`EXIF` chunk through EOF; `probe_header_seek` answers the same from a
+seekable source but seeks over such a WebP's image data (the gem's
+path and descriptor probes); `probe_animation` reports frames for GIF/WebP. Embedders set
 `default-features = false` to drop the HTTP stack. Failures are
 `pipeline::Error`; match `kind()`, wildcard arm required (`ErrorKind`
 is `#[non_exhaustive]`).

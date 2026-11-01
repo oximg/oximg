@@ -62,7 +62,7 @@ pub unsafe extern "C" fn oximg_probe_path(
         // The same leading context the CLI gives a failed read.
         let file =
             std::fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        pipeline::probe_header_reader(file).map_err(|e| format!("{}: {e:#}", path.display()))
+        pipeline::probe_header_seek(file).map_err(|e| format!("{}: {e:#}", path.display()))
     });
     unsafe { finish(result, dims, msg, msg_cap) }
 }
@@ -98,10 +98,25 @@ pub unsafe extern "C" fn oximg_probe_fd(
             Ok(n)
         }
     }
+    // Seeking moves only this offset, never the descriptor's: the
+    // caller's position stays where it was.
+    impl std::io::Seek for At {
+        fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+            let (base, delta) = match to {
+                std::io::SeekFrom::Start(n) => (n, 0),
+                std::io::SeekFrom::Current(d) => (self.offset, d),
+                std::io::SeekFrom::End(d) => (self.file.metadata()?.len(), d),
+            };
+            self.offset = base
+                .checked_add_signed(delta)
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+            Ok(self.offset)
+        }
+    }
     let result = catch_unwind(|| {
         let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let file = std::fs::File::from(fd.try_clone_to_owned().map_err(|e| format!("read: {e}"))?);
-        pipeline::probe_header_reader(At { file, offset: 0 }).map_err(|e| format!("{e:#}"))
+        pipeline::probe_header_seek(At { file, offset: 0 }).map_err(|e| format!("{e:#}"))
     });
     unsafe { finish(result, dims, msg, msg_cap) }
 }
