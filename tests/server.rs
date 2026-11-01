@@ -4538,7 +4538,7 @@ fn warm_requests_do_not_fault_their_buffers_back_in() {
     // also told pinned from unpinned: Zen 4 / glibc 2.44 measured 0.5-17
     // faults per warm request pinned and 120-135 with glibc's dynamic
     // thresholds. It no longer does. Re-measured 2026-10-22:
-    //   - starship (glibc 2.44): pinned 0.0-0.8, dynamic 0.9-2.6;
+    //   - AMD Ryzen 7 8745HS (glibc 2.44): pinned 0.0-0.8, dynamic 0.9-2.6;
     //   - the CI runners (Ubuntu glibc 2.39, amd64 and arm64): pinned
     //     0.1-5 per window, with rare one-window bursts of 15-37;
     //     dynamic 0.4-10.

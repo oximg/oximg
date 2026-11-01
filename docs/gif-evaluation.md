@@ -4,7 +4,7 @@ This document evaluates how to accept GIF — what the mainstream GIF
 optimization techniques are, which of them fit this codebase, and what
 each costs. It was written when `ImageFormat::sniff` deliberately
 returned `None` for `GIF89a`. Every number below was measured on
-**starship** (AMD Ryzen 7 8745HS, Arch Linux) on 2026-08-18 with a
+an AMD Ryzen 7 8745HS (Arch Linux) on 2026-08-18 with a
 purpose-built POC that links oximg's own crate graph. Nothing here is
 quoted from an encoder's documentation.
 
@@ -618,9 +618,9 @@ method) were never tuned, and imgproxy's numbers show the headroom.
 
 ## 10. Reproducing
 
-The POC harness lives outside this repo (`/tmp/gifpoc` on starship as of
-2026-08-18) and is not part of the build. It consists of: a Rust binary
-linking oximg's crate graph with modes
+The POC harness lives outside this repo (`/tmp/gifpoc` on the
+measuring machine as of 2026-08-18) and is not part of the build. It
+consists of: a Rust binary linking oximg's crate graph with modes
 `first|webp|webp-lossless|gif|gif2|gif2-c64`, `characterize.py` (GIF
 structure → `corpus.json`), `run.py` (reference encoders →
 `results.json`), `rescore.py` (time-aligned SSIMULACRA2), `score.py`

@@ -50,12 +50,12 @@ build. The AWS c7 run was redone on 0.15.0 in 2026-10
 decode for 4:2:0 sources reduced about 3.8x or more, which this cell
 is ([#60](https://github.com/oximg/oximg/issues/60)).
 
-It was measured on an Intel i7-1360P, because starship was busy with
-unrelated builds that invalidated two runs there. The harness shape
-is the same. The server is pinned to P-cores: one SMT pair or two
-physical cores. k6 runs on E-cores 8-13 and nginx on 14-15. The
-machine was on AC with the battery full. Configurations rotated each
-round; all 30 cells had 0 failed checks.
+It was measured on an Intel i7-1360P, because the usual AMD Ryzen 7
+8745HS machine was busy with unrelated builds that invalidated two runs
+there. The harness shape is the same. The server is pinned to P-cores:
+one SMT pair or two physical cores. k6 runs on E-cores 8-13 and nginx
+on 14-15. The machine was on AC with the battery full. Configurations
+rotated each round; all 30 cells had 0 failed checks.
 
 | server | SMT pair, 2 VUs | SMT pair, 8 VUs | 2 cores, 2 VUs | 2 cores, 8 VUs |
 |---|---|---|---|---|
