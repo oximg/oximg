@@ -582,3 +582,305 @@ fn probe_header_reader_finds_an_exif_behind_large_metadata() {
     assert_eq!((hdr.display_width(), hdr.display_height()), (h, w));
     assert!(read > 128 << 10 && read <= 256 << 10, "{read}");
 }
+
+/// A seekable source over `bytes` that counts the bytes it handed out.
+struct SeekCounting {
+    inner: std::io::Cursor<Vec<u8>>,
+    read: usize,
+}
+
+impl std::io::Read for SeekCounting {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n;
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for SeekCounting {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// `probe_header_seek`'s outcome on `bytes` and the bytes it read; an
+/// error by kind and message, so it compares with `probe_header`'s.
+fn seek_probe(bytes: &[u8]) -> (Result<pipeline::Header, String>, usize) {
+    let mut r = SeekCounting {
+        inner: std::io::Cursor::new(bytes.to_vec()),
+        read: 0,
+    };
+    let got = pipeline::probe_header_seek(&mut r).map_err(|e| format!("{:?}: {e:#}", e.kind()));
+    (got, r.read)
+}
+
+fn whole_probe(bytes: &[u8]) -> Result<pipeline::Header, String> {
+    pipeline::probe_header(bytes).map_err(|e| format!("{:?}: {e:#}", e.kind()))
+}
+
+/// A RIFF chunk: its FourCC and its body.
+type Chunk = ([u8; 4], Vec<u8>);
+
+/// The chunks of a WebP after its 12-byte RIFF header.
+fn webp_chunks(webp: &[u8]) -> Vec<Chunk> {
+    let mut out = Vec::new();
+    let mut p = 12;
+    while p + 8 <= webp.len() {
+        let size = u32::from_le_bytes(webp[p + 4..p + 8].try_into().unwrap()) as usize;
+        out.push((
+            webp[p..p + 4].try_into().unwrap(),
+            webp[p + 8..p + 8 + size].to_vec(),
+        ));
+        p += 8 + size + (size & 1);
+    }
+    out
+}
+
+/// A RIFF WebP of these chunks, each padded to an even length.
+fn riff(chunks: &[Chunk]) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+    for (four, data) in chunks {
+        body.extend_from_slice(four);
+        body.extend((data.len() as u32).to_le_bytes());
+        body.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            body.push(0);
+        }
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
+/// A `VP8X` chunk: `flags` (ICC 0x20, alpha 0x10, EXIF 0x08, XMP 0x04,
+/// animation 0x02) over a `w` x `h` canvas.
+fn vp8x(flags: u8, w: usize, h: usize) -> Chunk {
+    let mut v = vec![flags, 0, 0, 0];
+    v.extend(&((w - 1) as u32).to_le_bytes()[..3]);
+    v.extend(&((h - 1) as u32).to_le_bytes()[..3]);
+    (*b"VP8X", v)
+}
+
+/// A lossy WebP with an alpha channel (`ALPH` + `VP8 `) of noise, large
+/// enough that its image data outgrows the first 64 KiB read.
+fn big_alpha_webp() -> (Vec<u8>, usize, usize) {
+    let (w, h) = (400usize, 300usize);
+    let mut x = 0x9e37_79b9u32;
+    let px: Vec<u8> = (0..w * h * 4)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(&px).unwrap();
+    }
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        webp_quality: Some(100.0),
+        ..native_png()
+    };
+    let webp = pipeline::process(&png, &p).unwrap().0;
+    assert!(webp.len() > 2 * (64 << 10), "{} bytes", webp.len());
+    (webp, w, h)
+}
+
+/// A lossless WebP (`VP8L`) of noise, large enough that its image data
+/// outgrows the first 64 KiB read: the layout of the 2.6 MB WebP behind
+/// the sparse read's measured gain, whose size the mux reads through
+/// `VP8LGetInfo` rather than `VP8GetInfo`. Encoded with libwebp
+/// directly, since the pipeline writes lossless WebP only for alpha.
+fn big_lossless_webp() -> (Vec<u8>, usize, usize) {
+    let (w, h) = (400usize, 300usize);
+    let mut x = 0x85eb_ca6bu32;
+    let px: Vec<u8> = (0..w * h * 3)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let mut out: *mut u8 = std::ptr::null_mut();
+    // SAFETY: `px` holds w*h RGB pixels at stride 3*w; libwebp writes a
+    // buffer it allocates to `out` and returns its length (0 on failure),
+    // which is copied out before WebPFree releases it.
+    let webp = unsafe {
+        let n = libwebp_sys::WebPEncodeLosslessRGB(
+            px.as_ptr(),
+            w as i32,
+            h as i32,
+            (w * 3) as i32,
+            &mut out,
+        );
+        assert!(n > 0 && !out.is_null(), "lossless encode failed");
+        let v = std::slice::from_raw_parts(out, n).to_vec();
+        libwebp_sys::WebPFree(out.cast());
+        v
+    };
+    assert_eq!(&webp[12..16], b"VP8L");
+    assert!(webp.len() > 2 * (64 << 10), "{} bytes", webp.len());
+    (webp, w, h)
+}
+
+/// Every WebP shape the sparse read must answer exactly as the whole
+/// file does: around a lossy, a lossless, an alpha and an animated
+/// image, the EXIF
+/// flagged, unflagged, doubled, odd-sized, missing, or cut off; the
+/// file padded, truncated, or its sizes lying. `probe_header_seek`
+/// gives `probe_header`'s answer (or error) on every one.
+#[test]
+fn probe_header_seek_answers_as_the_whole_webp_does() {
+    let exif = |o: u16| (*b"EXIF", common::tiff_orientation(o));
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    let (lossy, w, h) = big_bare_webp();
+    let (lossless, lw, lh) = big_lossless_webp();
+    let (alpha, aw, ah) = big_alpha_webp();
+    let alpha_chunks: Vec<_> = webp_chunks(&alpha)
+        .into_iter()
+        .filter(|(f, _)| f != b"VP8X")
+        .collect();
+    let images: Vec<(&str, Vec<Chunk>, u8, usize, usize)> = vec![
+        ("lossy", webp_chunks(&lossy), 0, w, h),
+        ("lossless", webp_chunks(&lossless), 0, lw, lh),
+        ("alpha", alpha_chunks, 0x10, aw, ah),
+    ];
+    for (name, image, base, w, h) in &images {
+        let with = |flags: u8, before: &[Chunk], after: &[Chunk]| {
+            let mut c = vec![vp8x(base | flags, *w, *h)];
+            c.extend_from_slice(before);
+            c.extend(image.iter().cloned());
+            c.extend_from_slice(after);
+            riff(&c)
+        };
+        let icc = (*b"ICCP", common::fake_icc(900));
+        let big_icc = (*b"ICCP", common::fake_icc(100 << 10));
+        let xmp = (*b"XMP ", b"<x:xmpmeta/>".to_vec());
+        let mut odd = common::tiff_orientation(8);
+        odd.push(0);
+        let plain = with(0x08, &[], &[exif(6)]);
+        cases.push((format!("{name}: exif"), plain.clone()));
+        cases.push((format!("{name}: unflagged exif"), with(0, &[], &[exif(6)])));
+        cases.push((format!("{name}: flag, no chunk"), with(0x08, &[], &[])));
+        cases.push((
+            format!("{name}: icc+exif+xmp"),
+            with(0x2c, &[icc], &[exif(3), xmp]),
+        ));
+        cases.push((
+            format!("{name}: 100 KiB icc ahead of the image"),
+            with(0x28, &[big_icc], &[exif(5)]),
+        ));
+        cases.push((
+            format!("{name}: odd-sized exif"),
+            with(0x08, &[], &[(*b"EXIF", odd)]),
+        ));
+        cases.push((
+            format!("{name}: two exif"),
+            with(0x08, &[], &[exif(6), exif(3)]),
+        ));
+        cases.push((
+            format!("{name}: exif without orientation"),
+            with(
+                0x08,
+                &[],
+                &[(*b"EXIF", common::app1_exif_no_orientation()[6..].to_vec())],
+            ),
+        ));
+        let mut trailing = plain.clone();
+        trailing.extend(std::iter::repeat_n(0xAB, 1000));
+        cases.push((format!("{name}: bytes after the RIFF"), trailing));
+        cases.push((
+            format!("{name}: cut in the image data"),
+            plain[..plain.len() / 2].to_vec(),
+        ));
+        cases.push((
+            format!("{name}: cut in the exif"),
+            plain[..plain.len() - 6].to_vec(),
+        ));
+        let mut short_riff = plain.clone();
+        let declared = (plain.len() - 8 - 40) as u32;
+        short_riff[4..8].copy_from_slice(&declared.to_le_bytes());
+        cases.push((format!("{name}: RIFF size short of the exif"), short_riff));
+        let mut long_riff = plain.clone();
+        long_riff[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((format!("{name}: RIFF size past the end"), long_riff));
+        let mut huge_chunk = plain.clone();
+        let at = huge_chunk.len() - 8 - common::tiff_orientation(6).len();
+        huge_chunk[at + 4..at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push((format!("{name}: exif size past the end"), huge_chunk));
+    }
+    // Animated: the frames are read whole, the answer still exact.
+    let anim = common::fixture("animated.webp");
+    let mut anim_chunks = webp_chunks(&anim);
+    anim_chunks[0].1[0] |= 0x08;
+    anim_chunks.push(exif(6));
+    cases.push(("animated: exif".into(), riff(&anim_chunks)));
+    for name in ["photo.webp", "alpha.webp", "animated.webp"] {
+        cases.push((name.into(), common::fixture(name)));
+    }
+
+    let mut rotated = 0;
+    for (label, bytes) in &cases {
+        let (got, _) = seek_probe(bytes);
+        let want = whole_probe(bytes);
+        assert_eq!(got, want, "{label}");
+        rotated += usize::from(matches!(want, Ok(h) if h.orientation != 1));
+    }
+    // Not all refusals or 1s: per image, the plain, icc+xmp, big-ICC,
+    // odd-sized and trailing-bytes cases carry an orientation (the mux
+    // takes none from two EXIF chunks or a cut file), and so does the
+    // animation.
+    assert_eq!(rotated, 3 * 5 + 1, "cases that reported an orientation");
+
+    // And the point: past the first read, only chunk headers, the EXIF
+    // and a little of each image chunk are read.
+    for (_, image, base, w, h) in &images {
+        let mut c = vec![vp8x(base | 0x08, *w, *h)];
+        c.extend(image.iter().cloned());
+        c.push(exif(6));
+        let bytes = riff(&c);
+        let (got, read) = seek_probe(&bytes);
+        assert_eq!(got.unwrap().orientation, 6);
+        assert!(
+            read <= (64 << 10) + 3 * (4 << 10),
+            "read {read} of {}",
+            bytes.len()
+        );
+    }
+}
+
+/// Every fixture probes the same through the seekable reader.
+#[test]
+fn probe_header_seek_agrees_with_probe_header_on_every_fixture() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "jpg" | "png" | "webp" | "gif" | "avif") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            seek_probe(&bytes).0,
+            whole_probe(&bytes),
+            "{}",
+            path.display()
+        );
+        // A real file too, from where its reader stands.
+        let mut file = std::fs::File::open(&path).unwrap();
+        let from_file =
+            pipeline::probe_header_seek(&mut file).map_err(|e| format!("{:?}: {e:#}", e.kind()));
+        assert_eq!(from_file, whole_probe(&bytes), "{}", path.display());
+        seen += 1;
+    }
+    assert!(seen >= 30, "only {seen} fixtures probed");
+}

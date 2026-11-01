@@ -109,6 +109,56 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  # photo.webp (a bare VP8) in a VP8X container that flags an EXIF
+  # chunk, behind a 100 KiB unknown chunk: the EXIF lies past the first
+  # read, so a path or File probe seeks to it (ext/src/lib.rs).
+  def webp_with_far_exif(o)
+    chunk = ->(four, body) { four + [body.bytesize].pack("V") + body + ("\0" * (body.bytesize % 2)) }
+    vp8 = File.binread(fixture("photo.webp")).byteslice(12..)
+    vp8x = [0x08, 0, 0, 0].pack("C4") + [199].pack("V")[0, 3] + [149].pack("V")[0, 3]
+    body = "WEBP".b + chunk.call("VP8X", vp8x) + chunk.call("PADD", "\0".b * (100 << 10)) + vp8 +
+      chunk.call("EXIF", tiff_orientation(o))
+    "RIFF".b + [body.bytesize].pack("V") + body
+  end
+
+  def test_seeks_to_a_webp_exif_past_the_first_read
+    require_executable!
+    with_library do
+      bytes = webp_with_far_exif(6)
+      Tempfile.create(["oximg-far-exif", ".webp"]) do |file|
+        file.binmode
+        file.write(bytes)
+        file.flush
+        probed = Oximg.probe(file.path)
+        assert_equal [200, 150, 6, 150, 200],
+          probed.values_at(:width, :height, :orientation, :display_width, :display_height)
+        assert_equal spawned(file.path), probed, "like the executable"
+        File.open(file.path, "rb") { |f| assert_equal probed, Oximg.probe(f), "a File (its descriptor)" }
+        assert_equal probed, Oximg.probe(StringIO.new(bytes)), "an IO"
+      end
+    end
+  end
+
+  # A FIFO is a path that cannot seek: it is read forward, as before
+  # the path probe learned to seek over a WebP's image data.
+  def test_probes_a_fifo_path
+    with_library do
+      Dir.mktmpdir do |dir|
+        fifo = File.join(dir, "in.webp")
+        File.mkfifo(fifo)
+        bytes = webp_with_far_exif(6)
+        writer = Thread.new do
+          File.open(fifo, "wb") { |f| f.write(bytes) }
+        rescue Errno::EPIPE
+          nil # the probe stopped reading
+        end
+        probed = Oximg.probe(fifo)
+        writer.join
+        assert_equal [200, 150, 6], probed.values_at(:width, :height, :orientation)
+      end
+    end
+  end
+
   # Only the header is read: 64 KiB of a 4 MiB stream, and the IO is
   # left where the read stopped.
   def test_reads_only_the_header_from_an_io

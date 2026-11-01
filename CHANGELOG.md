@@ -29,6 +29,11 @@ HTTP interface without notice.
     same line as before.
   - `oximg-ctl probe` (and every `probe` object in its JSON) adds
     `orientation`, `display_width` and `display_height`.
+  - `pipeline::probe_header_seek` gives the same answer from a
+    seekable source, such as a file, without reading a WebP's image
+    data: it walks the RIFF chunk headers to the `EXIF` chunk. The
+    gem's path and open-File probes use it (2.6 MB WebP: 123 → 43 µs,
+    Apple M2 Max).
   - The Ruby gem's `Oximg.probe` hash adds `orientation:`,
     `display_width:` and `display_height:`, in-process and spawned. The
     probe library's C ABI is version 2 (`dims` holds three values); a
