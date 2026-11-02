@@ -96,21 +96,31 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
                 != Some("0")
         }
     };
-    let removed = pipeline::strip(
-        &src,
-        &StripParams {
-            icc: Some(keep_icc),
-            auto_rotate: a.auto_rotate,
-        },
-    );
-    let residue = pipeline::strip(
-        &bytes,
-        &StripParams {
-            icc: Some(keep_icc),
-            auto_rotate: false,
-        },
-    );
-    let rotated = removed.as_ref().ok().and_then(|s| s.rotated);
+    let strip_with = |b: &[u8], auto_rotate| {
+        pipeline::strip(
+            b,
+            &StripParams {
+                icc: Some(keep_icc),
+                auto_rotate,
+            },
+        )
+    };
+    let residue = strip_with(&bytes, false);
+    // Whether the child rotated is read from what it wrote, not from
+    // this process's library: the child's OXIMG_MAX_SRC_PIXELS (from
+    // --env) bounds its rotation, and our config may differ. A tagged
+    // source whose output carries no tag was turned upright.
+    let plain = strip_with(&src, false);
+    let source_orientation = plain.as_ref().ok().and_then(|s| s.orientation);
+    let output_tagged = residue.as_ref().map_or(true, |s| s.orientation.is_some());
+    let rotated = source_orientation.filter(|_| a.auto_rotate && !output_tagged);
+    let not_rotated = (a.auto_rotate && source_orientation.is_some() && rotated.is_none())
+        .then(|| child_not_rotated(&stderr));
+    let removed = if rotated.is_some() {
+        strip_with(&src, true)
+    } else {
+        plain
+    };
     // Pixels, residue and frames cannot see what must be kept (the
     // orientation EXIF, the ICC profile); the library's own answer for
     // the input pins those down, byte for byte.
@@ -151,7 +161,7 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             (Err(e), _) | (_, Err(e)) => json!({ "error": e }),
         },
         "rotated": rotated,
-        "not_rotated": removed.as_ref().ok().and_then(|s| s.not_rotated.clone()),
+        "not_rotated": not_rotated,
         "rotation": rotation.as_ref().map(Rotation::value),
         "frames_identical": frames_identical,
         "peak_rss_bytes": peak_rss_bytes(),
@@ -289,6 +299,21 @@ fn rotation_proof(src: &[u8], out: &[u8], o: u8, keep_icc: bool) -> Rotation {
         round_trip,
         max_diff,
     }
+}
+
+/// The reason in the child's summary, `...; kept orientation 6, not
+/// rotated: <why>)`: the child's own words, since its environment
+/// decided.
+fn child_not_rotated(stderr: &str) -> String {
+    stderr
+        .split_once(", not rotated: ")
+        .map(|(_, why)| {
+            // The summary's own closing parenthesis, once: the reason
+            // may end in one of its own.
+            let why = why.trim_end();
+            why.strip_suffix(')').unwrap_or(why).to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// `jpeg` with an EXIF APP1 holding orientation `o` after the SOI.

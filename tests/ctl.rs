@@ -1792,3 +1792,32 @@ fn strip_auto_rotate_proves_a_lossless_turn() {
     let why = v["not_rotated"].as_str().unwrap_or_default();
     assert!(why.contains("200x150") && why.contains("16x16"), "{v}");
 }
+
+/// PR #167 review: whether the child rotated is read from its output,
+/// not from ctl's own config. A pixel limit given only to the child
+/// (`--env`) keeps the tag there, and ctl reports that, with the
+/// child's reason, rather than the rotation its own library would do.
+#[test]
+fn strip_auto_rotate_reports_what_the_child_did() {
+    let path =
+        std::env::temp_dir().join(format!("oximg-ctl-rotate-env-{}.jpg", std::process::id()));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_MAX_SRC_PIXELS=1000",
+        "strip",
+        path.to_str().unwrap(),
+        "--auto-rotate",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], 5, "{v}");
+    assert_eq!(v["rotation"], Value::Null, "{v}");
+    assert_eq!(v["pixels_identical"], true, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
+    assert_eq!(
+        v["not_rotated"], "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)",
+        "{v}"
+    );
+}
