@@ -69,6 +69,64 @@ fn transform_code(o: Orientation) -> ffi::JXFORM_CODE {
     }
 }
 
+/// `jpeg_transform_info` as the vendored `transupp.h` declares it.
+/// mozjpeg-sys 2.2's binding of it predates the drop fields (the two
+/// pointers after the crop parameters, `drop_width` / `drop_height`),
+/// so it is 24 bytes short of the C struct, and transupp writing the
+/// trailing fields through it overran whatever followed. The extern
+/// functions take a raw pointer, so this layout is passed by cast.
+#[repr(C)]
+struct TransformInfo {
+    transform: ffi::JXFORM_CODE,
+    perfect: ffi::boolean,
+    trim: ffi::boolean,
+    force_grayscale: ffi::boolean,
+    crop: ffi::boolean,
+    slow_hflip: ffi::boolean,
+    crop_width: ffi::JDIMENSION,
+    crop_width_set: ffi::JCROP_CODE,
+    crop_height: ffi::JDIMENSION,
+    crop_height_set: ffi::JCROP_CODE,
+    crop_xoffset: ffi::JDIMENSION,
+    crop_xoffset_set: ffi::JCROP_CODE,
+    crop_yoffset: ffi::JDIMENSION,
+    crop_yoffset_set: ffi::JCROP_CODE,
+    drop_ptr: *mut ffi::jpeg_decompress_struct,
+    drop_coef_arrays: *mut ffi::jvirt_barray_ptr,
+    num_components: c_int,
+    workspace_coef_arrays: *mut ffi::jvirt_barray_ptr,
+    output_width: ffi::JDIMENSION,
+    output_height: ffi::JDIMENSION,
+    x_crop_offset: ffi::JDIMENSION,
+    y_crop_offset: ffi::JDIMENSION,
+    drop_width: ffi::JDIMENSION,
+    drop_height: ffi::JDIMENSION,
+    i_mcu_sample_width: c_int,
+    i_mcu_sample_height: c_int,
+}
+
+/// The transform info with a canary after it: a future vendored struct
+/// that grows again is caught as a failed rotation, not a corruption
+/// nobody sees.
+#[repr(C)]
+struct Guarded {
+    info: TransformInfo,
+    canary: [u8; CANARY_LEN],
+}
+
+const CANARY_LEN: usize = 64;
+const CANARY: u8 = 0xA5;
+
+impl Guarded {
+    fn ffi(&mut self) -> *mut ffi::jpeg_transform_info {
+        std::ptr::addr_of_mut!(self.info).cast()
+    }
+
+    fn intact(&self) -> bool {
+        self.canary.iter().all(|&b| b == CANARY)
+    }
+}
+
 /// A libjpeg error manager whose warnings are counted, not printed:
 /// any warning means the coefficients are not what the file says.
 fn error_mgr() -> Box<ffi::jpeg_error_mgr> {
@@ -225,10 +283,18 @@ unsafe fn rotate_unguarded(
         return Rotation::Kept(e.to_string());
     }
     // SAFETY: plain C data; zero is "no crop, no trim, all components".
-    let mut info: ffi::jpeg_transform_info = unsafe { mem::zeroed() };
-    info.transform = transform_code(o);
-    info.perfect = 1;
-    if unsafe { ffi::jtransform_request_workspace(&mut *d.cinfo, &mut info) } == 0 {
+    let mut info = Box::new(Guarded {
+        info: unsafe { mem::zeroed() },
+        canary: [CANARY; CANARY_LEN],
+    });
+    info.info.transform = transform_code(o);
+    info.info.perfect = 1;
+    let perfect = unsafe { ffi::jtransform_request_workspace(&mut *d.cinfo, info.ffi()) };
+    assert!(
+        info.intact(),
+        "jpeg_transform_info overran its declared size"
+    );
+    if perfect == 0 {
         let (bw, bh) = if d.cinfo.num_components == 1 {
             (8, 8)
         } else {
@@ -273,7 +339,7 @@ unsafe fn rotate_unguarded(
         );
         ffi::jpeg_copy_critical_parameters(&d.cinfo, &mut c.cinfo);
         let dst_coefs =
-            ffi::jtransform_adjust_parameters(&mut *d.cinfo, &mut *c.cinfo, src_coefs, &mut info);
+            ffi::jtransform_adjust_parameters(&mut *d.cinfo, &mut *c.cinfo, src_coefs, info.ffi());
         // Huffman tables are rebuilt for the moved blocks either way;
         // optimal ones cost a second pass over memory, not quality.
         c.cinfo.optimize_coding = 1;
@@ -288,10 +354,14 @@ unsafe fn rotate_unguarded(
         c.cinfo.dest = &mut c.dest.iface;
         ffi::jpeg_write_coefficients(&mut c.cinfo, dst_coefs);
         ffi::jcopy_markers_execute(&mut *d.cinfo, &mut *c.cinfo, ffi::JCOPY_OPTION_JCOPYOPT_ICC);
-        ffi::jtransform_execute_transform(&mut *d.cinfo, &mut *c.cinfo, src_coefs, &mut info);
+        ffi::jtransform_execute_transform(&mut *d.cinfo, &mut *c.cinfo, src_coefs, info.ffi());
         ffi::jpeg_finish_compress(&mut c.cinfo);
         ffi::jpeg_finish_decompress(&mut d.cinfo);
     }
+    assert!(
+        info.intact(),
+        "jpeg_transform_info overran its declared size"
+    );
     if d._err.num_warnings > 0 {
         return Rotation::Kept("the JPEG data is corrupt or truncated".into());
     }
@@ -342,6 +412,45 @@ mod tests {
             rotate(&src, six, &BASELINE, 64 * 48),
             Rotation::Rotated(_)
         ));
+    }
+
+    /// transupp writes fields past the end of mozjpeg-sys's
+    /// `jpeg_transform_info` (the iMCU size, here 16x16 for 4:2:0):
+    /// declared with that binding, they landed on whatever followed it
+    /// (a progressive source was then written baseline in one CI build).
+    /// They land in this struct, and the canary after it is untouched.
+    #[test]
+    fn transupp_writes_land_inside_the_declared_struct() {
+        let src = jpeg(64, 48);
+        assert!(
+            mem::offset_of!(TransformInfo, i_mcu_sample_width)
+                >= mem::size_of::<ffi::jpeg_transform_info>(),
+            "the binding grew: drop this struct for it"
+        );
+        let mut d = Decompress {
+            cinfo: Box::new(unsafe { mem::zeroed() }),
+            _err: error_mgr(),
+        };
+        d.cinfo.common.err = &mut *d._err;
+        let mut info = Box::new(Guarded {
+            info: unsafe { mem::zeroed() },
+            canary: [CANARY; CANARY_LEN],
+        });
+        info.info.transform = ffi::JXFORM_CODE_JXFORM_ROT_90;
+        info.info.perfect = 1;
+        let perfect = unsafe {
+            ffi::jpeg_create_decompress(&mut *d.cinfo);
+            ffi::jpeg_mem_src(&mut d.cinfo, src.as_ptr(), src.len() as c_ulong);
+            assert_eq!(ffi::jpeg_read_header(&mut d.cinfo, 1), 1);
+            ffi::jtransform_request_workspace(&mut *d.cinfo, info.ffi())
+        };
+        assert_eq!(perfect, 1);
+        assert_eq!(
+            (info.info.i_mcu_sample_width, info.info.i_mcu_sample_height),
+            (16, 16)
+        );
+        assert_eq!((info.info.output_width, info.info.output_height), (48, 64));
+        assert!(info.intact());
     }
 
     /// A fatal libjpeg error is a reason to keep the tag, not a failed
