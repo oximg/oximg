@@ -164,6 +164,25 @@ class Oximg::ProcessingTest < Oximg::Test
     end
   end
 
+  # photo.jpg is 200x150 at 4:2:0: a transpose (5) moves no partial
+  # block and comes out upright, while a quarter turn (6) would move
+  # the 150-px edge, which is not whole 16-px blocks, so it keeps its tag.
+  def test_strip_auto_rotate_turns_a_jpeg_upright_when_it_is_exact
+    in_tmpdir do |dir|
+      source = File.join(dir, "transposed.jpg")
+      File.binwrite(source, tagged_photo(5))
+      out = File.join(dir, "out.jpg")
+      assert_equal out, Oximg.strip(source, out, auto_rotate: true)
+      assert_equal [150, 200, 1], Oximg.probe(out).values_at(:width, :height, :orientation)
+      refute_includes File.binread(out), "Exif"
+      assert_includes File.binread(out), "ICC_PROFILE"
+
+      File.binwrite(source, tagged_photo(6))
+      Oximg.strip(source, out, auto_rotate: true)
+      assert_equal [200, 150, 6], Oximg.probe(out).values_at(:width, :height, :orientation)
+    end
+  end
+
   def test_strip_refuses_to_drop_a_cmyk_profile
     in_tmpdir do |dir|
       error = assert_raises(Oximg::ProcessingError) do
@@ -232,8 +251,8 @@ class Oximg::ProcessingTest < Oximg::Test
   # photo.jpg with an APP1 Exif (big-endian TIFF, one IFD entry:
   # Orientation = 6) and an APP2 ICC_PROFILE (one chunk of opaque
   # bytes; pass-through never parses it) right after SOI.
-  def tagged_photo
-    tiff = ["MM", 42, 8, 1, 0x0112, 3, 1, 6, 0, 0].pack("a2nNnnnNnnN")
+  def tagged_photo(orientation = 6)
+    tiff = ["MM", 42, 8, 1, 0x0112, 3, 1, orientation, 0, 0].pack("a2nNnnnNnnN")
     segment = ->(marker, body) { [0xFF, marker, body.bytesize + 2].pack("CCn") + body }
     jpeg = File.binread(fixture("photo.jpg"))
     jpeg[0, 2] + segment.call(0xE1, "Exif\0\0".b + tiff) +

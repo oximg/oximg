@@ -67,7 +67,7 @@ cannot be read as a flag.
 ## Stripping metadata
 
 ```ruby
-Oximg.strip(source, destination, icc: nil, env: nil)
+Oximg.strip(source, destination, icc: nil, auto_rotate: nil, env: nil)
 ```
 
 Removes EXIF (GPS, camera, timestamps), XMP, IPTC and comments from a
@@ -78,6 +78,16 @@ rotated photo keeps an EXIF block holding only its orientation, so it
 still displays upright. `icc: :strip` also drops the colour profile.
 The default is `:keep`, or `OXIMG_ICC`. Dropping a CMYK JPEG's profile
 raises `Oximg::ProcessingError`, as do GIF and AVIF sources.
+
+`auto_rotate: true` turns a rotated JPEG upright instead, still without
+re-encoding: its compressed 8x8 blocks are moved, as `jpegtran
+-perfect` does, so the stored and displayed sizes agree for every
+reader, not only for ones that honor EXIF. That is only exact when the
+edges it moves are whole 8 or 16 px blocks (a phone's 4032x3024 is);
+otherwise, and for PNG and WebP, the file is stripped as without it,
+orientation kept. `Oximg.probe(destination)` tells which: orientation
+1, or the one kept. It costs a full entropy decode and encode, about
+170 ms for a 12 MP photo.
 
 ## Knobs, per process or per call
 

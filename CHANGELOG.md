@@ -66,6 +66,7 @@ HTTP interface without notice.
     and the output is within 8 of the input as displayed (the decoder's
     rounding; 3 measured). `pixels_identical` is null for a rotated
     output.
+  - The Ruby gem's `Oximg.strip` takes `auto_rotate: true`.
 
 ### Changed
 
