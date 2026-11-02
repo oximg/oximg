@@ -2211,6 +2211,7 @@ mod gcs;
 mod gif;
 mod jpeg;
 mod jpeg_dec;
+mod jpeg_rotate;
 mod jpegli_enc;
 mod resolved;
 #[cfg(feature = "server")]

@@ -107,6 +107,14 @@ class Oximg::ArgvTest < Oximg::Test
       Oximg.strip_argv("/src/a.jpg", "/dst/a.jpg", icc: "KEEP")
   end
 
+  def test_maps_a_strip_auto_rotate_onto_the_cli_grammar
+    assert_equal ["strip", "/a.jpg", "/b.jpg", "--auto-rotate"],
+      Oximg.strip_argv("/a.jpg", "/b.jpg", auto_rotate: true)
+    assert_equal ["strip", "/a.jpg", "/b.jpg"],
+      Oximg.strip_argv("/a.jpg", "/b.jpg", auto_rotate: false)
+    assert_raises(ArgumentError) { Oximg.strip_argv("/a.jpg", "/b.jpg", auto_rotate: "yes") }
+  end
+
   def test_strip_rejects_an_unknown_icc_mode
     assert_raises(ArgumentError) { Oximg.strip_argv("/a.jpg", "/b.jpg", icc: :drop) }
     assert_raises(ArgumentError) { Oximg.strip_argv("/a.jpg", "") }

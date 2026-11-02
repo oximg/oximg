@@ -27,6 +27,7 @@ oximg-ctl probe tests/fixtures/photo.jpg   # probe.{orientation,display_width,di
 oximg-ctl resize tests/fixtures/photo.jpg 100 100 --out /tmp/out.jpg
 oximg-ctl resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/out.webp
 oximg-ctl strip tests/fixtures/animated.webp --out /tmp/out.webp
+oximg-ctl strip rotated.jpg --auto-rotate   # rotated, not_rotated, rotation{...}
 ```
 
 `resize` shells out to `oximg resize` (same argv a user types). Usage
@@ -40,7 +41,8 @@ in the CLI's spelling; `icc_bytes` is the output's embedded profile
 block (payload plus framing), null when there is none, and
 `probe.{width,height}` shows whether the orientation was applied.
 
-`strip` shells out to `oximg strip <in> <out> [--icc keep|strip]`:
+`strip` shells out to `oximg strip <in> <out> [--icc keep|strip]
+[--auto-rotate]`:
 lossless metadata removal for JPEG/PNG/WebP (GIF, AVIF: exit 1). Its
 JSON proves the result: `removed` (what went, per block kind),
 `orientation` (read back from the output, 2-8, else null),
@@ -53,8 +55,28 @@ PNG at its native bit depth),
 else null), `peak_rss_bytes` (O(file size)). `ok` is false unless the
 residue is empty, both sides decode, pixels and frames match, the
 orientation survives, and the output matches the library's. The
-input is read before the child runs, so `--out` may be the input. A CMYK JPEG
+input is read before the child runs, so `--out` may be the input.
+`--env OXIMG_*` knobs reach ctl's own library checks as well as the
+child, so a limit decides both sides alike. A CMYK JPEG
 with `--icc strip` exits 1 (refused, never written).
+
+With `--auto-rotate`, `rotated` and `not_rotated` are the library's
+answer for the input under the same knobs, the reference the output
+must match (`matches_library`); `orientation` is what the output
+actually carries. `rotated` is the orientation the strip applies to a
+JPEG's DCT blocks (2-8, else null), and `not_rotated` why a rotated
+source is left tagged (an edge that is not whole 8/16-px blocks, a corrupt
+stream, PNG/WebP, over `OXIMG_MAX_SRC_PIXELS`, or over
+`OXIMG_MAX_DECODED_BYTES`: the coefficients, twice for every turn but
+a horizontal flip, plus the compressed input, copy and output); the file is then
+exactly the plain strip. A rotated output cannot match the stored
+pixels, so `pixels_identical` is null and `rotation` proves it:
+`round_trip_identical` (the output tagged with the inverse orientation
+and rotated back decodes to the input's pixels exactly: the
+coefficients are untouched) and `max_diff_displayed` (largest sample
+difference against the input decoded upright; the decoder's rounding
+is not rotation-symmetric, at most 3 measured; `ok` needs ≤ 8, a wrong
+turn differs by 150+).
 
 ## Library (`oximg::pipeline`)
 
@@ -65,8 +87,11 @@ cargo run --release --example probe -- tests/fixtures/photo.webp
 
 `process` / `process_path` take `Params` and return `(bytes, ImageFormat)`.
 `strip` takes `StripParams` (`icc: Option<bool>`, resolved like
-`Params::icc`) and returns `Stripped {bytes, format, removed,
-orientation}` without decoding pixels.
+`Params::icc`; `auto_rotate: bool`, default off) and returns `Stripped
+{bytes, format, removed, orientation, rotated, not_rotated}` without
+decoding pixels, unless `auto_rotate` turns a JPEG upright: that reads
+and rewrites its DCT coefficients (`orientation` is then None and
+`rotated` the orientation applied).
 `probe` is header-only stored size; `probe_reader` is the same answer
 from a reader, read 64 KiB at a time, doubling, until the header
 parses (errors only at EOF; AVIF reads through EOF), and

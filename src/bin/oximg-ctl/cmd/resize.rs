@@ -184,7 +184,10 @@ fn decoded_bytes(stderr: &str) -> Option<Value> {
 /// profile block (APP2 ICC_PROFILE chain, `iCCP`, `ICCP`); payload plus
 /// container framing, so compare against null, not the source's length.
 fn icc_bytes(bytes: &[u8]) -> Option<usize> {
-    let keep = |icc| oximg::pipeline::StripParams { icc: Some(icc) };
+    let keep = |icc| oximg::pipeline::StripParams {
+        icc: Some(icc),
+        ..Default::default()
+    };
     let with = oximg::pipeline::strip(bytes, &keep(true)).ok()?;
     let without = oximg::pipeline::strip(bytes, &keep(false)).ok()?;
     let n = with.bytes.len().checked_sub(without.bytes.len())?;

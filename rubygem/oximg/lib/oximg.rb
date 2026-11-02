@@ -203,10 +203,18 @@ module Oximg
     # This is what <tt>saver(strip: true)</tt> / <tt>-strip</tt> did
     # under libvips or ImageMagick, minus the re-encode.
     #
+    # <tt>auto_rotate: true</tt> turns a rotated JPEG upright instead,
+    # still without re-encoding: the compressed 8x8 blocks are moved
+    # (what <tt>jpegtran -perfect</tt> does), so its stored and displayed
+    # dimensions agree for every reader and no orientation tag is left.
+    # That is only exact when the edges it moves are whole 8 or 16 px
+    # blocks; otherwise, and for PNG and WebP, the orientation is kept
+    # as without it. Probe the destination to see which happened.
+    #
     # +env:+ is per-call knobs, as for resize.
-    def strip(source, destination, icc: nil, env: nil)
+    def strip(source, destination, icc: nil, auto_rotate: nil, env: nil)
       output = expand(destination, "destination")
-      argv = strip_argv(source, output, icc: icc)
+      argv = strip_argv(source, output, icc: icc, auto_rotate: auto_rotate)
       Binary.run(*argv, env: knob_env(env))
       output
     end
@@ -235,9 +243,11 @@ module Oximg
 
     # The argv `strip` would run, minus the executable; public for the
     # same reason as resize_argv.
-    def strip_argv(source, destination, icc: nil)
+    def strip_argv(source, destination, icc: nil, auto_rotate: nil)
       argv = ["strip", expand(source, "source"), expand(destination, "destination")]
       argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
+      # Off is strip's own default, so false adds nothing.
+      argv.push("--auto-rotate") if !auto_rotate.nil? && boolean(auto_rotate, "auto_rotate")
       argv
     end
 

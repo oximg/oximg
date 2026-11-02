@@ -38,6 +38,36 @@ HTTP interface without notice.
     `display_width:` and `display_height:`, in-process and spawned. The
     probe library's C ABI is version 2 (`dims` holds three values); a
     gem refuses a library of the other version and spawns instead.
+- **`strip --auto-rotate` turns a rotated JPEG upright, losslessly**
+  ([#163]). The orientation is applied to the DCT blocks, as `jpegtran
+  -perfect` does (libjpeg's own `transupp.c`, vendored by mozjpeg-sys),
+  so the stored pixels come out upright with no re-encode and no
+  orientation tag, and stored and displayed dimensions agree for every
+  reader. Only possible when the edges the transform moves are whole
+  iMCUs (8 or 16 px by chroma subsampling; a phone's 4032x3024 is):
+  otherwise, for a JPEG libjpeg reads only with warnings (truncated,
+  corrupt), one whose coefficients would exceed `OXIMG_MAX_SRC_PIXELS`
+  or `OXIMG_MAX_DECODED_BYTES`, and for PNG and WebP, the file is stripped exactly as
+  without the flag, orientation kept. The entropy data is re-coded
+  (optimized Huffman, baseline or progressive as the source was), so it
+  costs a full entropy decode and encode: 4032x3024 Q92, 5.3 MB: 168 ms
+  and 88 MiB peak RSS, against 11.6 ms / 12 MiB for a plain strip and
+  172 ms / 72 MiB for `jpegtran -perfect -rotate 90` (Apple M2 Max,
+  interleaved). Output decodes identically to jpegtran's.
+  - `oximg strip <in> <out> --auto-rotate`; its summary ends `rotated
+    orientation 6 upright`, or `kept orientation 6, not rotated:
+    <why>`.
+  - `StripParams::auto_rotate` (default off), and `Stripped::rotated` /
+    `Stripped::not_rotated`. `StripParams` gained a field: construct it
+    with `..Default::default()`.
+  - `oximg-ctl strip --auto-rotate` adds `rotated`, `not_rotated` and
+    `rotation: {orientation, round_trip_identical,
+    max_diff_displayed}`: tagging the output with the inverse
+    orientation and rotating back restores the input's pixels exactly,
+    and the output is within 8 of the input as displayed (the decoder's
+    rounding; 3 measured). `pixels_identical` is null for a rotated
+    output.
+  - The Ruby gem's `Oximg.strip` takes `auto_rotate: true`.
 
 ### Changed
 

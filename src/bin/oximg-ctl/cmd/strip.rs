@@ -15,7 +15,22 @@ use std::process::Command;
 use std::time::Instant;
 
 pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
+    // Resolved from ctl's own environment, before `--env` is applied
+    // below: `--env` is for the child, and must not pick the executable.
     let bin = resolve_bin(opts.bin.as_deref())?;
+    // The cross-checks below run the library in this process; they must
+    // see the knobs the child was given (`--env`), not only the ones
+    // inherited: a pixel or decoded-bytes limit decides whether strip
+    // rotates, and whether the pixels can be decoded at all. The
+    // library reads its config once, on first use, which is after this.
+    // OXIMG_BIN is ctl's own setting, not a pipeline knob.
+    for (k, v) in &opts.env {
+        if k.starts_with("OXIMG_") && k != "OXIMG_BIN" {
+            // SAFETY: ctl is single-threaded until the child is spawned
+            // below, so nothing reads the environment concurrently.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
     let ephemeral = a.out.is_none();
     let out_path: PathBuf = a.out.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!(
@@ -27,7 +42,7 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
                 .unwrap_or(0),
         ))
     });
-    let argv = strip_argv(&a.input, &out_path, a.icc.as_deref());
+    let argv = strip_argv(&a.input, &out_path, a.icc.as_deref(), a.auto_rotate);
     if opts.dry_run {
         emit(
             &json!({
@@ -96,23 +111,34 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
                 != Some("0")
         }
     };
-    let removed = pipeline::strip(
-        &src,
-        &StripParams {
-            icc: Some(keep_icc),
-        },
-    );
-    let residue = pipeline::strip(
-        &bytes,
-        &StripParams {
-            icc: Some(keep_icc),
-        },
-    );
+    let strip_with = |b: &[u8], auto_rotate| {
+        pipeline::strip(
+            b,
+            &StripParams {
+                icc: Some(keep_icc),
+                auto_rotate,
+            },
+        )
+    };
+    let residue = strip_with(&bytes, false);
+    // The reference is the library's strip under the flag that was
+    // asked for, with the child's knobs applied above: a child that
+    // skipped a rotation it should have made, or made one it should
+    // not, differs from it and fails `matches_library`.
+    let removed = strip_with(&src, a.auto_rotate);
+    let rotated = removed.as_ref().ok().and_then(|s| s.rotated);
+    let not_rotated = removed.as_ref().ok().and_then(|s| s.not_rotated.clone());
     // Pixels, residue and frames cannot see what must be kept (the
     // orientation EXIF, the ICC profile); the library's own answer for
     // the input pins those down, byte for byte.
     let matches_library = matches!(&removed, Ok(s) if s.bytes == bytes);
-    let (pin, pout) = (pixels(&src), pixels(&bytes));
+    // A rotated output cannot match the stored pixels; `rotation`
+    // proves it instead.
+    let (pin, pout) = match rotated {
+        None => (pixels(&src), pixels(&bytes)),
+        Some(_) => (Ok(String::new()), Ok(String::new())),
+    };
+    let rotation = rotated.map(|o| rotation_proof(&src, &bytes, o, keep_icc));
     let frames_identical = match (webp_frames(&src), webp_frames(&bytes)) {
         (None, None) => None,
         (i, o) => Some(i == o),
@@ -137,9 +163,13 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
             Err(e) => json!({ "error": e.to_string() }),
         },
         "pixels_identical": match (&pin, &pout) {
+            _ if rotated.is_some() => Value::Null,
             (Ok(i), Ok(o)) => json!(i == o),
             (Err(e), _) | (_, Err(e)) => json!({ "error": e }),
         },
+        "rotated": rotated,
+        "not_rotated": not_rotated,
+        "rotation": rotation.as_ref().map(Rotation::value),
         "frames_identical": frames_identical,
         "peak_rss_bytes": peak_rss_bytes(),
         "stderr": stderr,
@@ -160,6 +190,8 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         Some("pixels could not be decoded for comparison")
     } else if pin != pout {
         Some("decoded pixels differ")
+    } else if let Some(failure) = rotation.as_ref().and_then(Rotation::failure) {
+        Some(failure)
     } else if !orientation_kept {
         Some("output lost the source's orientation")
     } else if !matches_library {
@@ -183,6 +215,131 @@ fn removed_value(removed: &[pipeline::Removed]) -> Value {
         .iter()
         .map(|r| json!({ "name": r.name, "count": r.count, "bytes": r.bytes }))
         .collect()
+}
+
+/// The largest per-sample difference a correct rotation shows against
+/// the input decoded and then turned upright. The coefficients are
+/// exact, but the decoder's rounding is not symmetric: a transposed
+/// block runs its IDCT passes in the other order, and fancy chroma
+/// upsampling rounds left and right edges differently. Measured: at
+/// most 3, over 4:4:4, 4:2:2, 4:2:0 and grey, baseline and progressive,
+/// all seven orientations. A wrong rotation differs by 150 and more.
+const ROTATION_MAX_DIFF: u8 = 8;
+
+/// What `--auto-rotate` is proved by. Lossless: tagging the output
+/// with the inverse orientation and rotating again (through the same
+/// library) restores the input's stored pixels exactly, which only
+/// identical coefficients can. Correct: the output is the input as
+/// displayed, to within [`ROTATION_MAX_DIFF`].
+struct Rotation {
+    orientation: u8,
+    round_trip: Result<bool, String>,
+    max_diff: Result<u8, String>,
+}
+
+impl Rotation {
+    fn value(&self) -> Value {
+        fn or_error<T: Into<Value> + Copy>(r: &Result<T, String>) -> Value {
+            match r {
+                Ok(v) => (*v).into(),
+                Err(e) => json!({ "error": e }),
+            }
+        }
+        json!({
+            "orientation": self.orientation,
+            "round_trip_identical": or_error(&self.round_trip),
+            "max_diff_displayed": or_error(&self.max_diff),
+        })
+    }
+
+    fn failure(&self) -> Option<&'static str> {
+        match (&self.round_trip, &self.max_diff) {
+            (Err(_), _) | (_, Err(_)) => Some("rotation could not be checked"),
+            (Ok(false), _) => {
+                Some("rotation is not lossless: its inverse does not restore the input")
+            }
+            (_, Ok(d)) if *d > ROTATION_MAX_DIFF => {
+                Some("rotated output is not the input as displayed")
+            }
+            _ => None,
+        }
+    }
+}
+
+fn rotation_proof(src: &[u8], out: &[u8], o: u8, keep_icc: bool) -> Rotation {
+    // 6 and 8 are quarter turns in opposite directions; every other
+    // orientation is its own inverse.
+    let inverse = match o {
+        6 => 8,
+        8 => 6,
+        o => o,
+    };
+    let round_trip = pipeline::strip(
+        &with_orientation(out, inverse),
+        &StripParams {
+            icc: Some(keep_icc),
+            auto_rotate: true,
+        },
+    )
+    .map_err(|e| e.to_string())
+    .and_then(|back| match back.rotated {
+        Some(_) => Ok(pixels(&back.bytes)? == pixels(src)?),
+        None => Err(format!(
+            "the inverse was not applied: {}",
+            back.not_rotated.unwrap_or_default()
+        )),
+    });
+    let max_diff = decoded(src, true).and_then(|want| {
+        let got = decoded(out, false)?;
+        if got.len() != want.len() || got[..10] != want[..10] {
+            return Err("rotated output has the wrong dimensions".into());
+        }
+        Ok(want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0))
+    });
+    Rotation {
+        orientation: o,
+        round_trip,
+        max_diff,
+    }
+}
+
+/// `jpeg` with an EXIF APP1 holding orientation `o` after the SOI.
+fn with_orientation(jpeg: &[u8], o: u8) -> Vec<u8> {
+    let mut tiff = [0u8; 26];
+    tiff[..8].copy_from_slice(b"MM\0\x2a\0\0\0\x08");
+    tiff[8..10].copy_from_slice(&1u16.to_be_bytes());
+    tiff[10..12].copy_from_slice(&0x0112u16.to_be_bytes());
+    tiff[12..14].copy_from_slice(&3u16.to_be_bytes());
+    tiff[14..18].copy_from_slice(&1u32.to_be_bytes());
+    tiff[18..20].copy_from_slice(&u16::from(o).to_be_bytes());
+    let mut v = Vec::with_capacity(jpeg.len() + 40);
+    v.extend_from_slice(&jpeg[..2.min(jpeg.len())]);
+    v.extend_from_slice(&[0xFF, 0xE1]);
+    v.extend_from_slice(&(2 + 6 + tiff.len() as u16).to_be_bytes());
+    v.extend_from_slice(b"Exif\0\0");
+    v.extend_from_slice(&tiff);
+    v.extend_from_slice(jpeg.get(2..).unwrap_or_default());
+    v
+}
+
+/// The decoded samples behind [`png_native`]'s colour type, depth and
+/// size header, stored or `displayed` upright, through the same
+/// lossless PNG as [`pixels`].
+fn decoded(bytes: &[u8], displayed: bool) -> Result<Vec<u8>, String> {
+    let p = Params {
+        output: Some(ImageFormat::Png),
+        auto_rotate: Some(displayed),
+        icc: Some(false),
+        png_quantize: Some(false),
+        ..Default::default()
+    };
+    let (png, _) = pipeline::process(bytes, &p).map_err(|e| e.to_string())?;
+    png_native(&png)
 }
 
 /// sha256 of the decoded pixels in stored orientation (lossless PNG,
@@ -266,7 +423,7 @@ fn webp_frames(b: &[u8]) -> Option<Vec<&[u8]>> {
     (!out.is_empty()).then_some(out)
 }
 
-fn strip_argv(input: &Path, out: &Path, icc: Option<&str>) -> Vec<String> {
+fn strip_argv(input: &Path, out: &Path, icc: Option<&str>, auto_rotate: bool) -> Vec<String> {
     let mut v = vec![
         "oximg".into(),
         "strip".into(),
@@ -276,6 +433,9 @@ fn strip_argv(input: &Path, out: &Path, icc: Option<&str>) -> Vec<String> {
     if let Some(icc) = icc {
         v.push("--icc".into());
         v.push(icc.into());
+    }
+    if auto_rotate {
+        v.push("--auto-rotate".into());
     }
     v
 }
@@ -318,12 +478,21 @@ mod tests {
     #[test]
     fn argv_is_what_a_user_types() {
         assert_eq!(
-            strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), None),
+            strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), None, false),
             ["oximg", "strip", "in.jpg", "o.jpg"]
         );
         assert_eq!(
-            strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), Some("strip")),
+            strip_argv(
+                Path::new("in.jpg"),
+                Path::new("o.jpg"),
+                Some("strip"),
+                false
+            ),
             ["oximg", "strip", "in.jpg", "o.jpg", "--icc", "strip"]
+        );
+        assert_eq!(
+            strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), None, true),
+            ["oximg", "strip", "in.jpg", "o.jpg", "--auto-rotate"]
         );
     }
 }

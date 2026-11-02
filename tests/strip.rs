@@ -13,11 +13,17 @@ use common::{fixture, params};
 use oximg::pipeline::{self, ErrorKind, ImageFormat, Params, StripParams, Stripped};
 
 fn keep_icc() -> StripParams {
-    StripParams { icc: Some(true) }
+    StripParams {
+        icc: Some(true),
+        ..Default::default()
+    }
 }
 
 fn drop_icc() -> StripParams {
-    StripParams { icc: Some(false) }
+    StripParams {
+        icc: Some(false),
+        ..Default::default()
+    }
 }
 
 /// The decoded pixels in stored orientation, as a lossless PNG — the
@@ -528,4 +534,322 @@ fn other_formats_are_refused() {
     }
     let e = pipeline::strip(b"not an image", &keep_icc()).unwrap_err();
     assert_eq!(e.kind(), ErrorKind::Undecodable);
+}
+// --- `auto_rotate` (#163): lossless DCT-domain rotation of a JPEG ---
+
+fn rotate(icc: bool) -> StripParams {
+    StripParams {
+        icc: Some(icc),
+        auto_rotate: true,
+    }
+}
+
+/// RGB pixels as a q90 JPEG with chroma subsampled `(h, v)` (4:2:0 is
+/// `(2, 2)`), baseline or progressive, carrying the APPn `markers`.
+fn jpeg_coded(
+    px: &[u8],
+    (w, h): (usize, usize),
+    sub: (u8, u8),
+    progressive: bool,
+    markers: &[(u8, &[u8])],
+) -> Vec<u8> {
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_fastest_defaults();
+    comp.set_size(w, h);
+    comp.set_quality(90.0);
+    comp.set_chroma_sampling_pixel_sizes(sub, sub);
+    if progressive {
+        comp.set_progressive_mode();
+    }
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    for (n, p) in markers {
+        started.write_marker(mozjpeg::Marker::APP(*n), p);
+    }
+    started.write_scanlines(px).unwrap();
+    started.finish().unwrap()
+}
+
+/// The decoded samples, stored or `displayed` upright, as RGB.
+fn rgb(b: &[u8], displayed: bool) -> (usize, usize, Vec<u8>) {
+    let p = Params {
+        output: Some(ImageFormat::Png),
+        auto_rotate: Some(displayed),
+        icc: Some(false),
+        png_quantize: Some(false),
+        ..Default::default()
+    };
+    let png = pipeline::process(b, &p).unwrap().0;
+    let mut r = png::Decoder::new(std::io::Cursor::new(png))
+        .read_info()
+        .unwrap();
+    let mut px = vec![0; r.output_buffer_size().unwrap()];
+    let info = r.next_frame(&mut px).unwrap();
+    px.truncate(info.buffer_size());
+    (info.width as usize, info.height as usize, px)
+}
+
+/// The inverse of orientation `o`: 6 and 8 are opposite quarter turns,
+/// every other orientation undoes itself.
+fn inverse(o: u8) -> u8 {
+    match o {
+        6 => 8,
+        8 => 6,
+        o => o,
+    }
+}
+
+/// `jpeg` with an Exif APP1 holding orientation `o` after the SOI.
+fn tagged(jpeg: &[u8], o: u8) -> Vec<u8> {
+    let app1 = common::app1_orientation(o.into());
+    let mut v = jpeg[..2].to_vec();
+    v.extend_from_slice(&[0xFF, 0xE1]);
+    v.extend_from_slice(&(app1.len() as u16 + 2).to_be_bytes());
+    v.extend_from_slice(&app1);
+    v.extend_from_slice(&jpeg[2..]);
+    v
+}
+
+/// Check one rotated strip of `src` (orientation `o`, displayed
+/// `w`x`h`): upright, untagged, lossless and clean.
+fn assert_rotated(src: &[u8], out: &Stripped, o: u8, (w, h): (usize, usize), what: &str) {
+    assert_eq!(out.rotated, Some(o), "{what}");
+    assert_eq!((out.orientation, &out.not_rotated), (None, &None), "{what}");
+    assert!(
+        !contains(&out.bytes, b"SECRET"),
+        "{what}: metadata survived"
+    );
+    let app1s = jpeg_markers(&out.bytes)
+        .iter()
+        .filter(|m| m.0 == 0xE1)
+        .count();
+    assert_eq!(app1s, 0, "{what}: an orientation tag survived");
+    // Upright as stored: the corners are where the display has them.
+    assert_eq!(
+        common::corner_classes(&out.bytes),
+        (w, h, ['R', 'G', 'B', 'W']),
+        "{what}"
+    );
+    // The same picture the source shows, up to the decoder's rounding
+    // (a transposed block's IDCT passes run in the other order; fancy
+    // upsampling is not mirror-symmetric): at most 3 measured.
+    let (want, got) = (rgb(src, true), rgb(&out.bytes, false));
+    assert_eq!((got.0, got.1), (want.0, want.1), "{what}");
+    let diff = want.2.iter().zip(&got.2).map(|(a, b)| a.abs_diff(*b)).max();
+    assert!(diff <= Some(3), "{what}: max diff {diff:?}");
+    // Lossless: the inverse turn restores the stored pixels exactly,
+    // which only the source's own coefficients decode to.
+    let back = pipeline::strip(&tagged(&out.bytes, inverse(o)), &rotate(true)).unwrap();
+    assert_eq!(back.rotated, Some(inverse(o)), "{what}");
+    assert_eq!(pixels(&back.bytes), pixels(src), "{what}: not lossless");
+    // Already upright: a second strip finds nothing and changes nothing.
+    let again = pipeline::strip(&out.bytes, &rotate(true)).unwrap();
+    assert!(
+        again.removed.is_empty(),
+        "{what}: residue {:?}",
+        again.removed
+    );
+    assert_eq!(again.bytes, out.bytes, "{what}: not idempotent");
+    assert_eq!(again.rotated, None, "{what}");
+}
+
+#[test]
+fn auto_rotate_turns_every_orientation_upright_losslessly() {
+    let (w, h) = (256, 192); // whole 16x16 iMCUs both ways
+    let display = common::corner_base(w, h, 64);
+    for (sub, label) in [((2, 2), "4:2:0"), ((2, 1), "4:2:2"), ((1, 1), "4:4:4")] {
+        for progressive in [false, true] {
+            for o in 1..=8u8 {
+                let what = format!("{label} progressive={progressive} o={o}");
+                let (stored, sw, sh) = common::store_for_orientation(&display, w, h, o);
+                let exif = exif_app1(o.into());
+                let src = jpeg_coded(&stored, (sw, sh), sub, progressive, &[(1, &exif), (1, XMP)]);
+                let out = pipeline::strip(&src, &rotate(true)).unwrap();
+                if o == 1 {
+                    assert_eq!(out.bytes, pipeline::strip(&src, &keep_icc()).unwrap().bytes);
+                    assert_eq!((out.rotated, out.not_rotated), (None, None), "{what}");
+                    continue;
+                }
+                assert_rotated(&src, &out, o, (w, h), &what);
+                // Coded as the source was: baseline stays baseline.
+                let sof = |b: &[u8]| common::jpeg_scans(b).0;
+                assert_eq!(sof(&out.bytes), sof(&src), "{what}");
+            }
+        }
+    }
+}
+
+/// Grey has one 8x8 block per iMCU, so 8-aligned edges suffice.
+#[test]
+fn auto_rotate_turns_a_grey_jpeg_on_8px_edges() {
+    let (w, h) = (248, 184);
+    let display = common::corner_base(w, h, 64);
+    for o in 2..=8u8 {
+        let (stored, sw, sh) = common::store_for_orientation(&display, w, h, o);
+        let grey: Vec<u8> = stored
+            .chunks(3)
+            .map(|p| ((u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3) as u8)
+            .collect();
+        let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_GRAYSCALE);
+        comp.set_fastest_defaults();
+        comp.set_size(sw, sh);
+        comp.set_quality(90.0);
+        let mut started = comp.start_compress(Vec::new()).unwrap();
+        started.write_marker(mozjpeg::Marker::APP(1), &exif_app1(o.into()));
+        started.write_scanlines(&grey).unwrap();
+        let src = started.finish().unwrap();
+        let out = pipeline::strip(&src, &rotate(true)).unwrap();
+        assert_eq!(out.rotated, Some(o), "o={o}");
+        let back = pipeline::strip(&tagged(&out.bytes, inverse(o)), &rotate(true)).unwrap();
+        assert_eq!(pixels(&back.bytes), pixels(&src), "o={o}: not lossless");
+        assert_eq!(rgb(&out.bytes, false).0, w, "o={o}");
+    }
+}
+
+/// A partial edge iMCU cannot move: the transforms that would move one
+/// leave the file exactly as a plain strip does, and say why.
+#[test]
+fn auto_rotate_keeps_the_tag_when_an_edge_is_partial() {
+    // 248 is not a multiple of 16, 192 is: only the transforms that
+    // leave the right edge in place are exact (libjpeg's own rule,
+    // `jtransform_perfect_transform`).
+    let (w, h) = (248, 192);
+    let px = common::corner_base(w, h, 64);
+    for o in 2..=8u8 {
+        let exif = exif_app1(o.into());
+        let src = jpeg_coded(&px, (w, h), (2, 2), false, &[(1, &exif)]);
+        let out = pipeline::strip(&src, &rotate(true)).unwrap();
+        let exact = (4..=6).contains(&o);
+        assert_eq!(out.rotated.is_some(), exact, "o={o}");
+        if exact {
+            let display = if o >= 5 { (h, w) } else { (w, h) };
+            assert_eq!(rgb(&out.bytes, false).0, display.0, "o={o}");
+            continue;
+        }
+        let plain = pipeline::strip(&src, &keep_icc()).unwrap();
+        assert_eq!(out.bytes, plain.bytes, "o={o}");
+        assert_eq!(out.orientation, Some(o), "o={o}");
+        let why = out.not_rotated.unwrap();
+        assert!(
+            why.contains("248x192") && why.contains("16x16"),
+            "o={o}: {why}"
+        );
+    }
+}
+
+#[test]
+fn auto_rotate_keeps_the_icc_profile_and_aspect() {
+    let (w, h) = (256, 192);
+    let display = common::corner_base(w, h, 64);
+    let icc = common::fake_icc(70_000);
+    let chunks = common::app2_icc_payloads(&icc, 60_000);
+    let (stored, sw, sh) = common::store_for_orientation(&display, w, h, 6);
+    let exif = exif_app1(6);
+    let src = jpeg_coded(
+        &stored,
+        (sw, sh),
+        (2, 2),
+        false,
+        &[(1, &exif), (2, &chunks[0]), (2, &chunks[1])],
+    );
+    // Non-square pixels: 72x144 dpi, which a quarter turn exchanges.
+    let mut src = src;
+    let at = src.windows(5).position(|w| w == b"JFIF\0").unwrap();
+    src[at + 7] = 1; // dots per inch
+    src[at + 8..at + 12].copy_from_slice(&[0, 72, 0, 144]);
+    let out = pipeline::strip(&src, &rotate(true)).unwrap();
+    assert_rotated(&src, &out, 6, (w, h), "icc");
+    assert_eq!(common::jpeg_icc(&out.bytes).as_deref(), Some(&icc[..]));
+    let jfif = &jpeg_markers(&out.bytes)[0];
+    assert_eq!(jfif.0, 0xE0);
+    assert_eq!(jfif.1[7..12], [1, 0, 144, 0, 72], "density not exchanged");
+    let dropped = pipeline::strip(&src, &rotate(false)).unwrap();
+    assert_eq!(dropped.rotated, Some(6));
+    assert_eq!(common::jpeg_icc(&dropped.bytes), None);
+}
+
+/// A source whose EXIF is already just the orientation (a plain strip's
+/// output) now loses that block too, and says so.
+#[test]
+fn auto_rotate_reports_the_dropped_orientation_block() {
+    let (w, h) = (256, 192);
+    let (stored, sw, sh) = common::store_for_orientation(&common::corner_base(w, h, 64), w, h, 8);
+    let exif = exif_app1(8);
+    let src = jpeg_coded(&stored, (sw, sh), (2, 2), false, &[(1, &exif)]);
+    let plain = pipeline::strip(&src, &keep_icc()).unwrap();
+    assert_eq!(plain.orientation, Some(8));
+    let out = pipeline::strip(&plain.bytes, &rotate(true)).unwrap();
+    assert_eq!(out.rotated, Some(8));
+    assert_eq!(removed_names(&out), ["APP1 Exif"]);
+    assert_eq!(out.removed[0].bytes, 36);
+
+    // PR #167 review: first-seen order holds. The minimal block comes
+    // before an XMP and a second Exif segment; it is reported first, and
+    // the later Exif is counted with it rather than ahead of the XMP.
+    let segment = |body: &[u8]| {
+        [
+            &[0xFF, 0xE1][..],
+            &(body.len() as u16 + 2).to_be_bytes(),
+            body,
+        ]
+        .concat()
+    };
+    // The minimal APP1: marker and length, then `Exif\0\0` and its
+    // 26-byte TIFF; 36 bytes from its marker.
+    let payload = plain
+        .bytes
+        .windows(6)
+        .position(|w| w == b"Exif\0\0")
+        .unwrap();
+    let minimal_end = payload - 4 + 36;
+    let later = [segment(XMP), segment(&exif_app1(3))].concat();
+    let busy = [
+        &plain.bytes[..minimal_end],
+        &later,
+        &plain.bytes[minimal_end..],
+    ]
+    .concat();
+    let out = pipeline::strip(&busy, &rotate(true)).unwrap();
+    assert_eq!(out.rotated, Some(8));
+    assert_eq!(removed_names(&out), ["APP1 Exif", "XMP"]);
+    assert_eq!(out.removed[0].count, 2);
+}
+
+/// Rotation must be exact or not happen: libjpeg would "repair" a
+/// truncated scan with grey, so a warning keeps the tag instead.
+#[test]
+fn auto_rotate_leaves_a_truncated_jpeg_tagged() {
+    let (w, h) = (256, 192);
+    let px = common::corner_base(w, h, 64);
+    let exif = exif_app1(6);
+    let src = jpeg_coded(&px, (w, h), (2, 2), false, &[(1, &exif)]);
+    let cut = &src[..src.len() * 2 / 3];
+    let out = pipeline::strip(cut, &rotate(true)).unwrap();
+    assert_eq!((out.rotated, out.orientation), (None, Some(6)));
+    assert!(out.not_rotated.unwrap().contains("truncated"));
+    assert_eq!(out.bytes, pipeline::strip(cut, &keep_icc()).unwrap().bytes);
+}
+
+/// PNG and WebP have no lossless rotation: the tag is kept, as without
+/// the flag, and the reason names the format.
+#[test]
+fn auto_rotate_keeps_png_and_webp_tagged() {
+    let (w, h) = (64, 48);
+    let px = common::corner_base(w, h, 16);
+    let png = common::png_with_orientation(&px, w, h, 6);
+    let out = pipeline::strip(&png, &rotate(true)).unwrap();
+    assert_eq!(out.bytes, pipeline::strip(&png, &keep_icc()).unwrap().bytes);
+    assert_eq!((out.rotated, out.orientation), (None, Some(6)));
+    assert!(out.not_rotated.unwrap().contains("image/png"));
+    let webp = common::webp_with_exif(
+        &fixture("photo.webp"),
+        200,
+        150,
+        &common::tiff_orientation(3),
+    );
+    let out = pipeline::strip(&webp, &rotate(true)).unwrap();
+    assert_eq!((out.rotated, out.orientation), (None, Some(3)));
+    assert!(out.not_rotated.unwrap().contains("image/webp"));
+    // Upright sources have nothing to explain.
+    let upright = pipeline::strip(&fixture("rgb.png"), &rotate(true)).unwrap();
+    assert_eq!((upright.rotated, upright.not_rotated), (None, None));
 }

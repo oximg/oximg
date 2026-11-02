@@ -17,8 +17,12 @@
 //! - **CMYK profiles.** Browsers render CMYK JPEG pixels without their
 //!   profile in visibly wrong colours, so dropping a CMYK frame's ICC
 //!   is refused; `resize` converts such a source to sRGB instead.
+//!
+//! With [`StripParams::auto_rotate`] a rotated JPEG is turned upright
+//! in the DCT domain instead (`jpeg_rotate`), which is still lossless
+//! but re-codes the entropy data, and the orientation tag goes too.
 
-use super::{Error, ImageFormat};
+use super::{Error, ImageFormat, jpeg_rotate};
 use crate::meta::Orientation;
 use anyhow::{Result, bail, ensure};
 use std::collections::HashMap;
@@ -30,6 +34,12 @@ pub struct StripParams {
     /// [`Params::icc`](super::Params::icc): `OXIMG_ICC`, else keep —
     /// a wide-gamut photo stripped of its profile renders desaturated.
     pub icc: Option<bool>,
+    /// Turn a rotated JPEG's stored pixels upright, losslessly, and drop
+    /// its orientation tag (#163). Only possible when the edges the
+    /// rotation moves are whole 8x8 (or 16x16, by chroma subsampling)
+    /// blocks; otherwise, and for PNG and WebP, the orientation is
+    /// kept as without it and [`Stripped::not_rotated`] says why.
+    pub auto_rotate: bool,
 }
 
 /// The result of [`strip`].
@@ -42,8 +52,14 @@ pub struct Stripped {
     /// seen. Empty when the source carried nothing to drop.
     pub removed: Vec<Removed>,
     /// The orientation written back (2..=8), or `None` when the source
-    /// was upright or carried none.
+    /// was upright, carried none, or was rotated upright.
     pub orientation: Option<u8>,
+    /// The orientation applied to the pixels by
+    /// [`StripParams::auto_rotate`], 2..=8.
+    pub rotated: Option<u8>,
+    /// Why [`StripParams::auto_rotate`] left a rotated source as it was
+    /// (its orientation is then in `orientation`).
+    pub not_rotated: Option<String>,
 }
 
 /// One kind of dropped block: a JPEG segment (`APP1 Exif`, `XMP`,
@@ -81,17 +97,39 @@ pub fn strip(bytes: &[u8], p: &StripParams) -> Result<Stripped, Error> {
     let keep_icc = p
         .icc
         .unwrap_or_else(|| crate::config::config().icc_passthrough);
-    strip_inner(bytes, keep_icc).map_err(|e| Error::classify(e, false))
+    strip_inner(bytes, keep_icc, p.auto_rotate).map_err(|e| Error::classify(e, false))
 }
 
-fn strip_inner(bytes: &[u8], keep_icc: bool) -> Result<Stripped> {
+fn strip_inner(bytes: &[u8], keep_icc: bool, auto_rotate: bool) -> Result<Stripped> {
     let mut header = [0u8; 12];
     let n = bytes.len().min(12);
     header[..n].copy_from_slice(&bytes[..n]);
     let mut log = Log::default();
+    let mut rotated = None;
+    let mut not_rotated = None;
     let (format, out, orientation) = match ImageFormat::sniff(&header) {
         Some(ImageFormat::Jpeg) => {
-            let (out, o) = strip_jpeg(bytes, keep_icc, &mut log)?;
+            let (mut out, mut o, coded) = strip_jpeg(bytes, keep_icc, &mut log)?;
+            if auto_rotate && !o.is_upright() {
+                let limits = jpeg_rotate::Limits {
+                    max_pixels: crate::config::config().max_src_pixels,
+                    held_bytes: (bytes.len() + out.capacity()) as u64,
+                };
+                match jpeg_rotate::rotate(&out, o, &coded.coding, &limits) {
+                    jpeg_rotate::Rotation::Rotated(upright) => {
+                        // The written-back tag goes too; a source whose
+                        // EXIF was already just that tag only now loses
+                        // it, logged where the walk met it.
+                        if let Some(at) = coded.minimal_exif_at {
+                            log.add_at(at, "APP1 Exif", MINIMAL_EXIF_APP1);
+                        }
+                        out = upright;
+                        rotated = Some(o.value());
+                        o = Orientation::UPRIGHT;
+                    }
+                    jpeg_rotate::Rotation::Kept(why) => not_rotated = Some(why),
+                }
+            }
             (ImageFormat::Jpeg, out, o)
         }
         Some(ImageFormat::Png) => {
@@ -108,12 +146,34 @@ fn strip_inner(bytes: &[u8], keep_icc: bool) -> Result<Stripped> {
         ),
         None => bail!("unsupported image format"),
     };
+    if auto_rotate && format != ImageFormat::Jpeg && !orientation.is_upright() {
+        not_rotated = Some(format!(
+            "only a JPEG can be rotated without re-encoding, not {}",
+            format.content_type()
+        ));
+    }
     Ok(Stripped {
         bytes: out,
         format,
         removed: log.removed,
         orientation: (!orientation.is_upright()).then_some(orientation.value()),
+        rotated,
+        not_rotated,
     })
+}
+
+/// The bytes of the APP1 segment a rotated JPEG's EXIF is reduced to:
+/// marker, length, `Exif\0\0` and [`Orientation::minimal_exif_tiff`].
+const MINIMAL_EXIF_APP1: usize = 2 + 2 + 6 + 26;
+
+/// What the JPEG walk learned besides the orientation.
+struct JpegCoded {
+    coding: jpeg_rotate::Coding,
+    /// The source's first EXIF was exactly the minimal orientation
+    /// block, so it was copied through rather than logged as removed:
+    /// the log's length when the walk met it, which is where it goes in
+    /// first-seen order if a rotation drops it after all.
+    minimal_exif_at: Option<usize>,
 }
 
 /// Removals aggregated by name in first-seen order. PNG chunk types and
@@ -143,6 +203,38 @@ impl Log {
             }
         }
     }
+
+    /// [`add`](Self::add), for a block met at position `at` of the walk
+    /// but known to go only after it: the entry lands at `at` in
+    /// first-seen order. An entry of the same name logged before `at`
+    /// was seen first and just counts it; one logged since is merged
+    /// into it at `at`.
+    fn add_at(&mut self, at: usize, name: &str, bytes: usize) {
+        let mut entry = Removed {
+            name: name.to_string(),
+            count: 1,
+            bytes,
+        };
+        if let Some(i) = self.index.get(name).copied() {
+            if i < at {
+                let r = &mut self.removed[i];
+                r.count += 1;
+                r.bytes += bytes;
+                return;
+            }
+            let later = self.removed.remove(i);
+            entry.count += later.count;
+            entry.bytes += later.bytes;
+        }
+        let at = at.min(self.removed.len());
+        self.removed.insert(at, entry);
+        self.index = self
+            .removed
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.name.clone(), i))
+            .collect();
+    }
 }
 
 /// Walk every marker segment of the JPEG, between scans too (APPn and
@@ -153,7 +245,11 @@ impl Log {
 /// EOI are dropped: that is where MPF secondary images (a second full
 /// picture with its own EXIF) live. A stream that ends without EOI is
 /// copied as far as it goes, as decoders and browsers accept it.
-fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orientation)> {
+fn strip_jpeg(
+    b: &[u8],
+    keep_icc: bool,
+    log: &mut Log,
+) -> Result<(Vec<u8>, Orientation, JpegCoded)> {
     ensure!(b.starts_with(&[0xFF, 0xD8]), "not a JPEG");
     let mut out = Vec::with_capacity(b.len());
     out.extend_from_slice(&b[..2]);
@@ -162,6 +258,13 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
     let mut orientation = Orientation::UPRIGHT;
     let mut components = None;
     let mut icc_dropped = false;
+    let mut coded = JpegCoded {
+        coding: jpeg_rotate::Coding {
+            progressive: false,
+            jfif: false,
+        },
+        minimal_exif_at: None,
+    };
     loop {
         ensure!(i < b.len(), "truncated JPEG header at offset {i}");
         ensure!(b[i] == 0xFF, "JPEG marker expected at offset {i}");
@@ -198,6 +301,7 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
             // a second picture, possibly of what a crop removed. Keep
             // the version and density, drop the thumbnail.
             0xE0 if body.starts_with(b"JFIF\0") && body.len() >= 14 => {
+                coded.coding.jfif = true;
                 if body.len() == 14 && body[12..14] == [0, 0] {
                     true
                 } else {
@@ -209,7 +313,11 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
                     false
                 }
             }
-            0xE0 => body.starts_with(b"JFIF\0"),
+            0xE0 => {
+                let jfif = body.starts_with(b"JFIF\0");
+                coded.coding.jfif |= jfif;
+                jfif
+            }
             0xE1 => {
                 if !exif_seen && body.starts_with(b"Exif\0\0") {
                     // The first Exif segment decides, as in the decode
@@ -219,6 +327,7 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
                     if !orientation.is_upright() {
                         let tiff = orientation.minimal_exif_tiff();
                         rewrote = body.strip_prefix(b"Exif\0\0") == Some(&tiff[..]);
+                        coded.minimal_exif_at = rewrote.then_some(log.removed.len());
                         out.extend_from_slice(&[0xFF, 0xE1]);
                         out.extend_from_slice(&(2 + 6 + tiff.len() as u16).to_be_bytes());
                         out.extend_from_slice(b"Exif\0\0");
@@ -236,6 +345,7 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
             // SOFn; C4 (DHT), C8 (JPG) and CC (DAC) share the range.
             0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
                 components = body.get(5).copied();
+                coded.coding.progressive = marker == 0xC2;
                 true
             }
             _ => true,
@@ -281,7 +391,7 @@ fn strip_jpeg(b: &[u8], keep_icc: bool, log: &mut Log) -> Result<(Vec<u8>, Orien
              which converts to sRGB)"
         );
     }
-    Ok((out, orientation))
+    Ok((out, orientation, coded))
 }
 
 /// Registered APPn identifiers a removal may be named after.
@@ -572,6 +682,33 @@ mod tests {
         // The CRC-32/ISO-HDLC check value, and IEND's well-known CRC.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    }
+
+    #[test]
+    fn add_at_keeps_first_seen_order_both_ways() {
+        let names = |log: &Log| -> Vec<(String, usize)> {
+            log.removed
+                .iter()
+                .map(|r| (r.name.clone(), r.count))
+                .collect()
+        };
+        // Logged after `at`: merged into the entry, which moves to `at`.
+        let mut log = Log::default();
+        log.add("XMP", 10);
+        log.add("APP1 Exif", 20);
+        log.add_at(0, "APP1 Exif", 36);
+        assert_eq!(names(&log), [("APP1 Exif".into(), 2), ("XMP".into(), 1)]);
+        assert_eq!(log.removed[0].bytes, 56);
+        // Logged before `at` (an earlier `Exif\0\xFF` APP1 carries the
+        // name too): it was seen first, so it stays put and counts it.
+        let mut log = Log::default();
+        log.add("APP1 Exif", 20);
+        log.add("XMP", 10);
+        log.add_at(1, "APP1 Exif", 36);
+        assert_eq!(names(&log), [("APP1 Exif".into(), 2), ("XMP".into(), 1)]);
+        // The index still finds every entry where it now is.
+        log.add("XMP", 1);
+        assert_eq!(log.removed[1].count, 2);
     }
 
     #[test]

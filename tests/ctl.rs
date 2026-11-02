@@ -1740,3 +1740,185 @@ fn strip_fails_when_pixels_cannot_be_compared() {
         assert!(why.contains("OXIMG_MAX_SRC_PIXELS"), "{name}: {v}");
     }
 }
+/// `photo.jpg` (200x150, 4:2:0) tagged with EXIF orientation `o`.
+fn photo_with_orientation(o: u16) -> Vec<u8> {
+    let src = std::fs::read(fixture("photo.jpg")).unwrap();
+    let app1 = common::app1_orientation(o);
+    let mut b = src[..2].to_vec();
+    b.extend_from_slice(&[0xFF, 0xE1]);
+    b.extend_from_slice(&(app1.len() as u16 + 2).to_be_bytes());
+    b.extend_from_slice(&app1);
+    b.extend_from_slice(&src[2..]);
+    b
+}
+
+/// #163: `strip --auto-rotate` turns a JPEG upright when the transform
+/// moves only whole blocks (a transpose always does), proved lossless
+/// by the inverse round trip and correct against the input as
+/// displayed; a quarter turn would move photo.jpg's 150-px edge, which
+/// is not whole 16-px blocks, so it keeps its tag and says why.
+#[test]
+fn strip_auto_rotate_proves_a_lossless_turn() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-rotate-{}.jpg", std::process::id()));
+    let p = path.to_str().unwrap();
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&["strip", p, "--auto-rotate"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["not_rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], Value::Null, "{v}");
+    assert_eq!(v["rotation"]["round_trip_identical"], true, "{v}");
+    assert!(
+        v["rotation"]["max_diff_displayed"].as_u64() <= Some(3),
+        "{v}"
+    );
+    assert_eq!(v["pixels_identical"], Value::Null, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
+    let probe = &v["probe"];
+    assert_eq!(
+        (&probe["width"], &probe["height"], &probe["orientation"]),
+        (&150.into(), &200.into(), &1.into()),
+        "{v}"
+    );
+    assert_eq!(v["removed"][0]["name"], "APP1 Exif", "{v}");
+
+    std::fs::write(&path, photo_with_orientation(6)).unwrap();
+    let (code, v) = run(&["strip", p, "--auto-rotate"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], 6, "{v}");
+    assert_eq!(v["pixels_identical"], true, "{v}");
+    let why = v["not_rotated"].as_str().unwrap_or_default();
+    assert!(why.contains("200x150") && why.contains("16x16"), "{v}");
+}
+
+/// PR #167 review: a pixel limit from `--env` reaches the child and
+/// ctl's library alike. The child keeps the tag; the library's
+/// reference strip, under the same limit, gives the same reason, and
+/// the output matches it. ctl cannot decode the pixels under that limit
+/// either, so the proof fails, as it does without `--auto-rotate`
+/// (`strip_fails_when_pixels_cannot_be_compared`).
+#[test]
+fn strip_auto_rotate_refuses_under_the_childs_limit() {
+    let path =
+        std::env::temp_dir().join(format!("oximg-ctl-rotate-env-{}.jpg", std::process::id()));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_MAX_SRC_PIXELS=1000",
+        "strip",
+        path.to_str().unwrap(),
+        "--auto-rotate",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(
+        v["error"], "pixels could not be decoded for comparison",
+        "{v}"
+    );
+    assert_eq!(v["rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], 5, "{v}");
+    assert_eq!(v["rotation"], Value::Null, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
+    assert_eq!(
+        v["not_rotated"], "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)",
+        "{v}"
+    );
+}
+
+/// PR #167 review: the other direction. ctl inherits a limit the
+/// child's `--env` raises; the child rotates, and ctl's own checks
+/// (the inverse round trip, the pixel decodes) run under the child's
+/// limit too instead of failing a valid output.
+#[test]
+fn strip_auto_rotate_checks_under_the_childs_limits() {
+    let path = std::env::temp_dir().join(format!(
+        "oximg-ctl-rotate-raised-{}.jpg",
+        std::process::id()
+    ));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let output = ctl()
+        .env("OXIMG_MAX_SRC_PIXELS", "1000")
+        .args([
+            "--env",
+            "OXIMG_MAX_SRC_PIXELS=30000",
+            "strip",
+            path.to_str().unwrap(),
+            "--auto-rotate",
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["rotation"]["round_trip_identical"], true, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
+}
+/// PR #167 review: the reference is the library's strip under the flag
+/// asked for, so an `oximg` that drops `--auto-rotate` (here a wrapper
+/// that runs a plain strip) fails the proof instead of passing as a
+/// refusal.
+#[cfg(unix)]
+#[test]
+fn strip_auto_rotate_fails_a_missed_rotation() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-missed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wrapper = dir.join("oximg");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' strip \"$2\" \"$3\"\n",
+            env!("CARGO_BIN_EXE_oximg")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let src = dir.join("in.jpg");
+    std::fs::write(&src, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&[
+        "--bin",
+        wrapper.to_str().unwrap(),
+        "strip",
+        src.to_str().unwrap(),
+        "--auto-rotate",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["matches_library"], false, "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["orientation"], 5, "{v}");
+}
+/// PR #167 review: `--env` is for the child. Applying its knobs to
+/// ctl's own checks must not let `--env OXIMG_BIN` choose the
+/// executable ctl runs.
+#[test]
+fn strip_env_does_not_pick_the_executable() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-env-bin-{}.jpg", std::process::id()));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    // Not `ctl()`: its explicit `--bin` would win over any OXIMG_BIN.
+    // ctl's own environment names the real executable; only `--env`
+    // could redirect it.
+    let oximg = std::path::Path::new(env!("CARGO_BIN_EXE_oximg"));
+    let output = Command::new(oximg.with_file_name(if cfg!(windows) {
+        "oximg-ctl.exe"
+    } else {
+        "oximg-ctl"
+    }))
+    .env("OXIMG_BIN", oximg)
+    .args([
+        "--env",
+        "OXIMG_BIN=/nonexistent/oximg",
+        "strip",
+        path.to_str().unwrap(),
+        "--auto-rotate",
+    ])
+    .output()
+    .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+}

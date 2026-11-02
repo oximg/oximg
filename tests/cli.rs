@@ -877,3 +877,135 @@ fn resize_auto_rotate_flags_override_the_knob() {
     }
     std::fs::remove_file(&src).ok();
 }
+/// #163: `oximg strip --auto-rotate` says what it did with a rotated
+/// JPEG: turned upright (a transpose of photo.jpg moves whole blocks
+/// only), or kept the tag, with the reason (a quarter turn would move
+/// its 150-px edge, not whole 16-px blocks).
+#[test]
+fn strip_auto_rotate_says_what_it_did() {
+    let photo = std::fs::read(fixture("photo.jpg")).unwrap();
+    let app1 = |o: u16| {
+        let body = common::app1_orientation(o);
+        [
+            &[0xFF, 0xE1][..],
+            &(body.len() as u16 + 2).to_be_bytes(),
+            &body,
+        ]
+        .concat()
+    };
+    for (o, says) in [
+        (5, "; rotated orientation 5 upright)".to_string()),
+        (
+            6,
+            "; kept orientation 6, not rotated: 200x150 does not divide into whole \
+             16x16 blocks on the edge orientation 6 moves)"
+                .to_string(),
+        ),
+    ] {
+        let src = tmp(&format!("strip-rotate-src-{o}.jpg"));
+        let out = tmp(&format!("strip-rotate-out-{o}.jpg"));
+        std::fs::write(&src, [&photo[..2], &app1(o), &photo[2..]].concat()).unwrap();
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "o={o}: {stderr}");
+        assert!(stderr.trim_end().ends_with(&says), "o={o}: {stderr}");
+        let (w, h) = common::dims_of(&std::fs::read(&out).unwrap());
+        assert_eq!(
+            (w, h),
+            if o == 5 { (150, 200) } else { (200, 150) },
+            "o={o}"
+        );
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&out).ok();
+    }
+}
+
+/// PR #167 review: the rotation realizes the whole coefficient set (and
+/// a workspace copy), so OXIMG_MAX_DECODED_BYTES bounds it like a
+/// decode. Over the cap the strip still succeeds, tag kept, and says
+/// so. A 512x512 4:2:0 transpose needs about 1.6 MB of coefficients
+/// (6144 blocks of 128 bytes, twice), over the knob's 1 MiB minimum.
+#[test]
+fn strip_auto_rotate_honors_the_decoded_bytes_cap() {
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_size(512, 512);
+    comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2));
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_marker(mozjpeg::Marker::APP(1), &common::app1_orientation(5));
+    started
+        .write_scanlines(&common::corner_base(512, 512, 128))
+        .unwrap();
+    let src = tmp("strip-rotate-cap-src.jpg");
+    let out = tmp("strip-rotate-cap-out.jpg");
+    std::fs::write(&src, started.finish().unwrap()).unwrap();
+    for (cap, rotates) in [("1048576", false), ("4194304", true)] {
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .env("OXIMG_MAX_DECODED_BYTES", cap)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "cap {cap}: {stderr}");
+        assert_eq!(
+            stderr.contains("rotated orientation 5 upright"),
+            rotates,
+            "{stderr}"
+        );
+        if !rotates {
+            assert!(
+                stderr.contains("over the OXIMG_MAX_DECODED_BYTES limit"),
+                "{stderr}"
+            );
+        }
+    }
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&out).ok();
+}
+/// PR #167 review: the cap also counts what the strip holds while it
+/// rotates, the source and the stripped copy's allocation, not only the
+/// stripped JPEG. photo.jpg's transpose fits 1 MiB on its own; with
+/// 1.5 MB of trailing bytes (dropped by the strip, but held) it does not.
+#[test]
+fn strip_auto_rotate_counts_the_held_source_against_the_cap() {
+    let photo = std::fs::read(fixture("photo.jpg")).unwrap();
+    let body = common::app1_orientation(5);
+    let app1 = [
+        &[0xFF, 0xE1][..],
+        &(body.len() as u16 + 2).to_be_bytes(),
+        &body,
+    ]
+    .concat();
+    let tagged = [&photo[..2], &app1, &photo[2..]].concat();
+    let heavy = [&tagged[..], &vec![0x5Au8; 1_500_000]].concat();
+    let out = tmp("strip-rotate-held-out.jpg");
+    for (name, bytes, rotates) in [("plain", &tagged, true), ("heavy", &heavy, false)] {
+        let src = tmp(&format!("strip-rotate-held-{name}.jpg"));
+        std::fs::write(&src, bytes).unwrap();
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .env("OXIMG_MAX_DECODED_BYTES", "1048576")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert_eq!(
+            stderr.contains("rotated orientation 5 upright"),
+            rotates,
+            "{name}: {stderr}"
+        );
+        std::fs::remove_file(&src).ok();
+    }
+    std::fs::remove_file(&out).ok();
+}
