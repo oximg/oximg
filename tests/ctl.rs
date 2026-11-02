@@ -1898,14 +1898,27 @@ fn strip_auto_rotate_fails_a_missed_rotation() {
 fn strip_env_does_not_pick_the_executable() {
     let path = std::env::temp_dir().join(format!("oximg-ctl-env-bin-{}.jpg", std::process::id()));
     std::fs::write(&path, photo_with_orientation(5)).unwrap();
-    let (code, v) = run(&[
+    // Not `ctl()`: its explicit `--bin` would win over any OXIMG_BIN.
+    // ctl's own environment names the real executable; only `--env`
+    // could redirect it.
+    let oximg = std::path::Path::new(env!("CARGO_BIN_EXE_oximg"));
+    let output = Command::new(oximg.with_file_name(if cfg!(windows) {
+        "oximg-ctl.exe"
+    } else {
+        "oximg-ctl"
+    }))
+    .env("OXIMG_BIN", oximg)
+    .args([
         "--env",
         "OXIMG_BIN=/nonexistent/oximg",
         "strip",
         path.to_str().unwrap(),
         "--auto-rotate",
-    ]);
+    ])
+    .output()
+    .unwrap();
     let _ = std::fs::remove_file(&path);
-    assert_eq!(code, 0, "{v}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
     assert_eq!(v["rotated"], 5, "{v}");
 }
