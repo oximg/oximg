@@ -206,8 +206,9 @@ impl Log {
 
     /// [`add`](Self::add), for a block met at position `at` of the walk
     /// but known to go only after it: the entry lands at `at` in
-    /// first-seen order. A later block of the same name logged since is
-    /// merged into it there.
+    /// first-seen order. An entry of the same name logged before `at`
+    /// was seen first and just counts it; one logged since is merged
+    /// into it at `at`.
     fn add_at(&mut self, at: usize, name: &str, bytes: usize) {
         let mut entry = Removed {
             name: name.to_string(),
@@ -215,6 +216,12 @@ impl Log {
             bytes,
         };
         if let Some(i) = self.index.get(name).copied() {
+            if i < at {
+                let r = &mut self.removed[i];
+                r.count += 1;
+                r.bytes += bytes;
+                return;
+            }
             let later = self.removed.remove(i);
             entry.count += later.count;
             entry.bytes += later.bytes;
@@ -675,6 +682,33 @@ mod tests {
         // The CRC-32/ISO-HDLC check value, and IEND's well-known CRC.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    }
+
+    #[test]
+    fn add_at_keeps_first_seen_order_both_ways() {
+        let names = |log: &Log| -> Vec<(String, usize)> {
+            log.removed
+                .iter()
+                .map(|r| (r.name.clone(), r.count))
+                .collect()
+        };
+        // Logged after `at`: merged into the entry, which moves to `at`.
+        let mut log = Log::default();
+        log.add("XMP", 10);
+        log.add("APP1 Exif", 20);
+        log.add_at(0, "APP1 Exif", 36);
+        assert_eq!(names(&log), [("APP1 Exif".into(), 2), ("XMP".into(), 1)]);
+        assert_eq!(log.removed[0].bytes, 56);
+        // Logged before `at` (an earlier `Exif\0\xFF` APP1 carries the
+        // name too): it was seen first, so it stays put and counts it.
+        let mut log = Log::default();
+        log.add("APP1 Exif", 20);
+        log.add("XMP", 10);
+        log.add_at(1, "APP1 Exif", 36);
+        assert_eq!(names(&log), [("APP1 Exif".into(), 2), ("XMP".into(), 1)]);
+        // The index still finds every entry where it now is.
+        log.add("XMP", 1);
+        assert_eq!(log.removed[1].count, 2);
     }
 
     #[test]
