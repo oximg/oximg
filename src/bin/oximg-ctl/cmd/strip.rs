@@ -303,10 +303,11 @@ fn rotation_proof(src: &[u8], out: &[u8], o: u8, keep_icc: bool) -> Rotation {
 
 /// The reason in the child's summary, `...; kept orientation 6, not
 /// rotated: <why>)`: the child's own words, since its environment
-/// decided.
+/// decided. The last delimiter: the output path printed before it may
+/// contain the same text.
 fn child_not_rotated(stderr: &str) -> String {
     stderr
-        .split_once(", not rotated: ")
+        .rsplit_once(", not rotated: ")
         .map(|(_, why)| {
             // The summary's own closing parenthesis, once: the reason
             // may end in one of its own.
@@ -469,6 +470,20 @@ mod tests {
     fn pixels_see_the_low_byte_of_a_16_bit_png() {
         assert_eq!(pixels(&gray16(0x1234)), pixels(&gray16(0x1234)));
         assert_ne!(pixels(&gray16(0x1234)), pixels(&gray16(0x1235)));
+    }
+
+    /// PR #167 review: the output path comes first in the summary and
+    /// may contain the delimiter; the reason ends in its own ')'.
+    #[test]
+    fn the_refusal_reason_is_the_last_one_in_the_summary() {
+        let stderr = "oximg: wrote /tmp/a, not rotated: b.jpg (7075 bytes, image/jpeg; \
+                      kept orientation 5, not rotated: 200x150 is over \
+                      OXIMG_MAX_SRC_PIXELS (1000))\n";
+        assert_eq!(
+            child_not_rotated(stderr),
+            "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)"
+        );
+        assert_eq!(child_not_rotated("oximg: wrote x (1 bytes)"), "");
     }
 
     #[test]
