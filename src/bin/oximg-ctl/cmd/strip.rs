@@ -118,21 +118,13 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         )
     };
     let residue = strip_with(&bytes, false);
-    // Whether the child rotated is read from what it wrote, not from
-    // this process's library: the child's OXIMG_MAX_SRC_PIXELS (from
-    // --env) bounds its rotation, and our config may differ. A tagged
-    // source whose output carries no tag was turned upright.
-    let plain = strip_with(&src, false);
-    let source_orientation = plain.as_ref().ok().and_then(|s| s.orientation);
-    let output_tagged = residue.as_ref().map_or(true, |s| s.orientation.is_some());
-    let rotated = source_orientation.filter(|_| a.auto_rotate && !output_tagged);
-    let not_rotated = (a.auto_rotate && source_orientation.is_some() && rotated.is_none())
-        .then(|| child_not_rotated(&stderr));
-    let removed = if rotated.is_some() {
-        strip_with(&src, true)
-    } else {
-        plain
-    };
+    // The reference is the library's strip under the flag that was
+    // asked for, with the child's knobs applied above: a child that
+    // skipped a rotation it should have made, or made one it should
+    // not, differs from it and fails `matches_library`.
+    let removed = strip_with(&src, a.auto_rotate);
+    let rotated = removed.as_ref().ok().and_then(|s| s.rotated);
+    let not_rotated = removed.as_ref().ok().and_then(|s| s.not_rotated.clone());
     // Pixels, residue and frames cannot see what must be kept (the
     // orientation EXIF, the ICC profile); the library's own answer for
     // the input pins those down, byte for byte.
@@ -313,22 +305,6 @@ fn rotation_proof(src: &[u8], out: &[u8], o: u8, keep_icc: bool) -> Rotation {
     }
 }
 
-/// The reason in the child's summary, `...; kept orientation 6, not
-/// rotated: <why>)`: the child's own words, since its environment
-/// decided. The last delimiter: the output path printed before it may
-/// contain the same text.
-fn child_not_rotated(stderr: &str) -> String {
-    stderr
-        .rsplit_once(", not rotated: ")
-        .map(|(_, why)| {
-            // The summary's own closing parenthesis, once: the reason
-            // may end in one of its own.
-            let why = why.trim_end();
-            why.strip_suffix(')').unwrap_or(why).to_string()
-        })
-        .unwrap_or_default()
-}
-
 /// `jpeg` with an EXIF APP1 holding orientation `o` after the SOI.
 fn with_orientation(jpeg: &[u8], o: u8) -> Vec<u8> {
     let mut tiff = [0u8; 26];
@@ -482,20 +458,6 @@ mod tests {
     fn pixels_see_the_low_byte_of_a_16_bit_png() {
         assert_eq!(pixels(&gray16(0x1234)), pixels(&gray16(0x1234)));
         assert_ne!(pixels(&gray16(0x1234)), pixels(&gray16(0x1235)));
-    }
-
-    /// PR #167 review: the output path comes first in the summary and
-    /// may contain the delimiter; the reason ends in its own ')'.
-    #[test]
-    fn the_refusal_reason_is_the_last_one_in_the_summary() {
-        let stderr = "oximg: wrote /tmp/a, not rotated: b.jpg (7075 bytes, image/jpeg; \
-                      kept orientation 5, not rotated: 200x150 is over \
-                      OXIMG_MAX_SRC_PIXELS (1000))\n";
-        assert_eq!(
-            child_not_rotated(stderr),
-            "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)"
-        );
-        assert_eq!(child_not_rotated("oximg: wrote x (1 bytes)"), "");
     }
 
     #[test]

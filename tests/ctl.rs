@@ -1855,3 +1855,38 @@ fn strip_auto_rotate_checks_under_the_childs_limits() {
     assert_eq!(v["rotation"]["round_trip_identical"], true, "{v}");
     assert_eq!(v["matches_library"], true, "{v}");
 }
+/// PR #167 review: the reference is the library's strip under the flag
+/// asked for, so an `oximg` that drops `--auto-rotate` (here a wrapper
+/// that runs a plain strip) fails the proof instead of passing as a
+/// refusal.
+#[cfg(unix)]
+#[test]
+fn strip_auto_rotate_fails_a_missed_rotation() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-missed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wrapper = dir.join("oximg");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec '{}' strip \"$2\" \"$3\"\n",
+            env!("CARGO_BIN_EXE_oximg")
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let src = dir.join("in.jpg");
+    std::fs::write(&src, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&[
+        "--bin",
+        wrapper.to_str().unwrap(),
+        "strip",
+        src.to_str().unwrap(),
+        "--auto-rotate",
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["matches_library"], false, "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["orientation"], 5, "{v}");
+}
