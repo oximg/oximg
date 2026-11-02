@@ -781,6 +781,37 @@ fn auto_rotate_reports_the_dropped_orientation_block() {
     assert_eq!(out.rotated, Some(8));
     assert_eq!(removed_names(&out), ["APP1 Exif"]);
     assert_eq!(out.removed[0].bytes, 36);
+
+    // PR #167 review: first-seen order holds. The minimal block comes
+    // before an XMP and a second Exif segment; it is reported first, and
+    // the later Exif is counted with it rather than ahead of the XMP.
+    let segment = |body: &[u8]| {
+        [
+            &[0xFF, 0xE1][..],
+            &(body.len() as u16 + 2).to_be_bytes(),
+            body,
+        ]
+        .concat()
+    };
+    // The minimal APP1: marker and length, then `Exif\0\0` and its
+    // 26-byte TIFF; 36 bytes from its marker.
+    let payload = plain
+        .bytes
+        .windows(6)
+        .position(|w| w == b"Exif\0\0")
+        .unwrap();
+    let minimal_end = payload - 4 + 36;
+    let later = [segment(XMP), segment(&exif_app1(3))].concat();
+    let busy = [
+        &plain.bytes[..minimal_end],
+        &later,
+        &plain.bytes[minimal_end..],
+    ]
+    .concat();
+    let out = pipeline::strip(&busy, &rotate(true)).unwrap();
+    assert_eq!(out.rotated, Some(8));
+    assert_eq!(removed_names(&out), ["APP1 Exif", "XMP"]);
+    assert_eq!(out.removed[0].count, 2);
 }
 
 /// Rotation must be exact or not happen: libjpeg would "repair" a

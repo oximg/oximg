@@ -118,9 +118,10 @@ fn strip_inner(bytes: &[u8], keep_icc: bool, auto_rotate: bool) -> Result<Stripp
                 match jpeg_rotate::rotate(&out, o, &coded.coding, &limits) {
                     jpeg_rotate::Rotation::Rotated(upright) => {
                         // The written-back tag goes too; a source whose
-                        // EXIF was already just that tag only now loses it.
-                        if coded.exif_was_minimal {
-                            log.add("APP1 Exif", MINIMAL_EXIF_APP1);
+                        // EXIF was already just that tag only now loses
+                        // it, logged where the walk met it.
+                        if let Some(at) = coded.minimal_exif_at {
+                            log.add_at(at, "APP1 Exif", MINIMAL_EXIF_APP1);
                         }
                         out = upright;
                         rotated = Some(o.value());
@@ -169,8 +170,10 @@ const MINIMAL_EXIF_APP1: usize = 2 + 2 + 6 + 26;
 struct JpegCoded {
     coding: jpeg_rotate::Coding,
     /// The source's first EXIF was exactly the minimal orientation
-    /// block, so it was copied through rather than logged as removed.
-    exif_was_minimal: bool,
+    /// block, so it was copied through rather than logged as removed:
+    /// the log's length when the walk met it, which is where it goes in
+    /// first-seen order if a rotation drops it after all.
+    minimal_exif_at: Option<usize>,
 }
 
 /// Removals aggregated by name in first-seen order. PNG chunk types and
@@ -200,6 +203,31 @@ impl Log {
             }
         }
     }
+
+    /// [`add`](Self::add), for a block met at position `at` of the walk
+    /// but known to go only after it: the entry lands at `at` in
+    /// first-seen order. A later block of the same name logged since is
+    /// merged into it there.
+    fn add_at(&mut self, at: usize, name: &str, bytes: usize) {
+        let mut entry = Removed {
+            name: name.to_string(),
+            count: 1,
+            bytes,
+        };
+        if let Some(i) = self.index.get(name).copied() {
+            let later = self.removed.remove(i);
+            entry.count += later.count;
+            entry.bytes += later.bytes;
+        }
+        let at = at.min(self.removed.len());
+        self.removed.insert(at, entry);
+        self.index = self
+            .removed
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.name.clone(), i))
+            .collect();
+    }
 }
 
 /// Walk every marker segment of the JPEG, between scans too (APPn and
@@ -228,7 +256,7 @@ fn strip_jpeg(
             progressive: false,
             jfif: false,
         },
-        exif_was_minimal: false,
+        minimal_exif_at: None,
     };
     loop {
         ensure!(i < b.len(), "truncated JPEG header at offset {i}");
@@ -292,7 +320,7 @@ fn strip_jpeg(
                     if !orientation.is_upright() {
                         let tiff = orientation.minimal_exif_tiff();
                         rewrote = body.strip_prefix(b"Exif\0\0") == Some(&tiff[..]);
-                        coded.exif_was_minimal = rewrote;
+                        coded.minimal_exif_at = rewrote.then_some(log.removed.len());
                         out.extend_from_slice(&[0xFF, 0xE1]);
                         out.extend_from_slice(&(2 + 6 + tiff.len() as u16).to_be_bytes());
                         out.extend_from_slice(b"Exif\0\0");
