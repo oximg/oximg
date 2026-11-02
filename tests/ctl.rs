@@ -1891,3 +1891,21 @@ fn strip_auto_rotate_fails_a_missed_rotation() {
     assert_eq!(v["rotated"], 5, "{v}");
     assert_eq!(v["orientation"], 5, "{v}");
 }
+/// PR #167 review: `--env` is for the child. Applying its knobs to
+/// ctl's own checks must not let `--env OXIMG_BIN` choose the
+/// executable ctl runs.
+#[test]
+fn strip_env_does_not_pick_the_executable() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-env-bin-{}.jpg", std::process::id()));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&[
+        "--env",
+        "OXIMG_BIN=/nonexistent/oximg",
+        "strip",
+        path.to_str().unwrap(),
+        "--auto-rotate",
+    ]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+}
