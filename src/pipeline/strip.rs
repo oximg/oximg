@@ -111,8 +111,11 @@ fn strip_inner(bytes: &[u8], keep_icc: bool, auto_rotate: bool) -> Result<Stripp
         Some(ImageFormat::Jpeg) => {
             let (mut out, mut o, coded) = strip_jpeg(bytes, keep_icc, &mut log)?;
             if auto_rotate && !o.is_upright() {
-                let max = crate::config::config().max_src_pixels;
-                match jpeg_rotate::rotate(&out, o, &coded.coding, max) {
+                let limits = jpeg_rotate::Limits {
+                    max_pixels: crate::config::config().max_src_pixels,
+                    held_bytes: (bytes.len() + out.capacity()) as u64,
+                };
+                match jpeg_rotate::rotate(&out, o, &coded.coding, &limits) {
                     jpeg_rotate::Rotation::Rotated(upright) => {
                         // The written-back tag goes too; a source whose
                         // EXIF was already just that tag only now loses it.

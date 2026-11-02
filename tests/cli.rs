@@ -970,3 +970,42 @@ fn strip_auto_rotate_honors_the_decoded_bytes_cap() {
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&out).ok();
 }
+/// PR #167 review: the cap also counts what the strip holds while it
+/// rotates, the source and the stripped copy's allocation, not only the
+/// stripped JPEG. photo.jpg's transpose fits 1 MiB on its own; with
+/// 1.5 MB of trailing bytes (dropped by the strip, but held) it does not.
+#[test]
+fn strip_auto_rotate_counts_the_held_source_against_the_cap() {
+    let photo = std::fs::read(fixture("photo.jpg")).unwrap();
+    let body = common::app1_orientation(5);
+    let app1 = [
+        &[0xFF, 0xE1][..],
+        &(body.len() as u16 + 2).to_be_bytes(),
+        &body,
+    ]
+    .concat();
+    let tagged = [&photo[..2], &app1, &photo[2..]].concat();
+    let heavy = [&tagged[..], &vec![0x5Au8; 1_500_000]].concat();
+    let out = tmp("strip-rotate-held-out.jpg");
+    for (name, bytes, rotates) in [("plain", &tagged, true), ("heavy", &heavy, false)] {
+        let src = tmp(&format!("strip-rotate-held-{name}.jpg"));
+        std::fs::write(&src, bytes).unwrap();
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .env("OXIMG_MAX_DECODED_BYTES", "1048576")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert_eq!(
+            stderr.contains("rotated orientation 5 upright"),
+            rotates,
+            "{name}: {stderr}"
+        );
+        std::fs::remove_file(&src).ok();
+    }
+    std::fs::remove_file(&out).ok();
+}
