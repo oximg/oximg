@@ -55,7 +55,9 @@ PNG at its native bit depth),
 else null), `peak_rss_bytes` (O(file size)). `ok` is false unless the
 residue is empty, both sides decode, pixels and frames match, the
 orientation survives, and the output matches the library's. The
-input is read before the child runs, so `--out` may be the input. A CMYK JPEG
+input is read before the child runs, so `--out` may be the input.
+`--env OXIMG_*` knobs reach ctl's own library checks as well as the
+child, so a limit decides both sides alike. A CMYK JPEG
 with `--icc strip` exits 1 (refused, never written).
 
 With `--auto-rotate`, `rotated` is the orientation applied to a JPEG's

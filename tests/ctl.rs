@@ -1794,9 +1794,10 @@ fn strip_auto_rotate_proves_a_lossless_turn() {
 }
 
 /// PR #167 review: whether the child rotated is read from its output,
-/// not from ctl's own config. A pixel limit given only to the child
-/// (`--env`) keeps the tag there, and ctl reports that, with the
-/// child's reason, rather than the rotation its own library would do.
+/// with the child's own reason. A pixel limit from `--env` keeps the
+/// tag there; ctl applies the same limit to its own checks, so it
+/// cannot decode the pixels either and fails the proof, as it does
+/// without `--auto-rotate` (`strip_fails_when_pixels_cannot_be_compared`).
 #[test]
 fn strip_auto_rotate_reports_what_the_child_did() {
     let path =
@@ -1810,14 +1811,47 @@ fn strip_auto_rotate_reports_what_the_child_did() {
         "--auto-rotate",
     ]);
     let _ = std::fs::remove_file(&path);
-    assert_eq!(code, 0, "{v}");
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(
+        v["error"], "pixels could not be decoded for comparison",
+        "{v}"
+    );
     assert_eq!(v["rotated"], Value::Null, "{v}");
     assert_eq!(v["orientation"], 5, "{v}");
     assert_eq!(v["rotation"], Value::Null, "{v}");
-    assert_eq!(v["pixels_identical"], true, "{v}");
     assert_eq!(v["matches_library"], true, "{v}");
     assert_eq!(
         v["not_rotated"], "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)",
         "{v}"
     );
+}
+
+/// PR #167 review: the other direction. ctl inherits a limit the
+/// child's `--env` raises; the child rotates, and ctl's own checks
+/// (the inverse round trip, the pixel decodes) run under the child's
+/// limit too instead of failing a valid output.
+#[test]
+fn strip_auto_rotate_checks_under_the_childs_limits() {
+    let path = std::env::temp_dir().join(format!(
+        "oximg-ctl-rotate-raised-{}.jpg",
+        std::process::id()
+    ));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let output = ctl()
+        .env("OXIMG_MAX_SRC_PIXELS", "1000")
+        .args([
+            "--env",
+            "OXIMG_MAX_SRC_PIXELS=30000",
+            "strip",
+            path.to_str().unwrap(),
+            "--auto-rotate",
+        ])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["rotation"]["round_trip_identical"], true, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
 }

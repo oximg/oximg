@@ -15,6 +15,18 @@ use std::process::Command;
 use std::time::Instant;
 
 pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
+    // The cross-checks below run the library in this process; they must
+    // see the knobs the child was given (`--env`), not only the ones
+    // inherited: a pixel or decoded-bytes limit decides whether strip
+    // rotates, and whether the pixels can be decoded at all. The
+    // library reads its config once, on first use, which is after this.
+    for (k, v) in &opts.env {
+        if k.starts_with("OXIMG_") {
+            // SAFETY: ctl is single-threaded until the child is spawned
+            // below, so nothing reads the environment concurrently.
+            unsafe { std::env::set_var(k, v) };
+        }
+    }
     let bin = resolve_bin(opts.bin.as_deref())?;
     let ephemeral = a.out.is_none();
     let out_path: PathBuf = a.out.clone().unwrap_or_else(|| {
