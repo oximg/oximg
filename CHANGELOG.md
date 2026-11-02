@@ -46,7 +46,8 @@ HTTP interface without notice.
   reader. Only possible when the edges the transform moves are whole
   iMCUs (8 or 16 px by chroma subsampling; a phone's 4032x3024 is):
   otherwise, for a JPEG libjpeg reads only with warnings (truncated,
-  corrupt) and for PNG and WebP, the file is stripped exactly as
+  corrupt), one whose coefficients would exceed `OXIMG_MAX_SRC_PIXELS`
+  or `OXIMG_MAX_DECODED_BYTES`, and for PNG and WebP, the file is stripped exactly as
   without the flag, orientation kept. The entropy data is re-coded
   (optimized Huffman, baseline or progressive as the source was), so it
   costs a full entropy decode and encode: 4032x3024 Q92, 5.3 MB: 168 ms

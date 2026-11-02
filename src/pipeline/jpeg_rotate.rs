@@ -156,6 +156,33 @@ impl Dest {
     }
 }
 
+/// The coefficient memory rotating by `o` realizes: each component's
+/// virtual block array (128 bytes a block, padded to its sampling
+/// factors as `jpeg_read_coefficients` allocates it), twice over
+/// unless the transform is a horizontal flip, the one transupp does in
+/// place (`jtransform_request_workspace`).
+fn coefficient_bytes(cinfo: &ffi::jpeg_decompress_struct, o: Orientation) -> u64 {
+    let comps = usize::try_from(cinfo.num_components).unwrap_or(0);
+    let mut bytes = 0u64;
+    for i in 0..comps {
+        // SAFETY: jpeg_read_header filled comp_info with num_components
+        // entries.
+        let c = unsafe { &*cinfo.comp_info.add(i) };
+        let round = |n: ffi::JDIMENSION, to: std::os::raw::c_int| {
+            let to = u64::try_from(to.max(1)).unwrap_or(1);
+            u64::from(n).div_ceil(to) * to
+        };
+        let blocks = round(c.width_in_blocks, c.h_samp_factor)
+            .saturating_mul(round(c.height_in_blocks, c.v_samp_factor));
+        bytes = bytes.saturating_add(blocks.saturating_mul(mem::size_of::<ffi::JBLOCK>() as u64));
+    }
+    if o.value() == 2 {
+        bytes
+    } else {
+        bytes.saturating_mul(2)
+    }
+}
+
 unsafe fn rotate_unguarded(
     jpeg: &[u8],
     o: Orientation,
@@ -185,6 +212,17 @@ unsafe fn rotate_unguarded(
         return Rotation::Kept(format!(
             "{w}x{h} is over OXIMG_MAX_SRC_PIXELS ({max_pixels})"
         ));
+    }
+    // OXIMG_MAX_DECODED_BYTES bounds this as it bounds a decode: the
+    // coefficients are realized whole when they are read.
+    let cost = super::DecodeCost {
+        whole_source_bytes: coefficient_bytes(&d.cinfo, o),
+        // The caller's source, the strip's copy of it, and the output.
+        compressed_bytes: 3 * jpeg.len() as u64,
+        ..Default::default()
+    };
+    if let Err(e) = super::check_decoded_bytes(cost, "JPEG rotation") {
+        return Rotation::Kept(e.to_string());
     }
     // SAFETY: plain C data; zero is "no crop, no trim, all components".
     let mut info: ffi::jpeg_transform_info = unsafe { mem::zeroed() };

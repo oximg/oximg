@@ -925,3 +925,48 @@ fn strip_auto_rotate_says_what_it_did() {
         std::fs::remove_file(&out).ok();
     }
 }
+
+/// PR #167 review: the rotation realizes the whole coefficient set (and
+/// a workspace copy), so OXIMG_MAX_DECODED_BYTES bounds it like a
+/// decode. Over the cap the strip still succeeds, tag kept, and says
+/// so. A 512x512 4:2:0 transpose needs about 1.6 MB of coefficients
+/// (6144 blocks of 128 bytes, twice), over the knob's 1 MiB minimum.
+#[test]
+fn strip_auto_rotate_honors_the_decoded_bytes_cap() {
+    let mut comp = mozjpeg::Compress::new(mozjpeg::ColorSpace::JCS_RGB);
+    comp.set_size(512, 512);
+    comp.set_chroma_sampling_pixel_sizes((2, 2), (2, 2));
+    let mut started = comp.start_compress(Vec::new()).unwrap();
+    started.write_marker(mozjpeg::Marker::APP(1), &common::app1_orientation(5));
+    started
+        .write_scanlines(&common::corner_base(512, 512, 128))
+        .unwrap();
+    let src = tmp("strip-rotate-cap-src.jpg");
+    let out = tmp("strip-rotate-cap-out.jpg");
+    std::fs::write(&src, started.finish().unwrap()).unwrap();
+    for (cap, rotates) in [("1048576", false), ("4194304", true)] {
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .env("OXIMG_MAX_DECODED_BYTES", cap)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "cap {cap}: {stderr}");
+        assert_eq!(
+            stderr.contains("rotated orientation 5 upright"),
+            rotates,
+            "{stderr}"
+        );
+        if !rotates {
+            assert!(
+                stderr.contains("over the OXIMG_MAX_DECODED_BYTES limit"),
+                "{stderr}"
+            );
+        }
+    }
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&out).ok();
+}

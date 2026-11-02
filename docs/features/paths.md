@@ -61,7 +61,9 @@ with `--icc strip` exits 1 (refused, never written).
 With `--auto-rotate`, `rotated` is the orientation applied to a JPEG's
 DCT blocks (2-8, else null) and `not_rotated` why a rotated source was
 left tagged (an edge that is not whole 8/16-px blocks, a corrupt
-stream, PNG/WebP, over `OXIMG_MAX_SRC_PIXELS`); the file is then
+stream, PNG/WebP, over `OXIMG_MAX_SRC_PIXELS`, or over
+`OXIMG_MAX_DECODED_BYTES`: the coefficients, twice for every turn but
+a horizontal flip, plus the compressed input, copy and output); the file is then
 exactly the plain strip. A rotated output cannot match the stored
 pixels, so `pixels_identical` is null and `rotation` proves it:
 `round_trip_identical` (the output tagged with the inverse orientation
