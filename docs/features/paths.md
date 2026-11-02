@@ -60,9 +60,12 @@ input is read before the child runs, so `--out` may be the input.
 child, so a limit decides both sides alike. A CMYK JPEG
 with `--icc strip` exits 1 (refused, never written).
 
-With `--auto-rotate`, `rotated` is the orientation applied to a JPEG's
-DCT blocks (2-8, else null) and `not_rotated` why a rotated source was
-left tagged (an edge that is not whole 8/16-px blocks, a corrupt
+With `--auto-rotate`, `rotated` and `not_rotated` are the library's
+answer for the input under the same knobs, the reference the output
+must match (`matches_library`); `orientation` is what the output
+actually carries. `rotated` is the orientation the strip applies to a
+JPEG's DCT blocks (2-8, else null), and `not_rotated` why a rotated
+source is left tagged (an edge that is not whole 8/16-px blocks, a corrupt
 stream, PNG/WebP, over `OXIMG_MAX_SRC_PIXELS`, or over
 `OXIMG_MAX_DECODED_BYTES`: the coefficients, twice for every turn but
 a horizontal flip, plus the compressed input, copy and output); the file is then

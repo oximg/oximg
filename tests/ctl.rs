@@ -1793,13 +1793,14 @@ fn strip_auto_rotate_proves_a_lossless_turn() {
     assert!(why.contains("200x150") && why.contains("16x16"), "{v}");
 }
 
-/// PR #167 review: whether the child rotated is read from its output,
-/// with the child's own reason. A pixel limit from `--env` keeps the
-/// tag there; ctl applies the same limit to its own checks, so it
-/// cannot decode the pixels either and fails the proof, as it does
-/// without `--auto-rotate` (`strip_fails_when_pixels_cannot_be_compared`).
+/// PR #167 review: a pixel limit from `--env` reaches the child and
+/// ctl's library alike. The child keeps the tag; the library's
+/// reference strip, under the same limit, gives the same reason, and
+/// the output matches it. ctl cannot decode the pixels under that limit
+/// either, so the proof fails, as it does without `--auto-rotate`
+/// (`strip_fails_when_pixels_cannot_be_compared`).
 #[test]
-fn strip_auto_rotate_reports_what_the_child_did() {
+fn strip_auto_rotate_refuses_under_the_childs_limit() {
     let path =
         std::env::temp_dir().join(format!("oximg-ctl-rotate-env-{}.jpg", std::process::id()));
     std::fs::write(&path, photo_with_orientation(5)).unwrap();
