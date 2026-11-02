@@ -536,7 +536,7 @@ unsafe extern "C-unwind" fn silence_message(_cinfo: &mut ffi::jpeg_common_struct
 /// Fatal libjpeg errors unwind with the formatted message as payload.
 /// `resume_unwind` skips the panic hook; `panic_guard` catches it.
 #[cold]
-unsafe extern "C-unwind" fn error_exit(cinfo: &mut ffi::jpeg_common_struct) {
+pub(super) unsafe extern "C-unwind" fn error_exit(cinfo: &mut ffi::jpeg_common_struct) {
     let mut buf = [0u8; 80];
     // SAFETY: cinfo.err is ours; format_message writes a NUL-terminated
     // message of at most JMSG_LENGTH_MAX (80) bytes into the buffer.

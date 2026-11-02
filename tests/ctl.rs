@@ -1740,3 +1740,55 @@ fn strip_fails_when_pixels_cannot_be_compared() {
         assert!(why.contains("OXIMG_MAX_SRC_PIXELS"), "{name}: {v}");
     }
 }
+/// `photo.jpg` (200x150, 4:2:0) tagged with EXIF orientation `o`.
+fn photo_with_orientation(o: u16) -> Vec<u8> {
+    let src = std::fs::read(fixture("photo.jpg")).unwrap();
+    let app1 = common::app1_orientation(o);
+    let mut b = src[..2].to_vec();
+    b.extend_from_slice(&[0xFF, 0xE1]);
+    b.extend_from_slice(&(app1.len() as u16 + 2).to_be_bytes());
+    b.extend_from_slice(&app1);
+    b.extend_from_slice(&src[2..]);
+    b
+}
+
+/// #163: `strip --auto-rotate` turns a JPEG upright when the transform
+/// moves only whole blocks (a transpose always does), proved lossless
+/// by the inverse round trip and correct against the input as
+/// displayed; a quarter turn would move photo.jpg's 150-px edge, which
+/// is not whole 16-px blocks, so it keeps its tag and says why.
+#[test]
+fn strip_auto_rotate_proves_a_lossless_turn() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-rotate-{}.jpg", std::process::id()));
+    let p = path.to_str().unwrap();
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (code, v) = run(&["strip", p, "--auto-rotate"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], 5, "{v}");
+    assert_eq!(v["not_rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], Value::Null, "{v}");
+    assert_eq!(v["rotation"]["round_trip_identical"], true, "{v}");
+    assert!(
+        v["rotation"]["max_diff_displayed"].as_u64() <= Some(3),
+        "{v}"
+    );
+    assert_eq!(v["pixels_identical"], Value::Null, "{v}");
+    assert_eq!(v["matches_library"], true, "{v}");
+    let probe = &v["probe"];
+    assert_eq!(
+        (&probe["width"], &probe["height"], &probe["orientation"]),
+        (&150.into(), &200.into(), &1.into()),
+        "{v}"
+    );
+    assert_eq!(v["removed"][0]["name"], "APP1 Exif", "{v}");
+
+    std::fs::write(&path, photo_with_orientation(6)).unwrap();
+    let (code, v) = run(&["strip", p, "--auto-rotate"]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["rotated"], Value::Null, "{v}");
+    assert_eq!(v["orientation"], 6, "{v}");
+    assert_eq!(v["pixels_identical"], true, "{v}");
+    let why = v["not_rotated"].as_str().unwrap_or_default();
+    assert!(why.contains("200x150") && why.contains("16x16"), "{v}");
+}

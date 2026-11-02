@@ -62,6 +62,8 @@ pub struct StripArgs {
     pub input: PathBuf,
     pub out: Option<PathBuf>,
     pub icc: Option<String>,
+    /// `--auto-rotate`, passed through to `oximg strip`.
+    pub auto_rotate: bool,
 }
 
 pub struct SignArgs {
@@ -298,6 +300,7 @@ fn parse_strip(args: &[String]) -> Result<StripArgs, CtlError> {
     let mut input = None;
     let mut out = None;
     let mut icc = None;
+    let mut auto_rotate = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -314,6 +317,7 @@ fn parse_strip(args: &[String]) -> Result<StripArgs, CtlError> {
                         .clone(),
                 );
             }
+            "--auto-rotate" => auto_rotate = true,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 return Err(CtlError::usage(format!("strip: unknown option {flag:?}")));
             }
@@ -322,9 +326,16 @@ fn parse_strip(args: &[String]) -> Result<StripArgs, CtlError> {
         }
     }
     let input = input.ok_or_else(|| {
-        CtlError::usage("usage: oximg-ctl strip <in> [--out PATH] [--icc keep|strip]")
+        CtlError::usage(
+            "usage: oximg-ctl strip <in> [--out PATH] [--icc keep|strip] [--auto-rotate]",
+        )
     })?;
-    Ok(StripArgs { input, out, icc })
+    Ok(StripArgs {
+        input,
+        out,
+        icc,
+        auto_rotate,
+    })
 }
 
 fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
@@ -675,6 +686,12 @@ mod tests {
             panic!("not strip")
         };
         assert_eq!(s.icc.as_deref(), Some("strip"));
+        assert!(!s.auto_rotate);
+        let (_, cmd) = parse(&["strip", "a.jpg", "--auto-rotate"]).unwrap();
+        let Cmd::Strip(s) = cmd else {
+            panic!("not strip")
+        };
+        assert!(s.auto_rotate);
     }
 
     #[test]

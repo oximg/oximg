@@ -32,7 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 mozjpeg = "0.10"
 # The libjpeg API directly for decoding (src/pipeline/jpeg_dec.rs): the
 # crate above hides the decompress struct. Same build the crate links.
-mozjpeg-sys = "2.2"
+# `jpegtran` adds the vendored transupp.c: lossless DCT-domain rotation
+# for `strip --auto-rotate` (src/pipeline/jpeg_rotate.rs).
+mozjpeg-sys = { version = "2.2", features = ["jpegtran"] }
 fast_image_resize = "5"
 anyhow = "1"
 mimalloc = { version = "0.1.52", optional = true }

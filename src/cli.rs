@@ -36,14 +36,19 @@ pub fn print_help() {
              --no-auto-rotate   Keep the stored orientation instead of\n                             \
                                 applying EXIF/irot (--auto-rotate forces\n                             \
                                 it on; default OXIMG_AUTO_ROTATE, else on)\n  \
-           oximg strip <in> <out> [--icc keep|strip]\n          \
+           oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]\n          \
              Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
              and other non-rendering metadata from a JPEG, PNG or WebP\n          \
              without re-encoding: the image data is copied byte for\n          \
              byte. A rotated photo keeps only its EXIF orientation.\n          \
              --icc keep|strip   Embedded colour profile (default keep,\n                             \
                                 or OXIMG_ICC). A CMYK JPEG's profile\n                             \
-                                is never dropped.\n  \
+                                is never dropped.\n          \
+             --auto-rotate      Turn a rotated JPEG upright losslessly\n                             \
+                                (DCT blocks moved, no re-encode) and\n                             \
+                                drop its orientation. Kept as without it\n                             \
+                                when an edge is not whole 8/16 px blocks,\n                             \
+                                and for PNG and WebP.\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \
              pixel decode), plus frame count, duration and loop count\n          \
@@ -186,7 +191,7 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `oximg strip <in> <out> [--icc keep|strip]`
+/// `oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]`
 pub fn strip(args: &[String]) -> anyhow::Result<()> {
     // OXIMG_ICC is the --icc default, so it is validated like resize's
     // knobs: a typo must not silently keep (or drop) a profile.
@@ -194,7 +199,7 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
         eprintln!("oximg: fatal: {e}");
         std::process::exit(2);
     }
-    const USAGE: &str = "usage: oximg strip <in> <out> [--icc keep|strip]";
+    const USAGE: &str = "usage: oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]";
     let mut positional: Vec<&str> = Vec::new();
     let mut params = pipeline::StripParams::default();
     let mut it = args.iter();
@@ -205,6 +210,7 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
                 return Ok(());
             }
             "--icc" => params.icc = icc_flag(&mut it),
+            "--auto-rotate" => params.auto_rotate = true,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 usage_error(&format!("unknown option {flag:?}"))
             }
@@ -235,9 +241,15 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
             names.join(", ")
         )
     };
-    let kept = match stripped.orientation {
-        Some(o) => format!("; kept orientation {o}"),
-        None => String::new(),
+    let kept = match (
+        stripped.orientation,
+        stripped.rotated,
+        &stripped.not_rotated,
+    ) {
+        (Some(o), _, Some(why)) => format!("; kept orientation {o}, not rotated: {why}"),
+        (Some(o), _, None) => format!("; kept orientation {o}"),
+        (None, Some(o), _) => format!("; rotated orientation {o} upright"),
+        (None, None, _) => String::new(),
     };
     eprintln!(
         "oximg: wrote {output} ({} bytes, {}; {removed}{kept})",

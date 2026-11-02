@@ -107,6 +107,11 @@ resize:
 strip:
   --out PATH                Output file (default: a temp file)
   --icc keep|strip          Passed through to `oximg strip`
+  --auto-rotate             Passed through: turn a rotated JPEG upright
+                            losslessly. JSON adds `rotated`, `not_rotated`
+                            and `rotation` {{orientation, round_trip_identical,
+                            max_diff_displayed}}; `pixels_identical` is null
+                            for a rotated output.
   JSON adds `removed` (what the library reports for the input),
   `orientation` (read back from the output), `matches_library` (the
   output is byte for byte the library's strip of the input), `residue` (what a second strip of the output, same ICC policy,

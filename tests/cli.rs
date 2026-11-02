@@ -877,3 +877,51 @@ fn resize_auto_rotate_flags_override_the_knob() {
     }
     std::fs::remove_file(&src).ok();
 }
+/// #163: `oximg strip --auto-rotate` says what it did with a rotated
+/// JPEG: turned upright (a transpose of photo.jpg moves whole blocks
+/// only), or kept the tag, with the reason (a quarter turn would move
+/// its 150-px edge, not whole 16-px blocks).
+#[test]
+fn strip_auto_rotate_says_what_it_did() {
+    let photo = std::fs::read(fixture("photo.jpg")).unwrap();
+    let app1 = |o: u16| {
+        let body = common::app1_orientation(o);
+        [
+            &[0xFF, 0xE1][..],
+            &(body.len() as u16 + 2).to_be_bytes(),
+            &body,
+        ]
+        .concat()
+    };
+    for (o, says) in [
+        (5, "; rotated orientation 5 upright)".to_string()),
+        (
+            6,
+            "; kept orientation 6, not rotated: 200x150 does not divide into whole \
+             16x16 blocks on the edge orientation 6 moves)"
+                .to_string(),
+        ),
+    ] {
+        let src = tmp(&format!("strip-rotate-src-{o}.jpg"));
+        let out = tmp(&format!("strip-rotate-out-{o}.jpg"));
+        std::fs::write(&src, [&photo[..2], &app1(o), &photo[2..]].concat()).unwrap();
+        let output = bin()
+            .arg("strip")
+            .arg(&src)
+            .arg(&out)
+            .arg("--auto-rotate")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "o={o}: {stderr}");
+        assert!(stderr.trim_end().ends_with(&says), "o={o}: {stderr}");
+        let (w, h) = common::dims_of(&std::fs::read(&out).unwrap());
+        assert_eq!(
+            (w, h),
+            if o == 5 { (150, 200) } else { (200, 150) },
+            "o={o}"
+        );
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&out).ok();
+    }
+}
