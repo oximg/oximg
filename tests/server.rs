@@ -1576,11 +1576,43 @@ fn graceful_shutdown_drains_inflight_and_refuses_new_connections() {
     assert!(status.success(), "exited {status}");
 }
 
+/// A temp directory removed when dropped, pass or panic. Derefs to its
+/// path, so it reads like the `PathBuf` it wraps.
+struct TempTree(std::path::PathBuf);
+
+impl std::ops::Deref for TempTree {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A temp IMAGES_DIR with a nested tree (and symlinks, for the
 /// containment tests): albums/2026/photo.jpg is a copy of the fixture.
-fn nested_images_dir(tag: &str) -> std::path::PathBuf {
+///
+/// Issue #168: the name used to be tag + pid only, and nothing removed
+/// it. A later run that drew the same pid found the tree already there,
+/// and the symlink test's `symlink()` failed with EEXIST. The name is
+/// now unique per call within the process, a leftover from another
+/// process is cleared first, and the tree goes with the guard.
+fn nested_images_dir(tag: &str) -> TempTree {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-    let dir = std::env::temp_dir().join(format!("oximg-nested-{tag}-{}", std::process::id()));
+    // Guarded before anything is created, so a setup step that fails
+    // part-way (and panics) removes what it made too.
+    let dir = TempTree(std::env::temp_dir().join(format!(
+        "oximg-nested-{tag}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )));
+    let _ = std::fs::remove_dir_all(&*dir);
     std::fs::create_dir_all(dir.join("albums/2026")).unwrap();
     std::fs::copy(
         format!("{fixtures}/photo.jpg"),
