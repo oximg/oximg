@@ -1599,13 +1599,16 @@ pub(crate) fn resize_uses_fir(px: PixelType, threads: usize, dst_h: usize) -> bo
 /// [`fuse::FuseKernel`]). That driver only pushes source rows into a
 /// [`crate::resize_kernel::StreamResize`], so a caller that can produce
 /// the source row by row may stream it itself — same operations, same
-/// bytes — without staging the whole frame. True on aarch64 only, and
-/// read off [`resize_uses_fir`] so the stream and the dispatch cannot
-/// disagree: x86-64 keeps pic-scale for U16x3 (full-frame), and
+/// bytes — without staging the whole frame. Read off
+/// [`resize_uses_fir`] so the stream and the dispatch cannot disagree:
+/// aarch64 runs the row kernel for U16x3 and U16x4, x86-64 for U16x4
+/// only (it keeps pic-scale for U16x3, full-frame; issue #154), and
 /// band-parallel requests and the fir escape hatch stay full-frame
 /// everywhere.
 fn bands_use_stream_kernel(px: PixelType, threads: usize, dst_h: usize) -> bool {
-    cfg!(target_arch = "aarch64") && !resize_uses_fir(px, threads, dst_h)
+    let row_kernel = (px == PixelType::U16x3 && cfg!(target_arch = "aarch64"))
+        || (px == PixelType::U16x4 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")));
+    row_kernel && !resize_uses_fir(px, threads, dst_h)
 }
 
 /// Split dst into row bands; each thread does a coordinate-consistent

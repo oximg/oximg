@@ -188,8 +188,10 @@ source bytes (local file or HTTP origin)
        JPEG rows stream through in-tree ring-scheduled f32 row kernels —
        AVX2 on x86-64, NEON on aarch64, both verified against an f64
        reference — optionally fused with the decode on a second thread;
-       other formats resize full-frame: pic-scale on x86-64, the same
-       in-tree kernel on aarch64)
+       non-interlaced PNG rows stream through the same kernel where it
+       is the resize — any layout on aarch64, alpha on x86-64 too;
+       other formats resize full-frame: pic-scale for opaque pixels
+       on x86-64, the same in-tree kernel otherwise)
   → encode in the source format (GIF sources: WebP, the default target)
       JPEG: jpegli, progressive above 12k output pixels (PRESET=fast / PRESET=small select mozjpeg profiles)
       PNG:  png crate | WebP: libwebp | AVIF: SVT-AV1 (10-bit 4:2:0, tune=ssim)
