@@ -1687,7 +1687,7 @@ fn decode_cost_prices_each_png_arm() {
     let (src, dst) = (320 * 240, 200 * 150);
 
     // RGB8 with a reduction: the fused arm. Where the row kernel runs
-    // (aarch64, one band; issue #129) rows stream into it, one mapped
+    // (one band, NEON or AVX2; issues #129, #154) rows stream into it, one mapped
     // source row at a time, and `out8` is the only frame; elsewhere they
     // land in `src16` for a full-frame resize into `dst16`.
     let rgb = black_white_lines_png(320, 240, 3);
@@ -1717,8 +1717,8 @@ fn decode_cost_prices_each_png_arm() {
     );
 
     // RGBA takes the fused arm too (issue #153), premultiplied row by
-    // row: streamed where the row kernel runs U16x4 (aarch64, and
-    // x86-64 with AVX2), else staged in `src16` without a u8 frame.
+    // row: streamed where the row kernel runs (as for RGB), else staged
+    // in `src16` without a u8 frame.
     let rgba = black_white_lines_png(320, 240, 4);
     let c = cost_of(&rgba, sized(200, 200));
     assert_eq!(c.staged_bytes, 0);
@@ -2612,22 +2612,21 @@ fn png_fused_arm_matches_the_general_arm_for_every_layout() {
 }
 
 /// The stream gate is resize_bands' own kernel choice: only where it
-/// would run the row kernel (one band, no fir override; U16x3 on
-/// aarch64 only, since x86-64 runs pic-scale for it; U16x4 wherever
-/// the SIMD kernel is available).
+/// would run the row kernel (one band, no fir override, a CPU with the
+/// SIMD kernel), for RGB and RGBA alike on both architectures (issue
+/// #154 moved x86-64 RGB off pic-scale).
 #[test]
 fn bands_stream_kernel_gate() {
     let fir = crate::config::config().fir_backend;
-    let x3 = cfg!(target_arch = "aarch64") && !fir;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    let x4 = !fir && <FuseKernel as crate::resize_kernel::RowKernel>::detect();
+    let streams = !fir && <FuseKernel as crate::resize_kernel::RowKernel>::detect();
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let x4 = false;
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), x3);
+    let streams = false;
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), streams);
     // Too few rows to band: still one call.
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), x3);
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), x4);
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 1, 500), x4);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), streams);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), streams);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 1, 500), streams);
     // Band-parallel requests stay staged (fir bands).
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 4, 8));
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 2, 500));

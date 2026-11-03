@@ -13,12 +13,11 @@ Sources are sniffed by magic bytes. Extensions are never trusted.
 PNG has no shrink-on-load. A non-interlaced, upright PNG resized in
 linear light as one band (`OXIMG_PAR=1`, or under two output rows per
 band) streams its rows into the resize, so only a window of rows is
-resident, wherever the in-tree row kernel is that resize:
-
-| layout (all decoded to 8 bits) | arm64 | amd64 (AVX2+FMA) |
-|---|---|---|
-| with alpha: RGBA, gray+alpha, palette or gray with `tRNS`, 8- or 16-bit | streams | streams |
-| opaque: RGB, gray, palette without `tRNS`, 8- or 16-bit | streams | full frame (pic-scale resize, #154) |
+resident. That holds for every 8-bit layout the decoder normalizes to
+(RGB, RGBA, gray, gray+alpha; 16-bit and palette sources included),
+on arm64 and on an amd64 CPU with AVX2+FMA (an older one resizes
+full-frame with pic-scale). Both run the same row kernel, which every
+other format's single-band linear-light resize runs too (#154).
 
 Everything else decodes to a full frame first: interlaced sources, an
 eXIf orientation other than 1, sRGB mode (`OXIMG_RESIZE=srgb`),

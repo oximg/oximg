@@ -243,9 +243,9 @@ impl Drop for Inputs {
 ///
 /// The bounds are the higher of two measured ratios plus ~25%: M2 Max
 /// (macOS) and Ryzen 7 8745HS (Linux, glibc, SVT-AV1 built as CI builds
-/// it), 2026-10-30. Where an arm takes a path only aarch64 runs (the
-/// streamed PNG thumbnail), CI's Linux arm64 runner is a third reading
-/// and can set the bound. A distribution SVT-AV1 built with its memory
+/// it), 2026-10-30. Where a small arm's ratio rests on the allocator
+/// (the streamed PNG thumbnail), CI's Linux arm64 runner is a third
+/// reading and can set the bound. A distribution SVT-AV1 built with its memory
 /// tracking on holds ~200 MB more per encode; CI does not use one.
 type Cell = (
     &'static str,
@@ -324,11 +324,11 @@ const CELLS: &[Cell] = &[
         2.0,
     ),
     // PNG source: the fused arm, exact size, RGBA.
-    // Streamed on aarch64 (issue #129) the fused thumbnail holds well
-    // under a megabyte, where the allocator's share moves the ratio:
-    // 0.81x M2 Max; Linux arm64 (CI) held 462848 bytes, 1.87x of an
-    // earlier 865 KB estimate and ~1.6x of the 744 KB one; 0.97x Ryzen
-    // (staged).
+    // Streamed (issue #129; on x86-64 since #154) the fused thumbnail
+    // holds well under a megabyte, where the allocator's share moves the
+    // ratio: 0.81x M2 Max; Linux arm64 (CI) held 462848 bytes, 1.87x of
+    // an earlier 865 KB estimate and ~1.6x of the 744 KB one; 1.39x
+    // Ryzen (0.97x staged).
     (
         "png fused thumbnail",
         "noise.png",

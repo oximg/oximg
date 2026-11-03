@@ -378,7 +378,7 @@ fn linear_to_srgb(src: &[u16], channels: usize, dst: &mut [u8], back: &[u8; 6553
 /// same source with alpha). The kernel's full-frame driver pushes
 /// exactly these rows in this order, so the bytes match. Otherwise the
 /// frame is staged as u16 in `src16` and resized by `resize_bands`
-/// (band-parallel, pic-scale for RGB on x86-64, fir).
+/// (band-parallel and fir; pic-scale for RGB on an x86-64 without AVX2).
 ///
 /// Every row is decoded either way: a truncated or corrupt tail fails
 /// the request before anything is encoded. Returns whether it streamed.

@@ -71,6 +71,27 @@ HTTP interface without notice.
 
 ### Changed
 
+- **Output bytes change on amd64: opaque images resize through the
+  AVX2 row kernel instead of pic-scale** ([#154]), under the
+  byte-change policy of [#121]. The single-band linear-light resize of
+  an opaque PNG, WebP, AVIF, GIF or CMYK JPEG now runs the kernel that
+  alpha images and every arm64 resize already ran. Three things follow:
+  - A large PNG thumbnail streams on amd64 as it does on arm64.
+    `oximg resize` of a 7000×7000 RGB PNG into a 10×200 box peaks at
+    9 MiB instead of 287 MiB on a Ryzen 7 8745HS.
+  - amd64 and arm64 agree. Of 116 fixture cells, 47 differed between
+    the two before and 7 after; those 7 are JPEG decodes and a
+    1/255 alpha difference, both unrelated to this change.
+  - The new pixels are closer to a float Lanczos3 reference. Over the
+    40 cells that changed, the mean absolute error is 0.33 instead of
+    0.42 (0–255). The largest error is at most 1/255 where it reached
+    43 on a hard-edged palette image. The mean SSIMULACRA2 is 97.40
+    instead of 97.22, and no cell loses more than 0.1.
+
+  Changed cells differ by 1–3/255 on photos and up to 43/255 at hard
+  edges. Server throughput is unchanged: PNG +0.9%, WebP −0.9%,
+  interleaved, within noise. An x86-64 CPU without AVX2+FMA keeps
+  pic-scale.
 - **Downscaling a large PNG with alpha, or a gray one, holds far less
   memory** ([#153]). Every non-interlaced, upright PNG layout now
   streams its decoded rows into the resize where the in-tree row
@@ -313,7 +334,9 @@ no fixture is that large.
 [#130]: https://github.com/oximg/oximg/issues/130
 [#133]: https://github.com/oximg/oximg/issues/133
 [#134]: https://github.com/oximg/oximg/issues/134
+[#121]: https://github.com/oximg/oximg/pull/121
 [#153]: https://github.com/oximg/oximg/issues/153
+[#154]: https://github.com/oximg/oximg/issues/154
 [#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26

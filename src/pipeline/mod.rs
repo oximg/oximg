@@ -1601,14 +1601,24 @@ pub(crate) fn resize_uses_fir(px: PixelType, threads: usize, dst_h: usize) -> bo
 /// the source row by row may stream it itself — same operations, same
 /// bytes — without staging the whole frame. Read off
 /// [`resize_uses_fir`] so the stream and the dispatch cannot disagree:
-/// aarch64 runs the row kernel for U16x3 and U16x4, x86-64 for U16x4
-/// only (it keeps pic-scale for U16x3, full-frame; issue #154), and
-/// band-parallel requests and the fir escape hatch stay full-frame
-/// everywhere.
+/// both architectures run the row kernel for U16x3 and U16x4 where the
+/// CPU has it (an x86-64 without AVX2+FMA keeps pic-scale for U16x3,
+/// full-frame), and band-parallel requests and the fir escape hatch
+/// stay full-frame everywhere.
 fn bands_use_stream_kernel(px: PixelType, threads: usize, dst_h: usize) -> bool {
-    let row_kernel = (px == PixelType::U16x3 && cfg!(target_arch = "aarch64"))
-        || (px == PixelType::U16x4 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")));
-    row_kernel && !resize_uses_fir(px, threads, dst_h)
+    matches!(px, PixelType::U16x3 | PixelType::U16x4)
+        && row_kernel_available()
+        && !resize_uses_fir(px, threads, dst_h)
+}
+
+/// Whether this CPU has the in-tree SIMD row kernel.
+fn row_kernel_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return crate::resize_avx2::Avx2::available();
+    #[cfg(target_arch = "aarch64")]
+    return std::arch::is_aarch64_feature_detected!("neon");
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    false
 }
 
 /// Split dst into row bands; each thread does a coordinate-consistent
@@ -1642,19 +1652,24 @@ fn resize_bands(
         // x86-64 full-frame dispatch. The linear JPEG path no longer
         // arrives here (it streams through the AVX2 row kernel, serial
         // and fused alike); what remains is PNG/WebP/AVIF, sRGB mode,
-        // band-parallel requests, and the fir escape hatch. U16x3 keeps
-        // pic-scale (still ~13% faster full-frame than the in-tree
-        // kernel; every user of this fn always takes the same backend,
-        // so bytes stay per-URL stable). U16x4 (alpha) uses the AVX2
-        // kernel (1.33x over fir on the benchmark shape; see
-        // examples/resize_bench_x86.rs).
+        // band-parallel requests, and the fir escape hatch. Both U16x3
+        // and U16x4 use the AVX2 row kernel, bit-identical to aarch64's
+        // NEON one, so the same URL gives the same bytes on both
+        // architectures, and a PNG can stream its rows into it (issue
+        // #154). An x86-64 without AVX2+FMA keeps pic-scale for U16x3.
         if !resize_uses_fir(px, threads, dst_h) {
             #[cfg(target_arch = "x86_64")]
-            return if px == PixelType::U16x3 {
+            return if px == PixelType::U16x3 && !crate::resize_avx2::Avx2::available() {
                 resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h)
             } else {
                 crate::resize_avx2::resize_u16_avx2(
-                    src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h, 4,
+                    src_bytes,
+                    dec_w,
+                    dec_h,
+                    dst_bytes,
+                    dst_w,
+                    dst_h,
+                    px.size() / 2,
                 )
             };
             #[cfg(target_arch = "aarch64")]
