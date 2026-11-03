@@ -92,6 +92,14 @@ HTTP interface without notice.
   edges. Server throughput is unchanged: PNG +0.9%, WebP −0.9%,
   interleaved, within noise. An x86-64 CPU without AVX2+FMA keeps
   pic-scale.
+- The decoded-bytes estimate now counts the row kernel's own buffers
+  (window tables, staging batch, ring) on a full-frame resize that
+  runs it: oriented or interlaced PNGs, WebP, AVIF, GIF and CMYK JPEG,
+  on arm64 and on amd64 with AVX2. Most requests rise by well under a
+  megabyte. A tall source squeezed to a few rows rises by its ring,
+  one padded row per source row: about 6 MB for 1×32000 into 1×1. A
+  cap tuned on the old figure may now refuse such a source
+  (`OXIMG_MAX_DECODED_BYTES`).
 - **Downscaling a large PNG with alpha, or a gray one, holds far less
   memory** ([#153]). Every non-interlaced, upright PNG layout now
   streams its decoded rows into the resize where the in-tree row
