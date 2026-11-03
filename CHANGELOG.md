@@ -12,19 +12,26 @@ HTTP interface without notice.
 
 ### Changed
 
-- **Output bytes change on amd64: JPEG resizes now match arm64**
-  ([#173]), under the [#121] policy. An 8-bit JPEG stream's horizontal
+- **Output bytes change on amd64 and on arm64 cores without FHM: JPEG
+  resizes now match across architectures** ([#173]), under the [#121]
+  policy. An 8-bit JPEG stream's horizontal
   resize pass rounds its samples and taps to f16 and accumulates in f32
   on every CPU, in one fixed order. arm64 cores with FP16 and FHM
   already did this since [#53]; amd64 and the other arm64 cores did it
   in plain f32, one 8-bit level apart on about 1% of samples. A product
   of two f16 values is exact in f32, so an f32 FMA rounds exactly where
   FMLAL does, and the results are bit-identical.
-  - arm64 output is unchanged: 0 of 352 fixture cells (every fixture ×
-    100x100, 333x0, 64x64, 10x200 × source, png, webp, jpeg).
+  - On arm64 cores with FP16 and FHM (Apple M-series, Neoverse N2 and
+    V1 and later, Graviton3 and 4), output is unchanged: 0 of 352
+    fixture cells on an Apple M2 Max (every fixture × 100x100, 333x0,
+    64x64, 10x200 × source, png, webp, jpeg).
   - amd64 output changes in 8 of those 352 cells, all `photo.jpg` at
     100x100 and 64x64. These were the only cells where amd64 and arm64
     differed, and now none do.
+  - arm64 cores without FHM, such as Neoverse N1 (Graviton2), ran the
+    plain f32 pass like amd64, so their JPEG bytes change the same way.
+    No such core was measured here; the scalar-model test below covers
+    the NEON f32 pass they now take.
   - A new test, `u8_stream_is_bit_identical_across_architectures`,
     checks committed hashes of the JPEG stream on every CI architecture.
     Every u8 pass is also checked against one scalar model of the
