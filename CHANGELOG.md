@@ -96,8 +96,9 @@ HTTP interface without notice.
   (window tables, staging batch, ring) on a full-frame resize that
   runs it: oriented or interlaced PNGs, WebP, AVIF, GIF and CMYK JPEG,
   on arm64 and on amd64 with AVX2. A photo downscale rises by about
-  1 MB (0.74 MB for 4032×3024 into 800×600, 1.26 MB for 8000×6000
-  into 400×300). A tall source squeezed to a few rows rises the most,
+  1 MB, a little more on amd64, whose staging batch is wider: 0.74 MB
+  on arm64 and 0.90 MB on amd64 for 4032×3024 into 800×600, 1.26 and
+  1.58 MB for 8000×6000 into 400×300. A tall source squeezed to a few rows rises the most,
   mostly in its ring (one padded row per source row) and vertical
   window tables: 10 MB for 1×32000 into 1×1. A cap tuned on the old
   figure may now refuse such a source (`OXIMG_MAX_DECODED_BYTES`).
