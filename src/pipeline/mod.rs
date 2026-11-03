@@ -1611,6 +1611,25 @@ fn bands_use_stream_kernel(px: PixelType, threads: usize, dst_h: usize) -> bool 
         && !resize_uses_fir(px, threads, dst_h)
 }
 
+/// Bytes the row kernel allocates for one resize of this shape, as
+/// [`crate::resize_kernel::StreamResize::resident_bytes`] sizes them; 0
+/// where the kernel does not exist.
+fn row_kernel_resident_bytes(
+    (src_w, src_h): (usize, usize),
+    (dst_w, dst_h): (usize, usize),
+    channels: usize,
+) -> u64 {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    return crate::resize_kernel::StreamResize::<fuse::FuseKernel>::resident_bytes(
+        src_w, src_h, dst_w, dst_h, channels,
+    );
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (src_w, src_h, dst_w, dst_h, channels);
+        0
+    }
+}
+
 /// Whether this CPU has the in-tree SIMD row kernel.
 fn row_kernel_available() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -1987,7 +2006,16 @@ impl DecodeCost {
         } else {
             0
         };
-        self.resize_input_bytes = src16.saturating_add(fir);
+        // Where the in-tree row kernel is the resize, its full-frame
+        // driver is a stream like any other: window tables, staging
+        // batch and ring, which a tall source squeezed to few rows makes
+        // a padded row per source row of the window.
+        let kernel = if p.linear_light && bands_use_stream_kernel(pixel, p.parallel, dst_h) {
+            row_kernel_resident_bytes((src_w, src_h), (dst_w, dst_h), channels as usize)
+        } else {
+            0
+        };
+        self.resize_input_bytes = src16.saturating_add(fir).saturating_add(kernel);
         self.output_bytes = dst16.saturating_add(out8);
         self
     }

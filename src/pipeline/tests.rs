@@ -1504,6 +1504,16 @@ fn fir_bytes(px: PixelType, dst_h: usize, intermediate: u64) -> u64 {
     }
 }
 
+/// The row kernel's own buffers where a single-band full-frame resize
+/// of this shape runs it, else 0.
+fn kernel_bytes(px: PixelType, src: (usize, usize), dst: (usize, usize)) -> u64 {
+    if bands_use_stream_kernel(px, 1, dst.1) {
+        row_kernel_resident_bytes(src, dst, px.size() / 2)
+    } else {
+        0
+    }
+}
+
 /// Issue #130: every JPEG arm is priced by the buffers it holds. A
 /// 320x240 source into a 200x200 box decodes at full size (a 1.6x
 /// reduction engages no shrink-on-load) and resizes to 200x150.
@@ -1608,7 +1618,9 @@ fn decode_cost_prices_each_jpeg_arm() {
     if (dw, dh) != (200, 150) {
         assert_eq!(
             c.resize_input_bytes,
-            (dw * dh * 6) as u64 + fir_bytes(PixelType::U16x3, 150, (200 * dh * 6) as u64)
+            (dw * dh * 6) as u64
+                + fir_bytes(PixelType::U16x3, 150, (200 * dh * 6) as u64)
+                + kernel_bytes(PixelType::U16x3, (dw, dh), (200, 150))
         );
         assert_eq!(c.output_bytes, dst * 9);
     }
@@ -1675,6 +1687,45 @@ fn decode_cost_covers_the_stream_ring_of_a_tall_source() {
     } else {
         // Staged: the whole linear-light frame.
         assert!(c.resize_input_bytes >= 40 * 32_000 * 6);
+    }
+}
+
+/// The same ring where the row kernel runs full-frame: an eXIf
+/// orientation keeps a PNG off the streamed arm, but `resize_bands`
+/// still drives the kernel over the staged frame (aarch64, and x86-64
+/// with AVX2 since issue #154), so the staged estimate must price the
+/// kernel's buffers on top of `src16`.
+#[test]
+fn decode_cost_covers_the_kernel_ring_of_a_staged_tall_source() {
+    let (w, h) = (1usize, 32_000usize);
+    let mut png_bytes = Vec::new();
+    {
+        let mut info = png::Info::with_size(w as u32, h as u32);
+        // Orientation 2 mirrors: same axes, so the same 1x1 fit.
+        info.exif_metadata = Some(std::borrow::Cow::Owned(tiff_orientation(2)));
+        info.color_type = png::ColorType::Rgb;
+        info.bit_depth = png::BitDepth::Eight;
+        let enc = png::Encoder::with_info(&mut png_bytes, info).unwrap();
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&vec![77u8; w * h * 3])
+            .unwrap();
+    }
+    let c = cost_of(&png_bytes, sized(1, 1));
+    let src16 = (w * h * 6) as u64;
+    if bands_use_stream_kernel(PixelType::U16x3, sized(1, 1).parallel, 1) {
+        let ring = 32_000 * 16 * 3 * 4;
+        assert!(
+            c.resize_input_bytes > src16 + ring,
+            "resize input {} must cover src16 {src16} plus the {ring}-byte ring",
+            c.resize_input_bytes
+        );
+        assert_eq!(
+            c.resize_input_bytes,
+            src16 + row_kernel_resident_bytes((w, h), (1, 1), 3)
+        );
+    } else {
+        assert!(c.resize_input_bytes >= src16);
     }
 }
 
