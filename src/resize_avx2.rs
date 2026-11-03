@@ -78,6 +78,60 @@ impl RowKernel for Avx2 {
     unsafe fn stage_x4(row: &[u16], stage: &mut [f32]) {
         unsafe { stage_row_x4(row, stage) }
     }
+    unsafe fn horiz_x3_batch_u8(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        _src_w: usize,
+        w: &Windows,
+        cf: &[f32],
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    ) {
+        assert!(cf.len() >= w.coeffs.len());
+        unsafe {
+            // Every AVX-512 CPU, AMD included: two zmm accumulators per
+            // row. Zen 4, 2040 -> 512/683/256 bench: 2.57/2.80/2.16 ms,
+            // against 3.05/3.43/2.78 for the AVX2 form below and
+            // 2.59/2.87/2.29 for the u16 pass.
+            if avx512f_detected() {
+                return match n {
+                    0 => {}
+                    4 => horiz_rows_x3_u8_512::<4>(
+                        stage, row_stride, w, cf, ring, plane, slots, dst_w,
+                    ),
+                    3 => horiz_rows_x3_u8_512::<3>(
+                        stage, row_stride, w, cf, ring, plane, slots, dst_w,
+                    ),
+                    2 => horiz_rows_x3_u8_512::<2>(
+                        stage, row_stride, w, cf, ring, plane, slots, dst_w,
+                    ),
+                    _ => horiz_rows_x3_u8_512::<1>(
+                        stage, row_stride, w, cf, ring, plane, slots, dst_w,
+                    ),
+                };
+            }
+            // Two rows per call: a row's eight chains take four ymm
+            // accumulators, so four rows would need all sixteen registers
+            // and spill. Zen 4, same bench, rows per call 1/2/3/4:
+            // 683 at 4.64/3.42/3.84/3.80 ms.
+            let mut r = 0;
+            while r < n {
+                let rows = &stage[r * row_stride..];
+                if r + 2 <= n {
+                    let s = [slots[r], slots[r + 1], 0, 0];
+                    horiz_rows_x3_u8::<2>(rows, row_stride, w, cf, ring, plane, &s, dst_w);
+                    r += 2;
+                } else {
+                    let s = [slots[r], 0, 0, 0];
+                    horiz_rows_x3_u8::<1>(rows, row_stride, w, cf, ring, plane, &s, dst_w);
+                    r += 1;
+                }
+            }
+        }
+    }
     unsafe fn horiz_x3(
         stage: &[f32],
         src_w: usize,
@@ -240,10 +294,11 @@ fn vbmi_detected() -> bool {
         && std::arch::is_x86_feature_detected!("avx512vbmi")
 }
 
-/// Split the 256-entry table into 256-entry byte tables of its values'
-/// low and high bytes, 64 entries per zmm (entries 64k..64k + 64 in
-/// register k). Exact because every entry is an integer in 0..=65535
-/// (the [`RowKernel::stage_x3_u8`] contract).
+/// Split the 256-entry table into 256-entry byte tables of the low and
+/// high bytes of its values' f16 bits, 64 entries per zmm (entries
+/// 64k..64k + 64 in register k). Exact because every entry is an f16
+/// value (the [`RowKernel::stage_x3_u8`] contract), which
+/// [`stage_rgbx16`] widens back.
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 fn byte_tables(
@@ -263,7 +318,8 @@ fn byte_tables(
         for j in 0..4 {
             // SAFETY: 16 f32s ending at 64k + 16j + 16 <= 256.
             let v = unsafe { _mm512_loadu_ps(lut.as_ptr().add(64 * k + 16 * j)) };
-            let d = _mm512_cvtps_epi32(v);
+            let h = _mm512_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(v);
+            let d = _mm512_cvtepu16_epi32(h);
             ql[j] = _mm512_cvtepi32_epi8(d);
             qh[j] = _mm512_cvtepi32_epi8(_mm512_srli_epi32::<8>(d));
         }
@@ -294,11 +350,12 @@ fn lookup_bytes(
 }
 
 /// Stage one u8 RGB row as f32 RGBX through `lut` with no memory lookups:
-/// the table lives in eight zmm as low/high byte halves, sixteen pixels'
-/// bytes are spread to RGBX order, looked up as bytes, re-paired into u16
-/// dwords, and converted. Bit-identical to the portable body (the table
-/// values are exact integers); -63% on staging on Zen 4, where the three
-/// scalar table reads per pixel cost as much as the horizontal pass.
+/// the table lives in eight zmm as low/high byte halves of its f16 bits,
+/// sixteen pixels' bytes are spread to RGBX order, looked up as bytes,
+/// re-paired into u16 dwords, and widened from f16. Bit-identical to the
+/// portable body (the table values are exact f16 values); -63% on
+/// staging on Zen 4, where the three scalar table reads per pixel cost
+/// as much as the horizontal pass.
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 // SAFETY: requires AVX-512 F/BW/VBMI, `row.len() >= 3 * w` and
 // `stage.len() >= 4 * w`. The vector loop runs while `x + 16 <= w`: its
@@ -362,10 +419,10 @@ fn pair_indices() -> [std::arch::x86_64::__m512i; 4] {
 
 /// Stage sixteen pixels given as RGBX table indices (`idx`, X bytes
 /// arbitrary) as RGBX f32 through the split table: look up both byte
-/// halves, re-pair them into u16 dwords, convert, and store 64 f32 at
+/// halves, re-pair them into f16 words, widen, and store 64 f32 at
 /// `out`. The `pix` mask keeps each channel's two bytes and zeroes the
 /// rest, including every X dword — its looked-up value is a table entry,
-/// not 0.
+/// not 0 (and f16 bits 0 are +0.0).
 #[inline]
 #[target_feature(enable = "avx512f,avx512bw,avx512vbmi")]
 // SAFETY: requires AVX-512 F/BW/VBMI and 64 writable f32 at `out`.
@@ -384,7 +441,8 @@ unsafe fn stage_rgbx16(
     for (k, p) in pair.iter().enumerate() {
         let d = _mm512_maskz_permutex2var_epi8(pix, lo, *p, hi);
         // SAFETY: store k covers out[16k, 16k + 16) within the 64.
-        unsafe { _mm512_storeu_ps(out.add(16 * k), _mm512_cvtepi32_ps(d)) };
+        let f = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(d));
+        unsafe { _mm512_storeu_ps(out.add(16 * k), f) };
     }
 }
 
@@ -711,6 +769,193 @@ unsafe fn horiz_rows_x3_512<const N: usize>(
     }
 }
 
+/// [`RowKernel::horiz_x3_batch_u8`] on 256-bit vectors over RGBX rows:
+/// the NEON half pass's order (`horiz_rows_x3_half` in
+/// [`crate::resize_neon`]) per output value. Each 8-tap block takes
+/// four FMAs per row, each over two pixels against a lanewise
+/// coefficient-pair broadcast, so `acc[i]` holds the chains of taps
+/// `2i` and `2i + 1` (mod 8). `acc[0] + acc[2]` and `acc[1] + acc[3]`
+/// are NEON's `lo + hi` per lane, and the reduction after them is
+/// `(l0 + l1) + (l2 + l3)`, as in [`horiz_rows_x3`].
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+// SAFETY: requires AVX2+FMA. As `horiz_rows_x3`: every load, in 8-tap
+// blocks and the last 4-tap one, stays below `padded` = size rounded up
+// to 4 (`<= w.stride`), so stage reads stay inside each row's
+// (src_w + w.stride) * 4 f32 and coefficient reads inside the checked
+// `padded`-long subslice of `cf`. `cf.len() >= w.coeffs.len()` is
+// asserted by the caller.
+unsafe fn horiz_rows_x3_u8<const N: usize>(
+    stage: &[f32],
+    row_stride: usize,
+    w: &Windows,
+    cf: &[f32],
+    ring: &mut [f32],
+    plane: usize,
+    slots: &[usize; 4],
+    dst_w: usize,
+) {
+    const SCALE: f32 = 65536.0;
+    unsafe {
+        use std::arch::x86_64::*;
+        let idx01 = _mm256_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1);
+        let idx23 = _mm256_setr_epi32(2, 2, 2, 2, 3, 3, 3, 3);
+        let scale = _mm_set1_ps(SCALE);
+        let pixel = |ox: usize| -> [__m128; N] {
+            let start = w.starts[ox];
+            // Whole 4-tap blocks: when a window's last 8-tap block holds
+            // at most four real taps, its upper half is all zero taps,
+            // which leave a chain unchanged (an FMA by +0.0 adds +0.0,
+            // and a chain started at +0.0 is never -0.0), so it is
+            // skipped: the same FMA count as `horiz_rows_x3`.
+            let padded = w.sizes[ox].div_ceil(4) * 4;
+            let coeffs = &cf[ox * w.stride..ox * w.stride + padded];
+
+            let mut acc = [[_mm256_setzero_ps(); 4]; N];
+            let mut k = 0usize;
+            while k + 8 <= padded {
+                let c0 = _mm_loadu_ps(coeffs.as_ptr().add(k));
+                let c1 = _mm_loadu_ps(coeffs.as_ptr().add(k + 4));
+                let v0 = _mm256_set_m128(c0, c0);
+                let v1 = _mm256_set_m128(c1, c1);
+                let c = [
+                    _mm256_permutevar8x32_ps(v0, idx01),
+                    _mm256_permutevar8x32_ps(v0, idx23),
+                    _mm256_permutevar8x32_ps(v1, idx01),
+                    _mm256_permutevar8x32_ps(v1, idx23),
+                ];
+                for (r, a) in acc.iter_mut().enumerate() {
+                    let base = stage.as_ptr().add(r * row_stride + (start + k) * 4);
+                    for i in 0..4 {
+                        a[i] = _mm256_fmadd_ps(_mm256_loadu_ps(base.add(8 * i)), c[i], a[i]);
+                    }
+                }
+                k += 8;
+            }
+            if k < padded {
+                let c0 = _mm_loadu_ps(coeffs.as_ptr().add(k));
+                let v0 = _mm256_set_m128(c0, c0);
+                let ca = _mm256_permutevar8x32_ps(v0, idx01);
+                let cb = _mm256_permutevar8x32_ps(v0, idx23);
+                for (r, a) in acc.iter_mut().enumerate() {
+                    let base = stage.as_ptr().add(r * row_stride + (start + k) * 4);
+                    a[0] = _mm256_fmadd_ps(_mm256_loadu_ps(base), ca, a[0]);
+                    a[1] = _mm256_fmadd_ps(_mm256_loadu_ps(base.add(8)), cb, a[1]);
+                }
+            }
+            std::array::from_fn(|r| {
+                let [a0, a1, a2, a3] = acc[r];
+                let l01 = _mm256_add_ps(a0, a2);
+                let l23 = _mm256_add_ps(a1, a3);
+                let s = _mm_add_ps(
+                    _mm_add_ps(_mm256_castps256_ps128(l01), _mm256_extractf128_ps::<1>(l01)),
+                    _mm_add_ps(_mm256_castps256_ps128(l23), _mm256_extractf128_ps::<1>(l23)),
+                );
+                _mm_mul_ps(s, scale)
+            })
+        };
+        // The store tail of `horiz_rows_x3`, unchanged.
+        let mut ox = 0;
+        while ox + 4 <= dst_w {
+            let p = [pixel(ox), pixel(ox + 1), pixel(ox + 2), pixel(ox + 3)];
+            for r in 0..N {
+                let at = slots[r] + ox;
+                assert!(at + 4 <= plane && 2 * plane + at + 4 <= ring.len());
+                let lo01 = _mm_unpacklo_ps(p[0][r], p[1][r]);
+                let lo23 = _mm_unpacklo_ps(p[2][r], p[3][r]);
+                let hi01 = _mm_unpackhi_ps(p[0][r], p[1][r]);
+                let hi23 = _mm_unpackhi_ps(p[2][r], p[3][r]);
+                let dst = ring.as_mut_ptr().add(at);
+                _mm_storeu_ps(dst, _mm_movelh_ps(lo01, lo23));
+                _mm_storeu_ps(dst.add(plane), _mm_movehl_ps(lo23, lo01));
+                _mm_storeu_ps(dst.add(2 * plane), _mm_movelh_ps(hi01, hi23));
+            }
+            ox += 4;
+        }
+        while ox < dst_w {
+            let p = pixel(ox);
+            for r in 0..N {
+                let mut out = [0f32; 4];
+                _mm_storeu_ps(out.as_mut_ptr(), p[r]);
+                ring[slots[r] + ox] = out[0];
+                ring[plane + slots[r] + ox] = out[1];
+                ring[2 * plane + slots[r] + ox] = out[2];
+            }
+            ox += 1;
+        }
+    }
+}
+
+/// [`horiz_rows_x3_u8`] on 512-bit vectors: one load covers the four
+/// pixels of half a tap block, so `lo` and `hi` hold NEON's two chains
+/// per lane directly, one 128-bit group per tap residue; `lo + hi`, then
+/// `(g0 + g1) + (g2 + g3)`. Bit-identical to the 256-bit form.
+#[target_feature(enable = "avx512f")]
+#[allow(clippy::too_many_arguments)]
+// SAFETY: requires AVX-512F. Reads the same pixels and taps as
+// `horiz_rows_x3_u8` (16-f32 loads instead of 8-f32 ones), under the same
+// row contract; ring writes are bounds-checked.
+unsafe fn horiz_rows_x3_u8_512<const N: usize>(
+    stage: &[f32],
+    row_stride: usize,
+    w: &Windows,
+    cf: &[f32],
+    ring: &mut [f32],
+    plane: usize,
+    slots: &[usize; 4],
+    dst_w: usize,
+) {
+    const SCALE: f32 = 65536.0;
+    unsafe {
+        use std::arch::x86_64::*;
+        let idx = _mm512_setr_epi32(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3);
+        for ox in 0..dst_w {
+            let start = w.starts[ox];
+            // Whole 4-tap blocks, the zero upper half skipped as in
+            // `horiz_rows_x3_u8`.
+            let padded = w.sizes[ox].div_ceil(4) * 4;
+            let coeffs = &cf[ox * w.stride..ox * w.stride + padded];
+
+            let mut lo = [_mm512_setzero_ps(); N];
+            let mut hi = [_mm512_setzero_ps(); N];
+            let mut k = 0usize;
+            while k + 8 <= padded {
+                let c0 = _mm512_castps128_ps512(_mm_loadu_ps(coeffs.as_ptr().add(k)));
+                let c1 = _mm512_castps128_ps512(_mm_loadu_ps(coeffs.as_ptr().add(k + 4)));
+                let c0 = _mm512_permutexvar_ps(idx, c0);
+                let c1 = _mm512_permutexvar_ps(idx, c1);
+                for r in 0..N {
+                    let base = stage.as_ptr().add(r * row_stride + (start + k) * 4);
+                    lo[r] = _mm512_fmadd_ps(_mm512_loadu_ps(base), c0, lo[r]);
+                    hi[r] = _mm512_fmadd_ps(_mm512_loadu_ps(base.add(16)), c1, hi[r]);
+                }
+                k += 8;
+            }
+            if k < padded {
+                let c0 = _mm512_castps128_ps512(_mm_loadu_ps(coeffs.as_ptr().add(k)));
+                let c0 = _mm512_permutexvar_ps(idx, c0);
+                for (r, l) in lo.iter_mut().enumerate() {
+                    let base = stage.as_ptr().add(r * row_stride + (start + k) * 4);
+                    *l = _mm512_fmadd_ps(_mm512_loadu_ps(base), c0, *l);
+                }
+            }
+            for r in 0..N {
+                let l = _mm512_add_ps(lo[r], hi[r]);
+                let g0 = _mm512_castps512_ps128(l);
+                let g1 = _mm512_extractf32x4_ps::<1>(l);
+                let g2 = _mm512_extractf32x4_ps::<2>(l);
+                let g3 = _mm512_extractf32x4_ps::<3>(l);
+                let s = _mm_add_ps(_mm_add_ps(g0, g1), _mm_add_ps(g2, g3));
+                let s = _mm_mul_ps(s, _mm_set1_ps(SCALE));
+                let mut out = [0f32; 4];
+                _mm_storeu_ps(out.as_mut_ptr(), s);
+                ring[slots[r] + ox] = out[0];
+                ring[plane + slots[r] + ox] = out[1];
+                ring[2 * plane + slots[r] + ox] = out[2];
+            }
+        }
+    }
+}
 /// One horizontal row, 4 channels, reading the interleaved f32 staged
 /// row: each pixel is a natural f32x4 lane group. Where NEON (128-bit
 /// vectors) applies one tap per FMA, a 256-bit load here covers two
@@ -972,8 +1217,98 @@ mod tests {
         testkit::assert_u8_staging_matches_u16::<Avx2>();
     }
 
+    #[test]
+    fn horiz_u8_matches_model() {
+        if !detected() {
+            return;
+        }
+        testkit::assert_horiz_u8_matches_model::<Avx2>();
+    }
+
+    /// Both x86 u8 passes against the model directly, whichever one the
+    /// host dispatches to: the AVX2 form at every row count, and the
+    /// 512-bit form where the host has AVX-512F.
+    #[test]
+    fn horiz_u8_forms_match_model() {
+        if !detected() {
+            return;
+        }
+        let lut = testkit::srgb_lut();
+        let lut_q: [f32; 256] = std::array::from_fn(|i| {
+            crate::resize_kernel::f16_to_f32(crate::resize_kernel::f32_to_f16(lut[i] / 65536.0))
+        });
+        for (sw, dw) in [
+            (2040usize, 512usize),
+            (2040, 683),
+            (2040, 100),
+            (333, 100),
+            (50, 120),
+            (17, 5),
+            (7, 4),
+            (1, 1),
+        ] {
+            let w = Windows::new(sw, dw);
+            let src: Vec<u8> = testkit::test_image(sw, 4, 3)
+                .iter()
+                .map(|&v| (v >> 8) as u8)
+                .collect();
+            let rs = (sw + w.stride) * 4;
+            let mut stage = vec![0f32; rs * 4];
+            for r in 0..4 {
+                // SAFETY: 3 * sw bytes in, 4 * sw f32 out.
+                unsafe {
+                    stage_x3_u8_words(&src[r * sw * 3..], &lut_q, &mut stage[r * rs..], sw, true)
+                };
+            }
+            let slots: [usize; 4] = std::array::from_fn(|i| i * dw);
+            let plane = 4 * dw;
+            let cf = w.coeffs_f16_f32();
+            type Pass =
+                unsafe fn(&[f32], usize, &Windows, &[f32], &mut [f32], usize, &[usize; 4], usize);
+            let mut forms: Vec<(&str, usize, Pass)> = vec![
+                ("avx2 x1", 1, horiz_rows_x3_u8::<1>),
+                ("avx2 x2", 2, horiz_rows_x3_u8::<2>),
+                ("avx2 x4", 4, horiz_rows_x3_u8::<4>),
+            ];
+            if avx512f_detected() {
+                forms.push(("avx512 x4", 4, horiz_rows_x3_u8_512::<4>));
+            }
+            for (name, n, pass) in forms {
+                let mut ring = vec![0f32; 3 * plane];
+                // SAFETY: AVX2+FMA checked above, AVX-512F before pushing that
+                // form; rows staged with the slack.
+                unsafe { pass(&stage, rs, &w, cf, &mut ring, plane, &slots, dw) };
+                for r in 0..n {
+                    let want = testkit::horiz_u8_model(&src[r * sw * 3..], &lut, &w, sw, dw);
+                    for (c, want) in want.iter().enumerate() {
+                        let got = &ring[c * plane + slots[r]..][..dw];
+                        assert!(
+                            got.iter()
+                                .zip(want)
+                                .all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "{name} {sw}->{dw} row {r} channel {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Arbitrary finite f16 values (every high and low byte pattern of
+    /// their bits in play), as [`RowKernel::stage_x3_u8`] requires.
+    fn f16_exact_table() -> [f32; 256] {
+        let mut seed = 0x9e37_79b9u32;
+        std::array::from_fn(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let h = (seed >> 16) as u16;
+            // Exponent 31 is infinity or NaN: clear its top bit.
+            let h = if h & 0x7c00 == 0x7c00 { h & !0x4000 } else { h };
+            crate::resize_kernel::f16_to_f32(h)
+        })
+    }
+
     /// The VBMI staging against the portable body, bit for bit: a table
-    /// of arbitrary u16 values (every high and low byte pattern in play),
+    /// of arbitrary f16 values,
     /// every code in every channel position, and widths around the
     /// 16-pixel step. Skips on hosts without VBMI, which includes most
     /// CI x86 runners.
@@ -983,11 +1318,7 @@ mod tests {
             eprintln!("skipping: host lacks avx512f+bw+vbmi");
             return;
         }
-        let mut seed = 0x9e37_79b9u32;
-        let lut: [f32; 256] = std::array::from_fn(|_| {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (seed >> 16) as f32
-        });
+        let lut = f16_exact_table();
         for w in (0..=50).chain([255, 256, 257, 2040]) {
             let row: Vec<u8> = (0..3 * w).map(|i| (i * 7 + w) as u8).collect();
             let mut want = vec![1.0f32; 4 * w];
@@ -1185,11 +1516,7 @@ mod tests {
             eprintln!("skipping: host lacks avx512f+bw+vbmi");
             return;
         }
-        let mut seed = 0x9e37_79b9u32;
-        let lut: [f32; 256] = std::array::from_fn(|_| {
-            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (seed >> 16) as f32
-        });
+        let lut = f16_exact_table();
         let check = |y: &[u8], cb: &[u8], cr: &[u8], w: usize| {
             let rgb: Vec<u8> = (0..w)
                 .flat_map(|x| crate::resize_kernel::ycc_to_rgb(y[x], cb[x / 2], cr[x / 2]))

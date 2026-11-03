@@ -35,6 +35,11 @@ oximg-ctl get /resize/400/400/rgba.png    # 200×150, same RGBA bytes
   see #60.) Off unless asked.
 - SIMD kernels (AVX2 / NEON) are verified against an f64 reference.
   Both architectures are production code; CI runs both.
+- The row kernels give the same bytes on x86-64 and aarch64: 16-bit
+  streams (#172) and 8-bit JPEG streams (#173, f16 samples and taps on
+  every CPU) are pinned by committed hashes,
+  `row_kernel_is_bit_identical_across_architectures` and
+  `u8_stream_is_bit_identical_across_architectures`.
 
 ## Orientation
 

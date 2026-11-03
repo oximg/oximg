@@ -12,6 +12,32 @@ HTTP interface without notice.
 
 ### Changed
 
+- **Output bytes change on amd64: JPEG resizes now match arm64**
+  ([#173]), under the [#121] policy. An 8-bit JPEG stream's horizontal
+  resize pass rounds its samples and taps to f16 and accumulates in f32
+  on every CPU, in one fixed order. arm64 cores with FP16 and FHM
+  already did this since [#53]; amd64 and the other arm64 cores did it
+  in plain f32, one 8-bit level apart on about 1% of samples. A product
+  of two f16 values is exact in f32, so an f32 FMA rounds exactly where
+  FMLAL does, and the results are bit-identical.
+  - arm64 output is unchanged: 0 of 352 fixture cells (every fixture ×
+    100x100, 333x0, 64x64, 10x200 × source, png, webp, jpeg).
+  - amd64 output changes in 8 of those 352 cells, all `photo.jpg` at
+    100x100 and 64x64. These were the only cells where amd64 and arm64
+    differed, and now none do.
+  - A new test, `u8_stream_is_bit_identical_across_architectures`,
+    checks committed hashes of the JPEG stream on every CI architecture.
+    Every u8 pass is also checked against one scalar model of the
+    arithmetic.
+  - Speed on amd64: every AVX-512 CPU now runs the pass on 512-bit
+    vectors, AMD included. On a Ryzen 7 8745HS (Zen 4) the pass is 1–6%
+    faster than before, and end to end there is no measurable change:
+    100 DIV2K JPEGs into a 512×512 WebP, 7 interleaved rounds, median
+    16.74 → 16.67 ms. CPUs with AVX2 but no AVX-512 pay for the extra
+    chains: on an Intel i9-10910 the pass costs 12–29% more, and the
+    same end-to-end run moves within its noise (median 21.80 → 21.83
+    ms, mean 21.75 → 22.03).
+
 - **arm64 and amd64 give the same bytes for 16-bit resizes, including
   RGBA** ([#172]). The NEON row kernel now runs exactly the AVX2
   kernel's f32 operations. Before, its four-channel horizontal pass
