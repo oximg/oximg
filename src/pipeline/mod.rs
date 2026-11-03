@@ -1967,7 +1967,9 @@ impl DecodeCost {
     /// holds nothing of its own: the decoded frame is handed to `out8`
     /// (issue #129; a rotation after it is
     /// [`Self::with_exact_size_rotation`]). Otherwise linear light adds
-    /// `src16` and `dst16`, and fir adds its intermediate image.
+    /// `src16` and `dst16`, fir adds its intermediate image, and the
+    /// in-tree row kernel, where it runs, its window tables, staging
+    /// batch and ring.
     pub fn with_full_frame_resize(
         mut self,
         (src_w, src_h): (usize, usize),
