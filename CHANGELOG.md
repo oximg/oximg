@@ -10,6 +10,29 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Changed
+
+- **arm64 and amd64 give the same bytes for 16-bit resizes, including
+  RGBA** ([#172]). The NEON row kernel now runs exactly the AVX2
+  kernel's f32 operations. Before, its four-channel horizontal pass
+  summed the taps in one chain where AVX2 sums four partial chains,
+  and its vertical pass fused a few more right-edge columns than
+  AVX2's. Both put a ±1 on about 0.2% of RGBA samples and a few
+  edge-column RGB samples in 16-bit, which now and then reached the
+  8-bit output.
+  - amd64 output is unchanged.
+  - arm64 output changes where it differed from amd64. In
+    `oximg-ctl parity` against 0.19.0 that is 9 of 84 cells over seven
+    PNG layouts, all RGBA or gray+alpha, and none of the 132 fixture
+    cells. Across both architectures, 2 of 100 cells still differ:
+    JPEG, from the f16 pass ([#173]).
+  - A new test, `row_kernel_is_bit_identical_across_architectures`,
+    checks committed hashes of the kernel's output on every CI
+    architecture.
+  - The NEON RGBA pass is faster: its four chains no longer wait on one
+    FMA's latency. Apple M2 Max, interleaved: −12% for 2040×1356 into
+    512×340, −36% for 4000×3000 into 400×300.
+
 ## [0.19.0] - 2026-11-02
 
 Large PNG thumbnails in a few megabytes on every architecture

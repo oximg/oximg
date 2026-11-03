@@ -434,7 +434,12 @@ unsafe fn horiz_rows_x3_half<const R: usize>(
 
 /// One horizontal row, 4 channels, reading the interleaved f32 staged
 /// row: each pixel is a natural f32x4 lane group; four taps share one
-/// coefficient vector via lane-indexed FMA (same sequence as before).
+/// coefficient vector via lane-indexed FMA. The AVX2 kernel's operation
+/// sequence exactly, so both architectures give the same bits (issue
+/// #172): one accumulator per tap residue mod 4, each fused in ascending
+/// order from +0.0, summed as (t0 + t1) + (t2 + t3) — the tree AVX2's
+/// two 256-bit streams reduce to. Four independent chains also hide the
+/// FMA latency a single accumulator stalled on.
 #[target_feature(enable = "neon")]
 // SAFETY: requires NEON. Stage loads read pixels [start, start + padded);
 // `start + sizes <= src_w` and `padded <= w.stride` (Windows invariants), so
@@ -458,14 +463,14 @@ unsafe fn horiz_row_x4(
             let padded = w.sizes[ox].div_ceil(4) * 4;
             let coeffs = &w.coeffs[ox * w.stride..ox * w.stride + padded];
 
-            let mut acc = vdupq_n_f32(0.0);
+            let mut t = [vdupq_n_f32(0.0); 4];
             let mut k = 0usize;
             while k < padded {
                 let cv = vld1q_f32(coeffs.as_ptr().add(k));
                 macro_rules! tap {
                     ($j:tt) => {{
                         let p = vld1q_f32(stage.as_ptr().add((start + k + $j) * 4));
-                        acc = vfmaq_laneq_f32::<$j>(acc, p, cv);
+                        t[$j] = vfmaq_laneq_f32::<$j>(t[$j], p, cv);
                     }};
                 }
                 tap!(0);
@@ -474,6 +479,7 @@ unsafe fn horiz_row_x4(
                 tap!(3);
                 k += 4;
             }
+            let acc = vaddq_f32(vaddq_f32(t[0], t[1]), vaddq_f32(t[2], t[3]));
             let out = [
                 vgetq_lane_f32::<0>(acc),
                 vgetq_lane_f32::<1>(acc),
@@ -526,7 +532,11 @@ unsafe fn vert_accumulate(
             vst1q_f32(acc.as_mut_ptr().add(x + 12), a3);
             x += 16;
         }
-        while x + 4 <= dst_w {
+        // Fused columns end where AVX2's 8-wide step ends: the scalar
+        // tail's `+=` rounds the product and the sum apart, so the same
+        // columns must reach it on both architectures (issue #172).
+        let fused_end = dst_w & !7;
+        while x + 4 <= fused_end {
             let mut a = vdupq_n_f32(0.0);
             for (&off, &c) in offs.iter().zip(coeffs) {
                 a = vfmaq_f32(a, vld1q_f32(plane.as_ptr().add(off + x)), vdupq_n_f32(c));
