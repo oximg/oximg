@@ -346,6 +346,109 @@ fn fuse_kernel_available() -> bool {
     }
 }
 
+/// (channels, dst_w, dst_h, FNV-1a 64 of the u16 output) for
+/// [`row_kernel_is_bit_identical_across_architectures`]. Widths straddle
+/// every SIMD step either kernel takes (4, 8, 16, 32 columns), heights a
+/// single row and several. Computed on aarch64 (NEON) and checked
+/// unchanged on x86-64 (AVX2) — the same table on every CI job is what
+/// pins the cross-architecture claim (issue #172).
+const KERNEL_GOLDEN: &[(usize, usize, usize, u64)] = &[
+    (3, 1, 1, 0x39294b7301e88ffd),
+    (3, 1, 64, 0x974b82e98153fb58),
+    (3, 5, 1, 0xc1c7a9e5094e2ec9),
+    (3, 5, 64, 0x408c4aec8ed6a3e0),
+    (3, 7, 1, 0xd12f204ecd3bd644),
+    (3, 7, 64, 0x9ee92eb1615993ae),
+    (3, 12, 1, 0x86943b86b34a7222),
+    (3, 12, 64, 0xf7f6d840a17d88d9),
+    (3, 20, 1, 0x27fe7dc4c118f6b7),
+    (3, 20, 64, 0x0d83a0465357dd1e),
+    (3, 31, 1, 0x8f492e00a0a860fc),
+    (3, 31, 64, 0x995f9244c5b0e3c6),
+    (3, 33, 1, 0x39b9774c8c044f04),
+    (3, 33, 64, 0xc3fcc04be08aaa78),
+    (3, 100, 1, 0x4e53f9cf322dc7bb),
+    (3, 100, 64, 0x6d700ea17976988e),
+    (3, 333, 1, 0x01589048920e7a58),
+    (3, 333, 64, 0x3eca7a8559c099b2),
+    (4, 1, 1, 0x1154807fae42ac01),
+    (4, 1, 64, 0xa7674ca98a73a5d2),
+    (4, 5, 1, 0xd569be5caf6fe527),
+    (4, 5, 64, 0x7914355eae82e037),
+    (4, 7, 1, 0xc5559a0d4e7e207d),
+    (4, 7, 64, 0x6fd2cf84186feeee),
+    (4, 12, 1, 0xd804c7366b07de1d),
+    (4, 12, 64, 0xc6072cf3708d1f35),
+    (4, 20, 1, 0x96c5b823baa3706f),
+    (4, 20, 64, 0x54596daece6b9f01),
+    (4, 31, 1, 0x69ba8bf714b5e62e),
+    (4, 31, 64, 0x6f6987856bf78ffa),
+    (4, 33, 1, 0x17fe0ea9df18f36f),
+    (4, 33, 64, 0x2cb0b352bee09a41),
+    (4, 100, 1, 0x9b899368d88f6343),
+    (4, 100, 64, 0x19c68639818136df),
+    (4, 333, 1, 0xb83b52228d9ab147),
+    (4, 333, 64, 0xa4a0ec43527c3729),
+];
+
+/// The in-tree row kernel gives the same bits on every architecture:
+/// one seeded 517x389 source resized to a grid of shapes, each output
+/// hashed against [`KERNEL_GOLDEN`]. The NEON and AVX2 kernels share
+/// the operation order per output value (taps fused in ascending order,
+/// the same vertical tail split); a change to either that breaks this
+/// changes some architecture's bytes.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[test]
+fn row_kernel_is_bit_identical_across_architectures() {
+    if !fuse_kernel_available() {
+        return;
+    }
+    let mut seed = 0x9E37_79B9u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 16) as u16
+    };
+    let (sw, sh) = (517usize, 389usize);
+    let src: Vec<u16> = (0..sw * sh * 4).map(|_| next()).collect();
+    let mut got = Vec::new();
+    for ch in [3usize, 4] {
+        for dw in [1usize, 5, 7, 12, 20, 31, 33, 100, 333] {
+            for dh in [1usize, 64] {
+                let mut dst = vec![0u16; dw * dh * ch];
+                crate::resize_kernel::resize_u16::<FuseKernel>(
+                    u16_as_bytes(&src[..sw * sh * ch]),
+                    sw,
+                    sh,
+                    u16_as_bytes_mut(&mut dst),
+                    dw,
+                    dh,
+                    ch,
+                )
+                .unwrap();
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                for &b in u16_as_bytes(&dst) {
+                    h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+                }
+                got.push((ch, dw, dh, h));
+            }
+        }
+    }
+    if KERNEL_GOLDEN.is_empty() {
+        for (ch, dw, dh, h) in &got {
+            eprintln!("    ({ch}, {dw}, {dh}, {h:#018x}),");
+        }
+        panic!("KERNEL_GOLDEN is empty: paste the table above");
+    }
+    let differ: Vec<_> = got
+        .iter()
+        .zip(KERNEL_GOLDEN)
+        .filter(|(g, w)| g != w)
+        .map(|(g, _)| format!("{}ch {}x{}", g.0, g.1, g.2))
+        .collect();
+    assert_eq!(got.len(), KERNEL_GOLDEN.len());
+    assert!(differ.is_empty(), "kernel output changed: {differ:?}");
+}
+
 /// The serial path streams rows through the same SIMD kernel the
 /// fused path runs on its worker thread, so the bytes must match
 /// exactly on every architecture.
