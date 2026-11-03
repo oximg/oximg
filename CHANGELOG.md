@@ -10,6 +10,20 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-02
+
+Large PNG thumbnails in a few megabytes on every architecture
+([#153], [#154]), upright JPEGs from `strip` and orientation from
+`probe` ([#163]).
+
+**Output bytes change on amd64**, under the [#121] policy: opaque
+resizes there now run the row kernel arm64 already ran, which is more
+accurate and agrees with arm64 (Changed, first entry). On arm64
+every output is byte-identical to 0.18.1: `oximg-ctl parity` finds
+all 132 fixture cells and 84 cells over seven PNG layouts unchanged.
+A cap set with `OXIMG_MAX_DECODED_BYTES` may need retuning: the
+estimate now also prices the row kernel's buffers.
+
 ### Added
 
 - **`probe` reports the EXIF orientation and the displayed size**
