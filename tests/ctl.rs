@@ -263,6 +263,42 @@ fn get_resizes_photo_and_probes_the_body() {
     assert_eq!(v["sha256"].as_str().unwrap().len(), 64, "sha256 hex");
 }
 
+/// The compiled JPEG resize gives the same bytes on every CI
+/// architecture (issue #173): `photo.jpg` through the u8 row stream at
+/// the two boxes where amd64 and arm64 used to differ, PNG and JPEG
+/// output, with the decode overlapped (`OXIMG_OVERLAP=1`: the pixel
+/// fuse, and for JPEG the fused jpegli encode) and serial
+/// (`OXIMG_OVERLAP=0`). The hashes are the same on x86-64 (with and
+/// without AVX-512) and aarch64.
+#[test]
+fn get_photo_jpg_bytes_match_across_architectures() {
+    let cells = [
+        (
+            "/resize/100/100/photo.jpg@png",
+            "ebdfbd3a3798847237fde42a3b13fd5dafd2302ff7a7febeaf3cdff16181a8e0",
+        ),
+        (
+            "/resize/64/64/photo.jpg@png",
+            "f599eb497efd76525ddfe9c81eddcdcd0d81743290e80189e9d777acc62cd8c9",
+        ),
+        (
+            "/resize/100/100/photo.jpg",
+            "b5d5aa7386f10845daed16f4e489f078ca6ae3e338b9ee75189c30e9fdd117b0",
+        ),
+        (
+            "/resize/64/64/photo.jpg",
+            "2fe1a79aa5446ac3397b81dea562fdba3442c3d71ded561848e97d43aa61f8b7",
+        ),
+    ];
+    for overlap in ["OXIMG_OVERLAP=1", "OXIMG_OVERLAP=0"] {
+        for (path, want) in cells {
+            let (code, v) = run(&["--env", overlap, "get", path, "--expect", "200"]);
+            assert_eq!(code, 0, "{v}");
+            assert_eq!(v["sha256"], want, "{overlap} {path}: {v}");
+        }
+    }
+}
+
 #[test]
 fn get_parallel_resize_with_fractional_band_boundaries() {
     // 150 / 117 makes the last band's bottom round to 150.00000000000003.
