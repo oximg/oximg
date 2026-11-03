@@ -449,6 +449,84 @@ fn row_kernel_is_bit_identical_across_architectures() {
     assert!(differ.is_empty(), "kernel output changed: {differ:?}");
 }
 
+/// (dst_w, dst_h, FNV-1a 64 of the u16 output) for
+/// [`u8_stream_is_bit_identical_across_architectures`], the shapes of
+/// [`KERNEL_GOLDEN`]'s RGB half. Computed on aarch64 with FHM (the f16
+/// pass) and checked on every other kernel (issue #173).
+const U8_STREAM_GOLDEN: &[(usize, usize, u64)] = &[
+    (1, 1, 0xa8b5ae75271042f8),
+    (1, 64, 0xf462538ce977115f),
+    (5, 1, 0x554e859e4d9ebe2b),
+    (5, 64, 0x39c0b4894beae1da),
+    (7, 1, 0xb79d616118de72b9),
+    (7, 64, 0x8a01c02d730750e0),
+    (12, 1, 0x397fa4a953813148),
+    (12, 64, 0x1f188ae6b4a15702),
+    (20, 1, 0xb5be2edb7df4cde0),
+    (20, 64, 0x664e6b79f0f18f23),
+    (31, 1, 0x936eab4b09f72107),
+    (31, 64, 0x806a50385971c7ee),
+    (33, 1, 0x189d7dff9744670f),
+    (33, 64, 0x28c3ea35209b1dad),
+    (100, 1, 0x18311375cf3fe693),
+    (100, 64, 0x8e7dc109b55e840a),
+    (333, 1, 0xf5f5c13c335f7f59),
+    (333, 64, 0x9ea6cb131f8608a3),
+];
+
+/// The u8 stream a JPEG resize runs (sRGB bytes through the linear
+/// LUT, f16 samples and taps) gives the same bits on every
+/// architecture and kernel variant, hashed against
+/// [`U8_STREAM_GOLDEN`].
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[test]
+fn u8_stream_is_bit_identical_across_architectures() {
+    if !fuse_kernel_available() {
+        return;
+    }
+    let mut seed = 0x9E37_79B9u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 24) as u8
+    };
+    let (sw, sh) = (517usize, 389usize);
+    let src: Vec<u8> = (0..sw * sh * 3).map(|_| next()).collect();
+    let lut = crate::resize_kernel::testkit::srgb_lut();
+    let mut got = Vec::new();
+    for dw in [1usize, 5, 7, 12, 20, 31, 33, 100, 333] {
+        for dh in [1usize, 64] {
+            let mut dst = vec![0u16; dw * dh * 3];
+            let mut sr =
+                crate::resize_kernel::StreamResize::<FuseKernel>::new(sw, sh, dw, dh, 3).unwrap();
+            for row in src.chunks_exact(sw * 3) {
+                sr.push_row_u8(row, &lut, |oy, out| {
+                    dst[oy * dw * 3..(oy + 1) * dw * 3].copy_from_slice(out)
+                });
+            }
+            assert_eq!(sr.rows_emitted(), dh);
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &b in u16_as_bytes(&dst) {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+            got.push((dw, dh, h));
+        }
+    }
+    if U8_STREAM_GOLDEN.is_empty() {
+        for (dw, dh, h) in &got {
+            eprintln!("    ({dw}, {dh}, {h:#018x}),");
+        }
+        panic!("U8_STREAM_GOLDEN is empty: paste the table above");
+    }
+    let differ: Vec<_> = got
+        .iter()
+        .zip(U8_STREAM_GOLDEN)
+        .filter(|(g, w)| g != w)
+        .map(|(g, _)| format!("{}x{}", g.0, g.1))
+        .collect();
+    assert_eq!(got.len(), U8_STREAM_GOLDEN.len());
+    assert!(differ.is_empty(), "u8 stream output changed: {differ:?}");
+}
+
 /// The serial path streams rows through the same SIMD kernel the
 /// fused path runs on its worker thread, so the bytes must match
 /// exactly on every architecture.

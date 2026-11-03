@@ -96,6 +96,30 @@ impl RowKernel for Neon {
             }
         }
     }
+    unsafe fn horiz_x3_batch_u8(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        src_w: usize,
+        w: &Windows,
+        cf: &[f32],
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    ) {
+        unsafe {
+            match n {
+                0 => {}
+                2 => horiz_rows_x3_u8::<2>(
+                    stage, row_stride, src_w, w, cf, ring, plane, slots, dst_w,
+                ),
+                _ => horiz_rows_x3_u8::<1>(
+                    stage, row_stride, src_w, w, cf, ring, plane, slots, dst_w,
+                ),
+            }
+        }
+    }
     unsafe fn horiz_x4(
         stage: &[f32],
         w: &Windows,
@@ -432,6 +456,107 @@ unsafe fn horiz_rows_x3_half<const R: usize>(
     }
 }
 
+/// [`dot3_rows_half`] in f32, for cores without FHM: the same 8-tap
+/// blocks and the same two chains per lane (`lo` takes taps `j, j + 8,
+/// ...`, `hi` taps `j + 4, j + 12, ...`), fused by `vfmaq_f32` over the
+/// f16-exact samples and taps. Each FMA rounds once, as FMLAL does, so
+/// the sums are the FMLAL sums bit for bit.
+#[inline(always)]
+// SAFETY: requires NEON; as `dot3_rows` with 8-tap blocks (`padded` =
+// size rounded up to 8, still `<= w.stride`) and `cf` laid out like
+// `w.coeffs`.
+unsafe fn dot3_rows_u8<const R: usize>(
+    ins: &[[*const f32; 3]; R],
+    w: &Windows,
+    cf: &[f32],
+    o: usize,
+) -> [[std::arch::aarch64::float32x4_t; 3]; R] {
+    unsafe {
+        use std::arch::aarch64::*;
+        let start = *w.starts.get_unchecked(o);
+        let padded = w.sizes.get_unchecked(o).div_ceil(8) * 8;
+        let cp = cf.as_ptr().add(o * w.stride);
+        let mut lo = [[vdupq_n_f32(0.0); 3]; R];
+        let mut hi = [[vdupq_n_f32(0.0); 3]; R];
+        let mut k = 0usize;
+        while k < padded {
+            let c0 = vld1q_f32(cp.add(k));
+            let c1 = vld1q_f32(cp.add(k + 4));
+            for r in 0..R {
+                for ch in 0..3 {
+                    let p = ins[r][ch].add(start + k);
+                    lo[r][ch] = vfmaq_f32(lo[r][ch], vld1q_f32(p), c0);
+                    hi[r][ch] = vfmaq_f32(hi[r][ch], vld1q_f32(p.add(4)), c1);
+                }
+            }
+            k += 8;
+        }
+        for r in 0..R {
+            for ch in 0..3 {
+                lo[r][ch] = vaddq_f32(lo[r][ch], hi[r][ch]);
+            }
+        }
+        lo
+    }
+}
+
+/// [`RowKernel::horiz_x3_batch_u8`]: [`horiz_rows_x3_half`] over f32
+/// staged rows, the same reduction and the same 65536 scale.
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+// SAFETY: requires NEON. As `horiz_rows_x3`, with reads to the 8-tap
+// padding (`<= w.stride`, inside the same slack), and
+// `cf.len() >= w.coeffs.len()`.
+unsafe fn horiz_rows_x3_u8<const R: usize>(
+    stage: &[f32],
+    row_stride: usize,
+    src_w: usize,
+    w: &Windows,
+    cf: &[f32],
+    ring: &mut [f32],
+    plane: usize,
+    slots: &[usize; 4],
+    dst_w: usize,
+) {
+    assert!(ring.len() >= 3 * plane);
+    assert!(slots[..R].iter().all(|&s| s + dst_w <= plane));
+    assert!(cf.len() >= w.coeffs.len());
+    const SCALE: f32 = 65536.0;
+    unsafe {
+        use std::arch::aarch64::*;
+        let ins: [[*const f32; 3]; R] = std::array::from_fn(|r| {
+            let p = stage.as_ptr().add(r * row_stride);
+            [p, p.add(src_w), p.add(2 * src_w)]
+        });
+        let base = ring.as_mut_ptr();
+        let mut ox = 0usize;
+        while ox + 4 <= dst_w {
+            let a0 = dot3_rows_u8::<R>(&ins, w, cf, ox);
+            let a1 = dot3_rows_u8::<R>(&ins, w, cf, ox + 1);
+            let a2 = dot3_rows_u8::<R>(&ins, w, cf, ox + 2);
+            let a3 = dot3_rows_u8::<R>(&ins, w, cf, ox + 3);
+            for r in 0..R {
+                for ch in 0..3 {
+                    let s = vpaddq_f32(
+                        vpaddq_f32(a0[r][ch], a1[r][ch]),
+                        vpaddq_f32(a2[r][ch], a3[r][ch]),
+                    );
+                    vst1q_f32(base.add(ch * plane + slots[r] + ox), vmulq_n_f32(s, SCALE));
+                }
+            }
+            ox += 4;
+        }
+        for ox in ox..dst_w {
+            let a = dot3_rows_u8::<R>(&ins, w, cf, ox);
+            for (row, &slot) in a.iter().zip(slots) {
+                for (ch, v) in row.iter().enumerate() {
+                    *base.add(ch * plane + slot + ox) = vaddvq_f32(*v) * SCALE;
+                }
+            }
+        }
+    }
+}
+
 /// One horizontal row, 4 channels, reading the interleaved f32 staged
 /// row: each pixel is a natural f32x4 lane group; four taps share one
 /// coefficient vector via lane-indexed FMA. The AVX2 kernel's operation
@@ -670,6 +795,11 @@ mod tests {
     #[test]
     fn u8_staging_matches_u16() {
         testkit::assert_u8_staging_matches_u16::<Neon>();
+    }
+
+    #[test]
+    fn horiz_u8_matches_model() {
+        testkit::assert_horiz_u8_matches_model::<Neon>();
     }
 
     #[test]

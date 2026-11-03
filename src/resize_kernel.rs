@@ -15,10 +15,11 @@
 //! accumulation applies taps in ascending order. Streamed emission
 //! performs the same operations in the same per-value order as the
 //! full-frame driver, so their outputs are bit-identical (asserted by
-//! tests per arch). The one deliberate exception is a u8 stream on a
-//! kernel with [`RowKernel::half_u8`]: its horizontal pass reads f16
-//! samples and taps (f32 accumulation), within one 8-bit level of the
-//! f32 result; the scheduling guarantees above still hold within it.
+//! tests per arch). u8 streams are the one deliberate exception: their
+//! horizontal pass reads f16 samples and taps (f32 accumulation), within
+//! one 8-bit level of the f32 result, in one fixed order on every kernel
+//! ([`RowKernel::horiz_x3_batch_u8`]), so they too are bit-identical
+//! across architectures; the scheduling guarantees above hold within it.
 
 use anyhow::{Result, ensure};
 use std::sync::Arc;
@@ -62,6 +63,10 @@ pub(crate) struct Windows {
     // Only the NEON kernel runs that pass.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     coeffs_h: std::sync::OnceLock<Vec<u16>>,
+    /// The same f16 taps widened back to f32 (exact), built on first use
+    /// by the f32 form of the u8 horizontal pass
+    /// ([`RowKernel::horiz_x3_batch_u8`]).
+    coeffs_hf: std::sync::OnceLock<Vec<f32>>,
 }
 
 impl Windows {
@@ -73,14 +78,15 @@ impl Windows {
     }
 
     /// Bytes [`Windows::new`] holds for this pass (positions, sizes, f32
-    /// coefficients, and with `f16` the half-precision copy the
-    /// horizontal pass builds on first use) plus its f64 working window,
-    /// from the sizes alone: pricing a table must not build it.
-    pub(crate) fn resident_bytes(in_size: usize, out_size: usize, f16: bool) -> u64 {
+    /// coefficients, and `copy` bytes per coefficient for the f16 taps a
+    /// u8 horizontal pass builds on first use: 2 as bits, 4 widened, 0
+    /// for none) plus its f64 working window, from the sizes alone:
+    /// pricing a table must not build it.
+    pub(crate) fn resident_bytes(in_size: usize, out_size: usize, copy: u64) -> u64 {
         let window_size = Self::window_size(in_size, out_size) as u64;
         let stride = window_size.next_multiple_of(8);
         let out = out_size as u64;
-        let per_coeff = if f16 { 4 + 2 } else { 4 };
+        let per_coeff = 4 + copy;
         out.saturating_mul(16)
             .saturating_add(out.saturating_mul(stride).saturating_mul(per_coeff))
             .saturating_add(window_size.saturating_mul(8))
@@ -138,6 +144,7 @@ impl Windows {
             sizes,
             coeffs,
             coeffs_h: std::sync::OnceLock::new(),
+            coeffs_hf: std::sync::OnceLock::new(),
         }
     }
 
@@ -146,28 +153,42 @@ impl Windows {
     /// several u16 steps on a flat bright area, so each window is
     /// rounded largest tap first, carrying the error so far into the
     /// next: what is left over is under half an ulp of the smallest tap.
+    // Only the NEON kernel stages f16 bits.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn coeffs_f16(&self) -> &[u16] {
-        self.coeffs_h.get_or_init(|| {
-            let mut out = vec![0u16; self.coeffs.len()];
-            let mut order = Vec::with_capacity(self.window_size);
-            for (o, &n) in self.sizes.iter().enumerate() {
-                let (want, taps) = (
-                    &self.coeffs[o * self.stride..][..n],
-                    &mut out[o * self.stride..][..n],
-                );
-                order.clear();
-                order.extend(0..n);
-                order.sort_by(|&a, &b| want[b].abs().total_cmp(&want[a].abs()));
-                let mut carry = 0f64;
-                for &k in &order {
-                    let v = want[k] as f64 + carry;
-                    taps[k] = f32_to_f16(v as f32);
-                    carry = v - f16_to_f32(taps[k]) as f64;
-                }
+        self.coeffs_h.get_or_init(|| self.round_f16())
+    }
+
+    /// [`Windows::coeffs_f16`] as f32: the taps every u8 stream's
+    /// horizontal pass multiplies by, on every kernel. A product of two
+    /// f16 values is exact in f32, so an f32 FMA over these and
+    /// f16-exact samples rounds exactly where FMLAL does. Built without
+    /// caching the bits: a stream holds one copy or the other.
+    pub(crate) fn coeffs_f16_f32(&self) -> &[f32] {
+        self.coeffs_hf
+            .get_or_init(|| self.round_f16().into_iter().map(f16_to_f32).collect())
+    }
+
+    /// The rounding behind [`Windows::coeffs_f16`], uncached.
+    fn round_f16(&self) -> Vec<u16> {
+        let mut out = vec![0u16; self.coeffs.len()];
+        let mut order = Vec::with_capacity(self.window_size);
+        for (o, &n) in self.sizes.iter().enumerate() {
+            let (want, taps) = (
+                &self.coeffs[o * self.stride..][..n],
+                &mut out[o * self.stride..][..n],
+            );
+            order.clear();
+            order.extend(0..n);
+            order.sort_by(|&a, &b| want[b].abs().total_cmp(&want[a].abs()));
+            let mut carry = 0f64;
+            for &k in &order {
+                let v = want[k] as f64 + carry;
+                taps[k] = f32_to_f16(v as f32);
+                carry = v - f16_to_f32(taps[k]) as f64;
             }
-            out
-        })
+        }
+        out
     }
 }
 
@@ -210,7 +231,6 @@ pub(crate) fn f32_to_f16(x: f32) -> u16 {
 }
 
 /// IEEE binary16 bits -> f32 (exact).
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h & 0x8000) as u32) << 16;
     let exp = ((h >> 10) & 0x1f) as u32;
@@ -349,8 +369,9 @@ pub(crate) trait RowKernel {
     /// Stage one u8 RGB row as f32 through a 256-entry lookup table
     /// (fusing e.g. the sRGB -> linear transfer into staging, so no
     /// separate full-image pass or u16 intermediate is needed). The
-    /// table holds exact f32 images of the u16 LUT values, making this
-    /// bit-identical to `lut[v] as u16` followed by [`RowKernel::stage_x3`].
+    /// table is the stream's LUT rounded to f16 at 1/65536 scale
+    /// ([`StreamResize::push_row_u8`]), so every entry is an exact f16
+    /// value; faster lookups may rely on that.
     // SAFETY: caller contract as for `stage_x3` (`Self::detect()` verified,
     // `row.len() >= 3 * w`, `stage.len() >= w * Self::STAGE3_FLOATS_PER_PIXEL`).
     // The default body forwards exactly that contract to
@@ -358,12 +379,14 @@ pub(crate) trait RowKernel {
     unsafe fn stage_x3_u8(row: &[u8], lut: &[f32; 256], stage: &mut [f32], w: usize) {
         unsafe { stage_x3_u8_words(row, lut, stage, w, Self::STAGE3_FLOATS_PER_PIXEL == 4) }
     }
-    /// Whether this CPU runs u8 streams at half precision: rows staged
-    /// as planar f16 and the horizontal pass fed f16 samples and
-    /// coefficients, accumulating in f32. That halves the pass's loads,
-    /// which bound it. The rounding (2^-11 relative, on samples and
-    /// coefficients) is far below one 8-bit output step, which is all
-    /// a u8 source feeds; u16 streams always stay f32.
+    /// Whether this CPU stores u8 streams' staged rows as f16: planar
+    /// f16 rows and taps fed to FMLAL, accumulating in f32. That halves
+    /// the horizontal pass's loads, which bound it. Every other kernel
+    /// stages the same f16 values as f32 and runs
+    /// [`RowKernel::horiz_x3_batch_u8`], which is the same arithmetic,
+    /// so the choice changes no bit (issue #173). The rounding (2^-11
+    /// relative, on samples and taps) is far below one 8-bit output
+    /// step, which is all a u8 source feeds; u16 streams stay f32.
     fn half_u8() -> bool {
         false
     }
@@ -425,6 +448,32 @@ pub(crate) trait RowKernel {
     ) {
         unreachable!("half_u8() is false for this kernel")
     }
+    /// The horizontal pass of every u8 stream not on
+    /// [`RowKernel::horiz_x3_batch_half`]: rows staged by
+    /// [`RowKernel::stage_x3_u8`] (or [`RowKernel::stage_ycc_h2`]) from
+    /// the f16-exact LUT at 1/65536 scale, taps `cf` =
+    /// [`Windows::coeffs_f16_f32`]. Per output and channel it is the
+    /// half pass's order exactly: eight chains (tap index mod 8), each
+    /// fused in ascending order from +0.0 over 8-tap blocks; chains j
+    /// and j + 4 added; then `(l0 + l1) + (l2 + l3)`; then times 65536.
+    /// The products are exact in f32 and each FMA rounds once, as
+    /// FMLAL does, so the two passes agree bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    // SAFETY: caller must have verified `Self::detect()`; per row i < n,
+    // `stage[i * row_stride..]` and ring slot `slots[i]` satisfy the
+    // `horiz_x3` preconditions, and `cf.len() >= w.coeffs.len()`.
+    unsafe fn horiz_x3_batch_u8(
+        stage: &[f32],
+        row_stride: usize,
+        n: usize,
+        src_w: usize,
+        w: &Windows,
+        cf: &[f32],
+        ring: &mut [f32],
+        plane: usize,
+        slots: &[usize; 4],
+        dst_w: usize,
+    );
     /// Convert one u16 RGBA row to f32, keeping the interleaved layout.
     // SAFETY: caller must have verified `Self::detect()` and pass
     // `stage.len() >= row.len()`.
@@ -637,6 +686,19 @@ pub(crate) fn clamp_u16(v: f32) -> u16 {
     (v + 0.5).clamp(0.0, 65535.0) as u16
 }
 
+/// How a [`StreamResize`] stages and convolves its rows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// u16 rows (or none yet): exact f32 staging, the u16 pass.
+    U16,
+    /// u8 rows through the f16-rounded LUT, staged as f32
+    /// ([`RowKernel::horiz_x3_batch_u8`]).
+    U8,
+    /// u8 rows through the same LUT, staged as f16
+    /// ([`RowKernel::horiz_x3_batch_half`]); bit-identical to `U8`.
+    U8Half,
+}
+
 /// Row-push streaming resizer: feed source rows top-to-bottom with
 /// [`StreamResize::push_row`]; each completed output row is handed to the
 /// callback immediately. Ring capacity bounds memory at
@@ -662,11 +724,13 @@ pub(crate) struct StreamResize<K: RowKernel> {
     pending: usize,
     /// f32s between consecutive staged rows in the batch buffer.
     stage_row_stride: usize,
-    /// Rows are staged as f16 ([`RowKernel::half_u8`]); decided by the
-    /// first row, since a stream is fed u8 or u16 rows, never both.
-    half: bool,
-    /// The stream's u8 LUT as f16 bits at 1/65536 scale (half mode).
+    /// How rows are staged and convolved, decided by the first row: a
+    /// stream is fed u8 or u16 rows, never both.
+    mode: Mode,
+    /// The stream's u8 LUT as f16 bits at 1/65536 scale (u8 modes).
     lut_h: [u16; 256],
+    /// `lut_h` widened to f32 (exact): what f32 staging reads.
+    lut_q: [f32; 256],
     /// `scratch.ycc` holds terms for this stream's current chroma row.
     ycc_ready: bool,
     oy: usize,
@@ -717,9 +781,9 @@ impl<K: RowKernel> StreamResize<K> {
             .saturating_add(Windows::resident_bytes(
                 src_w as usize,
                 dst_w as usize,
-                true,
+                if K::half_u8() { 2 } else { 4 },
             ))
-            .saturating_add(Windows::resident_bytes(src_h as usize, dst_h, false))
+            .saturating_add(Windows::resident_bytes(src_h as usize, dst_h, 0))
     }
 
     /// `cap_override` shrinks/expands the ring (tests use `src_h` to run
@@ -789,8 +853,9 @@ impl<K: RowKernel> StreamResize<K> {
             next_row: 0,
             pending: 0,
             stage_row_stride,
-            half: false,
+            mode: Mode::U16,
             lut_h: [0; 256],
+            lut_q: [0.0; 256],
             ycc_ready: false,
             oy: 0,
             scratch,
@@ -819,7 +884,7 @@ impl<K: RowKernel> StreamResize<K> {
     /// window is completed by this source row, in ascending `oy` order.
     pub(crate) fn push_row(&mut self, row: &[u16], emit: impl FnMut(usize, &[u16])) {
         assert!(row.len() >= self.src_w * self.channels, "short source row");
-        assert!(!self.half, "u16 row pushed into a u8 stream");
+        assert!(self.mode == Mode::U16, "u16 row pushed into a u8 stream");
         if self.next_row >= self.last_needed {
             self.next_row += 1;
             return; // trailing rows influence nothing
@@ -845,12 +910,29 @@ impl<K: RowKernel> StreamResize<K> {
         self.after_stage(emit);
     }
 
+    /// Enter a u8 mode on the stream's first row: `lut` (exact u16
+    /// values as f32) rounded to f16 at 1/65536 scale, the one rounding
+    /// every kernel's u8 pass shares (issue #173). f16 tops out at
+    /// 65504, below the u16 range; the power-of-two scale is exact and
+    /// the horizontal pass undoes it. Later rows must bring the same
+    /// table.
+    fn enter_u8(&mut self, lut: &[f32; 256]) {
+        if self.next_row != 0 {
+            assert!(self.mode != Mode::U16, "u8 row pushed into a u16 stream");
+            return;
+        }
+        self.lut_h = std::array::from_fn(|i| f32_to_f16(lut[i] / 65536.0));
+        self.lut_q = self.lut_h.map(f16_to_f32);
+        self.mode = if K::half_u8() { Mode::U8Half } else { Mode::U8 };
+    }
+
     /// Push the next source row as interleaved u8 RGB, staging through a
-    /// u8 -> f32 lookup table (3-channel streams only). Values are
-    /// bit-identical to applying the equivalent u16 LUT and calling
-    /// [`StreamResize::push_row`], except on kernels that run u8 streams
-    /// at half precision ([`RowKernel::half_u8`]), where they agree to
-    /// one 8-bit sRGB level.
+    /// u8 -> f32 lookup table (3-channel streams only). Every kernel
+    /// rounds the table to f16 and runs the same horizontal arithmetic
+    /// ([`RowKernel::horiz_x3_batch_u8`]), so the output is the same on
+    /// every architecture; it agrees with applying the equivalent u16
+    /// LUT and calling [`StreamResize::push_row`] to one 8-bit sRGB
+    /// level.
     pub(crate) fn push_row_u8(
         &mut self,
         row: &[u8],
@@ -863,17 +945,12 @@ impl<K: RowKernel> StreamResize<K> {
             self.next_row += 1;
             return; // trailing rows influence nothing
         }
-        if self.next_row == 0 && K::half_u8() {
-            self.half = true;
-            // f16 tops out at 65504, below the u16 range; the power-of-two
-            // scale is exact and the horizontal pass undoes it.
-            self.lut_h = std::array::from_fn(|i| f32_to_f16(lut[i] / 65536.0));
-        }
-        if self.half {
+        self.enter_u8(lut);
+        if self.mode == Mode::U8Half {
             let n = self.half_row_stride();
             let w = self.src_w;
             let stage = &mut as_u16_mut(&mut self.scratch.stage)[self.pending * n..][..n];
-            // SAFETY: half_u8() held when `half` was set; the row slice is
+            // SAFETY: half_u8() held when the mode was set; the row slice is
             // `3 * (w + stride) >= 3 * w` long.
             unsafe { K::stage_x3_u8_half(row, &self.lut_h, &mut stage[..3 * w], w) };
             // The padded tap-blocks read past the last plane: keep those
@@ -887,7 +964,7 @@ impl<K: RowKernel> StreamResize<K> {
             unsafe {
                 K::stage_x3_u8(
                     row,
-                    lut,
+                    &self.lut_q,
                     &mut self.scratch.stage[base..base + self.src_w * px],
                     self.src_w,
                 );
@@ -911,13 +988,14 @@ impl<K: RowKernel> StreamResize<K> {
         emit: impl FnMut(usize, &[u16]),
     ) {
         assert_eq!(self.channels, 3, "YCbCr staging is 3-channel only");
-        assert!(K::ycc_h2() && !self.half, "kernel lacks YCbCr staging");
+        assert!(K::ycc_h2() && !K::half_u8(), "kernel lacks YCbCr staging");
         let w = self.src_w;
         assert!(y.len() >= w, "short luma row");
         if self.next_row >= self.last_needed {
             self.next_row += 1;
             return; // trailing rows influence nothing
         }
+        self.enter_u8(lut);
         if let Some((cb, cr)) = chroma {
             let cw = w.div_ceil(2);
             assert!(cb.len() >= cw && cr.len() >= cw, "short chroma row");
@@ -937,7 +1015,7 @@ impl<K: RowKernel> StreamResize<K> {
             K::stage_ycc_h2(
                 y,
                 &self.scratch.ycc,
-                lut,
+                &self.lut_q,
                 &mut self.scratch.stage[base..base + w * px],
                 w,
             );
@@ -1024,13 +1102,26 @@ impl<K: RowKernel> StreamResize<K> {
         // SAFETY: constructor verified K::detect(); slice lengths include
         // the zero-coefficient slack the padded tap-blocks may read.
         unsafe {
-            if self.half {
+            if self.mode == Mode::U8Half {
                 K::horiz_x3_batch_half(
                     &as_u16(&s.stage)[..half_stride * self.pending],
                     half_stride,
                     self.pending,
                     self.src_w,
                     &self.wh,
+                    &mut s.ring[..],
+                    self.plane,
+                    &slots,
+                    self.dst_w,
+                );
+            } else if self.mode == Mode::U8 {
+                K::horiz_x3_batch_u8(
+                    &s.stage[..self.stage_row_stride * self.pending],
+                    self.stage_row_stride,
+                    self.pending,
+                    self.src_w,
+                    &self.wh,
+                    self.wh.coeffs_f16_f32(),
                     &mut s.ring[..],
                     self.plane,
                     &slots,
@@ -1325,10 +1416,11 @@ pub(crate) mod testkit {
                 let tables = |w: &Windows| {
                     (w.starts.len() * 8 + w.sizes.len() * 8 + w.coeffs.len() * 4) as u64
                 };
-                // The horizontal f16 copy is built on the first pushed
-                // row, not at construction; it is a real allocation of a
-                // running stream, so count it.
-                let f16 = (sr.wh.coeffs.len() * 2) as u64;
+                // The horizontal f16 copy (bits on a half kernel, f32
+                // otherwise) is built on the first pushed u8 row, not at
+                // construction; it is a real allocation of a running
+                // stream, so count it.
+                let f16 = (sr.wh.coeffs.len() * if K::half_u8() { 2 } else { 4 }) as u64;
                 let held = (s.stage.0.len() * 64
                     + s.ring.0.len() * 64
                     + s.acc.len() * 4
@@ -1381,10 +1473,10 @@ pub(crate) mod testkit {
         }
     }
 
-    /// u8 staging through a LUT == the same LUT applied up front and staged
-    /// as u16, bit-exact, including widths that leave a partial 4-pixel group.
-    pub(crate) fn assert_u8_staging_matches_u16<K: RowKernel>() {
-        let lut: [f32; 256] = std::array::from_fn(|v| {
+    /// The sRGB -> linear table a JPEG stream is fed: exact u16 values
+    /// as f32.
+    pub(crate) fn srgb_lut() -> [f32; 256] {
+        std::array::from_fn(|v| {
             let c = v as f64 / 255.0;
             let l = if c <= 0.04045 {
                 c / 12.92
@@ -1392,7 +1484,146 @@ pub(crate) mod testkit {
                 ((c + 0.055) / 1.055).powf(2.4)
             };
             (l * 65535.0).round() as f32
-        });
+        })
+    }
+
+    /// Scalar model of the u8 horizontal pass every kernel runs
+    /// ([`RowKernel::horiz_x3_batch_u8`], [`RowKernel::horiz_x3_batch_half`]):
+    /// one interleaved u8 RGB row through `lut` (exact u16 values) to its
+    /// three planar output rows. Written from the contract, not from
+    /// either kernel: f16 samples and taps, eight chains by tap index mod
+    /// 8, fused in ascending order, `(l0 + l1) + (l2 + l3)` over
+    /// `l_j = c_j + c_{j+4}`, times 65536.
+    pub(crate) fn horiz_u8_model(
+        row: &[u8],
+        lut: &[f32; 256],
+        w: &Windows,
+        sw: usize,
+        dw: usize,
+    ) -> [Vec<f32>; 3] {
+        let q: [f32; 256] = std::array::from_fn(|i| f16_to_f32(f32_to_f16(lut[i] / 65536.0)));
+        let cf = w.coeffs_f16_f32();
+        std::array::from_fn(|c| {
+            (0..dw)
+                .map(|o| {
+                    let start = w.starts[o];
+                    let mut chain = [0f32; 8];
+                    // Taps past the window are zero: a finite sample times
+                    // +0.0 adds nothing, so the model reads 0 there.
+                    for k in 0..w.sizes[o].div_ceil(8) * 8 {
+                        let x = start + k;
+                        let v = if x < sw {
+                            q[row[3 * x + c] as usize]
+                        } else {
+                            0.0
+                        };
+                        chain[k % 8] = v.mul_add(cf[o * w.stride + k], chain[k % 8]);
+                    }
+                    let l: [f32; 4] = std::array::from_fn(|j| chain[j] + chain[j + 4]);
+                    ((l[0] + l[1]) + (l[2] + l[3])) * 65536.0
+                })
+                .collect()
+        })
+    }
+
+    /// Every u8 horizontal pass the kernel has (f32-staged, and f16-staged
+    /// where [`RowKernel::half_u8`] holds) equals [`horiz_u8_model`] bit
+    /// for bit, for every batch size: what makes u8 streams identical
+    /// across architectures (issue #173).
+    pub(crate) fn assert_horiz_u8_matches_model<K: RowKernel>() {
+        let lut = srgb_lut();
+        let lut_h: [u16; 256] = std::array::from_fn(|i| f32_to_f16(lut[i] / 65536.0));
+        let lut_q = lut_h.map(f16_to_f32);
+        let narrow = (1..=13usize).map(|w| (w, 4, w.div_ceil(2), 1));
+        let more = [(2040usize, 0, 100usize, 0), (517, 0, 33, 0), (1, 0, 7, 0)];
+        for (sw, _, dw, _) in SHAPES.iter().copied().chain(narrow).chain(more) {
+            let w = Windows::new(sw, dw);
+            // Every code in play: the test image's high bytes, then a ramp.
+            let mut src: Vec<u8> = test_image(sw, 4, 3)
+                .iter()
+                .map(|&v| (v >> 8) as u8)
+                .collect();
+            for (i, v) in src[..3 * sw].iter_mut().enumerate() {
+                *v = (i * 7) as u8;
+            }
+            let row = |r: usize| &src[r * sw * 3..(r + 1) * sw * 3];
+            let want: Vec<[Vec<f32>; 3]> = (0..4)
+                .map(|r| horiz_u8_model(row(r), &lut, &w, sw, dw))
+                .collect();
+            let plane = 5 * dw;
+            let slots = [3 * dw, dw, 4 * dw, 0];
+            let check = |ring: &[f32], n: usize, what: &str| {
+                for (r, &slot) in slots.iter().enumerate().take(n) {
+                    for (c, want) in want[r].iter().enumerate() {
+                        let got = &ring[c * plane + slot..][..dw];
+                        let bad = got
+                            .iter()
+                            .zip(want)
+                            .position(|(a, b)| a.to_bits() != b.to_bits());
+                        assert!(
+                            bad.is_none(),
+                            "{what} {sw}->{dw} batch {n} row {r} channel {c} x {}: {} != {}",
+                            bad.unwrap(),
+                            got[bad.unwrap()],
+                            want[bad.unwrap()]
+                        );
+                    }
+                }
+            };
+
+            let px = K::STAGE3_FLOATS_PER_PIXEL;
+            let rs = (sw + w.stride) * px;
+            let mut stage = vec![0f32; rs * 4];
+            for r in 0..4 {
+                // SAFETY: after K::detect(); the row is 3 * sw bytes and its
+                // stage slice sw * px floats.
+                unsafe { K::stage_x3_u8(row(r), &lut_q, &mut stage[r * rs..][..sw * px], sw) };
+            }
+            for n in 1..=K::HORIZ_BATCH {
+                let mut ring = vec![-1f32; 3 * plane];
+                // SAFETY: rows carry the slack; every slot + dw <= plane.
+                unsafe {
+                    K::horiz_x3_batch_u8(
+                        &stage,
+                        rs,
+                        n,
+                        sw,
+                        &w,
+                        w.coeffs_f16_f32(),
+                        &mut ring,
+                        plane,
+                        &slots,
+                        dw,
+                    )
+                };
+                check(&ring, n, "f32-staged");
+            }
+
+            if !K::half_u8() {
+                continue;
+            }
+            let rh = (sw + w.stride) * 3;
+            let mut half = vec![0u16; rh * 4];
+            for r in 0..4 {
+                // SAFETY: half_u8() checked; 3 * sw bytes in, 3 * sw u16 out.
+                unsafe { K::stage_x3_u8_half(row(r), &lut_h, &mut half[r * rh..][..3 * sw], sw) };
+            }
+            for n in 1..=K::HORIZ_BATCH {
+                let mut ring = vec![-1f32; 3 * plane];
+                // SAFETY: as above, over f16 rows whose slack is zero.
+                unsafe {
+                    K::horiz_x3_batch_half(&half, rh, n, sw, &w, &mut ring, plane, &slots, dw)
+                };
+                check(&ring, n, "f16-staged");
+            }
+        }
+    }
+
+    /// A u8 stream through the kernel's LUT staging agrees with the same
+    /// LUT applied up front and staged as u16 to one 8-bit sRGB level,
+    /// including widths that leave a partial 4-pixel group.
+    pub(crate) fn assert_u8_staging_matches_u16<K: RowKernel>() {
+        let lut = srgb_lut();
         let narrow = (1..=13usize).map(|w| (w, 5, w.div_ceil(2), 3));
         for (sw, sh, dw, dh) in SHAPES.iter().copied().chain(narrow) {
             let src: Vec<u8> = test_image(sw, sh, 3)
@@ -1413,11 +1644,7 @@ pub(crate) mod testkit {
                     via_u16[oy * dw * 3..(oy + 1) * dw * 3].copy_from_slice(out)
                 });
             }
-            if !K::half_u8() {
-                assert_eq!(via_u8, via_u16, "{sw}x{sh}->{dw}x{dh} u8 staging");
-                continue;
-            }
-            // Half precision: judged where a u8 stream lands, 8-bit sRGB.
+            // f16 samples and taps: judged where a u8 stream lands, 8-bit sRGB.
             let enc = |v: u16| {
                 let l = v as f64 / 65535.0;
                 let c = if l <= 0.0031308 {
@@ -1436,11 +1663,12 @@ pub(crate) mod testkit {
             }
             // Measured on an M2 Max: worst 26 u16, 1 level, at most 1.02%
             // of samples off (640x480 -> 512x384: 0.92%) beyond the
-            // one-sample floor the tiny shapes need. FMLAL is IEEE with a
-            // fixed order, so these are the same on any FEAT_FHM core;
-            // the bounds (32, 1.25%) only leave room for coefficient-table
-            // tweaks.
-            let label = format!("{sw}x{sh}->{dw}x{dh} half-precision u8 staging");
+            // one-sample floor the tiny shapes need. Every kernel runs the
+            // same IEEE operations in the same order
+            // ([`assert_horiz_u8_matches_model`]), so these are the same on
+            // every CPU; the bounds (32, 1.25%) only leave room for
+            // coefficient-table tweaks.
+            let label = format!("{sw}x{sh}->{dw}x{dh} u8 staging");
             assert!(worst16 <= 32, "{label}: worst u16 diff {worst16}");
             assert!(worst8 <= 1, "{label}: worst 8-bit diff {worst8}");
             let allowed = (via_u8.len() / 80).max(1);
@@ -1525,28 +1753,38 @@ pub(crate) mod testkit {
             let plane = b * dw;
             let slots: [usize; 4] = std::array::from_fn(|i| i * dw);
             let mut ring = vec![0f32; 3 * plane];
-            let mut best = f64::MAX;
-            for _ in 0..15 {
+            // The u8 pass reads the same rows (their values only need to
+            // be finite to time it); its taps are built before timing.
+            let cf = w.coeffs_f16_f32();
+            let mut time = |u8_pass: bool| {
                 let t = crate::clock::Instant::now();
                 for y in (0..rows - rows % b).step_by(b) {
-                    // SAFETY: after K::detect(); rows y..y + b are staged.
+                    let rows = std::hint::black_box(&stage[y * rs..]);
+                    // SAFETY: after K::detect(); rows y..y + b are staged,
+                    // and `cf` is laid out like `w.coeffs`.
                     unsafe {
-                        K::horiz_x3_batch(
-                            std::hint::black_box(&stage[y * rs..]),
-                            rs,
-                            b,
-                            sw,
-                            &w,
-                            &mut ring,
-                            plane,
-                            &slots,
-                            dw,
-                        )
+                        if u8_pass {
+                            K::horiz_x3_batch_u8(
+                                rows, rs, b, sw, &w, cf, &mut ring, plane, &slots, dw,
+                            )
+                        } else {
+                            K::horiz_x3_batch(rows, rs, b, sw, &w, &mut ring, plane, &slots, dw)
+                        }
                     };
                 }
-                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            // Interleaved (bench/METHODOLOGY.md rule 1), the first pass
+            // alternating per round.
+            let (mut best, mut best_u8) = (f64::MAX, f64::MAX);
+            for round in 0..15 {
+                for u8_pass in [round % 2 == 1, round % 2 == 0] {
+                    let ms = time(u8_pass);
+                    let slot = if u8_pass { &mut best_u8 } else { &mut best };
+                    *slot = slot.min(ms);
+                }
             }
-            println!("horiz {sw}->{dw} x{rows}: {best:.3} ms");
+            println!("horiz {sw}->{dw} x{rows}: {best:.3} ms, u8 pass {best_u8:.3} ms");
         }
     }
 
