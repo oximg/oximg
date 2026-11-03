@@ -1653,10 +1653,11 @@ fn resize_bands(
         // arrives here (it streams through the AVX2 row kernel, serial
         // and fused alike); what remains is PNG/WebP/AVIF, sRGB mode,
         // band-parallel requests, and the fir escape hatch. Both U16x3
-        // and U16x4 use the AVX2 row kernel, bit-identical to aarch64's
-        // NEON one, so the same URL gives the same bytes on both
-        // architectures, and a PNG can stream its rows into it (issue
-        // #154). An x86-64 without AVX2+FMA keeps pic-scale for U16x3.
+        // and U16x4 use the AVX2 row kernel, the same algorithm as
+        // aarch64's NEON one, so both architectures give the same bytes
+        // (a rare last-bit difference remains, issue #172), and a PNG can
+        // stream its rows into it (issue #154). An x86-64 without
+        // AVX2+FMA keeps pic-scale for U16x3.
         if !resize_uses_fir(px, threads, dst_h) {
             #[cfg(target_arch = "x86_64")]
             return if px == PixelType::U16x3 && !crate::resize_avx2::Avx2::available() {

@@ -80,8 +80,8 @@ HTTP interface without notice.
     `oximg resize` of a 7000×7000 RGB PNG into a 10×200 box peaks at
     9 MiB instead of 287 MiB on a Ryzen 7 8745HS.
   - amd64 and arm64 agree. Of 116 fixture cells, 47 differed between
-    the two before and 7 after; those 7 are JPEG decodes and a
-    1/255 alpha difference, both unrelated to this change.
+    the two before and 7 after. Those 7 are JPEG resizes ([#173]) and
+    a 1/255 RGBA difference ([#172]), both unrelated to this change.
   - The new pixels are closer to a float Lanczos3 reference. Over the
     40 cells that changed, the mean absolute error is 0.33 instead of
     0.42 (0–255). The largest error is at most 1/255 where it reached
@@ -337,6 +337,8 @@ no fixture is that large.
 [#121]: https://github.com/oximg/oximg/pull/121
 [#153]: https://github.com/oximg/oximg/issues/153
 [#154]: https://github.com/oximg/oximg/issues/154
+[#172]: https://github.com/oximg/oximg/issues/172
+[#173]: https://github.com/oximg/oximg/issues/173
 [#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26
