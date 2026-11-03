@@ -16,6 +16,7 @@
 //! behind its `jpegtran` feature); this module drives it.
 
 use super::jpeg_dec::error_exit;
+use super::strip::{NotRotated, NotRotatedCode as Code};
 use crate::meta::Orientation;
 use mozjpeg_sys as ffi;
 use std::mem;
@@ -26,7 +27,7 @@ pub(super) enum Rotation {
     /// The upright JPEG.
     Rotated(Vec<u8>),
     /// Not rotated, and why: the caller keeps the orientation tag.
-    Kept(String),
+    Kept(NotRotated),
 }
 
 /// How the source was coded, read from its markers by the strip walk
@@ -64,8 +65,16 @@ pub(super) fn rotate(jpeg: &[u8], o: Orientation, coding: &Coding, limits: &Limi
     });
     match run {
         Ok(r) => r,
-        Err(e) => Rotation::Kept(e.to_string()),
+        // A fatal libjpeg error (error_exit unwinds) on a stream the
+        // strip walk accepted: one libjpeg cannot read. The canary
+        // asserts below also land here; they are a vendored-struct bug
+        // no input can reach, so they get no code of their own.
+        Err(e) => kept(Code::Corrupt, e.to_string()),
     }
+}
+
+fn kept(code: Code, message: impl Into<String>) -> Rotation {
+    Rotation::Kept(NotRotated::new(code, message))
 }
 
 fn transform_code(o: Orientation) -> ffi::JXFORM_CODE {
@@ -275,14 +284,15 @@ unsafe fn rotate_unguarded(
         // what the rotation makes redundant.
         ffi::jcopy_markers_setup(&mut *d.cinfo, ffi::JCOPY_OPTION_JCOPYOPT_ICC);
         if ffi::jpeg_read_header(&mut d.cinfo, 1) != 1 {
-            return Rotation::Kept("no image in the JPEG".into());
+            return kept(Code::Corrupt, "no image in the JPEG");
         }
     }
     let (w, h) = (d.cinfo.image_width, d.cinfo.image_height);
     if u64::from(w) * u64::from(h) > max_pixels {
-        return Rotation::Kept(format!(
-            "{w}x{h} is over OXIMG_MAX_SRC_PIXELS ({max_pixels})"
-        ));
+        return kept(
+            Code::OverLimit,
+            format!("{w}x{h} is over OXIMG_MAX_SRC_PIXELS ({max_pixels})"),
+        );
     }
     // OXIMG_MAX_DECODED_BYTES bounds this as it bounds a decode: the
     // coefficients are realized whole when they are read.
@@ -294,7 +304,7 @@ unsafe fn rotate_unguarded(
         ..Default::default()
     };
     if let Err(e) = super::check_decoded_bytes(cost, "JPEG rotation") {
-        return Rotation::Kept(e.to_string());
+        return kept(Code::OverLimit, e.to_string());
     }
     // SAFETY: plain C data; zero is "no crop, no trim, all components".
     let mut info = Box::new(Guarded {
@@ -314,15 +324,18 @@ unsafe fn rotate_unguarded(
         } else {
             (8 * d.cinfo.max_h_samp_factor, 8 * d.cinfo.max_v_samp_factor)
         };
-        return Rotation::Kept(format!(
-            "{w}x{h} does not divide into whole {bw}x{bh} blocks on the edge \
-             orientation {} moves",
-            o.value()
-        ));
+        return kept(
+            Code::UnalignedEdges,
+            format!(
+                "{w}x{h} does not divide into whole {bw}x{bh} blocks on the edge \
+                 orientation {} moves",
+                o.value()
+            ),
+        );
     }
     let src_coefs = unsafe { ffi::jpeg_read_coefficients(&mut d.cinfo) };
     if d._err.num_warnings > 0 {
-        return Rotation::Kept("the JPEG data is corrupt or truncated".into());
+        return kept(Code::Corrupt, "the JPEG data is corrupt or truncated");
     }
 
     let mut c = Compress {
@@ -377,7 +390,7 @@ unsafe fn rotate_unguarded(
         "jpeg_transform_info overran its declared size"
     );
     if d._err.num_warnings > 0 {
-        return Rotation::Kept("the JPEG data is corrupt or truncated".into());
+        return kept(Code::Corrupt, "the JPEG data is corrupt or truncated");
     }
     Rotation::Rotated(mem::take(&mut c.dest.out))
 }
@@ -413,7 +426,7 @@ mod tests {
         }
     }
 
-    fn kept(r: Rotation) -> String {
+    fn why(r: Rotation) -> NotRotated {
         match r {
             Rotation::Kept(why) => why,
             Rotation::Rotated(_) => panic!("rotated"),
@@ -424,9 +437,10 @@ mod tests {
     fn the_source_pixel_limit_bounds_the_coefficient_memory() {
         let six = six();
         let src = jpeg(64, 48);
-        let why = kept(rotate(&src, six, &BASELINE, &pixels(64 * 48 - 1)));
+        let why = why(rotate(&src, six, &BASELINE, &pixels(64 * 48 - 1)));
+        assert_eq!(why.code, Code::OverLimit);
         assert!(
-            why.contains("64x48") && why.contains("OXIMG_MAX_SRC_PIXELS"),
+            why.message.contains("64x48") && why.message.contains("OXIMG_MAX_SRC_PIXELS"),
             "{why}"
         );
         assert!(matches!(
@@ -483,8 +497,10 @@ mod tests {
         // SOF0 -> SOF3 (lossless), which this libjpeg build cannot read.
         let sof = src.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
         src[sof + 1] = 0xC3;
-        let why = kept(rotate(&src, six, &BASELINE, &pixels(u64::MAX)));
-        assert!(why.contains("libjpeg"), "{why}");
-        assert!(kept(rotate(b"\xFF\xD8", six, &BASELINE, &pixels(u64::MAX))).contains("libjpeg"));
+        for src in [&src[..], b"\xFF\xD8"] {
+            let why = why(rotate(src, six, &BASELINE, &pixels(u64::MAX)));
+            assert_eq!(why.code, Code::Corrupt, "{why}");
+            assert!(why.message.contains("libjpeg"), "{why}");
+        }
     }
 }

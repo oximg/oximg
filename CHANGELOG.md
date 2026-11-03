@@ -10,6 +10,25 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **`strip --auto-rotate` tells callers what happened, as data**
+  ([#176]). Why a rotated source was left tagged is now a stable code
+  beside the human message: `unaligned_edges`, `corrupt`, `over_limit`
+  or `not_jpeg` ([docs/features/paths.md](docs/features/paths.md)). A
+  caller that falls back to another rotation path can count fallbacks
+  by cause without parsing the stderr sentence.
+  - `oximg strip … --json` prints one JSON object on stdout: `bytes`,
+    `content_type`, `removed`, `orientation`, `rotated` and
+    `not_rotated: {code, message}`. The stderr summary is unchanged.
+  - **Breaking (library):** `Stripped::not_rotated` is
+    `Option<NotRotated>` (`code: NotRotatedCode`, `message: String`),
+    no longer `Option<String>`. `NotRotated` displays as the message.
+  - **Breaking (`oximg-ctl strip`):** `not_rotated` is `{code,
+    message}`. ctl runs the child with `--json` and adds `reported` and
+    `reported_matches`: the child's report must be the library's
+    answer for the input.
+
 ### Changed
 
 - **Output bytes change on amd64 and on arm64 cores without FHM: JPEG
@@ -419,6 +438,7 @@ no fixture is that large.
 [#154]: https://github.com/oximg/oximg/issues/154
 [#172]: https://github.com/oximg/oximg/issues/172
 [#173]: https://github.com/oximg/oximg/issues/173
+[#176]: https://github.com/oximg/oximg/issues/176
 [#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26

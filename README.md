@@ -494,6 +494,7 @@ oximg probe portrait.jpg                       # a rotated source also prints it
 oximg strip upload.jpg clean.jpg              # drop EXIF/GPS, XMP, IPTC, comments; no re-encode
 oximg strip upload.png clean.png --icc strip  # ...and the colour profile too
 oximg strip portrait.jpg clean.jpg --auto-rotate  # ...and turn a rotated JPEG upright, losslessly
+oximg strip portrait.jpg clean.jpg --auto-rotate --json  # ...and print the outcome as JSON on stdout
 ```
 
 `oximg strip` removes metadata from a JPEG, PNG or WebP without
@@ -523,6 +524,11 @@ against 12 ms for a plain strip (M2 Max). It is only exact when the
 edges the rotation moves are whole 8 or 16 px blocks; otherwise, for a
 truncated or corrupt JPEG, and for PNG and WebP, the file is stripped
 as without the flag, orientation kept, and the summary says why.
+`--json` prints the outcome on stdout for scripts: `orientation`,
+`rotated`, and `not_rotated: {code, message}`, where `code` is one of
+`unaligned_edges`, `corrupt`, `over_limit` or `not_jpeg`
+([docs/features/paths.md](docs/features/paths.md)) and stays stable
+while the message may change.
 
 The output format is `-f/--format`, else the `<out>` extension, else
 the source's own format — the same precedence idea as the server's

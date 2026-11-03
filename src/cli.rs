@@ -36,7 +36,7 @@ pub fn print_help() {
              --no-auto-rotate   Keep the stored orientation instead of\n                             \
                                 applying EXIF/irot (--auto-rotate forces\n                             \
                                 it on; default OXIMG_AUTO_ROTATE, else on)\n  \
-           oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]\n          \
+           oximg strip <in> <out> [--icc keep|strip] [--auto-rotate] [--json]\n          \
              Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
              and other non-rendering metadata from a JPEG, PNG or WebP\n          \
              without re-encoding: the image data is copied byte for\n          \
@@ -48,7 +48,11 @@ pub fn print_help() {
                                 (DCT blocks moved, no re-encode) and\n                             \
                                 drop its orientation. Kept as without it\n                             \
                                 when an edge is not whole 8/16 px blocks,\n                             \
-                                and for PNG and WebP.\n  \
+                                and for PNG and WebP.\n          \
+             --json             Print the outcome as one JSON object on\n                             \
+                                stdout: bytes, content_type, removed,\n                             \
+                                orientation, rotated, not_rotated\n                             \
+                                {{code, message}} (see docs/features)\n  \
            oximg probe <file>\n          \
              Print the format and stored dimensions (header-only, no\n          \
              pixel decode), plus frame count, duration and loop count\n          \
@@ -191,7 +195,7 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]`
+/// `oximg strip <in> <out> [--icc keep|strip] [--auto-rotate] [--json]`
 pub fn strip(args: &[String]) -> anyhow::Result<()> {
     // OXIMG_ICC is the --icc default, so it is validated like resize's
     // knobs: a typo must not silently keep (or drop) a profile.
@@ -199,9 +203,10 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
         eprintln!("oximg: fatal: {e}");
         std::process::exit(2);
     }
-    const USAGE: &str = "usage: oximg strip <in> <out> [--icc keep|strip] [--auto-rotate]";
+    const USAGE: &str = "usage: oximg strip <in> <out> [--icc keep|strip] [--auto-rotate] [--json]";
     let mut positional: Vec<&str> = Vec::new();
     let mut params = pipeline::StripParams::default();
+    let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -211,6 +216,7 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
             }
             "--icc" => params.icc = icc_flag(&mut it),
             "--auto-rotate" => params.auto_rotate = true,
+            "--json" => json = true,
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 usage_error(&format!("unknown option {flag:?}"))
             }
@@ -256,7 +262,33 @@ pub fn strip(args: &[String]) -> anyhow::Result<()> {
         stripped.bytes.len(),
         stripped.format.content_type(),
     );
+    if json {
+        println!("{}", strip_json(&stripped));
+    }
     Ok(())
+}
+
+/// The `--json` report (#176): the library's [`pipeline::Stripped`]
+/// minus the bytes, for callers that branch on the outcome (the Ruby
+/// gem's `Oximg::Stripped`). Only printed once the output is written;
+/// a failure is a non-zero exit with the reason on stderr, as without
+/// `--json`. `not_rotated.code` is the contract, `message` is not.
+fn strip_json(s: &pipeline::Stripped) -> serde_json::Value {
+    serde_json::json!({
+        "bytes": s.bytes.len(),
+        "content_type": s.format.content_type(),
+        "removed": s
+            .removed
+            .iter()
+            .map(|r| serde_json::json!({ "name": r.name, "count": r.count, "bytes": r.bytes }))
+            .collect::<Vec<_>>(),
+        "orientation": s.orientation,
+        "rotated": s.rotated,
+        "not_rotated": s.not_rotated.as_ref().map(|n| serde_json::json!({
+            "code": n.code.as_str(),
+            "message": n.message,
+        })),
+    })
 }
 
 /// `oximg probe <file>` — the probe example as a shipped command.

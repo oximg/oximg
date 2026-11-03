@@ -109,8 +109,8 @@ strip:
   --icc keep|strip          Passed through to `oximg strip`
   --auto-rotate             Passed through: turn a rotated JPEG upright
                             losslessly. JSON adds `rotated` / `not_rotated`
-                            (the library's answer, which the output must
-                            match) and `rotation` {{orientation, round_trip_identical,
+                            {{code, message}} (the library's answer, which
+                            the output must match) and `rotation` {{orientation, round_trip_identical,
                             max_diff_displayed}}; `pixels_identical` is null
                             for a rotated output.
   JSON adds `removed` (what the library reports for the input),
@@ -118,7 +118,9 @@ strip:
   output is byte for byte the library's strip of the input), `residue` (what a second strip of the output, same ICC policy,
   would still remove: [] when clean), `pixels_identical` (decoded pixels
   of input and output, stored orientation, PNG at native depth), `frames_identical`
-  (animated WebP: every frame's bitstream compared, else null), and
+  (animated WebP: every frame's bitstream compared, else null),
+  `reported` (the child's `oximg strip --json`), `reported_matches` (it
+  is the library's answer for the input, field for field), and
   `peak_rss_bytes`.
 
 sign:

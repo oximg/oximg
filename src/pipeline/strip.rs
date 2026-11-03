@@ -59,7 +59,80 @@ pub struct Stripped {
     pub rotated: Option<u8>,
     /// Why [`StripParams::auto_rotate`] left a rotated source as it was
     /// (its orientation is then in `orientation`).
-    pub not_rotated: Option<String>,
+    pub not_rotated: Option<NotRotated>,
+}
+
+/// Why [`StripParams::auto_rotate`] kept a rotated source's tag (#176):
+/// a stable [`code`](Self::code) for callers to branch on and count, and
+/// a [`message`](Self::message) for humans whose wording may change.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NotRotated {
+    pub code: NotRotatedCode,
+    pub message: String,
+}
+
+impl NotRotated {
+    pub(super) fn new(code: NotRotatedCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+/// `message`, which is what the CLI's summary line prints.
+impl std::fmt::Display for NotRotated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// The reason classes [`NotRotated`] reports. [`as_str`](Self::as_str)
+/// is the wire spelling (CLI `--json`, `oximg-ctl`, the Ruby gem), and
+/// is a contract: a new class is a new variant, never a rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NotRotatedCode {
+    /// An edge the rotation moves is not whole 8x8 (or 16x16, by chroma
+    /// subsampling) blocks, so it cannot be moved without its padding
+    /// showing.
+    UnalignedEdges,
+    /// libjpeg cannot read the stream cleanly: truncated, corrupt, or
+    /// coded in a way this build does not read (lossless, arithmetic).
+    Corrupt,
+    /// Over `OXIMG_MAX_SRC_PIXELS` or `OXIMG_MAX_DECODED_BYTES`; the
+    /// message names which.
+    OverLimit,
+    /// PNG or WebP: only a JPEG can be rotated without re-encoding.
+    NotJpeg,
+}
+
+impl NotRotatedCode {
+    /// Every code, in declaration order (for docs and exhaustive tests).
+    pub const ALL: [Self; 4] = [
+        Self::UnalignedEdges,
+        Self::Corrupt,
+        Self::OverLimit,
+        Self::NotJpeg,
+    ];
+
+    /// The snake_case wire spelling: `unaligned_edges`, `corrupt`,
+    /// `over_limit`, `not_jpeg`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnalignedEdges => "unaligned_edges",
+            Self::Corrupt => "corrupt",
+            Self::OverLimit => "over_limit",
+            Self::NotJpeg => "not_jpeg",
+        }
+    }
+}
+
+impl std::fmt::Display for NotRotatedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// One kind of dropped block: a JPEG segment (`APP1 Exif`, `XMP`,
@@ -147,9 +220,12 @@ fn strip_inner(bytes: &[u8], keep_icc: bool, auto_rotate: bool) -> Result<Stripp
         None => bail!("unsupported image format"),
     };
     if auto_rotate && format != ImageFormat::Jpeg && !orientation.is_upright() {
-        not_rotated = Some(format!(
-            "only a JPEG can be rotated without re-encoding, not {}",
-            format.content_type()
+        not_rotated = Some(NotRotated::new(
+            NotRotatedCode::NotJpeg,
+            format!(
+                "only a JPEG can be rotated without re-encoding, not {}",
+                format.content_type()
+            ),
         ));
     }
     Ok(Stripped {
