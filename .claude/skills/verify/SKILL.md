@@ -167,6 +167,11 @@ $CTL resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/oximg-verify-out.
 # Memory: the decoded-bytes estimate beside the child's peak RSS
 # (`decoded_bytes.total` vs `peak_rss_bytes`).
 $CTL --env OXIMG_LOG_DECODED_BYTES_ABOVE=1 resize tests/fixtures/photo.jpg 0 0
+# Strip: shells out to `oximg strip … --json`; `reported_matches` proves
+# the child's JSON is the library's answer. A tagged JPEG for
+# --auto-rotate is photo_with_orientation() in tests/ctl.rs.
+$CTL strip tests/fixtures/animated.webp
+$CTL strip /tmp/tagged.jpg --auto-rotate   # rotated | not_rotated{code,message}
 
 # Signing: same HMAC as tests/server.rs `signing_gate` / tests/ctl.rs
 KEY=deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
