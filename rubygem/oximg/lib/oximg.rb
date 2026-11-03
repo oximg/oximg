@@ -1,10 +1,12 @@
 # frozen_string_literal: true
 
 require "fcntl"
+require "json"
 require "tempfile"
 require_relative "oximg/version"
 require_relative "oximg/binary"
 require_relative "oximg/native"
+require_relative "oximg/stripped"
 
 # Ruby bindings for oximg (https://github.com/oximg/oximg):
 # high-performance image compression and resizing, in-process work for a
@@ -198,7 +200,12 @@ module Oximg
     # a rotated photo keeps only its EXIF orientation, so it still
     # displays upright. +icc:+ is :keep or :strip (default: the
     # binary's OXIMG_ICC, else keep); dropping a CMYK JPEG's profile is
-    # refused with a ProcessingError. Returns the destination path.
+    # refused with a ProcessingError.
+    #
+    # Returns an Oximg::Stripped: the binary's own account of the run
+    # (orientation kept, rotated?, not_rotated with a stable code). It
+    # stands in for the destination path this returned before:
+    # #to_path, #to_str and == against a String are the path.
     #
     # This is what <tt>saver(strip: true)</tt> / <tt>-strip</tt> did
     # under libvips or ImageMagick, minus the re-encode.
@@ -209,14 +216,36 @@ module Oximg
     # dimensions agree for every reader and no orientation tag is left.
     # That is only exact when the edges it moves are whole 8 or 16 px
     # blocks; otherwise, and for PNG and WebP, the orientation is kept
-    # as without it. Probe the destination to see which happened.
+    # as without it, and the result says why:
+    #
+    #   result = Oximg.strip(upload, clean, auto_rotate: true)
+    #   unless result.upright?
+    #     result.not_rotated.code  #=> :unaligned_edges, :corrupt, :over_limit, :not_jpeg
+    #   end
     #
     # +env:+ is per-call knobs, as for resize.
     def strip(source, destination, icc: nil, auto_rotate: nil, env: nil)
       output = expand(destination, "destination")
       argv = strip_argv(source, output, icc: icc, auto_rotate: auto_rotate)
-      Binary.run(*argv, env: knob_env(env))
-      output
+      child_env = knob_env(env)
+      unless Binary.legacy_strip?
+        begin
+          out, = Binary.run(*argv, "--json", env: child_env)
+          return Stripped.from_json(output, JSON.parse(out))
+        rescue ProcessingError => e
+          # An oximg older than 0.20 refuses the flag at parse time,
+          # before it reads or writes anything: remember that, and run
+          # the strip it does know.
+          raise unless e.status == 2 && e.message.include?('unknown option "--json"')
+
+          Binary.legacy_strip = true
+        end
+      end
+      # Read before the run: the destination may be the source.
+      auto = argv.include?("--auto-rotate")
+      before = auto ? probe(argv[1])[:orientation] : 1
+      Binary.run(*argv, env: child_env)
+      legacy_stripped(output, auto, before)
     end
 
     # The child environment an +env:+ turns into: String names and
@@ -241,8 +270,9 @@ module Oximg
       end
     end
 
-    # The argv `strip` would run, minus the executable; public for the
-    # same reason as resize_argv.
+    # The argv `strip` would run, minus the executable and the --json it
+    # adds to read the outcome; public for the same reason as
+    # resize_argv.
     def strip_argv(source, destination, icc: nil, auto_rotate: nil)
       argv = ["strip", expand(source, "source"), expand(destination, "destination")]
       argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
@@ -400,6 +430,19 @@ module Oximg
       raise ProcessingError, "unparsable probe output: #{output.inspect}" unless match
 
       Header.build(match[1], Integer(match[2]), Integer(match[3]), match[4] ? Integer(match[4]) : 1)
+    end
+
+    # The result from an oximg without --json, from the source's
+    # orientation (+before+, probed ahead of the run) and the output's:
+    # whether it was rotated is known, but not why it was not.
+    def legacy_stripped(output, auto_rotate, before)
+      orientation = probe(output)[:orientation]
+      kept = (orientation > 1) ? orientation : nil
+      rotated = (auto_rotate && before > 1 && kept.nil?) ? before : nil
+      why = (kept && auto_rotate) ? Stripped::NotRotated.new(code: :unknown,
+        message: "oximg #{Binary.version} has no strip --json; upgrade for the reason") : nil
+      Stripped.new(path: output, bytes: File.size(output), orientation: kept,
+        rotated: rotated, not_rotated: why)
     end
 
     # Absolute paths throughout: a relative name beginning with "-"

@@ -28,6 +28,12 @@ HTTP interface without notice.
     message}`. ctl runs the child with `--json` and adds `reported` and
     `reported_matches`: the child's report must be the library's
     answer for the input.
+  - The Ruby gem's `Oximg.strip` returns an `Oximg::Stripped`
+    (`rotated?`, `upright?`, `orientation`, `not_rotated.code` as a
+    Symbol, `not_rotated.message`) in place of the destination String.
+    It is still the path where one is expected (`to_s`, `to_path`,
+    `to_str`, `==` against a String). With an `oximg` older than 0.20
+    it probes the output instead, and the code is `:unknown`.
 
 ### Changed
 

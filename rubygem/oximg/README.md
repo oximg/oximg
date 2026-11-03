@@ -85,9 +85,30 @@ re-encoding: its compressed 8x8 blocks are moved, as `jpegtran
 reader, not only for ones that honor EXIF. That is only exact when the
 edges it moves are whole 8 or 16 px blocks (a phone's 4032x3024 is);
 otherwise, and for PNG and WebP, the file is stripped as without it,
-orientation kept. `Oximg.probe(destination)` tells which: orientation
-1, or the one kept. It costs a full entropy decode and encode, about
+orientation kept. It costs a full entropy decode and encode, about
 170 ms for a 12 MP photo.
+
+`strip` returns an `Oximg::Stripped`, the binary's own account of the
+run, so telling which happened needs no second read:
+
+```ruby
+result = Oximg.strip(upload, clean, icc: :keep, auto_rotate: true)
+result.upright?             # no orientation tag left: stored size is displayed size
+result.rotated?             # the pixels were turned upright
+result.orientation          #=> 6, the tag kept, or nil
+result.not_rotated&.code    #=> :unaligned_edges, :corrupt, :over_limit or :not_jpeg
+result.not_rotated&.message # for humans; the wording may change
+```
+
+`not_rotated` is nil unless `auto_rotate: true` left a rotated source
+tagged. The code is the contract (the table is in
+[docs/features/paths.md](../../docs/features/paths.md)), so count
+fallbacks by it. The result also stands in for the destination path
+`strip` used to return: `to_s`, `to_path` and `to_str` are the path and
+it compares equal to that String, so `File.size(Oximg.strip(...))`
+still works. With an `oximg` older than 0.20, which has no `strip
+--json`, the gem probes the output instead: `orientation` and
+`rotated?` are still right, and the code is `:unknown`.
 
 ## Knobs, per process or per call
 

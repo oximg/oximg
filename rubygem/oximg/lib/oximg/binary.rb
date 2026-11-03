@@ -76,11 +76,22 @@ module Oximg
         [out, err]
       end
 
+      # True once the executable refused `strip --json` (an oximg older
+      # than 0.20): Oximg.strip then runs without it and probes the
+      # output. Memoized per executable, like the path, so a process
+      # pays the refused spawn once.
+      attr_accessor :legacy_strip
+
+      def legacy_strip?
+        @legacy_strip == true
+      end
+
       # Resets the memoized lookup. For tests, and for a process that
       # changes OXIMG_BIN after boot.
       def reset!
         @path = nil
         @version = nil
+        @legacy_strip = nil
       end
 
       private
