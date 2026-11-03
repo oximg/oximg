@@ -1605,19 +1605,21 @@ fn nested_images_dir(tag: &str) -> TempTree {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let fixtures = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-    let dir = std::env::temp_dir().join(format!(
+    // Guarded before anything is created, so a setup step that fails
+    // part-way (and panics) removes what it made too.
+    let dir = TempTree(std::env::temp_dir().join(format!(
         "oximg-nested-{tag}-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    )));
+    let _ = std::fs::remove_dir_all(&*dir);
     std::fs::create_dir_all(dir.join("albums/2026")).unwrap();
     std::fs::copy(
         format!("{fixtures}/photo.jpg"),
         dir.join("albums/2026/photo.jpg"),
     )
     .unwrap();
-    TempTree(dir)
+    dir
 }
 
 /// Nested source paths resolve under IMAGES_DIR — the issue #1 happy
