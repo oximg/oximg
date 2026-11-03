@@ -1326,28 +1326,41 @@ fn jpeg_chroma_is_replicated_when_reducing_and_filtered_at_one_to_one() {
     );
 }
 
-/// The linear-light RGB8 PNG path streams decoded rows into the resize
-/// on single-band requests and stages the frame for band-parallel ones
-/// (issue #129). Through the binary, both must answer the fitted size —
-/// including an output height that does not divide the source and a
-/// 2000-row source reduced to one row — and a stream that ends early
-/// must still be a 422, never a partially resized image.
+/// The linear-light PNG path streams decoded rows into the resize on
+/// single-band requests and stages the frame for band-parallel ones
+/// (issue #129 for RGB, #153 for gray and alpha). Through the binary,
+/// every layout must answer the fitted size — including an output
+/// height that does not divide the source and a 2000-row source
+/// reduced to one row — and a stream that ends early must still be a
+/// 422, never a partially resized image.
 #[test]
-fn png_rgb8_resize_streams_and_truncation_is_422() {
+fn png_resize_streams_every_layout_and_truncation_is_422() {
     let dir = std::env::temp_dir().join(format!("oximg-ctl-pngstream-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let rgb = std::fs::read(fixture("rgb.png")).unwrap();
-    std::fs::write(dir.join("rgb.png"), &rgb).unwrap();
-    std::fs::write(dir.join("cut.png"), &rgb[..rgb.len() / 3]).unwrap();
+    // 200x150 each: 8-bit RGB, gray, RGBA, and 16-bit gray+alpha.
+    let layouts = ["rgb", "gray", "rgba", "graya"];
+    for name in layouts {
+        let bytes = std::fs::read(fixture(&format!("{name}.png"))).unwrap();
+        std::fs::write(dir.join(format!("{name}.png")), &bytes).unwrap();
+        // Cut halfway into the image data, past every header chunk.
+        let idat = bytes.windows(4).position(|w| w == b"IDAT").unwrap();
+        let cut = idat + (bytes.len() - idat) / 2;
+        std::fs::write(dir.join(format!("{name}_cut.png")), &bytes[..cut]).unwrap();
+    }
     let (tw, th) = (4u32, 2000u32);
-    let mut tall = Vec::new();
-    let mut enc = png::Encoder::new(&mut tall, tw, th);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    let px: Vec<u8> = (0..tw * th * 3).map(|i| (i * 7 % 251) as u8).collect();
-    enc.write_header().unwrap().write_image_data(&px).unwrap();
-    std::fs::write(dir.join("tall.png"), &tall).unwrap();
+    for (ct, ch, name) in [
+        (png::ColorType::Rgb, 3, "tall.png"),
+        (png::ColorType::Rgba, 4, "tall_rgba.png"),
+    ] {
+        let mut tall = Vec::new();
+        let mut enc = png::Encoder::new(&mut tall, tw, th);
+        enc.set_color(ct);
+        enc.set_depth(png::BitDepth::Eight);
+        let px: Vec<u8> = (0..tw * th * ch).map(|i| (i * 7 % 251) as u8).collect();
+        enc.write_header().unwrap().write_image_data(&px).unwrap();
+        std::fs::write(dir.join(name), &tall).unwrap();
+    }
 
     let images = dir.to_str().unwrap();
     for par in ["1", "4"] {
@@ -1366,22 +1379,26 @@ fn png_rgb8_resize_streams_and_truncation_is_422() {
             assert_eq!(code, 0, "PAR={par} {path}: {v}");
             v
         };
-        // 200x150 into 37x37: 37x28, and 150 / 28 is not whole.
-        let v = get("/resize/37/37/rgb.png", "200");
-        assert_eq!(v["content_type"], "image/png", "{v}");
-        assert_eq!(
-            (v["probe"]["width"].as_u64(), v["probe"]["height"].as_u64()),
-            (Some(37), Some(28)),
-            "{v}"
-        );
-        let v = get("/resize/1/1/tall.png", "200");
-        assert_eq!(
-            (v["probe"]["width"].as_u64(), v["probe"]["height"].as_u64()),
-            (Some(1), Some(1)),
-            "{v}"
-        );
-        let v = get("/resize/37/37/cut.png", "422");
-        assert_eq!(v["body_text"], "decode PNG", "{v}");
+        for name in layouts {
+            // 200x150 into 37x37: 37x28, and 150 / 28 is not whole.
+            let v = get(&format!("/resize/37/37/{name}.png"), "200");
+            assert_eq!(v["content_type"], "image/png", "{v}");
+            assert_eq!(
+                (v["probe"]["width"].as_u64(), v["probe"]["height"].as_u64()),
+                (Some(37), Some(28)),
+                "{v}"
+            );
+            let v = get(&format!("/resize/37/37/{name}_cut.png"), "422");
+            assert_eq!(v["body_text"], "decode PNG", "{v}");
+        }
+        for name in ["tall.png", "tall_rgba.png"] {
+            let v = get(&format!("/resize/1/1/{name}"), "200");
+            assert_eq!(
+                (v["probe"]["width"].as_u64(), v["probe"]["height"].as_u64()),
+                (Some(1), Some(1)),
+                "{v}"
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -323,7 +323,7 @@ const CELLS: &[Cell] = &[
         &["OXIMG_RESIZE_BACKEND=fir"],
         2.0,
     ),
-    // PNG source: the fused arm, exact size, the staged RGBA arm.
+    // PNG source: the fused arm, exact size, RGBA.
     // Streamed on aarch64 (issue #129) the fused thumbnail holds well
     // under a megabyte, where the allocator's share moves the ratio:
     // 0.81x M2 Max; Linux arm64 (CI) held 462848 bytes, 1.87x of an
@@ -344,6 +344,19 @@ const CELLS: &[Cell] = &[
     // 1.5 failed by noise (issue #149).
     ("png exact to png", "noise.png", "0", "0", "png", &[], 1.8),
     ("png exact to jpeg", "noise.png", "0", "0", "jpg", &[], 1.5),
+    // Issue #153: alpha streams on aarch64 and on x86-64 with AVX2.
+    // 0.90x M2 Max, 1.01x Ryzen; the bound is the RGB thumbnail's.
+    (
+        "png rgba thumbnail",
+        "noise_rgba.png",
+        "10",
+        "200",
+        "png",
+        &[],
+        2.4,
+    ),
+    // Streamed since issue #153, which took the 58 MB staged frame out
+    // of both sides: 1.24x M2 Max, 1.34x Ryzen (1.03-1.04x staged).
     (
         "png rgba resize",
         "noise_rgba.png",
@@ -351,7 +364,7 @@ const CELLS: &[Cell] = &[
         "1024",
         "png",
         &[],
-        1.3,
+        1.7,
     ),
     // Encoders priced at their worst case.
     (
@@ -374,6 +387,9 @@ const CELLS: &[Cell] = &[
         &["OXIMG_WEBP_EFFORT=3"],
         2.0,
     ),
+    // The decode streams since issue #153, leaving libwebp's worst-case
+    // price to dominate: 1.38x M2 Max, 2.14x Ryzen (1.25x and 1.63x
+    // staged), where libwebp holds less for the same request.
     (
         "png rgba to webp, effort 6",
         "noise_rgba.png",
@@ -381,7 +397,7 @@ const CELLS: &[Cell] = &[
         "1024",
         "webp",
         &["OXIMG_WEBP_EFFORT=6"],
-        2.0,
+        2.7,
     ),
     (
         "png quantized",

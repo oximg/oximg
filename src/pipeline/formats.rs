@@ -122,15 +122,23 @@ pub(super) fn process_png<R: std::io::BufRead>(
         None
     };
 
-    // Hot path: plain RGB8, non-interlaced, linear-light mode. Rows are
-    // sRGB->linear LUT-mapped as they are decoded, so the pixels never
-    // take a second full-image pass (and never exist as a full u8 copy).
-    // Everything that picks it is in the header, so it is decided
-    // before the estimate, which then prices the arm that will run.
+    // EXPAND|STRIP_16 normalize every layout to 8 bits, and resolve
+    // palettes to RGB or RGBA by tRNS (and gray tRNS to gray+alpha);
+    // grayscale is widened to RGB(A) after decoding.
     let (ct, bits) = png_reader.output_color_type();
+    let channels: usize = match ct {
+        png::ColorType::Rgba | png::ColorType::GrayscaleAlpha => 4,
+        _ => 3,
+    };
+    // Hot path: non-interlaced, linear-light mode, any layout. Rows are
+    // sRGB->linear LUT-mapped (alpha premultiplied, gray widened) as
+    // they are decoded, so the pixels never take a second full-image
+    // pass and never exist as a full u8 copy. Everything that picks it
+    // is in the header, so it is decided before the estimate, which
+    // then prices the arm that will run.
     let fused = {
         let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
-        ct == png::ColorType::Rgb
+        ct != png::ColorType::Indexed
             && bits == png::BitDepth::Eight
             && !png_reader.info().interlaced
             && (src_w, src_h) != (dst_w, dst_h)
@@ -139,22 +147,22 @@ pub(super) fn process_png<R: std::io::BufRead>(
             // rather than teaching the row-streaming path to rotate.
             && orientation.is_upright()
     };
+    let px = if channels == 4 {
+        PixelType::U16x4
+    } else {
+        PixelType::U16x3
+    };
     // Whether the fused arm streams rows into the row kernel instead of
     // staging `src16`: decided once, for the estimate and the decode.
     let stream = fused && {
         let (_, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
-        bands_use_stream_kernel(PixelType::U16x3, p.parallel, dst_h)
+        bands_use_stream_kernel(px, p.parallel, dst_h)
     };
     {
-        // EXPAND|STRIP_16 normalize to 8 bits, and resolve palettes to
-        // RGB or RGBA by tRNS; grayscale is widened to RGB(A) in place.
-        let channels = match ct {
-            png::ColorType::Rgba | png::ColorType::GrayscaleAlpha => 4,
-            _ => 3,
-        };
         let (dst_w, dst_h) = oriented_fit(src_w, src_h, orientation, p);
         // The encoder sees the frame after rotation.
         let (enc_w, enc_h) = orientation.display_dims(dst_w, dst_h);
+        let ch = channels as u64;
         // PNG has no shrink-on-load: the general arm stages the whole
         // frame in `chunk8`; the fused arm never does. Streamed, it does
         // not stage `src16` either: one mapped source row, the kernel's
@@ -163,33 +171,28 @@ pub(super) fn process_png<R: std::io::BufRead>(
         // to a few rows keeps a padded ring row per source row), and
         // `out8` written straight from the kernel.
         let cost = if stream {
-            let mut row = DecodeCost::streaming().with_streamed_output(dst_w, dst_h, 3);
+            let mut row = DecodeCost::streaming().with_streamed_output(dst_w, dst_h, ch);
             #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             let kernel = crate::resize_kernel::StreamResize::<FuseKernel>::resident_bytes(
-                src_w, src_h, dst_w, dst_h, 3,
+                src_w, src_h, dst_w, dst_h, channels,
             );
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             let kernel = 0;
-            row.resize_input_bytes = (src_w as u64).saturating_mul(3 * 2).saturating_add(kernel);
+            row.resize_input_bytes = (src_w as u64).saturating_mul(ch * 2).saturating_add(kernel);
             row
         } else if fused {
-            DecodeCost::streaming().with_full_frame_resize(
-                (src_w, src_h),
-                (dst_w, dst_h),
-                channels,
-                p,
-            )
+            DecodeCost::streaming().with_full_frame_resize((src_w, src_h), (dst_w, dst_h), ch, p)
         } else {
-            DecodeCost::staged(src_w, src_h, channels).with_full_frame_resize(
+            DecodeCost::staged(src_w, src_h, ch).with_full_frame_resize(
                 (src_w, src_h),
                 (dst_w, dst_h),
-                channels,
+                ch,
                 p,
             )
         };
         check_decoded_bytes(
-            cost.with_exact_size_rotation((src_w, src_h), (dst_w, dst_h), channels, orientation)
-                .with_encode(Some(target), enc_w, enc_h, channels, p)
+            cost.with_exact_size_rotation((src_w, src_h), (dst_w, dst_h), ch, orientation)
+                .with_encode(Some(target), enc_w, enc_h, ch, p)
                 // Decoded straight from the reader: no `srcbuf` copy, and
                 // its length may be a previous request's.
                 .with_compressed(s.held_source_bytes),
@@ -204,7 +207,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
             out8: &mut s.out8,
             resizer: &mut s.resizer,
         };
-        let streamed = png_rgb8_linear_resize(
+        let streamed = png_linear_resize(
             bufs,
             &mut png_reader,
             (src_w, src_h),
@@ -214,7 +217,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
         )?;
         let t_resize = t0.elapsed();
         let t2 = crate::clock::Instant::now();
-        let out = encode_output(s, dst_w, dst_h, 3, target, p, icc.as_deref());
+        let out = encode_output(s, dst_w, dst_h, channels, target, p, icc.as_deref());
         if timing {
             let how = if streamed { "streamed" } else { "fused" };
             eprintln!(
@@ -266,7 +269,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
     out
 }
 
-/// The [`Scratch`] buffers [`png_rgb8_linear_resize`] writes, borrowed
+/// The [`Scratch`] buffers [`png_linear_resize`] writes, borrowed
 /// field by field.
 pub(super) struct LinearBufs<'a> {
     pub(super) src16: &'a mut Vec<u16>,
@@ -275,23 +278,111 @@ pub(super) struct LinearBufs<'a> {
     pub(super) resizer: &'a mut Option<Resizer>,
 }
 
-/// The linear-light resize of a plain RGB8, non-interlaced PNG into
-/// `out8[..dst_w * dst_h * 3]`, reading the decoder's remaining rows.
-/// Each row is sRGB->linear LUT-mapped as it is decoded.
+/// One 8-bit sRGB RGBA pixel as linear-light u16, color premultiplied
+/// by alpha: in linear light, so resampling never bleeds color from
+/// fully transparent pixels. Every linear-light alpha resize stages
+/// its pixels through this one function, so a streamed and a staged
+/// frame hand the kernel the same samples.
+#[inline]
+fn premul_linear(px: [u8; 4], fwd: &[u16; 256]) -> [u16; 4] {
+    let a = px[3] as u32 * 257;
+    let c = |v: u8| ((fwd[v as usize] as u32 * a) / 65535) as u16;
+    [c(px[0]), c(px[1]), c(px[2]), a as u16]
+}
+
+/// The inverse of [`premul_linear`] on one resized pixel: unpremultiply
+/// (a zero alpha leaves black), then linear -> 8-bit sRGB.
+#[inline]
+fn unpremul_srgb(px: [u16; 4], back: &[u8; 65536]) -> [u8; 4] {
+    let a = px[3] as u32;
+    let c = |pre: u16| {
+        let un = (pre as u32 * 65535)
+            .checked_div(a)
+            .map_or(0, |v| v.min(65535));
+        back[un as usize]
+    };
+    [c(px[0]), c(px[1]), c(px[2]), (a / 257) as u8]
+}
+
+/// One decoded 8-bit PNG row with `in_ch` samples per pixel (gray,
+/// gray+alpha, RGB or RGBA: what EXPAND|STRIP_16 leave) as the
+/// linear-light u16 row the resize takes: RGB, or premultiplied RGBA.
+/// Gray is widened to three equal samples as [`gray_to_rgb`] widens a
+/// staged frame, so every layout maps exactly as the general arm would.
+fn png_row_to_linear(src: &[u8], in_ch: usize, dst: &mut [u16], fwd: &[u16; 256]) {
+    match in_ch {
+        1 => {
+            for (d, &g) in dst.as_chunks_mut::<3>().0.iter_mut().zip(src) {
+                *d = [fwd[g as usize]; 3];
+            }
+        }
+        2 => {
+            for (d, &[g, a]) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<2>().0)
+            {
+                *d = premul_linear([g, g, g, a], fwd);
+            }
+        }
+        4 => {
+            for (d, &s) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<4>().0)
+            {
+                *d = premul_linear(s, fwd);
+            }
+        }
+        _ => {
+            for (d, &b) in dst.iter_mut().zip(src) {
+                *d = fwd[b as usize];
+            }
+        }
+    }
+}
+
+/// Linear-light u16 samples (RGB, or premultiplied RGBA) back to 8-bit
+/// sRGB: the last step of every linear-light resize.
+fn linear_to_srgb(src: &[u16], channels: usize, dst: &mut [u8], back: &[u8; 65536]) {
+    if channels == 4 {
+        for (d, &s) in dst
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src.as_chunks::<4>().0)
+        {
+            *d = unpremul_srgb(s, back);
+        }
+    } else {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = back[v as usize];
+        }
+    }
+}
+
+/// The linear-light resize of a non-interlaced 8-bit PNG (any layout
+/// EXPAND|STRIP_16 produce) into `out8[..dst_w * dst_h * channels]`,
+/// reading the decoder's remaining rows: three channels, or four when
+/// the source carries alpha. Each row is sRGB->linear LUT-mapped (gray
+/// widened, alpha premultiplied) as it is decoded.
 ///
 /// With `stream` (see [`bands_use_stream_kernel`]) the mapped rows go
 /// straight into the row-push kernel that `resize_bands` would have run
 /// over the staged frame, so only one source row plus the kernel's
 /// window ring is resident: bounded by the output and the filter
 /// support, not the source (issue #129: 294 MB of u16 staging for a
-/// 7000x7000 source, even for a thumbnail). The kernel's full-frame
-/// driver pushes exactly these rows in this order, so the bytes match.
-/// Otherwise the frame is staged as u16 in `src16` and resized by
-/// `resize_bands` (band-parallel, pic-scale on x86-64, fir).
+/// 7000x7000 source, even for a thumbnail; issue #153: 565 MiB for the
+/// same source with alpha). The kernel's full-frame driver pushes
+/// exactly these rows in this order, so the bytes match. Otherwise the
+/// frame is staged as u16 in `src16` and resized by `resize_bands`
+/// (band-parallel, pic-scale for RGB on x86-64, fir).
 ///
 /// Every row is decoded either way: a truncated or corrupt tail fails
 /// the request before anything is encoded. Returns whether it streamed.
-pub(super) fn png_rgb8_linear_resize<R: std::io::BufRead + std::io::Seek>(
+pub(super) fn png_linear_resize<R: std::io::BufRead + std::io::Seek>(
     s: LinearBufs<'_>,
     png_reader: &mut png::Reader<R>,
     (src_w, src_h): (usize, usize),
@@ -299,25 +390,33 @@ pub(super) fn png_rgb8_linear_resize<R: std::io::BufRead + std::io::Seek>(
     parallel: usize,
     stream: bool,
 ) -> Result<bool> {
+    let (ct, bits) = png_reader.output_color_type();
+    anyhow::ensure!(
+        bits == png::BitDepth::Eight && ct != png::ColorType::Indexed,
+        "PNG rows are not expanded to 8 bits"
+    );
+    let in_ch = ct.samples();
+    let ch = if in_ch.is_multiple_of(2) { 4 } else { 3 };
     let fwd = fwd_lut();
     let back = back_lut();
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if stream
         && let Ok(mut resizer) =
-            crate::resize_kernel::StreamResize::<FuseKernel>::new(src_w, src_h, dst_w, dst_h, 3)
+            crate::resize_kernel::StreamResize::<FuseKernel>::new(src_w, src_h, dst_w, dst_h, ch)
     {
         // One mapped row, reused; every element is written per row.
-        let row16 = scratch_u16(s.src16, src_w * 3);
-        let out = scratch_u8(s.out8, dst_w * dst_h * 3);
+        let row16 = scratch_u16(s.src16, src_w * ch);
+        let out = scratch_u8(s.out8, dst_w * dst_h * ch);
         let mut y = 0usize;
         while let Some(row) = png_reader.next_row().context("decode PNG")? {
-            for (d, &b) in row16.iter_mut().zip(row.data()) {
-                *d = fwd[b as usize];
-            }
+            png_row_to_linear(row.data(), in_ch, row16, fwd);
             resizer.push_row(row16, |oy, o| {
-                for (d, &v) in out[oy * dst_w * 3..(oy + 1) * dst_w * 3].iter_mut().zip(o) {
-                    *d = back[v as usize];
-                }
+                linear_to_srgb(
+                    o,
+                    ch,
+                    &mut out[oy * dst_w * ch..(oy + 1) * dst_w * ch],
+                    back,
+                );
             });
             y += 1;
         }
@@ -328,32 +427,32 @@ pub(super) fn png_rgb8_linear_resize<R: std::io::BufRead + std::io::Seek>(
     }
     // Fully filled row by row; the row-count check below rejects
     // truncated streams before the buffer is consumed.
-    scratch_u16(s.src16, src_w * src_h * 3);
+    scratch_u16(s.src16, src_w * src_h * ch);
     let mut y = 0usize;
     while let Some(row) = png_reader.next_row().context("decode PNG")? {
-        let dst = &mut s.src16[y * src_w * 3..(y + 1) * src_w * 3];
-        for (d, &b) in dst.iter_mut().zip(row.data()) {
-            *d = fwd[b as usize];
-        }
+        let dst = &mut s.src16[y * src_w * ch..(y + 1) * src_w * ch];
+        png_row_to_linear(row.data(), in_ch, dst, fwd);
         y += 1;
     }
     anyhow::ensure!(y == src_h, "PNG row count mismatch");
-    scratch_u16(s.dst16, dst_w * dst_h * 3);
+    scratch_u16(s.dst16, dst_w * dst_h * ch);
     resize_bands(
-        u16_as_bytes(&s.src16[..src_w * src_h * 3]),
+        u16_as_bytes(&s.src16[..src_w * src_h * ch]),
         src_w,
         src_h,
-        u16_as_bytes_mut(&mut s.dst16[..dst_w * dst_h * 3]),
+        u16_as_bytes_mut(&mut s.dst16[..dst_w * dst_h * ch]),
         dst_w,
         dst_h,
-        PixelType::U16x3,
+        if ch == 4 {
+            PixelType::U16x4
+        } else {
+            PixelType::U16x3
+        },
         parallel,
         s.resizer,
     )?;
-    let out = scratch_u8(s.out8, dst_w * dst_h * 3);
-    for (d, &v) in out.iter_mut().zip(&s.dst16[..dst_w * dst_h * 3]) {
-        *d = back[v as usize];
-    }
+    let out = scratch_u8(s.out8, dst_w * dst_h * ch);
+    linear_to_srgb(&s.dst16[..dst_w * dst_h * ch], ch, out, back);
     Ok(false)
 }
 
@@ -725,26 +824,7 @@ pub(super) fn resize_pixels_to(
         let (fwd, back) = (fwd_lut(), back_lut());
         // Fully overwritten by the LUT/premultiply loops just below.
         scratch_u16(&mut s.src16, src_len);
-        if channels == 4 {
-            for (d, src) in s.src16[..src_len]
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(s.chunk8[..src_len].as_chunks::<4>().0)
-            {
-                let a = src[3] as u32 * 257;
-                for c in 0..3 {
-                    // Premultiply in linear light so resampling never bleeds
-                    // color from fully transparent pixels.
-                    d[c] = ((fwd[src[c] as usize] as u32 * a) / 65535) as u16;
-                }
-                d[3] = a as u16;
-            }
-        } else {
-            for (d, src) in s.src16[..src_len].iter_mut().zip(&s.chunk8[..src_len]) {
-                *d = fwd[*src as usize];
-            }
-        }
+        png_row_to_linear(&s.chunk8[..src_len], channels, &mut s.src16[..src_len], fwd);
         let dst_len = dst_w * dst_h * channels;
         scratch_u16(&mut s.dst16, dst_len);
         resize_bands(
@@ -763,27 +843,7 @@ pub(super) fn resize_pixels_to(
             &mut s.resizer,
         )?;
         scratch_u8(&mut s.out8, dst_len);
-        if channels == 4 {
-            for (d, src) in s.out8[..dst_len]
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(s.dst16[..dst_len].as_chunks::<4>().0)
-            {
-                let a = src[3] as u32;
-                for (out, &pre) in d[..3].iter_mut().zip(&src[..3]) {
-                    let un = (pre as u32 * 65535)
-                        .checked_div(a)
-                        .map_or(0, |v| v.min(65535)) as u16;
-                    *out = back[un as usize];
-                }
-                d[3] = (a / 257) as u8;
-            }
-        } else {
-            for (d, src) in s.out8[..dst_len].iter_mut().zip(&s.dst16[..dst_len]) {
-                *d = back[*src as usize];
-            }
-        }
+        linear_to_srgb(&s.dst16[..dst_len], channels, &mut s.out8[..dst_len], back);
     } else {
         if channels == 4 {
             // Premultiply in place (u8 approximation for speed mode).

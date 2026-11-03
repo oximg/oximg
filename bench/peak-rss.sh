@@ -23,7 +23,7 @@ mkdir -p "$FX"
 # so different on every host) are regenerated.
 STAMP=$FX/.inputs-seeded-v1
 if [ ! -f "$STAMP" ]; then
-  rm -f "$FX"/huge_8000.jpg "$FX"/raw_7000.png "$FX"/photo_7000.jpg "$FX"/photo_7000.png
+  rm -f "$FX"/huge_8000.jpg "$FX"/raw_7000.png "$FX"/photo_7000.jpg "$FX"/photo_7000*.png
 fi
 if [ ! -f "$FX/huge_8000.jpg" ]; then
   magick -seed 7 -size 8000x8000 plasma:fractal "$FX/a.png"
@@ -36,6 +36,18 @@ if [ ! -f "$FX/photo_7000.png" ]; then
   magick "$FX/photo_7000.jpg" "$FX/photo_7000.png"
 fi
 touch "$STAMP"
+# Issue #153: the same photo in the other PNG layouts, derived from the
+# seeded photo above. Alpha is a flat 50%, as in the issue's repro.
+layout() {
+  [ -f "$FX/$1" ] || magick "$FX/photo_7000.png" "${@:2}" "$FX/$1"
+}
+layout photo_7000_rgba.png -alpha set -channel A -evaluate set 50% +channel \
+  -define png:color-type=6
+layout photo_7000_rgba16.png -alpha set -channel A -evaluate set 50% +channel \
+  -depth 16 -define png:color-type=6
+layout photo_7000_gray.png -colorspace Gray -define png:color-type=0
+layout photo_7000_graya.png -colorspace Gray -alpha set -channel A -evaluate set 50% \
+  +channel -define png:color-type=4
 
 # A failed run must return non-zero: time still writes its rusage then,
 # and GNU time adds a "Command exited with non-zero status" line first.
@@ -58,6 +70,11 @@ CASES=(
   "jpg_2000||huge_8000.jpg|2000|2000|jpg|"
   "png_thumb||photo_7000.png|10|200|png|"
   "png_thumb_raw||raw_7000.png|10|200|png|"
+  "png_thumb_rgba||photo_7000_rgba.png|10|200|png|"
+  "png_thumb_rgba16||photo_7000_rgba16.png|10|200|png|"
+  "png_thumb_gray||photo_7000_gray.png|10|200|png|"
+  "png_thumb_graya||photo_7000_graya.png|10|200|png|"
+  "png_thumb_rgba_jpg||photo_7000_rgba.png|10|200|jpg|"
   "png_full||photo_7000.png|0|0|png|"
   "png_to_jpg_full||photo_7000.png|0|0|jpg|"
   "png_to_webp_full||photo_7000.png|0|0|webp|"

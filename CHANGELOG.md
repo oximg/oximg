@@ -71,6 +71,19 @@ HTTP interface without notice.
 
 ### Changed
 
+- **Downscaling a large PNG with alpha, or a gray one, holds far less
+  memory** ([#153]). Every non-interlaced, upright PNG layout now
+  streams its decoded rows into the resize where the in-tree row
+  kernel runs it, as opaque RGB already did on arm64 ([#129]):
+  alpha (RGBA, gray+alpha, a palette or gray with `tRNS`) on arm64
+  and amd64 with AVX2, opaque gray on arm64. `oximg resize` of a
+  7000×7000 PNG into a 10×200 box peaks at 4 MiB instead of 565 MiB
+  for RGBA (8- or 16-bit) and 424 MiB for gray on an M2 Max, and at
+  9 MiB instead of 569 MiB for RGBA on a Ryzen 7 8745HS, where opaque
+  gray drops from 427 to 287 MiB. Output is byte-identical. Where a PNG still decodes to a full frame is
+  listed in `docs/features/formats.md`. Of those, a gray or alpha
+  source on a band-parallel request, or opaque gray on amd64, no
+  longer holds an 8-bit copy of the frame beside its 16-bit one.
 - `pipeline::ProbeStep` takes a type parameter, defaulting to
   `probe_step`'s answer, so `probe_header_step` can share it. Code that
   names `ProbeStep` without one compiles unchanged.
@@ -300,6 +313,7 @@ no fixture is that large.
 [#130]: https://github.com/oximg/oximg/issues/130
 [#133]: https://github.com/oximg/oximg/issues/133
 [#134]: https://github.com/oximg/oximg/issues/134
+[#153]: https://github.com/oximg/oximg/issues/153
 [#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26

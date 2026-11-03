@@ -1716,15 +1716,26 @@ fn decode_cost_prices_each_png_arm() {
         (src * 3, 0, 0)
     );
 
-    // RGBA takes the general arm: staged, premultiplied into `src16`.
+    // RGBA takes the fused arm too (issue #153), premultiplied row by
+    // row: streamed where the row kernel runs U16x4 (aarch64, and
+    // x86-64 with AVX2), else staged in `src16` without a u8 frame.
     let rgba = black_white_lines_png(320, 240, 4);
     let c = cost_of(&rgba, sized(200, 200));
-    assert_eq!(c.staged_bytes, src * 4);
-    assert_eq!(
-        c.resize_input_bytes,
-        src * 8 + fir_bytes(PixelType::U16x4, 150, 200 * 240 * 8)
-    );
-    assert_eq!(c.output_bytes, dst * 12);
+    assert_eq!(c.staged_bytes, 0);
+    if bands_use_stream_kernel(PixelType::U16x4, sized(200, 200).parallel, 150) {
+        let kernel =
+            crate::resize_kernel::StreamResize::<FuseKernel>::resident_bytes(320, 240, 200, 150, 4);
+        assert_eq!(
+            (c.resize_input_bytes, c.output_bytes),
+            (320 * 8 + kernel, dst * 4)
+        );
+    } else {
+        assert_eq!(
+            c.resize_input_bytes,
+            src * 8 + fir_bytes(PixelType::U16x4, 150, 200 * 240 * 8)
+        );
+        assert_eq!(c.output_bytes, dst * 12);
+    }
 
     // eXIf orientation 6 is read before the estimate: a 400x100 source
     // displays as 100x400, which fits a 120-wide box as it is. The
@@ -2326,11 +2337,19 @@ fn exact_size_jpeg_streaming_keeps_truncation_and_error_behavior() {
 
 /// Deterministic noisy RGB8 frame (gradients + LCG noise), as a PNG.
 fn noisy_rgb_png(w: usize, h: usize) -> Vec<u8> {
+    noisy_png(w, h, png::ColorType::Rgb)
+}
+
+/// [`noisy_rgb_png`] in any 8-bit layout. Alpha takes the same noise,
+/// so it spans 0..=255: fully transparent pixels exercise the
+/// unpremultiply's zero-alpha case.
+fn noisy_png(w: usize, h: usize, ct: png::ColorType) -> Vec<u8> {
+    let ch = ct.samples();
     let mut seed = 0x2545F491u32;
-    let mut px = Vec::with_capacity(w * h * 3);
+    let mut px = Vec::with_capacity(w * h * ch);
     for y in 0..h {
         for x in 0..w {
-            for c in 0..3 {
+            for c in 0..ch {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 let g = (x * 255 / w + y * 97 / h + c * 40) % 256;
                 px.push(((g + (seed >> 26) as usize) % 256) as u8);
@@ -2339,10 +2358,24 @@ fn noisy_rgb_png(w: usize, h: usize) -> Vec<u8> {
     }
     let mut out = Vec::new();
     let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgb);
+    enc.set_color(ct);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().unwrap().write_image_data(&px).unwrap();
     out
+}
+
+/// Every 8-bit layout the fused PNG arm takes after EXPAND|STRIP_16.
+const PNG_LAYOUTS: [png::ColorType; 4] = [
+    png::ColorType::Grayscale,
+    png::ColorType::GrayscaleAlpha,
+    png::ColorType::Rgb,
+    png::ColorType::Rgba,
+];
+
+/// The resize's channel count for a decoded PNG layout: gray widens to
+/// RGB, and any alpha makes it RGBA.
+fn png_resize_channels(ct: png::ColorType) -> usize {
+    if ct.samples().is_multiple_of(2) { 4 } else { 3 }
 }
 
 /// PNG chunk CRC (ISO 3309), for hand-patched test streams.
@@ -2386,8 +2419,9 @@ fn png_linear(
     d.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut r = d.read_info()?;
     let src = (r.info().width as usize, r.info().height as usize);
+    let ch = png_resize_channels(r.output_color_type().0);
     let (mut src16, mut dst16, mut out8, mut resizer) = (Vec::new(), Vec::new(), Vec::new(), None);
-    let streamed = super::formats::png_rgb8_linear_resize(
+    let streamed = super::formats::png_linear_resize(
         super::formats::LinearBufs {
             src16: &mut src16,
             dst16: &mut dst16,
@@ -2400,7 +2434,7 @@ fn png_linear(
         parallel,
         stream,
     )?;
-    out8.truncate(dst.0 * dst.1 * 3);
+    out8.truncate(dst.0 * dst.1 * ch);
     Ok((out8, streamed))
 }
 
@@ -2421,10 +2455,31 @@ const PNG_STREAM_SHAPES: &[(Dims, Dims)] = &[
     ((5, 7000), (1, 1)),
 ];
 
+/// A PNG's pixels as the general arm stages them: EXPAND'd, then gray
+/// widened to RGB(A) by `gray_to_rgb`, in `s.chunk8`. Returns the
+/// channel count.
+fn stage_png_like_general_arm(s: &mut Scratch, png_bytes: &[u8]) -> usize {
+    let mut d = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    d.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut r = d.read_info().unwrap();
+    let len = r.output_buffer_size().unwrap();
+    scratch_u8(&mut s.chunk8, len);
+    let info = r.next_frame(&mut s.chunk8[..len]).unwrap();
+    let len = info.buffer_size();
+    match info.color_type {
+        png::ColorType::Grayscale => gray_to_rgb(s, len, 1),
+        png::ColorType::GrayscaleAlpha => gray_to_rgb(s, len, 2),
+        _ => {}
+    }
+    png_resize_channels(info.color_type)
+}
+
 /// The streamed helper must produce exactly what the row kernel's
-/// full-frame driver produces over the staged u16 frame — which is
-/// what `resize_bands` runs for these requests on aarch64 — on every
-/// architecture that has the kernel.
+/// full-frame driver produces over the staged u16 frame, for every
+/// layout — which is what `resize_bands` runs for these requests where
+/// the stream gate opens — on every architecture that has the kernel.
+/// The reference maps pixels with its own copy of the linear-light
+/// premultiply, independent of the pipeline's helpers.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
 fn png_streamed_resize_matches_the_full_frame_kernel() {
@@ -2433,64 +2488,153 @@ fn png_streamed_resize_matches_the_full_frame_kernel() {
     if !fuse_kernel_available() {
         return;
     }
-    for &((sw, sh), (dw, dh)) in PNG_STREAM_SHAPES {
-        let png_bytes = noisy_rgb_png(sw, sh);
-        let (got, streamed) = png_linear(&png_bytes, (dw, dh), 1, true).unwrap();
-        assert!(streamed, "{sw}x{sh}->{dw}x{dh} did not stream");
+    let (fwd, back) = (fwd_lut(), back_lut());
+    for ct in PNG_LAYOUTS {
+        for &((sw, sh), (dw, dh)) in PNG_STREAM_SHAPES {
+            let png_bytes = noisy_png(sw, sh, ct);
+            let (got, streamed) = png_linear(&png_bytes, (dw, dh), 1, true).unwrap();
+            assert!(streamed, "{ct:?} {sw}x{sh}->{dw}x{dh} did not stream");
 
-        // Reference: stage the whole frame, resize it in one call.
-        let mut d = png::Decoder::new(std::io::Cursor::new(&png_bytes[..]));
-        d.set_transformations(png::Transformations::EXPAND);
-        let mut r = d.read_info().unwrap();
-        let mut px = vec![0u8; r.output_buffer_size().unwrap()];
-        r.next_frame(&mut px).unwrap();
-        let fwd = fwd_lut();
-        let src16: Vec<u16> = px.iter().map(|&b| fwd[b as usize]).collect();
-        let mut dst16 = vec![0u16; dw * dh * 3];
-        crate::resize_kernel::resize_u16::<FuseKernel>(
-            u16_as_bytes(&src16),
-            sw,
-            sh,
-            u16_as_bytes_mut(&mut dst16),
-            dw,
-            dh,
-            3,
-        )
-        .unwrap();
-        let back = back_lut();
-        let want: Vec<u8> = dst16.iter().map(|&v| back[v as usize]).collect();
-        assert!(got == want, "{sw}x{sh}->{dw}x{dh}: streamed bytes differ");
+            // Reference: stage the whole frame, resize it in one call.
+            let mut s = Scratch::default();
+            let ch = stage_png_like_general_arm(&mut s, &png_bytes);
+            let px = &s.chunk8[..sw * sh * ch];
+            let src16: Vec<u16> = if ch == 4 {
+                px.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| {
+                        let a = p[3] as u32 * 257;
+                        let c = |v: u8| ((fwd[v as usize] as u32 * a) / 65535) as u16;
+                        [c(p[0]), c(p[1]), c(p[2]), a as u16]
+                    })
+                    .collect()
+            } else {
+                px.iter().map(|&b| fwd[b as usize]).collect()
+            };
+            let mut dst16 = vec![0u16; dw * dh * ch];
+            crate::resize_kernel::resize_u16::<FuseKernel>(
+                u16_as_bytes(&src16),
+                sw,
+                sh,
+                u16_as_bytes_mut(&mut dst16),
+                dw,
+                dh,
+                ch,
+            )
+            .unwrap();
+            let want: Vec<u8> = if ch == 4 {
+                dst16
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|p| {
+                        let a = p[3] as u32;
+                        let c = |v: u16| match a {
+                            0 => back[0],
+                            _ => back[((v as u32 * 65535) / a).min(65535) as usize],
+                        };
+                        [c(p[0]), c(p[1]), c(p[2]), (a / 257) as u8]
+                    })
+                    .collect()
+            } else {
+                dst16.iter().map(|&v| back[v as usize]).collect()
+            };
+            assert!(
+                got == want,
+                "{ct:?} {sw}x{sh}->{dw}x{dh}: streamed bytes differ"
+            );
+        }
     }
 }
 
-/// On aarch64 the streamed path replaces exactly the staged path it
-/// skips: same request, same bytes (issue #129's identity contract).
-#[cfg(target_arch = "aarch64")]
+/// Wherever the gate streams a layout, the streamed path replaces
+/// exactly the staged path it skips: same request, same bytes (the
+/// identity contract of issues #129 and #153).
 #[test]
 fn png_streamed_resize_matches_the_staged_path() {
-    for &((sw, sh), (dw, dh)) in PNG_STREAM_SHAPES {
-        let png_bytes = noisy_rgb_png(sw, sh);
-        let (staged, streamed) = png_linear(&png_bytes, (dw, dh), 1, false).unwrap();
-        assert!(!streamed);
-        let (got, _) = png_linear(&png_bytes, (dw, dh), 1, true).unwrap();
-        assert!(got == staged, "{sw}x{sh}->{dw}x{dh}: streamed != staged");
+    for ct in PNG_LAYOUTS {
+        let px = if png_resize_channels(ct) == 4 {
+            PixelType::U16x4
+        } else {
+            PixelType::U16x3
+        };
+        for &((sw, sh), (dw, dh)) in PNG_STREAM_SHAPES {
+            if !bands_use_stream_kernel(px, 1, dh) {
+                continue;
+            }
+            let png_bytes = noisy_png(sw, sh, ct);
+            let (staged, streamed) = png_linear(&png_bytes, (dw, dh), 1, false).unwrap();
+            assert!(!streamed);
+            let (got, streamed) = png_linear(&png_bytes, (dw, dh), 1, true).unwrap();
+            assert!(streamed, "{ct:?} {sw}x{sh}->{dw}x{dh} did not stream");
+            assert!(
+                got == staged,
+                "{ct:?} {sw}x{sh}->{dw}x{dh}: streamed != staged"
+            );
+        }
+    }
+}
+
+/// Issue #153: every layout now takes the fused arm, and its output is
+/// what main's general arm made of the same request — the EXPAND'd
+/// frame widened by `gray_to_rgb` and resized by `resize_pixels_to` —
+/// whether or not this host's gate streams it.
+#[test]
+fn png_fused_arm_matches_the_general_arm_for_every_layout() {
+    for ct in PNG_LAYOUTS {
+        let px = if png_resize_channels(ct) == 4 {
+            PixelType::U16x4
+        } else {
+            PixelType::U16x3
+        };
+        for parallel in [1, 4] {
+            for &((sw, sh), (dw, dh)) in PNG_STREAM_SHAPES {
+                let png_bytes = noisy_png(sw, sh, ct);
+                // As `process_png` decides it.
+                let stream = bands_use_stream_kernel(px, parallel, dh);
+                let (got, streamed) = png_linear(&png_bytes, (dw, dh), parallel, stream).unwrap();
+                assert_eq!(streamed, stream);
+                let mut s = Scratch::default();
+                let ch = stage_png_like_general_arm(&mut s, &png_bytes);
+                let p = Resolved::new(&Params {
+                    parallel,
+                    ..Params::default()
+                });
+                resize_pixels_to(&mut s, ch, sw, sh, dw, dh, &p).unwrap();
+                assert!(
+                    got == s.out8[..dw * dh * ch],
+                    "{ct:?} parallel={parallel} {sw}x{sh}->{dw}x{dh}: fused != general"
+                );
+            }
+        }
     }
 }
 
 /// The stream gate is resize_bands' own kernel choice: only where it
-/// would run the row kernel (aarch64, one band, no fir override).
+/// would run the row kernel (one band, no fir override; U16x3 on
+/// aarch64 only, since x86-64 runs pic-scale for it; U16x4 wherever
+/// the SIMD kernel is available).
 #[test]
 fn bands_stream_kernel_gate() {
-    let streams = cfg!(target_arch = "aarch64") && !crate::config::config().fir_backend;
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), streams);
+    let fir = crate::config::config().fir_backend;
+    let x3 = cfg!(target_arch = "aarch64") && !fir;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let x4 = !fir && <FuseKernel as crate::resize_kernel::RowKernel>::detect();
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let x4 = false;
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), x3);
     // Too few rows to band: still one call.
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), streams);
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), streams);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), x3);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), x4);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 1, 500), x4);
     // Band-parallel requests stay staged (fir bands).
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 4, 8));
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 2, 500));
+    assert!(!bands_use_stream_kernel(PixelType::U16x4, 2, 500));
     // u8 pixels never reach the u16 kernel.
     assert!(!bands_use_stream_kernel(PixelType::U8x3, 1, 500));
+    assert!(!bands_use_stream_kernel(PixelType::U8x4, 1, 500));
 }
 
 /// Decode a PNG to its raw (expanded) samples.

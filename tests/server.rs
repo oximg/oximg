@@ -3723,6 +3723,34 @@ fn oversize_413_names_the_limit_on_stderr() {
     let _ = child.wait();
 }
 
+/// An 8-bit grayscale PNG that takes the staged general arm on every
+/// architecture, for tests that pin what a staged frame costs. Upright,
+/// non-interlaced PNGs of every layout stream their rows into the
+/// resize where the row kernel runs (issues #129, #153), so this one
+/// carries eXIf orientation 2: a mirror, which keeps the axes and so
+/// the fit, but sends it down the staged, rotating arm.
+fn staged_gray_png(w: u32, h: u32, luma: &[u8]) -> Vec<u8> {
+    // A little-endian TIFF holding only Orientation = 2.
+    let mut exif = b"II*\0\x08\0\0\0".to_vec();
+    exif.extend_from_slice(&1u16.to_le_bytes()); // one entry
+    exif.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+    exif.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+    exif.extend_from_slice(&1u32.to_le_bytes()); // count
+    exif.extend_from_slice(&2u16.to_le_bytes());
+    exif.extend_from_slice(&[0, 0]); // value padding
+    exif.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+    let mut info = png::Info::with_size(w, h);
+    info.exif_metadata = Some(std::borrow::Cow::Owned(exif));
+    info.color_type = png::ColorType::Grayscale;
+    info.bit_depth = png::BitDepth::Eight;
+    let mut out = Vec::new();
+    let enc = png::Encoder::with_info(&mut out, info).unwrap();
+    let mut writer = enc.write_header().unwrap();
+    writer.write_image_data(luma).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
 /// Issue #17: the decoded-bytes cap is expressed in the unit an
 /// operator has a limit in, and — the part that made pixel caps
 /// unusable — it separates sources that pixel counts cannot. The
@@ -3734,19 +3762,10 @@ fn decoded_bytes_cap_bounds_what_pixels_cannot() {
     std::fs::create_dir_all(&dir).unwrap();
     // A wide-but-shallow PNG: 4000x800 = 3.2 MP, ~9.6 MB once widened
     // to RGB8. Cheap to generate, and its estimate is far above the
-    // 1 MiB floor so a cap can straddle it. Grayscale, so it is staged
-    // on every architecture: an RGB8 downscale streams its rows on
-    // aarch64 (issue #129) and costs little more than its output there.
+    // 1 MiB floor so a cap can straddle it. Staged on every
+    // architecture (see `staged_gray_png`).
     let (w, h) = (4000u32, 800u32);
-    let mut png_bytes = Vec::new();
-    let mut enc = png::Encoder::new(&mut png_bytes, w, h);
-    enc.set_color(png::ColorType::Grayscale);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().unwrap();
-    writer
-        .write_image_data(&vec![96u8; (w * h) as usize])
-        .unwrap();
-    writer.finish().unwrap();
+    let png_bytes = staged_gray_png(w, h, &vec![96u8; (w * h) as usize]);
     std::fs::write(dir.join("wide.png"), &png_bytes).unwrap();
     // The cheap baseline-JPEG comparison lives in the same directory.
     std::fs::copy(
@@ -3949,17 +3968,11 @@ fn decoded_bytes_cap_reaches_every_source_path() {
     }
     writer.write_image_data(&rows).unwrap();
     writer.finish().unwrap();
-    // The PNG case itself as 8-bit grayscale, which is staged (widened
-    // to RGB) on every architecture; the RGB8 one streams on aarch64
-    // and is checked separately below.
-    let mut gray = Vec::new();
-    let mut enc = png::Encoder::new(&mut gray, w as u32, h as u32);
-    enc.set_color(png::ColorType::Grayscale);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().unwrap();
+    // The PNG case itself staged (widened to RGB) on every
+    // architecture, see `staged_gray_png`; the plain RGB8 one streams
+    // on aarch64 and is checked separately below.
     let luma: Vec<u8> = rows.as_chunks::<3>().0.iter().map(|p| p[0]).collect();
-    writer.write_image_data(&luma).unwrap();
-    writer.finish().unwrap();
+    let gray = staged_gray_png(w as u32, h as u32, &luma);
     std::fs::write(dir.join("big.png"), &gray).unwrap();
     std::fs::write(dir.join("big_rgb.png"), &png).unwrap();
 
@@ -4172,18 +4185,10 @@ fn expensive_requests_are_reported_without_being_refused() {
     let dir = std::env::temp_dir().join(format!("oximg-report-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // 800x800 grayscale, widened to RGB: 1.9 MB staged plus 3.8 MB as
-    // the linear-light input on every architecture (an RGB8 downscale
-    // streams its rows on aarch64, issue #129, and would cost far less).
+    // the linear-light input on every architecture (`staged_gray_png`;
+    // a streamed downscale would cost far less).
     let (w, h) = (800u32, 800u32);
-    let mut png = Vec::new();
-    let mut enc = png::Encoder::new(&mut png, w, h);
-    enc.set_color(png::ColorType::Grayscale);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut writer = enc.write_header().unwrap();
-    writer
-        .write_image_data(&vec![55u8; (w * h) as usize])
-        .unwrap();
-    writer.finish().unwrap();
+    let png = staged_gray_png(w, h, &vec![55u8; (w * h) as usize]);
     std::fs::write(dir.join("costly.png"), &png).unwrap();
     let images = dir.to_str().unwrap().to_string();
 
