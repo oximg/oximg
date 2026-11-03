@@ -1753,51 +1753,36 @@ pub(crate) mod testkit {
             let plane = b * dw;
             let slots: [usize; 4] = std::array::from_fn(|i| i * dw);
             let mut ring = vec![0f32; 3 * plane];
-            let mut best = f64::MAX;
-            for _ in 0..15 {
-                let t = crate::clock::Instant::now();
-                for y in (0..rows - rows % b).step_by(b) {
-                    // SAFETY: after K::detect(); rows y..y + b are staged.
-                    unsafe {
-                        K::horiz_x3_batch(
-                            std::hint::black_box(&stage[y * rs..]),
-                            rs,
-                            b,
-                            sw,
-                            &w,
-                            &mut ring,
-                            plane,
-                            &slots,
-                            dw,
-                        )
-                    };
-                }
-                best = best.min(t.elapsed().as_secs_f64() * 1e3);
-            }
-            // The u8 pass over the same rows (their values only need to
-            // be finite to time it).
+            // The u8 pass reads the same rows (their values only need to
+            // be finite to time it); its taps are built before timing.
             let cf = w.coeffs_f16_f32();
-            let mut best_u8 = f64::MAX;
-            for _ in 0..15 {
+            let mut time = |u8_pass: bool| {
                 let t = crate::clock::Instant::now();
                 for y in (0..rows - rows % b).step_by(b) {
-                    // SAFETY: as above, with `cf` laid out like `w.coeffs`.
+                    let rows = std::hint::black_box(&stage[y * rs..]);
+                    // SAFETY: after K::detect(); rows y..y + b are staged,
+                    // and `cf` is laid out like `w.coeffs`.
                     unsafe {
-                        K::horiz_x3_batch_u8(
-                            std::hint::black_box(&stage[y * rs..]),
-                            rs,
-                            b,
-                            sw,
-                            &w,
-                            cf,
-                            &mut ring,
-                            plane,
-                            &slots,
-                            dw,
-                        )
+                        if u8_pass {
+                            K::horiz_x3_batch_u8(
+                                rows, rs, b, sw, &w, cf, &mut ring, plane, &slots, dw,
+                            )
+                        } else {
+                            K::horiz_x3_batch(rows, rs, b, sw, &w, &mut ring, plane, &slots, dw)
+                        }
                     };
                 }
-                best_u8 = best_u8.min(t.elapsed().as_secs_f64() * 1e3);
+                t.elapsed().as_secs_f64() * 1e3
+            };
+            // Interleaved (bench/METHODOLOGY.md rule 1), the first pass
+            // alternating per round.
+            let (mut best, mut best_u8) = (f64::MAX, f64::MAX);
+            for round in 0..15 {
+                for u8_pass in [round % 2 == 1, round % 2 == 0] {
+                    let ms = time(u8_pass);
+                    let slot = if u8_pass { &mut best_u8 } else { &mut best };
+                    *slot = slot.min(ms);
+                }
             }
             println!("horiz {sw}->{dw} x{rows}: {best:.3} ms, u8 pass {best_u8:.3} ms");
         }
