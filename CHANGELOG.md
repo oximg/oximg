@@ -95,11 +95,12 @@ HTTP interface without notice.
 - The decoded-bytes estimate now counts the row kernel's own buffers
   (window tables, staging batch, ring) on a full-frame resize that
   runs it: oriented or interlaced PNGs, WebP, AVIF, GIF and CMYK JPEG,
-  on arm64 and on amd64 with AVX2. Most requests rise by well under a
-  megabyte. A tall source squeezed to a few rows rises by its ring,
-  one padded row per source row: about 6 MB for 1×32000 into 1×1. A
-  cap tuned on the old figure may now refuse such a source
-  (`OXIMG_MAX_DECODED_BYTES`).
+  on arm64 and on amd64 with AVX2. A photo downscale rises by about
+  1 MB (0.74 MB for 4032×3024 into 800×600, 1.26 MB for 8000×6000
+  into 400×300). A tall source squeezed to a few rows rises the most,
+  mostly in its ring (one padded row per source row) and vertical
+  window tables: 10 MB for 1×32000 into 1×1. A cap tuned on the old
+  figure may now refuse such a source (`OXIMG_MAX_DECODED_BYTES`).
 - **Downscaling a large PNG with alpha, or a gray one, holds far less
   memory** ([#153]). Every non-interlaced, upright PNG layout now
   streams its decoded rows into the resize where the in-tree row
