@@ -1601,14 +1601,43 @@ pub(crate) fn resize_uses_fir(px: PixelType, threads: usize, dst_h: usize) -> bo
 /// the source row by row may stream it itself — same operations, same
 /// bytes — without staging the whole frame. Read off
 /// [`resize_uses_fir`] so the stream and the dispatch cannot disagree:
-/// aarch64 runs the row kernel for U16x3 and U16x4, x86-64 for U16x4
-/// only (it keeps pic-scale for U16x3, full-frame; issue #154), and
-/// band-parallel requests and the fir escape hatch stay full-frame
-/// everywhere.
+/// both architectures run the row kernel for U16x3 and U16x4 where the
+/// CPU has it (an x86-64 without AVX2+FMA keeps pic-scale for U16x3,
+/// full-frame), and band-parallel requests and the fir escape hatch
+/// stay full-frame everywhere.
 fn bands_use_stream_kernel(px: PixelType, threads: usize, dst_h: usize) -> bool {
-    let row_kernel = (px == PixelType::U16x3 && cfg!(target_arch = "aarch64"))
-        || (px == PixelType::U16x4 && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")));
-    row_kernel && !resize_uses_fir(px, threads, dst_h)
+    matches!(px, PixelType::U16x3 | PixelType::U16x4)
+        && row_kernel_available()
+        && !resize_uses_fir(px, threads, dst_h)
+}
+
+/// Bytes the row kernel allocates for one resize of this shape, as
+/// [`crate::resize_kernel::StreamResize::resident_bytes`] sizes them; 0
+/// where the kernel does not exist.
+fn row_kernel_resident_bytes(
+    (src_w, src_h): (usize, usize),
+    (dst_w, dst_h): (usize, usize),
+    channels: usize,
+) -> u64 {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    return crate::resize_kernel::StreamResize::<fuse::FuseKernel>::resident_bytes(
+        src_w, src_h, dst_w, dst_h, channels,
+    );
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (src_w, src_h, dst_w, dst_h, channels);
+        0
+    }
+}
+
+/// Whether this CPU has the in-tree SIMD row kernel.
+fn row_kernel_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return crate::resize_avx2::Avx2::available();
+    #[cfg(target_arch = "aarch64")]
+    return std::arch::is_aarch64_feature_detected!("neon");
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    false
 }
 
 /// Split dst into row bands; each thread does a coordinate-consistent
@@ -1642,19 +1671,25 @@ fn resize_bands(
         // x86-64 full-frame dispatch. The linear JPEG path no longer
         // arrives here (it streams through the AVX2 row kernel, serial
         // and fused alike); what remains is PNG/WebP/AVIF, sRGB mode,
-        // band-parallel requests, and the fir escape hatch. U16x3 keeps
-        // pic-scale (still ~13% faster full-frame than the in-tree
-        // kernel; every user of this fn always takes the same backend,
-        // so bytes stay per-URL stable). U16x4 (alpha) uses the AVX2
-        // kernel (1.33x over fir on the benchmark shape; see
-        // examples/resize_bench_x86.rs).
+        // band-parallel requests, and the fir escape hatch. Both U16x3
+        // and U16x4 use the AVX2 row kernel, the same algorithm as
+        // aarch64's NEON one, so both architectures give the same bytes
+        // (a rare last-bit difference remains, issue #172), and a PNG can
+        // stream its rows into it (issue #154). An x86-64 without
+        // AVX2+FMA keeps pic-scale for U16x3.
         if !resize_uses_fir(px, threads, dst_h) {
             #[cfg(target_arch = "x86_64")]
-            return if px == PixelType::U16x3 {
+            return if px == PixelType::U16x3 && !crate::resize_avx2::Avx2::available() {
                 resize_u16x3_picscale(src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h)
             } else {
                 crate::resize_avx2::resize_u16_avx2(
-                    src_bytes, dec_w, dec_h, dst_bytes, dst_w, dst_h, 4,
+                    src_bytes,
+                    dec_w,
+                    dec_h,
+                    dst_bytes,
+                    dst_w,
+                    dst_h,
+                    px.size() / 2,
                 )
             };
             #[cfg(target_arch = "aarch64")]
@@ -1932,7 +1967,9 @@ impl DecodeCost {
     /// holds nothing of its own: the decoded frame is handed to `out8`
     /// (issue #129; a rotation after it is
     /// [`Self::with_exact_size_rotation`]). Otherwise linear light adds
-    /// `src16` and `dst16`, and fir adds its intermediate image.
+    /// `src16` and `dst16`, fir adds its intermediate image, and the
+    /// in-tree row kernel, where it runs, its window tables, staging
+    /// batch and ring.
     pub fn with_full_frame_resize(
         mut self,
         (src_w, src_h): (usize, usize),
@@ -1971,7 +2008,16 @@ impl DecodeCost {
         } else {
             0
         };
-        self.resize_input_bytes = src16.saturating_add(fir);
+        // Where the in-tree row kernel is the resize, its full-frame
+        // driver is a stream like any other: window tables, staging
+        // batch and ring, which a tall source squeezed to few rows makes
+        // a padded row per source row of the window.
+        let kernel = if p.linear_light && bands_use_stream_kernel(pixel, p.parallel, dst_h) {
+            row_kernel_resident_bytes((src_w, src_h), (dst_w, dst_h), channels as usize)
+        } else {
+            0
+        };
+        self.resize_input_bytes = src16.saturating_add(fir).saturating_add(kernel);
         self.output_bytes = dst16.saturating_add(out8);
         self
     }

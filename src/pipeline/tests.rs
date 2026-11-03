@@ -1504,6 +1504,16 @@ fn fir_bytes(px: PixelType, dst_h: usize, intermediate: u64) -> u64 {
     }
 }
 
+/// The row kernel's own buffers where a single-band full-frame resize
+/// of this shape runs it, else 0.
+fn kernel_bytes(px: PixelType, src: (usize, usize), dst: (usize, usize)) -> u64 {
+    if bands_use_stream_kernel(px, 1, dst.1) {
+        row_kernel_resident_bytes(src, dst, px.size() / 2)
+    } else {
+        0
+    }
+}
+
 /// Issue #130: every JPEG arm is priced by the buffers it holds. A
 /// 320x240 source into a 200x200 box decodes at full size (a 1.6x
 /// reduction engages no shrink-on-load) and resizes to 200x150.
@@ -1608,7 +1618,9 @@ fn decode_cost_prices_each_jpeg_arm() {
     if (dw, dh) != (200, 150) {
         assert_eq!(
             c.resize_input_bytes,
-            (dw * dh * 6) as u64 + fir_bytes(PixelType::U16x3, 150, (200 * dh * 6) as u64)
+            (dw * dh * 6) as u64
+                + fir_bytes(PixelType::U16x3, 150, (200 * dh * 6) as u64)
+                + kernel_bytes(PixelType::U16x3, (dw, dh), (200, 150))
         );
         assert_eq!(c.output_bytes, dst * 9);
     }
@@ -1678,6 +1690,45 @@ fn decode_cost_covers_the_stream_ring_of_a_tall_source() {
     }
 }
 
+/// The same ring where the row kernel runs full-frame: an eXIf
+/// orientation keeps a PNG off the streamed arm, but `resize_bands`
+/// still drives the kernel over the staged frame (aarch64, and x86-64
+/// with AVX2 since issue #154), so the staged estimate must price the
+/// kernel's buffers on top of `src16`.
+#[test]
+fn decode_cost_covers_the_kernel_ring_of_a_staged_tall_source() {
+    let (w, h) = (1usize, 32_000usize);
+    let mut png_bytes = Vec::new();
+    {
+        let mut info = png::Info::with_size(w as u32, h as u32);
+        // Orientation 2 mirrors: same axes, so the same 1x1 fit.
+        info.exif_metadata = Some(std::borrow::Cow::Owned(tiff_orientation(2)));
+        info.color_type = png::ColorType::Rgb;
+        info.bit_depth = png::BitDepth::Eight;
+        let enc = png::Encoder::with_info(&mut png_bytes, info).unwrap();
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&vec![77u8; w * h * 3])
+            .unwrap();
+    }
+    let c = cost_of(&png_bytes, sized(1, 1));
+    let src16 = (w * h * 6) as u64;
+    if bands_use_stream_kernel(PixelType::U16x3, sized(1, 1).parallel, 1) {
+        let ring = 32_000 * 16 * 3 * 4;
+        assert!(
+            c.resize_input_bytes > src16 + ring,
+            "resize input {} must cover src16 {src16} plus the {ring}-byte ring",
+            c.resize_input_bytes
+        );
+        assert_eq!(
+            c.resize_input_bytes,
+            src16 + row_kernel_resident_bytes((w, h), (1, 1), 3)
+        );
+    } else {
+        assert!(c.resize_input_bytes >= src16);
+    }
+}
+
 /// Issue #130: the PNG arm is chosen from the header before the
 /// estimate runs, so the estimate prices that arm — not a staged frame
 /// the fused arm never allocates, nor a resize an exact-size request
@@ -1687,7 +1738,7 @@ fn decode_cost_prices_each_png_arm() {
     let (src, dst) = (320 * 240, 200 * 150);
 
     // RGB8 with a reduction: the fused arm. Where the row kernel runs
-    // (aarch64, one band; issue #129) rows stream into it, one mapped
+    // (one band, NEON or AVX2; issues #129, #154) rows stream into it, one mapped
     // source row at a time, and `out8` is the only frame; elsewhere they
     // land in `src16` for a full-frame resize into `dst16`.
     let rgb = black_white_lines_png(320, 240, 3);
@@ -1717,8 +1768,8 @@ fn decode_cost_prices_each_png_arm() {
     );
 
     // RGBA takes the fused arm too (issue #153), premultiplied row by
-    // row: streamed where the row kernel runs U16x4 (aarch64, and
-    // x86-64 with AVX2), else staged in `src16` without a u8 frame.
+    // row: streamed where the row kernel runs (as for RGB), else staged
+    // in `src16` without a u8 frame.
     let rgba = black_white_lines_png(320, 240, 4);
     let c = cost_of(&rgba, sized(200, 200));
     assert_eq!(c.staged_bytes, 0);
@@ -2612,22 +2663,21 @@ fn png_fused_arm_matches_the_general_arm_for_every_layout() {
 }
 
 /// The stream gate is resize_bands' own kernel choice: only where it
-/// would run the row kernel (one band, no fir override; U16x3 on
-/// aarch64 only, since x86-64 runs pic-scale for it; U16x4 wherever
-/// the SIMD kernel is available).
+/// would run the row kernel (one band, no fir override, a CPU with the
+/// SIMD kernel), for RGB and RGBA alike on both architectures (issue
+/// #154 moved x86-64 RGB off pic-scale).
 #[test]
 fn bands_stream_kernel_gate() {
     let fir = crate::config::config().fir_backend;
-    let x3 = cfg!(target_arch = "aarch64") && !fir;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    let x4 = !fir && <FuseKernel as crate::resize_kernel::RowKernel>::detect();
+    let streams = !fir && <FuseKernel as crate::resize_kernel::RowKernel>::detect();
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let x4 = false;
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), x3);
+    let streams = false;
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 1, 500), streams);
     // Too few rows to band: still one call.
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), x3);
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), x4);
-    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 1, 500), x4);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x3, 4, 7), streams);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 0, 10), streams);
+    assert_eq!(bands_use_stream_kernel(PixelType::U16x4, 1, 500), streams);
     // Band-parallel requests stay staged (fir bands).
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 4, 8));
     assert!(!bands_use_stream_kernel(PixelType::U16x3, 2, 500));

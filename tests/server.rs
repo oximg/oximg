@@ -4050,13 +4050,10 @@ fn decoded_bytes_cap_reaches_every_source_path() {
         "a streaming source of identical pixels fits the same cap"
     );
     // So does the RGB8 PNG where its rows stream into the row kernel
-    // (aarch64, one band; issue #129): one mapped row, the kernel's
-    // window state and the output. Elsewhere it stages `src16`.
-    let rgb_png = if cfg!(target_arch = "aarch64") {
-        200
-    } else {
-        413
-    };
+    // (one band, NEON or AVX2+FMA; issues #129, #154): one mapped row,
+    // the kernel's window state and the output. Elsewhere it stages
+    // `src16`.
+    let rgb_png = if png_rows_stream() { 200 } else { 413 };
     assert_eq!(tight.status_of("/resize/100/100/big_rgb.png"), rgb_png);
 }
 
@@ -4099,11 +4096,11 @@ fn oriented_sources_are_capped_on_their_own_fit() {
     // three rows), 1.08 + 1.08 + 2.43 MB = 4.59 MB. The upright one
     // takes the fused resize: staged, `src16` 2.16 MB, `dst16` + `out8`
     // 2.25 MB and the encoder 1.77 MB = 6.18 MB; streamed through the
-    // row kernel (aarch64, issue #129), one mapped row and the kernel's
+    // row kernel (issues #129, #154), one mapped row and the kernel's
     // window state 0.22 MB, `out8` 0.75 MB and the encoder = 2.74 MB. A
     // cap between the two serves one and refuses the other, which only
     // an estimate that knows each source's orientation can do.
-    let streams = cfg!(target_arch = "aarch64");
+    let streams = png_rows_stream();
     let (cap, rotated, upright) = if streams {
         (3_600_000, 413, 200)
     } else {
@@ -4127,6 +4124,17 @@ fn oriented_sources_are_capped_on_their_own_fit() {
             "{file} serves above its estimate"
         );
     }
+}
+
+/// Whether a single-band linear-light PNG resize streams its rows into
+/// the in-tree row kernel on this host: NEON on aarch64, AVX2+FMA on
+/// x86-64 (issues #129, #153, #154). Elsewhere it stages `src16`.
+fn png_rows_stream() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    cfg!(target_arch = "aarch64")
 }
 
 /// Run one server with `envs`, issue `path`, then stop it and drain
