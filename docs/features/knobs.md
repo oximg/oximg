@@ -72,7 +72,7 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_JPEG_STREAMING_PIXELS` | `16000000` | Outputs above this many pixels are sequential on the standard Huffman tables, encoded row by row; overrides the two above; `0` = every output |
 | `OXIMG_FLATTEN_BG` | `ffffff` | Alpha→JPEG background |
 | `OXIMG_PNG_EFFORT` | path-dependent | `fastest`/`fast`/`balanced`/`high`, or zlib-style `0`–`9` |
-| `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG |
+| `OXIMG_PNG_QUANTIZE` | `0` | `1` palette-quantizes opaque PNG (RGBA output with every alpha 255 counts) |
 | `OXIMG_PNG_QUANTIZE_COLORS` | `256` | Palette size 2–256 |
 | `OXIMG_WEBP_QUALITY` | `75` | |
 | `OXIMG_WEBP_EFFORT` | `2` | libwebp `method` |
