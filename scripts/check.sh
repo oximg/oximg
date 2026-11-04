@@ -122,6 +122,7 @@ else
   step test-avif avif cargo test --release --features avif
   step test-gif-bench any cargo test --release --features bench-internals --test formats_gif
   step build-all-targets avif cargo build --release --all-targets --features avif
+  step s3-harness any ./target/release/examples/s3-harness check
   step examples-smoke any examples_smoke
   step examples-smoke-avif avif examples_smoke_avif
 fi
