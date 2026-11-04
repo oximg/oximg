@@ -10,6 +10,18 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Output bytes change for PNG output of opaque RGBA sources: an alpha
+  no pixel uses is dropped** ([#70]), under the [#121] policy. When
+  every alpha in the resized frame is 255, the PNG encoder gets RGB, so
+  `OXIMG_PNG_QUANTIZE=1` now works for them (−66% bytes on 89 opaque
+  corpus images at fit 512), and lossless output is 7–11% smaller.
+  Output that uses alpha is unchanged. With the knob on, the
+  decoded-bytes estimate prices every RGBA PNG output as quantized (20
+  instead of 8 B/px), so a tight `OXIMG_MAX_DECODED_BYTES` may now
+  answer 413.
+
 ## [0.21.0] - 2026-11-12
 
 Animated GIF sources get an optional budget for the decode half
@@ -500,6 +512,7 @@ no fixture is that large.
 [#172]: https://github.com/oximg/oximg/issues/172
 [#173]: https://github.com/oximg/oximg/issues/173
 [#176]: https://github.com/oximg/oximg/issues/176
+[#70]: https://github.com/oximg/oximg/issues/70
 [#163]: https://github.com/oximg/oximg/issues/163
 
 ## [0.17.0] - 2026-10-26
