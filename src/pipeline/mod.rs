@@ -2284,4 +2284,4 @@ pub use jpeg::decode_and_resize;
 use jpeg::*;
 use jpegli_enc::{JPEG_APP2, JpegMode, JpegliEncoder};
 use resolved::Resolved;
-pub use strip::{Removed, StripParams, Stripped, strip};
+pub use strip::{NotRotated, NotRotatedCode, Removed, StripParams, Stripped, strip};

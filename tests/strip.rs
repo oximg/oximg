@@ -10,7 +10,9 @@
 mod common;
 
 use common::{fixture, params};
-use oximg::pipeline::{self, ErrorKind, ImageFormat, Params, StripParams, Stripped};
+use oximg::pipeline::{
+    self, ErrorKind, ImageFormat, NotRotatedCode, Params, StripParams, Stripped,
+};
 
 fn keep_icc() -> StripParams {
     StripParams {
@@ -729,8 +731,9 @@ fn auto_rotate_keeps_the_tag_when_an_edge_is_partial() {
         assert_eq!(out.bytes, plain.bytes, "o={o}");
         assert_eq!(out.orientation, Some(o), "o={o}");
         let why = out.not_rotated.unwrap();
+        assert_eq!(why.code, NotRotatedCode::UnalignedEdges, "o={o}");
         assert!(
-            why.contains("248x192") && why.contains("16x16"),
+            why.message.contains("248x192") && why.message.contains("16x16"),
             "o={o}: {why}"
         );
     }
@@ -825,7 +828,9 @@ fn auto_rotate_leaves_a_truncated_jpeg_tagged() {
     let cut = &src[..src.len() * 2 / 3];
     let out = pipeline::strip(cut, &rotate(true)).unwrap();
     assert_eq!((out.rotated, out.orientation), (None, Some(6)));
-    assert!(out.not_rotated.unwrap().contains("truncated"));
+    let why = out.not_rotated.unwrap();
+    assert_eq!(why.code, NotRotatedCode::Corrupt);
+    assert!(why.message.contains("truncated"), "{why}");
     assert_eq!(out.bytes, pipeline::strip(cut, &keep_icc()).unwrap().bytes);
 }
 
@@ -839,7 +844,9 @@ fn auto_rotate_keeps_png_and_webp_tagged() {
     let out = pipeline::strip(&png, &rotate(true)).unwrap();
     assert_eq!(out.bytes, pipeline::strip(&png, &keep_icc()).unwrap().bytes);
     assert_eq!((out.rotated, out.orientation), (None, Some(6)));
-    assert!(out.not_rotated.unwrap().contains("image/png"));
+    let why = out.not_rotated.unwrap();
+    assert_eq!(why.code, NotRotatedCode::NotJpeg);
+    assert!(why.message.contains("image/png"), "{why}");
     let webp = common::webp_with_exif(
         &fixture("photo.webp"),
         200,
@@ -848,8 +855,27 @@ fn auto_rotate_keeps_png_and_webp_tagged() {
     );
     let out = pipeline::strip(&webp, &rotate(true)).unwrap();
     assert_eq!((out.rotated, out.orientation), (None, Some(3)));
-    assert!(out.not_rotated.unwrap().contains("image/webp"));
+    let why = out.not_rotated.unwrap();
+    assert_eq!(why.code, NotRotatedCode::NotJpeg);
+    assert!(why.message.contains("image/webp"), "{why}");
     // Upright sources have nothing to explain.
     let upright = pipeline::strip(&fixture("rgb.png"), &rotate(true)).unwrap();
     assert_eq!((upright.rotated, upright.not_rotated), (None, None));
+}
+
+/// #176: the not-rotated codes are a contract, so every one is in the
+/// table callers read, spelled as the wire spells it, and the table
+/// lists no code the library cannot return.
+#[test]
+fn not_rotated_codes_are_documented() {
+    let doc = include_str!("../docs/features/paths.md");
+    let table: Vec<&str> = doc
+        .lines()
+        .skip_while(|l| !l.starts_with("| `code` |"))
+        .skip(2)
+        .take_while(|l| l.starts_with("| `"))
+        .map(|l| l.split('`').nth(1).unwrap())
+        .collect();
+    let codes: Vec<&str> = NotRotatedCode::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(table, codes);
 }

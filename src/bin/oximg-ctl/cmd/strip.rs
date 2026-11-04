@@ -127,7 +127,16 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
     // not, differs from it and fails `matches_library`.
     let removed = strip_with(&src, a.auto_rotate);
     let rotated = removed.as_ref().ok().and_then(|s| s.rotated);
-    let not_rotated = removed.as_ref().ok().and_then(|s| s.not_rotated.clone());
+    let not_rotated = removed
+        .as_ref()
+        .ok()
+        .and_then(|s| s.not_rotated.as_ref())
+        .map(not_rotated_value);
+    // The child's `--json` (#176), which callers such as the Ruby gem
+    // branch on: it must be the library's answer for the input, field
+    // for field, or a caller is told something other than what was done.
+    let reported: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
+    let reported_matches = matches!(&removed, Ok(s) if reported == stripped_value(s));
     // Pixels, residue and frames cannot see what must be kept (the
     // orientation EXIF, the ICC profile); the library's own answer for
     // the input pins those down, byte for byte.
@@ -169,6 +178,8 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         },
         "rotated": rotated,
         "not_rotated": not_rotated,
+        "reported": reported,
+        "reported_matches": reported_matches,
         "rotation": rotation.as_ref().map(Rotation::value),
         "frames_identical": frames_identical,
         "peak_rss_bytes": peak_rss_bytes(),
@@ -196,6 +207,8 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
         Some("output lost the source's orientation")
     } else if !matches_library {
         Some("output differs from the library's strip of the input")
+    } else if !reported_matches {
+        Some("the child's --json differs from the library's strip of the input")
     } else if frames_identical == Some(false) {
         Some("animation frames differ")
     } else {
@@ -208,6 +221,27 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
     }
     emit(&report, opts.pretty);
     Ok(())
+}
+
+/// `not_rotated` on the wire: the stable code and the human message.
+fn not_rotated_value(n: &pipeline::NotRotated) -> Value {
+    json!({ "code": n.code.as_str(), "message": n.message })
+}
+
+/// What `oximg strip --json` must print for `s`, written out here from
+/// the library's struct rather than shared with the CLI, so a CLI that
+/// drops or renames a field is caught. `bytes` is the library's length,
+/// not the file's: a child that wrote extra bytes and reported them
+/// must not agree with it.
+fn stripped_value(s: &pipeline::Stripped) -> Value {
+    json!({
+        "bytes": s.bytes.len(),
+        "content_type": s.format.content_type(),
+        "removed": removed_value(&s.removed),
+        "orientation": s.orientation,
+        "rotated": s.rotated,
+        "not_rotated": s.not_rotated.as_ref().map(not_rotated_value),
+    })
 }
 
 fn removed_value(removed: &[pipeline::Removed]) -> Value {
@@ -286,7 +320,7 @@ fn rotation_proof(src: &[u8], out: &[u8], o: u8, keep_icc: bool) -> Rotation {
         Some(_) => Ok(pixels(&back.bytes)? == pixels(src)?),
         None => Err(format!(
             "the inverse was not applied: {}",
-            back.not_rotated.unwrap_or_default()
+            back.not_rotated.map(|n| n.message).unwrap_or_default()
         )),
     });
     let max_diff = decoded(src, true).and_then(|want| {
@@ -437,6 +471,8 @@ fn strip_argv(input: &Path, out: &Path, icc: Option<&str>, auto_rotate: bool) ->
     if auto_rotate {
         v.push("--auto-rotate".into());
     }
+    // Always: the report proves the child's own account of the run.
+    v.push("--json".into());
     v
 }
 
@@ -479,7 +515,7 @@ mod tests {
     fn argv_is_what_a_user_types() {
         assert_eq!(
             strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), None, false),
-            ["oximg", "strip", "in.jpg", "o.jpg"]
+            ["oximg", "strip", "in.jpg", "o.jpg", "--json"]
         );
         assert_eq!(
             strip_argv(
@@ -488,11 +524,20 @@ mod tests {
                 Some("strip"),
                 false
             ),
-            ["oximg", "strip", "in.jpg", "o.jpg", "--icc", "strip"]
+            [
+                "oximg", "strip", "in.jpg", "o.jpg", "--icc", "strip", "--json"
+            ]
         );
         assert_eq!(
             strip_argv(Path::new("in.jpg"), Path::new("o.jpg"), None, true),
-            ["oximg", "strip", "in.jpg", "o.jpg", "--auto-rotate"]
+            [
+                "oximg",
+                "strip",
+                "in.jpg",
+                "o.jpg",
+                "--auto-rotate",
+                "--json"
+            ]
         );
     }
 }

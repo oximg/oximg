@@ -1842,8 +1842,10 @@ fn strip_auto_rotate_proves_a_lossless_turn() {
     assert_eq!(v["rotated"], Value::Null, "{v}");
     assert_eq!(v["orientation"], 6, "{v}");
     assert_eq!(v["pixels_identical"], true, "{v}");
-    let why = v["not_rotated"].as_str().unwrap_or_default();
+    assert_eq!(v["not_rotated"]["code"], "unaligned_edges", "{v}");
+    let why = v["not_rotated"]["message"].as_str().unwrap_or_default();
     assert!(why.contains("200x150") && why.contains("16x16"), "{v}");
+    assert_eq!(v["reported_matches"], true, "{v}");
 }
 
 /// PR #167 review: a pixel limit from `--env` reaches the child and
@@ -1874,10 +1876,95 @@ fn strip_auto_rotate_refuses_under_the_childs_limit() {
     assert_eq!(v["orientation"], 5, "{v}");
     assert_eq!(v["rotation"], Value::Null, "{v}");
     assert_eq!(v["matches_library"], true, "{v}");
+    assert_eq!(v["not_rotated"]["code"], "over_limit", "{v}");
     assert_eq!(
-        v["not_rotated"], "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)",
+        v["not_rotated"]["message"], "200x150 is over OXIMG_MAX_SRC_PIXELS (1000)",
         "{v}"
     );
+    assert_eq!(v["reported_matches"], true, "{v}");
+}
+
+/// #176: `oximg strip --json` gives callers the outcome as data, one
+/// fixture per `not_rotated.code` (over_limit is the test above), and
+/// ctl proves the child's report is the library's answer for the input.
+#[test]
+fn strip_json_reports_each_not_rotated_code() {
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-codes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tagged = photo_with_orientation(5);
+    let px = common::corner_base(64, 48, 16);
+    let cases: [(&str, Vec<u8>, Option<&str>); 4] = [
+        ("rotated.jpg", tagged.clone(), None),
+        // A quarter turn moves the 150-px edge: not whole 16-px blocks.
+        (
+            "unaligned.jpg",
+            photo_with_orientation(6),
+            Some("unaligned_edges"),
+        ),
+        // Cut inside the scan: libjpeg would fill the rest with grey.
+        (
+            "cut.jpg",
+            tagged[..tagged.len() * 2 / 3].to_vec(),
+            Some("corrupt"),
+        ),
+        (
+            "tagged.png",
+            common::png_with_orientation(&px, 64, 48, 6),
+            Some("not_jpeg"),
+        ),
+    ];
+    for (name, bytes, code) in cases {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let (status, v) = run(&["strip", path.to_str().unwrap(), "--auto-rotate"]);
+        assert_eq!(status, 0, "{name}: {v}");
+        assert_eq!(v["reported_matches"], true, "{name}: {v}");
+        let reported = &v["reported"];
+        assert_eq!(reported["not_rotated"], v["not_rotated"], "{name}: {v}");
+        match code {
+            None => {
+                assert_eq!(reported["rotated"], 5, "{name}: {v}");
+                assert_eq!(reported["orientation"], Value::Null, "{name}: {v}");
+                assert_eq!(reported["not_rotated"], Value::Null, "{name}: {v}");
+            }
+            Some(code) => {
+                assert_eq!(reported["rotated"], Value::Null, "{name}: {v}");
+                assert!(reported["orientation"].as_u64() > Some(1), "{name}: {v}");
+                assert_eq!(reported["not_rotated"]["code"], code, "{name}: {v}");
+                assert!(
+                    reported["not_rotated"]["message"]
+                        .as_str()
+                        .is_some_and(|m| !m.is_empty()),
+                    "{name}: {v}"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #176: without a rotation asked for, `--json` still reports the
+/// strip, and `not_rotated` stays null: nothing was refused.
+#[test]
+fn strip_json_without_auto_rotate_reports_the_kept_tag() {
+    let path = std::env::temp_dir().join(format!("oximg-ctl-json-{}.jpg", std::process::id()));
+    std::fs::write(&path, photo_with_orientation(5)).unwrap();
+    let (status, v) = run(&["strip", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(status, 0, "{v}");
+    assert_eq!(v["reported_matches"], true, "{v}");
+    let r = &v["reported"];
+    assert_eq!(
+        (
+            &r["content_type"],
+            &r["orientation"],
+            &r["rotated"],
+            &r["not_rotated"]
+        ),
+        (&"image/jpeg".into(), &5.into(), &Value::Null, &Value::Null),
+        "{v}"
+    );
+    assert_eq!(r["bytes"], v["bytes"], "{v}");
 }
 
 /// PR #167 review: the other direction. ctl inherits a limit the
@@ -1943,6 +2030,53 @@ fn strip_auto_rotate_fails_a_missed_rotation() {
     assert_eq!(v["matches_library"], false, "{v}");
     assert_eq!(v["rotated"], 5, "{v}");
     assert_eq!(v["orientation"], 5, "{v}");
+}
+
+/// PR #179 review: `reported_matches` compares the child's report with
+/// the library's answer, byte count included. A child that writes one
+/// byte too many and reports that size agrees with its own file, but
+/// not with the library.
+#[cfg(unix)]
+#[test]
+fn strip_report_must_carry_the_librarys_byte_count() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-padded-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("in.jpg");
+    let tagged = photo_with_orientation(5);
+    std::fs::write(&src, &tagged).unwrap();
+    let want = oximg::pipeline::strip(
+        &tagged,
+        &oximg::pipeline::StripParams {
+            icc: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .bytes
+    .len();
+    let wrapper = dir.join("oximg");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n'{}' \"$@\" | sed 's/\"bytes\":{want},/\"bytes\":{},/'\nprintf x >> \"$3\"\n",
+            env!("CARGO_BIN_EXE_oximg"),
+            want + 1
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, v) = run(&[
+        "--bin",
+        wrapper.to_str().unwrap(),
+        "strip",
+        src.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["reported"]["bytes"], want + 1, "{v}");
+    assert_eq!(v["bytes"], want + 1, "{v}");
+    assert_eq!(v["reported_matches"], false, "{v}");
 }
 /// PR #167 review: `--env` is for the child. Applying its knobs to
 /// ctl's own checks must not let `--env OXIMG_BIN` choose the

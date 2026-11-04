@@ -41,11 +41,16 @@ module Oximg
     # a `cargo build` in this checkout, a platform gem, or PATH — and
     # skip when there is none, so the unit suite stays runnable on a
     # machine with no Rust toolchain.
+    #
+    # Of this checkout's builds, the newest: `agent` is the profile
+    # agents iterate on, and a stale release build left behind would
+    # otherwise test yesterday's binary.
     def executable
       @executable ||= begin
-        debug = File.expand_path("../../../target/debug/oximg", __dir__)
-        release = File.expand_path("../../../target/release/oximg", __dir__)
-        [debug, release].find { |path| File.executable?(path) } ||
+        built = %w[debug agent release]
+          .map { |profile| File.expand_path("../../../target/#{profile}/oximg", __dir__) }
+          .select { |path| File.executable?(path) }
+        built.max_by { |path| File.mtime(path) } ||
           (Oximg.available? ? Oximg.executable : nil)
       end
     end

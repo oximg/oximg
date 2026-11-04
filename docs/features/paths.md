@@ -27,7 +27,7 @@ oximg-ctl probe tests/fixtures/photo.jpg   # probe.{orientation,display_width,di
 oximg-ctl resize tests/fixtures/photo.jpg 100 100 --out /tmp/out.jpg
 oximg-ctl resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/out.webp
 oximg-ctl strip tests/fixtures/animated.webp --out /tmp/out.webp
-oximg-ctl strip rotated.jpg --auto-rotate   # rotated, not_rotated, rotation{...}
+oximg-ctl strip rotated.jpg --auto-rotate   # rotated, not_rotated{code,message}, rotation{...}
 ```
 
 `resize` shells out to `oximg resize` (same argv a user types). Usage
@@ -42,7 +42,7 @@ block (payload plus framing), null when there is none, and
 `probe.{width,height}` shows whether the orientation was applied.
 
 `strip` shells out to `oximg strip <in> <out> [--icc keep|strip]
-[--auto-rotate]`:
+[--auto-rotate] --json`:
 lossless metadata removal for JPEG/PNG/WebP (GIF, AVIF: exit 1). Its
 JSON proves the result: `removed` (what went, per block kind),
 `orientation` (read back from the output, 2-8, else null),
@@ -52,9 +52,12 @@ strip under the same ICC policy would remove; must be `[]`),
 `pixels_identical` (decoded pixels of input and output compared; a
 PNG at its native bit depth),
 `frames_identical` (animated WebP: every frame's bitstream compared,
-else null), `peak_rss_bytes` (O(file size)). `ok` is false unless the
+else null), `reported` (the child's own `--json`, below),
+`reported_matches` (it is the library's answer for the input, field
+for field), `peak_rss_bytes` (O(file size)). `ok` is false unless the
 residue is empty, both sides decode, pixels and frames match, the
-orientation survives, and the output matches the library's. The
+orientation survives, and the output and the child's report match the
+library's. The
 input is read before the child runs, so `--out` may be the input.
 `--env OXIMG_*` knobs reach ctl's own library checks as well as the
 child, so a limit decides both sides alike. A CMYK JPEG
@@ -65,11 +68,10 @@ answer for the input under the same knobs, the reference the output
 must match (`matches_library`); `orientation` is what the output
 actually carries. `rotated` is the orientation the strip applies to a
 JPEG's DCT blocks (2-8, else null), and `not_rotated` why a rotated
-source is left tagged (an edge that is not whole 8/16-px blocks, a corrupt
-stream, PNG/WebP, over `OXIMG_MAX_SRC_PIXELS`, or over
-`OXIMG_MAX_DECODED_BYTES`: the coefficients, twice for every turn but
-a horizontal flip, plus the compressed input, copy and output); the file is then
-exactly the plain strip. A rotated output cannot match the stored
+source is left tagged, as `{code, message}` (codes below; the
+decoded-bytes limit counts the coefficients, twice for every turn but
+a horizontal flip, plus the compressed input, copy and output); the
+file is then exactly the plain strip. A rotated output cannot match the stored
 pixels, so `pixels_identical` is null and `rotation` proves it:
 `round_trip_identical` (the output tagged with the inverse orientation
 and rotated back decodes to the input's pixels exactly: the
@@ -77,6 +79,36 @@ coefficients are untouched) and `max_diff_displayed` (largest sample
 difference against the input decoded upright; the decoder's rounding
 is not rotation-symmetric, at most 3 measured; `ok` needs ≤ 8, a wrong
 turn differs by 150+).
+
+### `oximg strip --json` and the not-rotated codes
+
+`oximg strip … --json` prints one JSON object on stdout once the
+output is written; the stderr summary is unchanged, and a failure is
+still a non-zero exit with the reason on stderr and nothing on stdout.
+
+```json
+{"bytes": 7075, "content_type": "image/jpeg",
+ "removed": [],
+ "orientation": 6, "rotated": null,
+ "not_rotated": {"code": "unaligned_edges",
+                 "message": "200x150 does not divide into whole 16x16 blocks on the edge orientation 6 moves"}}
+```
+
+`orientation` is the tag the output keeps (2-8, else null), `rotated`
+the orientation applied to the pixels (2-8, else null), and
+`not_rotated` is null unless `--auto-rotate` was asked for and a
+rotated source was left tagged. `code` is the contract (a new class is
+a new code, never a rename); `message` is for humans and may change.
+
+| `code` | the source was left tagged because |
+|---|---|
+| `unaligned_edges` | an edge the rotation moves is not whole 8x8 (or 16x16, by chroma subsampling) blocks |
+| `corrupt` | libjpeg cannot read the stream cleanly: truncated, corrupt, or a coding this build does not read |
+| `over_limit` | over `OXIMG_MAX_SRC_PIXELS` or `OXIMG_MAX_DECODED_BYTES`; the message names which |
+| `not_jpeg` | PNG or WebP: only a JPEG can be rotated without re-encoding |
+
+The library's `NotRotatedCode::as_str` is the spelling; the Ruby gem's
+`Oximg::Stripped#not_rotated` gives the code as a Symbol.
 
 ## Library (`oximg::pipeline`)
 
@@ -88,7 +120,8 @@ cargo run --release --example probe -- tests/fixtures/photo.webp
 `process` / `process_path` take `Params` and return `(bytes, ImageFormat)`.
 `strip` takes `StripParams` (`icc: Option<bool>`, resolved like
 `Params::icc`; `auto_rotate: bool`, default off) and returns `Stripped
-{bytes, format, removed, orientation, rotated, not_rotated}` without
+{bytes, format, removed, orientation, rotated, not_rotated:
+Option<NotRotated {code, message}>}` without
 decoding pixels, unless `auto_rotate` turns a JPEG upright: that reads
 and rewrites its DCT coefficients (`orientation` is then None and
 `rotated` the orientation applied).
