@@ -33,7 +33,8 @@ HTTP interface without notice.
     Symbol, `not_rotated.message`) in place of the destination String.
     It is still the path where one is expected (`to_s`, `to_path`,
     `to_str`, `==` against a String). With an `oximg` older than 0.20
-    it probes the output instead, and the code is `:unknown`.
+    it reads that binary's summary line instead, and the code is
+    `:unknown`.
 
 ### Changed
 

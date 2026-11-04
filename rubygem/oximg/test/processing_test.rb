@@ -257,26 +257,12 @@ class Oximg::ProcessingTest < Oximg::Test
   end
 
   # An oximg older than 0.20 has no --json and refuses it at parse
-  # time. strip runs the strip it knows, once remembered, and probes
-  # the output: the orientation is known, the reason is :unknown.
+  # time. strip runs the strip it knows, once remembered, and reads the
+  # summary line every release since 0.18 prints: the orientation and
+  # whether it was rotated are known, the reason has no code (:unknown).
   def test_strip_falls_back_for_an_oximg_without_json
-    real = executable
     in_tmpdir do |dir|
-      fake = File.join(dir, "oximg")
-      log = File.join(dir, "calls")
-      File.write(fake, <<~SH)
-        #!/bin/sh
-        echo "$*" >> '#{log}'
-        for a in "$@"; do
-          if [ "$a" = --json ]; then
-            echo 'oximg: unknown option "--json" (try --help)' >&2
-            exit 2
-          fi
-        done
-        exec '#{real}' "$@"
-      SH
-      File.chmod(0o755, fake)
-      Oximg.executable = fake
+      log = legacy_oximg(dir)
       source = File.join(dir, "in.jpg")
       File.binwrite(source, tagged_photo(6))
       out = File.join(dir, "out.jpg")
@@ -286,7 +272,9 @@ class Oximg::ProcessingTest < Oximg::Test
         assert_equal 6, result.orientation
         refute_predicate result, :rotated?
         assert_equal :unknown, result.not_rotated.code
+        assert_match(/16x16/, result.not_rotated.message)
         assert_equal File.size(out), result.bytes
+        assert_equal "image/jpeg", result.content_type
       end
       File.binwrite(source, tagged_photo(5))
       result = Oximg.strip(source, out, auto_rotate: true)
@@ -295,6 +283,61 @@ class Oximg::ProcessingTest < Oximg::Test
       assert_equal 4, strips.size, "one refused --json, then three plain strips"
       assert_equal 1, strips.count { |l| l.include?("--json") }
     end
+  end
+
+  # PR #179 review: the fallback must not depend on probe. Probe stops
+  # looking for the orientation after 1 MiB of metadata; strip does not,
+  # so a tag behind 1.1 MiB of comments is still rotated, and reported.
+  def test_strip_fallback_sees_an_orientation_probe_does_not
+    in_tmpdir do |dir|
+      legacy_oximg(dir)
+      comment = [0xFF, 0xFE, 65_535].pack("CCn") + ("c" * 65_533)
+      photo = tagged_photo(5)
+      source = File.join(dir, "in.jpg")
+      File.binwrite(source, photo[0, 2] + (comment * 17) + photo[2..])
+      result = Oximg.strip(source, File.join(dir, "out.jpg"), auto_rotate: true)
+      assert_equal [5, nil, nil], [result.rotated, result.orientation, result.not_rotated]
+    end
+  end
+
+  # PR #179 review: nor on a header libjpeg can read. Strip copies a
+  # lossless (SOF3) JPEG it cannot rotate; the fallback reports that
+  # rather than raising after the destination was written.
+  def test_strip_fallback_takes_a_jpeg_libjpeg_cannot_read
+    in_tmpdir do |dir|
+      legacy_oximg(dir)
+      photo = tagged_photo(6)
+      sof = photo.index("\xFF\xC0".b)
+      photo.setbyte(sof + 1, 0xC3)
+      source = File.join(dir, "in.jpg")
+      File.binwrite(source, photo)
+      out = File.join(dir, "out.jpg")
+      assert_equal 6, Oximg.strip(source, out).orientation
+      result = Oximg.strip(source, out, auto_rotate: true)
+      assert_equal [nil, 6], [result.rotated, result.orientation]
+      assert_equal :unknown, result.not_rotated.code
+    end
+  end
+
+  # An executable that runs the real one but refuses --json, as every
+  # oximg before 0.20 does. Returns the file each call's argv is logged to.
+  def legacy_oximg(dir)
+    fake = File.join(dir, "oximg")
+    log = File.join(dir, "calls")
+    File.write(fake, <<~SH)
+      #!/bin/sh
+      echo "$*" >> '#{log}'
+      for a in "$@"; do
+        if [ "$a" = --json ]; then
+          echo 'oximg: unknown option "--json" (try --help)' >&2
+          exit 2
+        fi
+      done
+      exec '#{executable}' "$@"
+    SH
+    File.chmod(0o755, fake)
+    Oximg.executable = fake
+    log
   end
 
   def test_strip_refuses_to_drop_a_cmyk_profile

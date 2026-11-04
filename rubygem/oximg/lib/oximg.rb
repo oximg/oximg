@@ -241,11 +241,8 @@ module Oximg
           Binary.legacy_strip = true
         end
       end
-      # Read before the run: the destination may be the source.
-      auto = argv.include?("--auto-rotate")
-      before = auto ? probe(argv[1])[:orientation] : 1
-      Binary.run(*argv, env: child_env)
-      legacy_stripped(output, auto, before)
+      _, err = Binary.run(*argv, env: child_env)
+      legacy_stripped(output, err)
     end
 
     # The child environment an +env:+ turns into: String names and
@@ -432,17 +429,28 @@ module Oximg
       Header.build(match[1], Integer(match[2]), Integer(match[3]), match[4] ? Integer(match[4]) : 1)
     end
 
-    # The result from an oximg without --json, from the source's
-    # orientation (+before+, probed ahead of the run) and the output's:
-    # whether it was rotated is known, but not why it was not.
-    def legacy_stripped(output, auto_rotate, before)
-      orientation = probe(output)[:orientation]
-      kept = (orientation > 1) ? orientation : nil
-      rotated = (auto_rotate && before > 1 && kept.nil?) ? before : nil
-      why = (kept && auto_rotate) ? Stripped::NotRotated.new(code: :unknown,
-        message: "oximg #{Binary.version} has no strip --json; upgrade for the reason") : nil
-      Stripped.new(path: output, bytes: File.size(output), orientation: kept,
-        rotated: rotated, not_rotated: why)
+    # The summary every oximg since 0.18 ends a strip with, after
+    # "oximg: wrote <out> " (src/cli.rs). Those releases are frozen, so
+    # their wording is a fixed format here, though it is not a contract
+    # for later ones (they have --json). Removed block names are JPEG
+    # segment names or 4-byte chunk types, so the tail is unambiguous.
+    LEGACY_STRIP_SUMMARY = /\A\((\d+) bytes, ([^;\s]+); (.*?)(?:; kept orientation ([2-8])(?:, not rotated: (.*))?|; rotated orientation ([2-8]) upright)?\)\z/m
+
+    # The result from an oximg without --json, read from that summary
+    # rather than by probing: probe stops looking for the orientation
+    # after 1 MiB of metadata and needs a header libjpeg reads, where
+    # strip does neither. The reason a rotation was not made has no
+    # code before 0.20, so it is :unknown, with the binary's sentence.
+    def legacy_stripped(output, stderr)
+      prefix = "oximg: wrote #{output} "
+      line = stderr.lines.map(&:chomp).reverse.find { |l| l.start_with?(prefix) }
+      match = line && line.delete_prefix(prefix).match(LEGACY_STRIP_SUMMARY)
+      raise ProcessingError, "unparsable strip summary: #{stderr.strip.inspect}" unless match
+
+      kept = match[4] && Integer(match[4])
+      why = match[5] && Stripped::NotRotated.new(code: :unknown, message: match[5])
+      Stripped.new(path: output, bytes: Integer(match[1]), content_type: match[2],
+        orientation: kept, rotated: match[6] && Integer(match[6]), not_rotated: why)
     end
 
     # Absolute paths throughout: a relative name beginning with "-"

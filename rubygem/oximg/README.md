@@ -107,8 +107,9 @@ fallbacks by it. The result also stands in for the destination path
 `strip` used to return: `to_s`, `to_path` and `to_str` are the path and
 it compares equal to that String, so `File.size(Oximg.strip(...))`
 still works. With an `oximg` older than 0.20, which has no `strip
---json`, the gem probes the output instead: `orientation` and
-`rotated?` are still right, and the code is `:unknown`.
+--json`, the gem reads the summary line that binary prints instead:
+`orientation` and `rotated?` are still right, `removed` is nil, and
+the code is `:unknown` beside the binary's own reason.
 
 ## Knobs, per process or per call
 

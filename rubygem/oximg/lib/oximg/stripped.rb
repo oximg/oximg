@@ -28,8 +28,7 @@ module Oximg
 
     # The destination, absolute.
     attr_reader :path
-    # The output's content type ("image/jpeg", ...); nil from an oximg
-    # older than 0.20, which has no --json.
+    # The output's content type ("image/jpeg", ...).
     attr_reader :content_type
     # Output size in bytes.
     attr_reader :bytes
@@ -42,8 +41,8 @@ module Oximg
     # The orientation turned into the pixels, 2..8, or nil.
     attr_reader :rotated
     # A NotRotated, or nil unless auto_rotate left a rotated source
-    # tagged. From an oximg older than 0.20 the code is :unknown: the
-    # output was probed, so its orientation is known, but not why.
+    # tagged. From an oximg older than 0.20, which has no --json and
+    # gives the reason only as a sentence, the code is :unknown.
     attr_reader :not_rotated
 
     # From the hash <tt>oximg strip --json</tt> prints.
@@ -60,7 +59,7 @@ module Oximg
       )
     end
 
-    def initialize(path:, bytes:, orientation:, rotated:, not_rotated:, content_type: nil, removed: nil)
+    def initialize(path:, bytes:, content_type:, orientation:, rotated:, not_rotated:, removed: nil)
       @path = path
       @content_type = content_type
       @bytes = bytes
