@@ -136,7 +136,7 @@ pub fn run(opts: &Opts, a: &StripArgs) -> Result<(), CtlError> {
     // branch on: it must be the library's answer for the input, field
     // for field, or a caller is told something other than what was done.
     let reported: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
-    let reported_matches = matches!(&removed, Ok(s) if reported == stripped_value(s, bytes.len()));
+    let reported_matches = matches!(&removed, Ok(s) if reported == stripped_value(s));
     // Pixels, residue and frames cannot see what must be kept (the
     // orientation EXIF, the ICC profile); the library's own answer for
     // the input pins those down, byte for byte.
@@ -230,10 +230,12 @@ fn not_rotated_value(n: &pipeline::NotRotated) -> Value {
 
 /// What `oximg strip --json` must print for `s`, written out here from
 /// the library's struct rather than shared with the CLI, so a CLI that
-/// drops or renames a field is caught. `bytes` is the output's length.
-fn stripped_value(s: &pipeline::Stripped, bytes: usize) -> Value {
+/// drops or renames a field is caught. `bytes` is the library's length,
+/// not the file's: a child that wrote extra bytes and reported them
+/// must not agree with it.
+fn stripped_value(s: &pipeline::Stripped) -> Value {
     json!({
-        "bytes": bytes,
+        "bytes": s.bytes.len(),
         "content_type": s.format.content_type(),
         "removed": removed_value(&s.removed),
         "orientation": s.orientation,

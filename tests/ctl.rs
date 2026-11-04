@@ -2031,6 +2031,53 @@ fn strip_auto_rotate_fails_a_missed_rotation() {
     assert_eq!(v["rotated"], 5, "{v}");
     assert_eq!(v["orientation"], 5, "{v}");
 }
+
+/// PR #179 review: `reported_matches` compares the child's report with
+/// the library's answer, byte count included. A child that writes one
+/// byte too many and reports that size agrees with its own file, but
+/// not with the library.
+#[cfg(unix)]
+#[test]
+fn strip_report_must_carry_the_librarys_byte_count() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("oximg-ctl-padded-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("in.jpg");
+    let tagged = photo_with_orientation(5);
+    std::fs::write(&src, &tagged).unwrap();
+    let want = oximg::pipeline::strip(
+        &tagged,
+        &oximg::pipeline::StripParams {
+            icc: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .bytes
+    .len();
+    let wrapper = dir.join("oximg");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n'{}' \"$@\" | sed 's/\"bytes\":{want},/\"bytes\":{},/'\nprintf x >> \"$3\"\n",
+            env!("CARGO_BIN_EXE_oximg"),
+            want + 1
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, v) = run(&[
+        "--bin",
+        wrapper.to_str().unwrap(),
+        "strip",
+        src.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, 1, "{v}");
+    assert_eq!(v["reported"]["bytes"], want + 1, "{v}");
+    assert_eq!(v["bytes"], want + 1, "{v}");
+    assert_eq!(v["reported_matches"], false, "{v}");
+}
 /// PR #167 review: `--env` is for the child. Applying its knobs to
 /// ctl's own checks must not let `--env OXIMG_BIN` choose the
 /// executable ctl runs.
