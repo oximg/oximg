@@ -77,8 +77,9 @@ module Oximg
       end
 
       # True once the executable refused `strip --json` (an oximg older
-      # than 0.20): Oximg.strip then runs without it and probes the
-      # output. Memoized per executable, like the path, so a process
+      # than 0.20): Oximg.strip then runs without it and reads the
+      # summary line that binary prints. Memoized per executable, like
+      # the path, so a process
       # pays the refused spawn once.
       attr_accessor :legacy_strip
 
