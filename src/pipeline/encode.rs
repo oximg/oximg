@@ -14,7 +14,8 @@ pub(super) fn encode_png(
 ) -> Result<Vec<u8>> {
     // Opaque output only: quantette has no alpha-aware quantizer, and
     // approximating one (per-palette-cell alpha) would produce fringes
-    // exactly where alpha matters. Alpha sources stay lossless RGBA.
+    // exactly where alpha matters. Output that uses alpha stays lossless
+    // RGBA.
     let quantized = if channels == 3 {
         p.png_quantize
             .map(|colors| quantize_rgb(pixels, w, h, colors))
@@ -673,10 +674,11 @@ pub(super) fn encode_cost(
         // touch twice that while its Vec doubles. Measured 1.1 B per raw
         // byte on noise (2048², M2 Max; 3.6 before #133 streamed it),
         // 0.3 on a photo. Quantization adds quantette's working set
-        // (17.6-18.2 B/px, RGB only).
+        // (17.6-18.2 B/px, measured on RGB). RGBA is priced as quantized
+        // too: whether every alpha is 255 is known only after the resize.
         // Plus the writer's chunk buffer and three rows.
         ImageFormat::Png => {
-            let per_px = if p.png_quantize.is_some() && channels == 3 {
+            let per_px = if p.png_quantize.is_some() {
                 20
             } else {
                 2 * channels
@@ -849,14 +851,26 @@ fn encode_output_inner(
             }
             encode_with_icc(&s.out8[..dst_w * dst_h * 3], dst_w, dst_h, p, icc)
         }
-        ImageFormat::Png => encode_png(
-            &s.out8[..dst_w * dst_h * channels],
-            dst_w,
-            dst_h,
-            channels,
-            icc,
-            p,
-        ),
+        ImageFormat::Png => {
+            // An alpha no output pixel uses is dropped before the encode,
+            // so an opaque RGBA source encodes, and quantizes, as RGB (#70).
+            // The AVX2 and NEON row kernels resize each channel of RGBA as
+            // they resize RGB, so there these are the bytes of the same
+            // pixels without alpha.
+            let channels = if channels == 4 {
+                compact_if_opaque(&mut s.out8, dst_w * dst_h)
+            } else {
+                channels
+            };
+            encode_png(
+                &s.out8[..dst_w * dst_h * channels],
+                dst_w,
+                dst_h,
+                channels,
+                icc,
+                p,
+            )
+        }
         ImageFormat::Webp => encode_webp(
             &s.out8[..dst_w * dst_h * channels],
             dst_w,
