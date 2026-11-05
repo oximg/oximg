@@ -451,3 +451,39 @@ pub fn corner_classes(jpeg: &[u8]) -> (usize, usize, [char; 4]) {
         ],
     )
 }
+
+/// Wrap a bare lossy WebP (`VP8 ` chunk) in a VP8X container whose ALPH
+/// chunk is raw (uncompressed, unfiltered) and 255 everywhere: a file
+/// that declares alpha but never uses it. libwebp itself does not write
+/// these (it drops an opaque alpha plane), so tests build one by hand.
+pub fn webp_with_opaque_alph(webp: &[u8], w: usize, h: usize) -> Vec<u8> {
+    assert_eq!(&webp[0..4], b"RIFF");
+    assert_eq!(&webp[8..12], b"WEBP");
+    assert_eq!(
+        &webp[12..16],
+        b"VP8 ",
+        "helper expects a bare lossy container"
+    );
+    let push_chunk = |chunks: &mut Vec<u8>, four: &[u8; 4], body: &[u8]| {
+        chunks.extend_from_slice(four);
+        chunks.extend((body.len() as u32).to_le_bytes());
+        chunks.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            chunks.push(0);
+        }
+    };
+    let mut chunks = Vec::new();
+    let mut vp8x = vec![0x10u8, 0, 0, 0]; // alpha flag
+    vp8x.extend(&((w - 1) as u32).to_le_bytes()[..3]);
+    vp8x.extend(&((h - 1) as u32).to_le_bytes()[..3]);
+    push_chunk(&mut chunks, b"VP8X", &vp8x);
+    let mut alph = vec![0u8]; // no preprocessing, no filter, raw
+    alph.resize(1 + w * h, 255);
+    push_chunk(&mut chunks, b"ALPH", &alph);
+    chunks.extend_from_slice(&webp[12..]); // the VP8 chunk as it was
+    let mut out = b"RIFF".to_vec();
+    out.extend(((chunks.len() + 4) as u32).to_le_bytes());
+    out.extend(b"WEBP");
+    out.extend(chunks);
+    out
+}

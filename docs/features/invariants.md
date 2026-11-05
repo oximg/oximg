@@ -12,7 +12,8 @@ change and needs a changelog.
 - `tiny.jpg` (40×30) into 100×100 stays 40×30.
 - A box at or above the source size resamples nothing: the decoded
   frame goes to the encoder as is (after any rotation), so
-  unquantized PNG→PNG reproduces the source samples, alpha included.
+  unquantized PNG→PNG reproduces the source samples, alpha included
+  unless every alpha is 255.
 
 ```sh
 oximg-ctl get /resize/100/100/photo.jpg   # 200×150 source → 100×75
@@ -24,6 +25,12 @@ oximg-ctl get /resize/400/400/rgba.png    # 200×150, same RGBA bytes
 
 - Resize in linear light on 16-bit samples, Lanczos3. `OXIMG_RESIZE=srgb` disables.
 - Alpha is premultiplied before the resample, unpremultiplied after.
+- PNG output keeps its alpha channel only if an output pixel uses
+  it: an all-255 alpha is dropped after the resize. Where the AVX2 or
+  NEON row kernel resizes, the output is then the same bytes as the
+  same pixels without alpha. An x86-64 without AVX2 resizes RGB with
+  pic-scale and RGBA with fir, so there the bytes differ. The WebP and
+  AVIF encoders drop such an alpha themselves; JPEG has none.
 - JPEG sources decode at full size by default, except that 4:2:0 and
   grayscale sources reduced ~3.8× or more decode luma at 1/2 through a
   linear-light 2×2 average of the full IDCT (`OXIMG_LINEAR_SHRINK`;
