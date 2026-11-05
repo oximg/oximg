@@ -66,6 +66,18 @@ checks the endpoint and the keys at boot and refuses to start if they
 are wrong. R2 answers a missing bucket with 403 `AccessDenied`, so a
 wrong bucket name only logs a warning at boot.
 
+On AWS, leave the keys out and use the role of the place oximg runs
+in. On ECS, the task role works without settings. On an EC2 host,
+oximg asks the instance metadata service (IMDSv2) for the instance
+role's keys. From inside a container, that needs a metadata hop limit
+of 2; the EC2 default of 1 stops the answer one hop short, and oximg
+then fails at boot with a message that says so:
+
+```sh
+aws ec2 modify-instance-metadata-options --instance-id <id> \
+  --http-put-response-hop-limit 2
+```
+
 ## docker-compose
 
 ```yaml

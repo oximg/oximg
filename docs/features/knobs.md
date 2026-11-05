@@ -46,10 +46,20 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `GCE_METADATA_HOST` | Google metadata | GCS auth emulator / PSC; read when fetching or refreshing the metadata token (including the startup credential probe) |
 | `OXIMG_S3_ENDPOINT` | AWS for `AWS_REGION` (China uses `.amazonaws.com.cn`) | `scheme://host[:port]` of an S3-compatible store (R2, MinIO) |
 | `OXIMG_S3_PATH_STYLE` | `1` with a custom endpoint or for a bucket name with a `.`, else `0` | `0`/`1`: bucket in the path or in the host name |
-| `AWS_REGION` | unset | Required for `s3://`; signed into every request. R2 accepts `auto` |
+| `AWS_REGION` | unset | Required for `s3://`; the default region, as in the AWS SDKs. On AWS, a bucket in another region is found from S3's 301 at boot. R2 accepts `auto` |
 | `AWS_ACCESS_KEY_ID` | unset | `s3://` static key |
 | `AWS_SECRET_ACCESS_KEY` | unset | `s3://` static key |
 | `AWS_SESSION_TOKEN` | unset | `s3://` temporary keys only |
+| `AWS_WEB_IDENTITY_TOKEN_FILE` | unset | `s3://` keys from EKS IRSA: the OIDC token, read again on every fetch. Needs `AWS_ROLE_ARN` |
+| `AWS_ROLE_ARN` | unset | Role that STS `AssumeRoleWithWebIdentity` assumes |
+| `AWS_ROLE_SESSION_NAME` | `oximg-<unix time>` | Session name in CloudTrail |
+| `AWS_ENDPOINT_URL_STS` | `https://sts.<AWS_REGION>.amazonaws.com` (`.com.cn` in China) | STS endpoint for web identity |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` | unset | `s3://` keys from the ECS task role; a path on `169.254.170.2`. Used when neither static keys nor web identity are set |
+| `AWS_CONTAINER_CREDENTIALS_FULL_URI` | unset | `s3://` keys from EKS Pod Identity or another agent. `http://` only to loopback or the ECS or EKS agent address |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | unset | Token for the container endpoint, read again on every fetch. Wins over `AWS_CONTAINER_AUTHORIZATION_TOKEN` |
+| `AWS_CONTAINER_AUTHORIZATION_TOKEN` | unset | Token for the container endpoint, as a value |
+| `AWS_EC2_METADATA_DISABLED` | `false` | `true`: do not try EC2 instance metadata (IMDSv2) for `s3://` keys. IMDS is the last source and is tried when nothing else is set |
+| `AWS_EC2_METADATA_SERVICE_ENDPOINT` | `http://169.254.169.254` | IMDS address as `scheme://host[:port]`; tests and the IPv6 address `http://[fd00:ec2::254]` |
 | `GLIBC_TUNABLES` | unset | Any `glibc.malloc.*` entry turns off the server's malloc pins (`mmap_threshold` 32 MiB, `trim_threshold` 64 MiB, `arena_max` 2; Linux glibc, no `mimalloc`) |
 | `OXIMG_AUTO_FORMAT` | unset | `avif,webp` preference list |
 | `QUALITY` | `80` | JPEG quality (process-wide) |

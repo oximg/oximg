@@ -4,9 +4,11 @@
 //! caps and deadlines apply unchanged. `fetch` has its own copy of the
 //! one-retry rule.
 //!
-//! Credentials: static keys from the environment (`AWS_ACCESS_KEY_ID`
-//! and `AWS_SECRET_ACCESS_KEY`, plus `AWS_SESSION_TOKEN` for temporary
-//! keys). The `~/.aws` profile files are out of scope.
+//! Credentials come from a chain of sources in `creds`: static keys
+//! from the environment (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`,
+//! plus `AWS_SESSION_TOKEN` for temporary keys), then web identity
+//! (`web_identity`), then the container endpoint (`container`), then EC2
+//! instance metadata (`imds`). The `~/.aws` profile files are out of scope.
 //! `aws configure export-credentials --format env` turns a profile
 //! into static keys.
 //!
@@ -21,21 +23,33 @@
 //! it. `.` and `..` segments are refused before signing: reqwest would
 //! remove them from the URL, and the signature would no longer match.
 //!
-//! Settings are read once, on first use. `AWS_REGION` is required.
+//! Settings are read once, on first use. `AWS_REGION` is required. It
+//! is the default region, as in the AWS SDKs, not always the bucket's:
+//! ECS and EKS set it to the region they run in. When AWS answers 301
+//! with `x-amz-bucket-region`, that bucket's requests go to its region
+//! from then on (`Settings::learn_region`).
 //! `OXIMG_S3_ENDPOINT` defaults to the regional AWS endpoint, with
 //! `.amazonaws.com.cn` for China regions and `.amazonaws.com` otherwise.
 //! `OXIMG_S3_PATH_STYLE` is explained at `Settings::path_style`.
-//! Temporary keys are not refreshed. When `AWS_SESSION_TOKEN` expires,
-//! every fetch fails until the process restarts with new keys.
+//! Keys from a credential endpoint are fetched again before they
+//! expire, and once more when S3 says they have expired. Static keys
+//! are not refreshed: when `AWS_SESSION_TOKEN` expires, every fetch
+//! fails until the process restarts with new keys.
 
 use anyhow::Result;
 use hmac::Mac;
 use hmac::digest::KeyInit;
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::{SourceRejected, UpstreamFault};
+
+mod container;
+mod creds;
+mod imds;
+mod web_identity;
 
 type HmacSha256 = hmac::Hmac<Sha256>;
 
@@ -43,6 +57,7 @@ type HmacSha256 = hmac::Hmac<Sha256>;
 /// so this is always the payload hash.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+#[derive(Clone)]
 struct Credentials {
     access_key_id: String,
     secret_access_key: String,
@@ -196,7 +211,10 @@ struct Settings {
     /// Whether `OXIMG_S3_ENDPOINT` is set. A custom endpoint defaults to
     /// path style.
     custom_endpoint: bool,
-    credentials: Credentials,
+    credentials: creds::Chain,
+    /// Buckets that S3 placed in another region than `region`, from the
+    /// `x-amz-bucket-region` of a 301. Only for the AWS endpoint.
+    moved: Mutex<HashMap<String, String>>,
 }
 
 impl Settings {
@@ -210,6 +228,59 @@ impl Settings {
         self.path_style
             .unwrap_or(self.custom_endpoint || bucket.contains('.'))
     }
+
+    /// The region `bucket` is in: the one S3 reported, or `region`.
+    fn region_of(&self, bucket: &str) -> String {
+        let moved = self.moved.lock().unwrap_or_else(PoisonError::into_inner);
+        moved.get(bucket).unwrap_or(&self.region).clone()
+    }
+
+    /// The endpoint host for `region`. A custom endpoint has only one.
+    fn endpoint_host(&self, region: &str) -> String {
+        if self.custom_endpoint || region == self.region {
+            self.host.clone()
+        } else {
+            format!("s3.{region}.{}", aws_domain(region))
+        }
+    }
+
+    /// Use `region` for `bucket` from now on. The first time, say so:
+    /// the operator may want to set it.
+    fn learn_region(&self, bucket: &str, region: &str) {
+        let mut moved = self.moved.lock().unwrap_or_else(PoisonError::into_inner);
+        if moved
+            .insert(bucket.to_string(), region.to_string())
+            .as_deref()
+            != Some(region)
+        {
+            eprintln!(
+                "oximg: s3:// bucket {bucket:?} is in {region}, not AWS_REGION={:?}; \
+                 requests for it go to {region}",
+                self.region
+            );
+        }
+    }
+}
+
+/// AWS region names are lowercase letters, digits and `-`. The region
+/// goes into the host name and the signature scope.
+fn is_region_name(region: &str) -> bool {
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The bucket's region from a 301, when S3 says the bucket is not in
+/// `t.region`. AWS answers this way for any key and any permission, so
+/// the boot probe always learns it. A custom endpoint is one host, so
+/// there is nowhere else to go.
+fn moved_region(s: &Settings, t: &Target, resp: &reqwest::Response) -> Option<String> {
+    if s.custom_endpoint || resp.status() != reqwest::StatusCode::MOVED_PERMANENTLY {
+        return None;
+    }
+    let region = resp.headers().get("x-amz-bucket-region")?.to_str().ok()?;
+    (is_region_name(region) && region != t.region).then(|| region.to_string())
 }
 
 /// Read an `AWS_*` variable the way `config::var` reads ours: trimmed,
@@ -224,27 +295,21 @@ fn aws_var(value: Result<String, std::env::VarError>) -> Option<String> {
 }
 
 fn load_settings() -> Result<Settings, String> {
-    let region = aws_var(std::env::var("AWS_REGION")).ok_or(
-        "s3:// needs AWS_REGION, the bucket's region (R2 accepts `auto`). \
-             AWS_DEFAULT_REGION is not read",
-    )?;
-    // The region goes into the host name and the signature scope.
-    if !region
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-    {
+    let region = aws_var(std::env::var("AWS_REGION"))
+        .ok_or("s3:// needs AWS_REGION (R2 accepts `auto`). AWS_DEFAULT_REGION is not read")?;
+    if !is_region_name(&region) {
         return Err(format!("AWS_REGION={region:?} is not a region name"));
     }
     let custom = crate::config::var("OXIMG_S3_ENDPOINT");
     if custom.is_none() && region == "auto" {
         return Err(
             "AWS_REGION=auto is for R2. Set OXIMG_S3_ENDPOINT to the R2 endpoint, \
-                    or set AWS_REGION to the AWS bucket's region"
+                    or set AWS_REGION to an AWS region"
                 .into(),
         );
     }
     let endpoint = custom.clone().unwrap_or_else(|| default_endpoint(&region));
-    let (scheme, host) = parse_endpoint(&endpoint)?;
+    let (scheme, host) = parse_endpoint("OXIMG_S3_ENDPOINT", &endpoint)?;
     // `config::validate` refuses other values at boot. A library caller
     // that skips it gets the default.
     let path_style = match crate::config::var("OXIMG_S3_PATH_STYLE").as_deref() {
@@ -257,45 +322,43 @@ fn load_settings() -> Result<Settings, String> {
     // custom endpoint already uses path style.
     if path_style == Some(false) && is_ip_literal(&host) {
         return Err(format!(
-            "OXIMG_S3_ENDPOINT={endpoint:?} is an IP address, so it needs path style \
-             (OXIMG_S3_PATH_STYLE=1)"
+            "OXIMG_S3_ENDPOINT={:?} is an IP address, so it needs path style \
+             (OXIMG_S3_PATH_STYLE=1)",
+            shown_url(&endpoint)
         ));
     }
-    let (Some(access_key_id), Some(secret_access_key)) = (
-        aws_var(std::env::var("AWS_ACCESS_KEY_ID")),
-        aws_var(std::env::var("AWS_SECRET_ACCESS_KEY")),
-    ) else {
-        return Err("s3:// needs AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY".into());
-    };
+    let credentials = creds::Chain::from_env()?;
     Ok(Settings {
         scheme,
         host,
         region,
         path_style,
         custom_endpoint: custom.is_some(),
-        credentials: Credentials {
-            access_key_id,
-            secret_access_key,
-            session_token: aws_var(std::env::var("AWS_SESSION_TOKEN")),
-        },
+        credentials,
+        moved: Mutex::default(),
     })
 }
 
 fn default_endpoint(region: &str) -> String {
-    let suffix = if region.starts_with("cn-") {
+    format!("https://s3.{region}.{}", aws_domain(region))
+}
+
+/// The domain of the AWS partition that `region` is in.
+fn aws_domain(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
         "amazonaws.com.cn"
     } else {
         "amazonaws.com"
-    };
-    format!("https://s3.{region}.{suffix}")
+    }
 }
 
-/// Split an endpoint URL into its scheme and its `Host` value. Only
-/// `scheme://host[:port]` is accepted: a path, a query or user info in
-/// the endpoint would change what we sign.
-fn parse_endpoint(raw: &str) -> Result<(String, String), String> {
-    let bad = |why: &str| format!("OXIMG_S3_ENDPOINT={raw:?} {why}");
-    let url = reqwest::Url::parse(raw).map_err(|e| bad(&format!("is not a URL ({e})")))?;
+/// Split the endpoint URL in setting `var` into its scheme and its
+/// `Host` value. Only `scheme://host[:port]` is accepted: a path, a
+/// query or user info in the endpoint would change what we sign or
+/// where the request goes.
+fn parse_endpoint(var: &str, raw: &str) -> Result<(String, String), String> {
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("{var} is not a URL ({e})"))?;
+    let bad = |why: &str| format!("{var}={:?} {why}", shown_url(raw));
     if !matches!(url.scheme(), "http" | "https") {
         return Err(bad("must be http:// or https://"));
     }
@@ -315,6 +378,20 @@ fn parse_endpoint(raw: &str) -> Result<(String, String), String> {
         None => host.to_string(),
     };
     Ok((url.scheme().to_string(), host))
+}
+
+/// `url` without user info, query or fragment, for messages: a setting
+/// can carry a secret there.
+fn shown_url(url: &str) -> String {
+    let Ok(mut u) = reqwest::Url::parse(url) else {
+        return String::new();
+    };
+    // Both only fail for URLs that cannot have them.
+    let _ = u.set_username("");
+    let _ = u.set_password(None);
+    u.set_query(None);
+    u.set_fragment(None);
+    u.to_string()
 }
 
 /// True for an IPv4 or bracketed IPv6 host, with or without a port.
@@ -342,20 +419,25 @@ struct Target {
     url: String,
     host: String,
     path: String,
+    /// The region we sign for.
+    region: String,
 }
 
 impl Target {
     fn new(s: &Settings, bucket: &str, raw_key: &[u8]) -> Self {
         let key = uri_encode_path(raw_key);
+        let region = s.region_of(bucket);
+        let endpoint = s.endpoint_host(&region);
         let (host, path) = if s.path_style(bucket) {
-            (s.host.clone(), format!("/{bucket}/{key}"))
+            (endpoint, format!("/{bucket}/{key}"))
         } else {
-            (format!("{bucket}.{}", s.host), format!("/{key}"))
+            (format!("{bucket}.{endpoint}"), format!("/{key}"))
         };
         Self {
             url: format!("{}://{host}{path}", s.scheme),
             host,
             path,
+            region,
         }
     }
 }
@@ -368,14 +450,14 @@ fn unix_now() -> u64 {
 
 /// Sign and send one GET. Every attempt is signed again, so a retry
 /// carries a fresh `x-amz-date`.
-async fn send_signed(s: &Settings, t: &Target) -> reqwest::Result<reqwest::Response> {
+async fn send_signed(creds: &Credentials, t: &Target) -> reqwest::Result<reqwest::Response> {
     let datetime = amz_datetime(unix_now());
     let mut headers = vec![
         ("host", t.host.as_str()),
         ("x-amz-content-sha256", EMPTY_SHA256),
         ("x-amz-date", datetime.as_str()),
     ];
-    if let Some(token) = &s.credentials.session_token {
+    if let Some(token) = &creds.session_token {
         headers.push(("x-amz-security-token", token));
     }
     let req = Request {
@@ -385,7 +467,7 @@ async fn send_signed(s: &Settings, t: &Target) -> reqwest::Result<reqwest::Respo
         headers: &headers,
         payload_hash: EMPTY_SHA256,
     };
-    let auth = authorization(&req, &s.credentials, &s.region, "s3", &datetime);
+    let auth = authorization(&req, creds, &t.region, "s3", &datetime);
     // reqwest sets `Host` from the URL. We signed the same value.
     let mut builder = super::fetch_client()
         .get(&t.url)
@@ -436,10 +518,17 @@ fn percent_decode(encoded: &str) -> Vec<u8> {
 }
 
 /// Statuses worth one retry, as the SDKs retry reads: throttling and
-/// temporary server errors. Unlike `gs://`, 401 is not here. Static
-/// keys do not refresh, so a second try would fail the same way.
+/// temporary server errors. Unlike `gs://`, 401 is not here: S3 reports
+/// expired keys with a code, see `needs_new_keys`.
 fn retryable_status(code: u16) -> bool {
     matches!(code, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Error codes that mean the keys ran out. Keys from a credential
+/// endpoint can expire between our refresh and S3's check, or be
+/// replaced early, so one fetch of new keys and one more try is worth it.
+fn needs_new_keys(code: &str) -> bool {
+    matches!(code, "ExpiredToken" | "TokenRefreshRequired")
 }
 
 /// GET one object, signed. `key` is already percent-encoded by the
@@ -467,30 +556,83 @@ pub(crate) async fn fetch(bucket: &str, key: &str) -> Result<reqwest::Response> 
     let s = settings().map_err(|e| {
         anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
     })?;
-    let target = Target::new(s, bucket, &raw_key);
-    // One retry, on connection transients and on `retryable_status`.
-    // Unlike `gs://`, a 401 is not retried.
-    let first = send_signed(s, &target).await;
+    let mut target = Target::new(s, bucket, &raw_key);
+    let refreshes = s.credentials.refreshes();
+    // Whether S3 already sent us to the bucket's region once.
+    let mut moved = false;
+    // The keys the store refused as expired, and its code. Keys from a
+    // credential source get one more try with new keys.
+    let mut expired: Option<(Arc<Credentials>, String)> = None;
+    loop {
+        // Pass the keys that failed: if another request already replaced
+        // them, this one uses the new keys instead of fetching again.
+        let creds = s
+            .credentials
+            .current(expired.as_ref().map(|(c, _)| c))
+            .await
+            .map_err(|e| {
+                map_cred_err(match &expired {
+                    Some((_, code)) => e.context(format_args!("after the store answered {code}")),
+                    None => e,
+                })
+            })?;
+        let resp = send_with_retry(&creds, &target).await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        if !moved && let Some(region) = moved_region(s, &target, &resp) {
+            drop(resp);
+            moved = true;
+            s.learn_region(bucket, &region);
+            target = Target::new(s, bucket, &raw_key);
+            continue;
+        }
+        let body = read_error_body(resp).await?;
+        match body.code {
+            Some(code) if expired.is_none() && refreshes && needs_new_keys(&code) => {
+                super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                expired = Some((creds, code));
+            }
+            code => return Err(status_error(status, code.as_deref(), bucket, refreshes)),
+        }
+    }
+}
+
+/// Send once, and once more on connection transients and on
+/// `retryable_status`. Unlike `gs://`, a 401 is not retried.
+async fn send_with_retry(creds: &Credentials, target: &Target) -> Result<reqwest::Response> {
+    let first = send_signed(creds, target).await;
     let retry = match &first {
         Ok(resp) => retryable_status(resp.status().as_u16()),
         Err(e) => !e.is_timeout() && (e.is_connect() || e.is_request()),
     };
-    let resp = if retry {
-        // Release the failed response before waiting or opening another request.
-        drop(first);
-        super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        send_signed(s, &target).await
-    } else {
-        first
+    if !retry {
+        return first.map_err(map_transport_err);
     }
-    .map_err(map_transport_err)?;
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp);
+    // Release the failed response before waiting or opening another request.
+    drop(first);
+    super::UPSTREAM_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    send_signed(creds, target).await.map_err(map_transport_err)
+}
+
+/// A credential failure, classed as a store failure would be: our
+/// settings are a deployment fault, a source that times out is a
+/// timeout, and a source that is down is an upstream fault.
+fn map_cred_err(e: creds::CredError) -> anyhow::Error {
+    match e.fault {
+        creds::Fault::Settings => anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            e.message,
+        )),
+        creds::Fault::TimedOut => {
+            anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::TimedOut, e.message))
+        }
+        creds::Fault::Unavailable => anyhow::anyhow!(e.message)
+            .context("fetch s3 credentials")
+            .context(UpstreamFault),
     }
-    let body = read_error_body(resp).await?;
-    Err(status_error(status, body.code.as_deref(), bucket))
 }
 
 /// Transport failures: timeouts keep their io shape for
@@ -533,7 +675,14 @@ const REQUESTER_CODES: &[&str] = &[
 ///
 /// Deployment faults use `PermissionDenied`, which classifies as
 /// `SourceUnreadable` (HTTP 500).
-fn status_error(status: reqwest::StatusCode, code: Option<&str>, bucket: &str) -> anyhow::Error {
+/// `refreshes` says whether the keys come from a source that can hand
+/// out new ones, which changes the advice for an expired token.
+fn status_error(
+    status: reqwest::StatusCode,
+    code: Option<&str>,
+    bucket: &str,
+    refreshes: bool,
+) -> anyhow::Error {
     let answer = match code {
         Some(code) => format!("{status} {code}"),
         None => status.to_string(),
@@ -565,15 +714,19 @@ fn status_error(status: reqwest::StatusCode, code: Option<&str>, bucket: &str) -
             deployment("check AWS_REGION and OXIMG_S3_ENDPOINT (redirects are not followed)".into())
         }
         (429, _) => upstream(),
-        (400..=499, _) => deployment(deployment_hint(status.as_u16(), code, bucket)),
+        (400..=499, _) => deployment(deployment_hint(status.as_u16(), code, bucket, refreshes)),
         _ => upstream(),
     }
 }
 
 /// What an operator should check, by error code.
-fn deployment_hint(status: u16, code: Option<&str>, bucket: &str) -> String {
+fn deployment_hint(status: u16, code: Option<&str>, bucket: &str, refreshes: bool) -> String {
     match code {
-        Some("ExpiredToken") => "AWS_SESSION_TOKEN has expired. Temporary keys are not \
+        Some("ExpiredToken") if refreshes => "the keys from the credential source were \
+                                              fetched again and still expired. Check this \
+                                              host's clock and the source"
+            .into(),
+        Some("ExpiredToken") => "the session token has expired. AWS_SESSION_TOKEN is not \
                                  refreshed, so restart with new keys"
             .into(),
         Some("RequestTimeTooSkewed") => {
@@ -606,25 +759,39 @@ struct ErrorBody {
 /// faults; never classify a truncated error as a missing object or bad key.
 const ERROR_BODY_LIMIT: usize = 16 * 1024;
 
-async fn read_error_body(mut resp: reqwest::Response) -> Result<ErrorBody> {
-    let too_large = || {
-        anyhow::anyhow!("S3 error response exceeds the {ERROR_BODY_LIMIT}-byte limit")
-            .context(UpstreamFault)
-    };
-    if resp
-        .content_length()
-        .is_some_and(|len| len > ERROR_BODY_LIMIT as u64)
-    {
-        return Err(too_large());
+async fn read_error_body(resp: reqwest::Response) -> Result<ErrorBody> {
+    let body = read_capped(resp, ERROR_BODY_LIMIT)
+        .await
+        .map_err(|e| match e {
+            ReadError::TooLarge => {
+                anyhow::anyhow!("S3 error response exceeds the {ERROR_BODY_LIMIT}-byte limit")
+                    .context(UpstreamFault)
+            }
+            ReadError::Transport(e) => map_transport_err(e),
+        })?;
+    Ok(parse_error_body(&body))
+}
+
+/// Why `read_capped` gave no body.
+enum ReadError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+/// Read a whole body of at most `limit` bytes. A larger one is refused,
+/// not cut short, so a truncated answer is never read as a whole one.
+async fn read_capped(mut resp: reqwest::Response, limit: usize) -> Result<Vec<u8>, ReadError> {
+    if resp.content_length().is_some_and(|len| len > limit as u64) {
+        return Err(ReadError::TooLarge);
     }
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(map_transport_err)? {
-        if chunk.len() > ERROR_BODY_LIMIT - body.len() {
-            return Err(too_large());
+    while let Some(chunk) = resp.chunk().await.map_err(ReadError::Transport)? {
+        if chunk.len() > limit - body.len() {
+            return Err(ReadError::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(parse_error_body(&body))
+    Ok(body)
 }
 
 /// Read `<Code>` and `<Message>` from an S3 error body. These two
@@ -633,12 +800,7 @@ async fn read_error_body(mut resp: reqwest::Response) -> Result<ErrorBody> {
 /// printable ASCII, and the code must look like a code.
 fn parse_error_body(body: &[u8]) -> ErrorBody {
     let text = String::from_utf8_lossy(body);
-    let element = |name: &str| -> Option<String> {
-        let open = format!("<{name}>");
-        let start = text.find(&open)? + open.len();
-        let end = start + text[start..].find(&format!("</{name}>"))?;
-        Some(unescape_xml(&text[start..end]))
-    };
+    let element = |name: &str| xml_element(&text, name).map(unescape_xml);
     let code = element("Code").filter(|c| {
         !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
     });
@@ -649,6 +811,15 @@ fn parse_error_body(body: &[u8]) -> ErrorBody {
             .collect()
     });
     ErrorBody { code, message }
+}
+
+/// The raw text of the first `<name>` element in `xml`. It does not
+/// handle nesting, so it is only for elements that never nest.
+fn xml_element<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&format!("</{name}>"))?;
+    Some(&xml[start..end])
 }
 
 /// Replace the five predefined XML entities and the numeric form that
@@ -733,26 +904,49 @@ pub(crate) fn startup(bucket: &str, prefix: Option<&str>) -> Result<(), String> 
              outside a trusted network."
         );
     }
+    if let Some(warning) = s.credentials.warning() {
+        eprintln!("oximg: warning: {warning}");
+    }
     let key = probe_key(prefix)?;
-    let target = Target::new(s, bucket, key.as_bytes());
     // `block_on_fetch` runs the future on another thread, so it must
     // own what it uses.
-    super::block_on_fetch(probe(s, bucket.to_string(), target))
+    super::block_on_fetch(probe(s, bucket.to_string(), key))?;
+    // With more than one source configured (IRSA and Pod Identity on
+    // one pod), this is the only place that says which one won.
+    eprintln!("oximg: s3:// credentials: {}", s.credentials.source_name());
+    Ok(())
 }
 
-async fn probe(s: &'static Settings, bucket: String, target: Target) -> Result<(), String> {
+async fn probe(s: &'static Settings, bucket: String, key: String) -> Result<(), String> {
     let fail = |what: String| {
+        let region = s.region_of(&bucket);
         format!(
-            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {:?}) {what}",
-            s.scheme, s.host, s.region
+            "s3:// boot probe of bucket {bucket:?} at {}://{} (region {region:?}, {}) {what}",
+            s.scheme,
+            s.endpoint_host(&region),
+            s.credentials.source_name()
         )
     };
-    let resp = send_signed(s, &target).await.map_err(|e| {
+    let creds = s
+        .credentials
+        .current(None)
+        .await
+        .map_err(|e| fail(e.to_string()))?;
+    let unreachable = |e: reqwest::Error| {
         fail(format!(
             "could not reach the endpoint: {:#}",
             anyhow::Error::new(e)
         ))
-    })?;
+    };
+    let target = Target::new(s, &bucket, key.as_bytes());
+    let mut resp = send_signed(&creds, &target).await.map_err(unreachable)?;
+    // A bucket in another region: go there once, as `fetch` does.
+    if let Some(region) = moved_region(s, &target, &resp) {
+        drop(resp);
+        s.learn_region(&bucket, &region);
+        let target = Target::new(s, &bucket, key.as_bytes());
+        resp = send_signed(&creds, &target).await.map_err(unreachable)?;
+    }
     let status = resp.status();
     if status.is_success() {
         return Ok(());
@@ -982,7 +1176,8 @@ mod tests {
             region: "us-east-1".into(),
             path_style,
             custom_endpoint: false,
-            credentials: creds(None),
+            credentials: creds::fixed(creds(None)),
+            moved: Mutex::default(),
         }
     }
 
@@ -1058,13 +1253,17 @@ mod tests {
     #[test]
     fn endpoint_must_be_scheme_and_host() {
         assert_eq!(
-            parse_endpoint("http://127.0.0.1:9000").unwrap(),
+            parse_endpoint("OXIMG_S3_ENDPOINT", "http://127.0.0.1:9000").unwrap(),
             ("http".into(), "127.0.0.1:9000".into())
         );
         // A trailing slash is fine. A default port is dropped, because
         // reqwest drops it from `Host` too.
         assert_eq!(
-            parse_endpoint("https://example.r2.cloudflarestorage.com:443/").unwrap(),
+            parse_endpoint(
+                "OXIMG_S3_ENDPOINT",
+                "https://example.r2.cloudflarestorage.com:443/"
+            )
+            .unwrap(),
             ("https".into(), "example.r2.cloudflarestorage.com".into())
         );
         for bad in [
@@ -1074,8 +1273,31 @@ mod tests {
             "https://host/?x=1",
             "https://user:pw@host",
         ] {
-            assert!(parse_endpoint(bad).is_err(), "{bad} should be refused");
+            assert!(
+                parse_endpoint("OXIMG_S3_ENDPOINT", bad).is_err(),
+                "{bad} should be refused"
+            );
         }
+        // The message names the setting and shows no secret.
+        let e = parse_endpoint(
+            "AWS_ENDPOINT_URL_STS",
+            "https://user:pw-secret@host/?sig=q-secret",
+        )
+        .unwrap_err();
+        assert!(e.starts_with("AWS_ENDPOINT_URL_STS="), "{e}");
+        assert!(!e.contains("secret"), "{e}");
+    }
+
+    #[test]
+    fn messages_show_the_url_without_secrets() {
+        assert_eq!(
+            shown_url("https://user:pw@creds.example.com/x?sig=abc#frag"),
+            "https://creds.example.com/x"
+        );
+        assert_eq!(
+            shown_url("http://169.254.170.2/v2/credentials/id"),
+            "http://169.254.170.2/v2/credentials/id"
+        );
     }
 
     #[test]
@@ -1088,7 +1310,7 @@ mod tests {
         ] {
             let endpoint = default_endpoint(region);
             assert_eq!(endpoint, format!("https://s3.{region}.{suffix}"));
-            let (_, host) = parse_endpoint(&endpoint).unwrap();
+            let (_, host) = parse_endpoint("OXIMG_S3_ENDPOINT", &endpoint).unwrap();
             let target = Target::new(&settings_for("https", &host, None), "pics", b"photo.jpg");
             assert_eq!(
                 target.url,
@@ -1154,9 +1376,67 @@ mod tests {
         assert!(!is_ip_literal("minio.internal:9000"));
     }
 
+    /// A 301 with `x-amz-bucket-region` names the bucket's region. AWS
+    /// sends it for any key, with or without `s3:ListBucket`.
+    #[test]
+    fn a_301_names_the_buckets_region() {
+        let aws = settings_for("https", "s3.us-east-1.amazonaws.com", None);
+        let target = Target::new(&aws, "pics", b"x.jpg");
+        let resp = |status: u16, region: Option<&str>| {
+            let mut b = axum::http::Response::builder().status(status);
+            if let Some(r) = region {
+                b = b.header("x-amz-bucket-region", r);
+            }
+            reqwest::Response::from(b.body(String::new()).unwrap())
+        };
+        assert_eq!(
+            moved_region(&aws, &target, &resp(301, Some("ap-northeast-1"))).as_deref(),
+            Some("ap-northeast-1")
+        );
+        // Not a move: another status, no header, the same region, or a
+        // value that is not a region name.
+        assert!(moved_region(&aws, &target, &resp(400, Some("ap-northeast-1"))).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, None)).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, Some("us-east-1"))).is_none());
+        assert!(moved_region(&aws, &target, &resp(301, Some("evil.com/x"))).is_none());
+        // A custom endpoint is one host: nowhere else to go.
+        let custom = Settings {
+            custom_endpoint: true,
+            ..settings_for("https", "minio.example.com", None)
+        };
+        let target = Target::new(&custom, "pics", b"x.jpg");
+        assert!(moved_region(&custom, &target, &resp(301, Some("ap-northeast-1"))).is_none());
+    }
+
+    /// After S3 names another region, requests for that bucket go to its
+    /// regional endpoint and are signed for it. Other buckets do not.
+    #[test]
+    fn a_learned_region_moves_only_that_bucket() {
+        let aws = settings_for("https", "s3.us-east-1.amazonaws.com", None);
+        aws.learn_region("pics", "ap-northeast-1");
+        let moved = Target::new(&aws, "pics", b"photo.jpg");
+        assert_eq!(
+            moved.url,
+            "https://pics.s3.ap-northeast-1.amazonaws.com/photo.jpg"
+        );
+        assert_eq!(moved.region, "ap-northeast-1");
+        let other = Target::new(&aws, "other", b"photo.jpg");
+        assert_eq!(
+            other.url,
+            "https://other.s3.us-east-1.amazonaws.com/photo.jpg"
+        );
+        assert_eq!(other.region, "us-east-1");
+        // China regions keep their partition's domain.
+        aws.learn_region("cn-pics", "cn-northwest-1");
+        assert_eq!(
+            Target::new(&aws, "cn-pics", b"x.jpg").host,
+            "cn-pics.s3.cn-northwest-1.amazonaws.com.cn"
+        );
+    }
+
     fn kind_of(status: u16, code: Option<&str>) -> crate::pipeline::ErrorKind {
         let status = reqwest::StatusCode::from_u16(status).unwrap();
-        crate::pipeline::Error::classify(status_error(status, code, "pics"), true).kind()
+        crate::pipeline::Error::classify(status_error(status, code, "pics", false), true).kind()
     }
 
     /// What AWS S3, Cloudflare R2 and MinIO answered to signed requests
@@ -1218,12 +1498,21 @@ mod tests {
 
     #[test]
     fn deployment_hints_name_the_cause() {
-        assert!(deployment_hint(400, Some("ExpiredToken"), "b").contains("restart"));
-        assert!(deployment_hint(403, Some("RequestTimeTooSkewed"), "b").contains("clock"));
-        assert!(deployment_hint(403, Some("SignatureDoesNotMatch"), "b").contains("AWS_REGION"));
-        let denied = deployment_hint(403, Some("AccessDenied"), "b");
+        assert!(deployment_hint(400, Some("ExpiredToken"), "b", false).contains("restart"));
+        let chain = deployment_hint(400, Some("ExpiredToken"), "b", true);
+        assert!(
+            chain.contains("fetched again") && !chain.contains("restart"),
+            "{chain}"
+        );
+        assert!(deployment_hint(403, Some("RequestTimeTooSkewed"), "b", false).contains("clock"));
+        assert!(
+            deployment_hint(403, Some("SignatureDoesNotMatch"), "b", false).contains("AWS_REGION")
+        );
+        let denied = deployment_hint(403, Some("AccessDenied"), "b", false);
         assert!(denied.contains("s3:ListBucket") && denied.contains("bucket exists"));
-        assert!(deployment_hint(400, Some("InvalidRequest"), "b").contains("not the requester"));
+        assert!(
+            deployment_hint(400, Some("InvalidRequest"), "b", false).contains("not the requester")
+        );
     }
 
     #[test]
@@ -1234,5 +1523,22 @@ mod tests {
         for code in [400, 401, 403, 404] {
             assert!(!retryable_status(code));
         }
+    }
+
+    #[test]
+    fn credential_faults_map_like_store_faults() {
+        use super::super::error::{Error, ErrorKind};
+        let kind = |fault| {
+            let e = creds::CredError {
+                fault,
+                message: "x".into(),
+                code: None,
+                status: None,
+            };
+            Error::classify(map_cred_err(e), true).kind()
+        };
+        assert_eq!(kind(creds::Fault::Settings), ErrorKind::SourceUnreadable);
+        assert_eq!(kind(creds::Fault::TimedOut), ErrorKind::UpstreamTimeout);
+        assert_eq!(kind(creds::Fault::Unavailable), ErrorKind::Upstream);
     }
 }
