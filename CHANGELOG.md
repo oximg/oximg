@@ -10,6 +10,24 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-07
+
+`strip --auto-rotate` says why it left a JPEG tagged, as a stable code
+callers can branch on ([#176]), and resizes give the same bytes on
+amd64 and arm64 ([#172], [#173]).
+
+**Breaking:** the library's `Stripped::not_rotated` and `oximg-ctl
+strip`'s `not_rotated` are now `{code, message}`, and the gem's
+`Oximg.strip` returns an `Oximg::Stripped` in place of a String, which
+still works where a path is expected (Added, first entry).
+
+**Output bytes change on amd64** for JPEG sources, under the [#121]
+policy, and on arm64 for some 16-bit RGBA and gray+alpha PNGs, and for
+JPEG sources on cores without FHM (Changed). On an Apple M2 Max,
+`oximg-ctl parity` against 0.19.0 finds all 352 fixture cells
+byte-identical (every fixture × 100x100, 333x0, 64x64, 10x200 ×
+source, png, webp, jpeg).
+
 ### Added
 
 - **`strip --auto-rotate` tells callers what happened, as data**
@@ -2334,7 +2352,9 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.18.1...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/oximg/oximg/compare/v0.19.0...v0.20.0
+[0.19.0]: https://github.com/oximg/oximg/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/oximg/oximg/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/oximg/oximg/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/oximg/oximg/compare/v0.16.0...v0.17.0
