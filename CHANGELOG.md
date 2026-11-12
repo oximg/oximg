@@ -10,6 +10,15 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Release archives, the Docker image and the platform gems ship the
+  third-party notices they need** ([#59]). The bundle now also covers
+  the avif build, the C code in Highway and libwebp, and musl. It
+  includes the IJG statement. The Rust standard library's notices ship
+  as `THIRD-PARTY-LICENSES-rust-std.html`. The image keeps every notice
+  under `/usr/share/doc/`.
+
 ## [0.21.0] - 2026-11-12
 
 Animated GIF sources get an optional budget for the decode half
@@ -501,6 +510,7 @@ no fixture is that large.
 [#173]: https://github.com/oximg/oximg/issues/173
 [#176]: https://github.com/oximg/oximg/issues/176
 [#163]: https://github.com/oximg/oximg/issues/163
+[#59]: https://github.com/oximg/oximg/issues/59
 
 ## [0.17.0] - 2026-10-26
 

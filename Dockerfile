@@ -7,7 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # speed), and this revision carries the aarch64 kernels missing from
 # 4.1 for the QM/tune=IQ still-image path (-36% encode time at equal
 # quality). ABI-verified against the pregenerated bindings (identical
-# struct size and field offsets).
+# struct size and field offsets). Its LICENSE.md (BSD-3-Clause-Clear)
+# asks for the notice with a binary, and PATENTS.md (AOM Patent License
+# 1.0) for its own text in the documentation, as a condition of the
+# grant. Keep both from the same checkout before the tree is removed.
 RUN git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt \
     && git -C /svt fetch --depth 1 origin d3c4cb3947a8bfed0aa5a2be996b37bb117fa1bd \
     && git -C /svt checkout d3c4cb3947a8bfed0aa5a2be996b37bb117fa1bd \
@@ -15,6 +18,7 @@ RUN git clone --depth 1 https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt \
        -DBUILD_APPS=OFF -DBUILD_TESTING=OFF \
        -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib \
     && make -C /svt/build -j"$(nproc)" install \
+    && install -Dm644 -t /usr/local/share/doc/svt-av1 /svt/LICENSE.md /svt/PATENTS.md \
     && rm -rf /svt
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -24,13 +28,23 @@ COPY examples ./examples
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=${RUSTFLAGS}
 RUN cargo build --release --locked --features avif
+# The standard library is linked into the binary. Keep its notices
+# from the toolchain that built it.
+RUN install -Dm644 "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" \
+      /usr/local/share/doc/oximg/THIRD-PARTY-LICENSES-rust-std.html
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libdav1d7 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/lib/libSvtAv1Enc.so* /usr/local/lib/
+COPY --from=build /usr/local/share/doc/svt-av1 /usr/share/doc/svt-av1
 RUN ldconfig
 COPY --from=build /app/target/release/oximg /usr/local/bin/oximg
+# Notices for the code oximg links statically (THIRD-PARTY-LICENSES.md
+# and the standard library's), and its own license. libdav1d7 brings
+# its own under /usr/share/doc.
+COPY LICENSE THIRD-PARTY-LICENSES.md /usr/share/doc/oximg/
+COPY --from=build /usr/local/share/doc/oximg /usr/share/doc/oximg
 LABEL org.opencontainers.image.title="oximg" \
       org.opencontainers.image.description="High-performance image compression and resizing: JPEG, PNG, WebP, AVIF. Linear-light Lanczos, per-architecture SIMD." \
       org.opencontainers.image.source="https://github.com/oximg/oximg" \
