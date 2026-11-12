@@ -10,6 +10,17 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-12
+
+Animated GIF sources get an optional budget for the decode half
+(#41), and every GIF output decision is observable: as JSON under
+`OXIMG_TIMING`, in `oximg-ctl resize`, and as a `/metrics` counter.
+
+Nothing changes by default: the budget is unset until an operator sets
+`OXIMG_MAX_ANIM_DECODE_WORK`. On an Apple M2 Max, `oximg-ctl parity`
+against 0.20.0 finds all 352 fixture cells byte-identical (every
+fixture × 100x100, 333x0, 64x64, 10x200 × source, png, webp, jpeg).
+
 ### Added
 
 - Optional `OXIMG_MAX_ANIM_DECODE_WORK` (#41), unset by default: cap the
@@ -2377,7 +2388,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.20.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/oximg/oximg/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/oximg/oximg/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/oximg/oximg/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/oximg/oximg/compare/v0.18.0...v0.18.1
