@@ -782,6 +782,49 @@ fn strip_refusals_and_usage_errors() {
     assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&webp).unwrap());
     std::fs::remove_file(&out).ok();
 }
+
+/// The binary's side of `a_stuffed_byte_is_not_a_marker`
+/// (tests/strip.rs), on the same 30-byte JPEG: FF 00 where a marker
+/// belongs exits 1, names the pair and its offset, and writes nothing,
+/// under either ICC policy and with or without `--auto-rotate`.
+#[test]
+fn strip_refuses_a_stuffed_byte_where_a_marker_belongs() {
+    let src = tmp("strip-ff00.jpg");
+    let out = tmp("strip-ff00.out");
+    let bytes = [
+        &[0xFF, 0xD8][..],
+        &[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00],
+        &[0x12],
+        &[0xFF, 0xE0, 0x00, 0x05, b'X', b'Y', b'Z'],
+        &[0xFF, 0x00, 0x00, 0x06, 0xFF, 0xD8, 0xFF, 0xE2],
+        &[0xFF, 0xD9],
+    ]
+    .concat();
+    std::fs::write(&src, &bytes).unwrap();
+    for flags in [
+        &[][..],
+        &["--icc", "strip"][..],
+        &["--auto-rotate"][..],
+        &["--icc", "strip", "--auto-rotate"][..],
+    ] {
+        let output = bin()
+            .arg("strip")
+            .args([&src, &out])
+            .args(flags)
+            .env_remove("OXIMG_ICC")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{flags:?}: {stderr}");
+        assert!(
+            stderr.contains("JPEG marker 0xFF00 at offset 20"),
+            "{flags:?}: {stderr}"
+        );
+        assert!(!out.exists(), "{flags:?} wrote output");
+    }
+    std::fs::remove_file(&src).ok();
+}
+
 /// Issue #128: `--icc keep|strip` overrides `OXIMG_ICC` per call, the
 /// same precedence as `strip` (flag > knob > keep), and the default
 /// keeps a source profile.

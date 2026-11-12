@@ -283,6 +283,29 @@ fn truncated_jpegs() {
     assert_eq!(e.kind(), ErrorKind::Undecodable);
 }
 
+/// FF 00 is a stuffed byte, not a marker. Here it follows an APP0 the
+/// strip removes, which leaves it right after the scan's entropy byte:
+/// copied as a segment, a second strip read it as entropy data, then
+/// took the FF D8 inside its body for a marker with a 65506-byte length
+/// (the fuzz target's fixed-point check). Refused up front instead.
+#[test]
+fn a_stuffed_byte_is_not_a_marker() {
+    let src = [
+        &[0xFF, 0xD8][..],
+        &[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00],
+        &[0x12],
+        &[0xFF, 0xE0, 0x00, 0x05, b'X', b'Y', b'Z'],
+        &[0xFF, 0x00, 0x00, 0x06, 0xFF, 0xD8, 0xFF, 0xE2],
+        &[0xFF, 0xD9],
+    ]
+    .concat();
+    for p in [keep_icc(), drop_icc()] {
+        let e = pipeline::strip(&src, &p).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Undecodable);
+        assert!(e.to_string().contains("0xFF00"), "{e}");
+    }
+}
+
 /// Bitwise CRC-32, independent of the strip's own.
 fn crc32(data: &[u8]) -> u32 {
     let mut c = !0u32;

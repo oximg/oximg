@@ -126,6 +126,15 @@ source, png, webp, jpeg).
     FMA's latency. Apple M2 Max, interleaved: −12% for 2040×1356 into
     512×340, −36% for 4000×3000 into 400×300.
 
+### Fixed
+
+- **`strip` refuses a JPEG with `FF 00` where a marker belongs**, as
+  libjpeg does. That pair is a stuffed byte, never a marker. Copied
+  through as a segment, it could end up right after a scan once
+  the metadata between them was removed. Stripping that output again
+  then failed with "truncated JPEG segment". Found by the `strip` fuzz
+  target; 0.19.0 has it too.
+
 ## [0.19.0] - 2026-11-02
 
 Large PNG thumbnails in a few megabytes on every architecture

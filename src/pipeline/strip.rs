@@ -351,6 +351,11 @@ fn strip_jpeg(
         ensure!(i < b.len(), "truncated JPEG marker");
         let marker = b[i];
         i += 1;
+        // FF 00 is a stuffed byte, never a marker (libjpeg refuses it
+        // too). Copied as a segment, it could land right after a scan
+        // once the segment between them is removed, where a second
+        // strip reads it as entropy data and walks off into its body.
+        ensure!(marker != 0x00, "JPEG marker 0xFF00 at offset {}", i - 2);
         if marker == 0xD9 {
             out.extend_from_slice(&[0xFF, 0xD9]);
             if i < b.len() {
