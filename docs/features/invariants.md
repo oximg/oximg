@@ -66,8 +66,13 @@ paint CMYK), through the embedded profile when present.
 
 Animated GIF → WebP keeps the animation unless a budget is exceeded,
 in which case it degrades to the still first frame and still answers
-**200** (not 413). Budgets: `OXIMG_GIF_ANIMATION`, `OXIMG_MAX_ANIM_FRAMES`,
-`OXIMG_MAX_ANIM_WORK`, `OXIMG_ANIM_FRAME_STEP`. Loop counts are
+**200** if the first frame passes ordinary source caps. Budgets:
+`OXIMG_GIF_ANIMATION`, `OXIMG_MAX_ANIM_FRAMES`,
+`OXIMG_MAX_ANIM_WORK`, `OXIMG_MAX_ANIM_DECODE_WORK` (unset by default),
+`OXIMG_ANIM_FRAME_STEP`. Decode work includes every source frame and
+its full rectangle before clipping; resizing and stepping do not reduce
+it. [Output decisions](formats.md#gif-animation-decisions) are observable
+in timing JSON and metrics. Loop counts are
 translated (GIF repeats-after-first → WebP total plays).
 
 ```sh

@@ -374,6 +374,9 @@ fn invalid_knobs_refuse_to_boot() {
         ("OXIMG_GIF_ANIMATION", "off"),
         ("OXIMG_MAX_ANIM_FRAMES", "0"),
         ("OXIMG_MAX_ANIM_WORK", "none"),
+        ("OXIMG_MAX_ANIM_DECODE_WORK", "0"),
+        ("OXIMG_MAX_ANIM_DECODE_WORK", "none"),
+        ("OXIMG_MAX_ANIM_DECODE_WORK", "18446744073709551616"),
         ("OXIMG_ANIM_FRAME_STEP", "0"),
         ("OXIMG_ANIM_FRAME_STEP", "100"),
         ("QUALITY", "eighty"),
@@ -573,6 +576,7 @@ fn animation_budgets_degrade_to_a_still_instead_of_failing() {
         ("OXIMG_GIF_ANIMATION", "0"),   // switched off outright
         ("OXIMG_MAX_ANIM_FRAMES", "2"), // anim.gif carries three
         ("OXIMG_MAX_ANIM_WORK", "1"),   // one pixel of encode budget
+        ("OXIMG_MAX_ANIM_DECODE_WORK", "1"),
     ] {
         let s = Server::start(&[(knob, value.to_string())]);
         let (status, ct, body) = s.get("/resize/120/120/anim.gif").unwrap();
@@ -607,6 +611,7 @@ fn decoded_bytes_cap_degrades_an_animation_it_cannot_afford() {
 
     let capped = Server::start(&[
         ("IMAGES_DIR", dir),
+        ("OXIMG_METRICS", "1".into()),
         ("OXIMG_MAX_DECODED_BYTES", (8 << 20).to_string()),
     ]);
     let (status, ct, body) = capped.get("/resize/200/200/anim.gif").unwrap();
@@ -614,6 +619,11 @@ fn decoded_bytes_cap_degrades_an_animation_it_cannot_afford() {
     assert_eq!(frames_of(&body), None, "over the cap, a still is served");
     let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
     assert_eq!((w, h), (200, 150), "the still is the whole logical screen");
+    let metrics = String::from_utf8(capped.get("/metrics").unwrap().2).unwrap();
+    assert_eq!(
+        metric(&metrics, "oximg_gif_output_total{outcome=\"memory_limit\"}"),
+        1.0
+    );
 }
 
 /// A temp IMAGES_DIR holding GIFs whose frame rectangles are far larger
@@ -4626,4 +4636,40 @@ fn page_size() -> usize {
     let size = unsafe { sysconf(SC_PAGESIZE) };
     assert!(size > 0, "sysconf(_SC_PAGESIZE) failed");
     size as usize
+}
+
+/// A 1x1 screen does not make the full rectangles the LZW decoder expands
+/// cheap. Count each rectangle before decoding; the still fallback is 200.
+#[test]
+fn gif_decode_budget_prices_oversized_frames_and_counts_fallbacks() {
+    let dir = oversized_frame_gif_dir("decode-work", 32);
+    for (cap, animated) in [(3072, true), (3071, false)] {
+        let s = Server::start(&[
+            ("IMAGES_DIR", dir.clone()),
+            ("OXIMG_METRICS", "1".into()),
+            ("OXIMG_MAX_ANIM_DECODE_WORK", cap.to_string()),
+        ]);
+        let (status, ct, body) = s.get("/resize/100/100/big_anim.gif").unwrap();
+        assert_eq!((status, ct.as_str()), (200, "image/webp"));
+        assert_eq!(frames_of(&body), animated.then_some(3));
+        // A GIF targeting PNG has its own decision; missing input is not counted.
+        assert_eq!(s.get("/resize/100/100/big.gif@png").unwrap().0, 200);
+        assert_eq!(s.status_of("/resize/100/100/missing.gif"), 404);
+        let body = String::from_utf8(s.get("/metrics").unwrap().2).unwrap();
+        for (outcome, expected) in [
+            ("animated", u8::from(animated)),
+            ("decode_work_limit", u8::from(!animated)),
+            ("target_still", 1),
+            ("frame_limit", 0),
+        ] {
+            assert_eq!(
+                metric(
+                    &body,
+                    &format!("oximg_gif_output_total{{outcome=\"{outcome}\"}}")
+                ),
+                f64::from(expected),
+                "{body}"
+            );
+        }
+    }
 }

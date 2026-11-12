@@ -2259,6 +2259,7 @@ mod fuse;
 #[cfg(feature = "server")]
 mod gcs;
 mod gif;
+pub use gif::gif_output_counts;
 mod jpeg;
 mod jpeg_dec;
 mod jpeg_rotate;

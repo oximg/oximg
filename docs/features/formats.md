@@ -49,3 +49,52 @@ oximg-ctl probe tests/fixtures/anim.gif          # 3 frames, 1500ms
 ```
 
 AVIF cells need a build with `--features avif` (`photo.avif` fixture).
+
+## GIF animation decisions
+
+`OXIMG_MAX_ANIM_DECODE_WORK` is optional (positive integer). The header
+scan sums `max(logical screen area, frame rectangle area)` for each source
+frame with saturating arithmetic. This prices both small updates on a
+large canvas and rectangles that the decoder expands before clipping.
+It is independent of output size and `OXIMG_ANIM_FRAME_STEP`; equal to
+the cap passes. It is a work proxy, not a deadline or memory cap.
+Over it, only the first frame is rendered, subject to the usual source
+pixel/decoded-bytes limits. A still source is unaffected by this cap.
+
+Under `OXIMG_TIMING`, `oximg-ctl resize` adds `gif_animation` from the
+child's dedicated JSON diagnostic. The fields are `outcome`,
+`source_frames`, `decode_work`, `encode_work` (potential encoded frames ×
+output area), and `submitted_frames` (one for a still, otherwise frames
+submitted to the final encoder before any further merging). Source/work fields are
+null when policy skips the scan. The scan skips LZW payloads, so its frame
+count is metadata parsed, not a guarantee all those frames decode.
+
+Stable outcome codes (new codes may be added):
+
+| Code | Meaning |
+|---|---|
+| `animated` | Animation encoder completed; libwebp may merge frames further, and truncated inputs retain the existing keep-decoded-frames policy |
+| `disabled` | Animation disabled; source not scanned |
+| `target_still` | Output is not WebP; source not scanned |
+| `single_frame` | Fewer than two source frames, or empty canvas |
+| `frame_step` | Stepping leaves fewer than two candidate frames |
+| `frame_limit` | Source frame count exceeds `OXIMG_MAX_ANIM_FRAMES` |
+| `decode_work_limit` | Source work exceeds `OXIMG_MAX_ANIM_DECODE_WORK` |
+| `encode_work_limit` | Output work exceeds `OXIMG_MAX_ANIM_WORK` |
+| `memory_limit` | Animation estimate exceeds `OXIMG_MAX_DECODED_BYTES` |
+| `duration_limit` | Duration cannot fit WebP encoder timestamps |
+| `single_output` | Fewer than two frames submitted after decoding (duplicates or incomplete source) |
+
+The first matching decision is reported, not every exceeded limit.
+Only successful calls produce a diagnostic or increment
+`oximg_gif_output_total{outcome}` under `/metrics`. Still GIFs count too;
+coalesced followers and failed requests do not. This is not a count of
+lost animations: disabled/non-WebP calls intentionally skip detection.
+
+```sh
+oximg-ctl --env OXIMG_TIMING=1 --env OXIMG_MAX_ANIM_DECODE_WORK=32399 resize tests/fixtures/anim.gif 100 100 -f webp
+# gif_animation: outcome=decode_work_limit, source_frames=3, decode_work=32400,
+# encode_work=22500, submitted_frames=1; probe has no animation
+oximg-ctl --env OXIMG_TIMING=1 --env OXIMG_MAX_ANIM_DECODE_WORK=32400 resize tests/fixtures/anim.gif 100 100 -f webp
+# outcome=animated; probe.animation: 3 frames, 1500ms, loop_count=0
+```

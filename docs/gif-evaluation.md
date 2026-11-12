@@ -6,7 +6,8 @@ each costs. It was written when `ImageFormat::sniff` deliberately
 returned `None` for `GIF89a`. Every number below was measured on
 an AMD Ryzen 7 8745HS (Arch Linux) on 2026-08-18 with a
 purpose-built POC that links oximg's own crate graph. Nothing here is
-quoted from an encoder's documentation.
+quoted from an encoder's documentation. Section 11 is a separate
+2026-11-12 follow-up with current sources and a reproducible mode study.
 
 **Status (2026-08-18): Tiers 0 and 1 are shipped**, so the sections
 below are the reasoning behind the code, not a plan. One deliberate
@@ -54,9 +55,11 @@ changes the format — the output still plays anywhere a GIF plays.
 
 **(B) Animated WebP.** A VP8/VP8L keyframe-plus-delta container
 (`ANMF` chunks in a RIFF file, written via libwebp's `WebPAnimEncoder`).
-Drop-in for `<img>`: no markup change, universal browser support.
-Supports lossy and lossless, alpha, and per-frame disposal, and it does
-inter-frame prediction, which GIF cannot.
+Drop-in for `<img>` in browsers supporting animated WebP: no markup
+change. Supports lossy and lossless, alpha, sub-rectangles, blending,
+and per-frame disposal. Each rectangle carries an independently coded
+VP8/VP8L image; this is not video-style motion-compensated inter-frame
+prediction. See the [container specification](https://developers.google.com/speed/webp/docs/riff_container).
 
 **(C) Animated AVIF.** An AV1 image sequence in an ISOBMFF container.
 Best compression of everything measured. Decoder support in browsers is
@@ -630,3 +633,123 @@ structure → `corpus.json`), `run.py` (reference encoders →
 Final state: 15 corpus files, 246 reference rows with 0 errors and 0
 missing scores, 120 in-process timing rows, 15 decimation rows, 75
 imgproxy rows across 5 scenarios.
+
+## 11. Follow-up: decode budgets and WebP modes (2026-11-12)
+
+### Current support and the next change
+
+The latest GitHub release at this review is
+[v0.19.0](https://github.com/oximg/oximg/releases/tag/v0.19.0);
+main at `fff0a636455396ba261e9b940d8d99a485d2defe` already carries the
+0.20.0 version/changelog. GIF input and GIF-to-animated-WebP shipped
+through [#28](https://github.com/oximg/oximg/pull/28). GIF output is
+unsupported, other output formats use the first frame, and animated
+WebP input still uses its first frame. These are different capabilities.
+
+[#41](https://github.com/oximg/oximg/issues/41) remains open at review:
+source frame count and post-resize work do not bound source decode work.
+The implementation accompanying this follow-up adds the optional
+`OXIMG_MAX_ANIM_DECODE_WORK` cap and observable output decisions; see
+[the format contract](features/formats.md#gif-animation-decisions).
+It defaults to unset. Count `sum(max(canvas area, rectangle area))`,
+including rectangles extending beyond the canvas, before decoding the
+animation. Neither resizing nor stepping avoids the intervening source
+frames. This is a work estimate, not a CPU deadline; the first-frame
+fallback still needs its own decode and memory checks.
+
+### Reading Cloudinary and web.dev
+
+[Cloudinary's comparison](https://cloudinary.com/guides/image-formats/gif-vs-webp)
+is useful for format capabilities and distribution compatibility. Its
+general claim that WebP uses fewer resources does not establish browser
+decode CPU, battery use, or server encoding cost. Nor can converting an
+existing palette GIF recover the colors or alpha precision already lost.
+Smaller transfers and cheaper playback need separate measurements.
+
+[Google's WebP FAQ](https://developers.google.com/speed/webp/faq)
+distinguishes sequential decode from seeking: its historical study found
+smaller WebP files and faster seeking, but higher sequential decode cost.
+The often-repeated 64% lossy / 19% lossless savings are corpus results,
+not guarantees for each image or present-day devices.
+
+[web.dev's GIF replacement guide](https://web.dev/articles/replace-gifs-with-videos)
+primarily recommends MP4/WebM video for large animations. That changes
+the caller's markup to `<video autoplay loop muted playsinline>` and is
+not evidence that animated WebP is always the best replacement. Its
+2018 advice that video without a poster is excluded from LCP is stale:
+the [current LCP definition](https://web.dev/articles/lcp) considers the
+poster or the first presented video frame, whichever is earlier.
+Keep video conversion in a separate, explicitly requested media workflow.
+
+### Reproducible offline mode study
+
+Run [bench/gif-modes.py](../bench/gif-modes.py), requiring ImageMagick
+and a release-built `gif2webp`:
+
+```sh
+python3 bench/gif-modes.py --cpu 'Apple M2 Max' --rounds 7
+# Or substitute a representative local corpus:
+python3 bench/gif-modes.py --cpu 'YOUR CPU MODEL' --corpus /path/to/gifs --rounds 7
+```
+
+Measured on Apple M2 Max, macOS 26.6.2 arm64, Homebrew gif2webp/libwebp
+1.6.0 and ImageMagick 7.1.2-35. Each source has 24 frames, 160x120
+pixels, 100 ms frame durations and infinite looping. Generated cases
+cover opaque flat shapes, transparent shapes, seeded 64-color noise,
+and a pan over the committed `photo.jpg`. No resize is applied.
+
+Every mode uses q75, method 2, kmin 9, kmax 17, no metadata, and the
+default single-threaded path. Warm each mode once, then interleave
+seven rounds in a seeded shuffled order. Report median subprocess wall
+time, including launch/I/O, with no concurrent build or benchmark.
+Raw samples, source/output SHA-256, settings and versions are written to
+`target/gif-modes/results.json`; repeated encodes must have identical hashes.
+These are reference-encoder timings, not oximg latency or CPU time.
+
+| Source (GIF bytes) | Mode | WebP bytes | Median ms | RGBA RMSE |
+|---|---|---:|---:|---:|
+| Alpha shapes (5,456) | lossy | 7,774 | 17.84 | 3.03 |
+| | lossless | 3,716 | 12.77 | 0 |
+| | mixed | 3,716 | 12.88 | 0 |
+| Flat shapes (8,807) | lossy | 10,218 | 18.07 | 3.44 |
+| | lossless | 5,516 | 14.84 | 0 |
+| | mixed | 5,516 | 15.05 | 0 |
+| Noise (481,093) | lossy | 339,934 | 70.81 | 65.58 |
+| | lossless | 349,082 | 65.87 | 0 |
+| | mixed | 339,934 | 127.07 | 65.58 |
+| Photo pan (295,749) | lossy | 65,270 | 39.45 | 5.98 |
+| | lossless | 256,292 | 99.41 | 0 |
+| | mixed | 65,270 | 41.63 | 5.98 |
+
+Quality compares coalesced animations at matching time intervals,
+weighted by duration, using premultiplied RGB plus alpha on the 0–255
+scale. Invisible RGB is ignored. Dimensions and total duration must
+match; lossless must have zero error. This is not a perceptual metric
+or an equal-quality comparison. In lossless mode q controls compression
+effort, not fidelity; mixed permits per-frame lossy/lossless choices
+([gif2webp options](https://developers.google.com/speed/webp/docs/gif2webp)).
+
+On these fixtures lossless improves both size and time for flat/alpha
+graphics, while lossy makes the photo pan much smaller. Mixed buys no
+bytes over lossy on noise and costs about 1.8x wall time. The lossy
+noise result also demonstrates why byte savings alone are insufficient.
+This four-source native-size corpus cannot choose a production default,
+especially after resampling changes the palette and alpha distribution.
+
+### Decision and rollout
+
+Keep accepting GIF and producing animated WebP within budgets. Keep
+the current lossy default and the existing frame/output/memory limits.
+Ship the optional decode cap and decision metrics first; select an
+operational threshold from source-work distributions and measured
+latency on deployment hardware, with the fallback rate visible.
+
+Before exposing lossless/mixed as production modes, expand the corpus
+to real stickers, text, UI recordings and video-like GIFs at native and
+resized dimensions. Compare perceptual quality, duration, loop semantics,
+RSS and p95 latency through oximg itself on arm64 and amd64. Separately
+measure current Safari/Chromium/Firefox playback, including mobile
+sequential playback and hide/show seeking. Mixed should only graduate
+if its size/quality gains justify its measured encoding cost. No GIF
+encoder, automatic video output, or universal decode threshold follows
+from this experiment.

@@ -699,9 +699,33 @@ an image a browser will happily display.
 | Variable | Default | Meaning |
 |---|---|---|
 | `OXIMG_GIF_ANIMATION` | `1` | `0` renders every animated GIF as its still first frame, i.e. 0.11.0 behaviour |
-| `OXIMG_MAX_ANIM_FRAMES` | `200` | Source frames an animation may carry before it degrades to a still. Bounds the decode+composite half of the work, which shrinking the output does not touch |
+| `OXIMG_MAX_ANIM_FRAMES` | `200` | Source frames an animation may carry before it degrades to a still. Bounds frame count; use the decode-work cap below to also price frame area |
 | `OXIMG_MAX_ANIM_WORK` | `8,000,000` | Encoded frames x **post-resize** frame area, in pixels — the product that predicts encode time, which is what dominates an animation (3018 ms of a 3213 ms worst case). The default admits the measured corpus' worst in-budget file (26 frames of 1280x720 into a 512 box, ~6.8 Mpx, 517 ms) and refuses its worst overall (~34 Mpx, 3.2 s). Because it is measured *after* the resize, a small output box is what buys an expensive source back: the same source that is refused at native size fits into a thumbnail |
+| `OXIMG_MAX_ANIM_DECODE_WORK` | unset | Optional source-side work cap: sum of `max(canvas area, frame rectangle area)` over **all** source frames, in pixels. Checked before animation decode; over it, serve the first frame. Positive integer; unset preserves existing behavior. Neither a smaller output nor frame stepping reduces it |
 | `OXIMG_ANIM_FRAME_STEP` | `1` | Encode every Nth frame. Total play time is preserved (a skipped frame extends the previous frame's duration), so this costs smoothness, not fidelity — which is why it is off by default. `2` roughly halves encode cost |
+
+The decode-work figure is a CPU-work proxy, not milliseconds or an
+allocation limit. GIF rectangles can be larger than the logical screen:
+the decoder expands the entire rectangle before the compositor clips it.
+A 4320×4320 source with 12 full-screen frames therefore costs 223,948,800
+pixels of decode work even when the output is 512×512. The first-frame
+fallback still decodes one frame and must pass the ordinary pixel and
+memory caps; a failure there remains an error, not a promised 200.
+
+With `OXIMG_TIMING=1`, successful GIF calls emit a dedicated
+`oximg: gif-animation {JSON}` stderr line containing `outcome`,
+`source_frames`, `decode_work`, `encode_work`, and `submitted_frames`.
+`encode_work` is the pre-encode upper bound, and `submitted_frames` counts
+frames handed to the encoder, which may merge them further. Work fields
+are null when animation is disabled or the output target is not WebP:
+those policies do not scan the source. `oximg-ctl resize` exposes this
+line as `gif_animation` in its JSON. See [the outcome codes](docs/features/formats.md#gif-animation-decisions).
+
+`OXIMG_METRICS=1` exposes `oximg_gif_output_total{outcome}` for the same
+decisions, including budget fallbacks. It counts successful pipeline
+calls (still GIFs included), not coalesced followers or errors. Collect
+work reports on your corpus before choosing a decode-work cap; no
+universal threshold is inferred from the small benchmark corpus.
 
 One caveat on bytes: animated WebP wins hugely on photographic and
 video-like GIFs (4–30% of the source across the corpus) but can *lose*

@@ -30,6 +30,90 @@ use super::*;
 // name in the extern prelude — the leading `::` reaches past it.
 use ::gif::{ColorOutput, DecodeOptions, DisposalMethod, Frame, MemoryLimit, Repeat};
 
+// These codes describe successful GIF processing, including policy decisions
+// that skip the animation scan. Failed requests stay in the error metrics.
+#[derive(Clone, Copy)]
+enum GifOutcome {
+    Animated,
+    Disabled,
+    TargetStill,
+    SingleFrame,
+    FrameStep,
+    FrameLimit,
+    DecodeWorkLimit,
+    EncodeWorkLimit,
+    MemoryLimit,
+    DurationLimit,
+    SingleOutput,
+}
+
+const GIF_OUTCOMES: [&str; 11] = [
+    "animated",
+    "disabled",
+    "target_still",
+    "single_frame",
+    "frame_step",
+    "frame_limit",
+    "decode_work_limit",
+    "encode_work_limit",
+    "memory_limit",
+    "duration_limit",
+    "single_output",
+];
+static GIF_OUTPUT_COUNTS: [std::sync::atomic::AtomicU64; GIF_OUTCOMES.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; GIF_OUTCOMES.len()];
+
+/// Lifetime successful GIF pipeline calls by output decision. Coalesced HTTP
+/// followers do not run the pipeline and are not counted again. Codes are
+/// stable; new codes may be added. Disabled/non-WebP requests skip the scan,
+/// so their counters include still sources too.
+pub fn gif_output_counts() -> impl Iterator<Item = (&'static str, u64)> {
+    GIF_OUTCOMES
+        .iter()
+        .zip(&GIF_OUTPUT_COUNTS)
+        .map(|(&code, n)| (code, n.load(std::sync::atomic::Ordering::Relaxed)))
+}
+
+struct GifReport {
+    outcome: GifOutcome,
+    // None means not scanned, rather than zero-cost input.
+    work: Option<(usize, u64, u64)>,
+    submitted_frames: usize,
+}
+
+impl GifReport {
+    fn record(&self) {
+        GIF_OUTPUT_COUNTS[self.outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if crate::config::config().timing {
+            eprintln!("oximg: gif-animation {self}");
+        }
+    }
+}
+
+// A dedicated JSON line, not the human timing sentence. Only fixed codes and
+// integers enter this formatter; it also works without the server/serde feature.
+impl std::fmt::Display for GifReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{\"outcome\":\"{}\",\"submitted_frames\":{}",
+            GIF_OUTCOMES[self.outcome as usize], self.submitted_frames
+        )?;
+        if let Some((frames, decode, encode)) = self.work {
+            write!(
+                f,
+                ",\"source_frames\":{frames},\"decode_work\":{decode},\"encode_work\":{encode}"
+            )?;
+        } else {
+            write!(
+                f,
+                ",\"source_frames\":null,\"decode_work\":null,\"encode_work\":null"
+            )?;
+        }
+        write!(f, "}}")
+    }
+}
+
 /// Logical screen size, without decoding a single frame:
 /// `skip_frame_decoding` means nothing pixel-sized is allocated no
 /// matter what the header claims, so this stays safe on untrusted input
@@ -69,12 +153,18 @@ fn process_gif_src(
     target: ImageFormat,
     p: &Resolved,
 ) -> Result<Vec<u8>> {
+    let mut report = GifReport {
+        outcome: GifOutcome::TargetStill,
+        work: None,
+        submitted_frames: 1,
+    };
     // WebP is the only target here that can carry an animation at all;
     // for the others the still path below is not a degradation, it is
     // the only thing the format can say.
     if target == ImageFormat::Webp
-        && let Some(out) = try_animated(s, src, p)?
+        && let Some(out) = try_animated(s, src, p, &mut report)?
     {
+        report.record();
         return Ok(out);
     }
     let timing = crate::config::config().timing;
@@ -89,6 +179,7 @@ fn process_gif_src(
 
     let t2 = crate::clock::Instant::now();
     let out = encode_output(s, dst_w, dst_h, channels, target, p, None)?;
+    report.record();
     if timing {
         eprintln!(
             "timing gif decode({src_w}x{src_h}x{channels})={:.1}ms resize={:.1}ms encode={:.1}ms",
@@ -236,6 +327,10 @@ pub(super) struct GifScan {
     /// already expanded the whole thing — so this, not the screen area,
     /// is what the staged frame buffer costs.
     pub max_frame_px: u64,
+    /// CPU work proxy, not bytes or elapsed time: every source frame pays
+    /// at least one canvas, and an oversized rectangle pays its full LZW
+    /// expansion even though composition later clips it to the canvas.
+    pub decode_work: u64,
     /// Total plays, in WebP's spelling: 0 = forever. Converted from
     /// GIF's own counting — see [`scan_gif`].
     pub loop_count: u32,
@@ -272,6 +367,9 @@ pub(super) fn scan_gif(src: &[u8]) -> Result<GifScan> {
         scan.max_frame_px = scan
             .max_frame_px
             .max(u64::from(f.width) * u64::from(f.height));
+        let frame_px = u64::from(f.width) * u64::from(f.height);
+        let canvas_px = (scan.width as u64) * (scan.height as u64);
+        scan.decode_work = scan.decode_work.saturating_add(frame_px.max(canvas_px));
     }
     // Read after the walk, not before: the loop-count extension is an
     // application block that may sit anywhere, and by now the whole file
@@ -325,9 +423,15 @@ fn delay_ms(delay_cs: u16) -> u32 {
 /// part is estimated below (`ANIM_RETAINED_PER_PX` per encoded pixel,
 /// plus the encoder's canvases) and bounded by
 /// `OXIMG_MAX_ANIM_WORK`, not by the canvas.
-fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<u8>>> {
+fn try_animated(
+    s: &mut Scratch,
+    src: &[u8],
+    p: &Resolved,
+    report: &mut GifReport,
+) -> Result<Option<Vec<u8>>> {
     let cfg = crate::config::config();
     if !cfg.gif_animation {
+        report.outcome = GifOutcome::Disabled;
         return Ok(None);
     }
     let Ok(scan) = scan_gif(src) else {
@@ -340,15 +444,30 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     // lower it. Budgeting the bound keeps every allocation and every
     // decision ahead of the first decoded pixel.
     let encoded = scan.frames.div_ceil(step);
+    let (out_w, out_h) = fit_dims(cw, ch, p.max_width, p.max_height);
+    let work = (encoded as u64).saturating_mul((out_w as u64).saturating_mul(out_h as u64));
+    report.work = Some((scan.frames, scan.decode_work, work));
     // A single frame *is* the still path, and wrapping it in an
     // animation container would only add bytes.
     if encoded < 2 || cw == 0 || ch == 0 {
+        report.outcome = if scan.frames < 2 || cw == 0 || ch == 0 {
+            GifOutcome::SingleFrame
+        } else {
+            GifOutcome::FrameStep
+        };
         return Ok(None);
     }
-    // Two budgets for the two halves of the work: the frame count bounds
-    // decode+composite, which no output size reduces, and the
-    // frames x area product bounds the encode, which dominates (§5).
+    // Independent budgets: neither smaller output nor frame stepping
+    // avoids decoding and compositing the intervening source frames.
     if scan.frames > cfg.max_anim_frames {
+        report.outcome = GifOutcome::FrameLimit;
+        return Ok(None);
+    }
+    if cfg
+        .max_anim_decode_work
+        .is_some_and(|cap| scan.decode_work > cap)
+    {
+        report.outcome = GifOutcome::DecodeWorkLimit;
         return Ok(None);
     }
     if check_src_pixels(cw, ch).is_err() {
@@ -362,11 +481,11 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     // past its default, since one frame is at most 655_350 ms — but a
     // knob is not a promise, so check rather than assume.
     if scan.duration_ms > i32::MAX as u64 {
+        report.outcome = GifOutcome::DurationLimit;
         return Ok(None);
     }
-    let (out_w, out_h) = fit_dims(cw, ch, p.max_width, p.max_height);
-    let work = (encoded as u64).saturating_mul((out_w as u64).saturating_mul(out_h as u64));
     if work > cfg.max_anim_work {
+        report.outcome = GifOutcome::EncodeWorkLimit;
         return Ok(None);
     }
 
@@ -405,6 +524,7 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     // animation budgets and serve less instead of refusing. The still
     // path runs its own check, so nothing escapes the cap.
     if cfg.max_decoded_bytes.is_some_and(|cap| cost.bytes() > cap) {
+        report.outcome = GifOutcome::MemoryLimit;
         return Ok(None);
     }
     check_decoded_bytes(cost, "animated GIF")?;
@@ -487,10 +607,13 @@ fn try_animated(s: &mut Scratch, src: &[u8], p: &Resolved) -> Result<Option<Vec<
     // animation container, and if nothing decoded at all the still path's
     // error message for this source is the canonical one.
     if emitted < 2 {
+        report.outcome = GifOutcome::SingleOutput;
         return Ok(None);
     }
     let t = crate::clock::Instant::now();
     let out = enc.finish(ts).context(ServerFault)?;
+    report.outcome = GifOutcome::Animated;
+    report.submitted_frames = emitted;
     t_encode += t.elapsed();
     if cfg.timing {
         eprintln!(
@@ -625,4 +748,25 @@ fn compact_if_opaque(chunk8: &mut [u8], pixels: usize) -> usize {
         chunk8.copy_within(i * 4..i * 4 + 3, i * 3);
     }
     3
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+
+    #[test]
+    fn scan_prices_each_rectangle_and_at_least_one_canvas_per_frame() {
+        let mut bytes = Vec::new();
+        {
+            let mut enc = ::gif::Encoder::new(&mut bytes, 4, 3, &[0, 0, 0, 255, 0, 0]).unwrap();
+            for (w, h) in [(6, 5), (2, 1), (3, 7)] {
+                let f = Frame::from_indexed_pixels(w, h, vec![1; w as usize * h as usize], None);
+                enc.write_frame(&f).unwrap();
+            }
+        }
+        let scan = scan_gif(&bytes).unwrap();
+        assert_eq!(scan.frames, 3);
+        assert_eq!(scan.max_frame_px, 30);
+        assert_eq!(scan.decode_work, 30 + 12 + 21);
+    }
 }

@@ -89,8 +89,9 @@ Pass extras to a spawned server with `oximg-ctl --env KEY=VAL …`.
 | `OXIMG_UPSTREAM_TIMEOUT` | `30` | Whole fetch including credentials, retry waits and body; timeout → 504 |
 | `OXIMG_OVERLAP` | `auto` | Fuse JPEG decode with resize+encode |
 | `OXIMG_GIF_ANIMATION` | `1` | `0` = still first frame |
-| `OXIMG_MAX_ANIM_FRAMES` | `200` | Over → still 200, not 413 |
+| `OXIMG_MAX_ANIM_FRAMES` | `200` | Over → first frame, still subject to source caps |
 | `OXIMG_MAX_ANIM_WORK` | `8e6` | encoded frames × post-resize area |
+| `OXIMG_MAX_ANIM_DECODE_WORK` | unset | Positive integer; sum of max(canvas, rectangle) pixels over all source frames; over → first frame, still subject to source caps |
 | `OXIMG_ANIM_FRAME_STEP` | `1` | Encode every Nth frame |
 
 Adding a pipeline knob: field on `Config` **and** `Resolved` if it has
