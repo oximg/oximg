@@ -112,6 +112,13 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
     if let Some(estimate) = decoded_bytes(&stderr) {
         report["decoded_bytes"] = estimate;
     }
+    if let Some(line) = stderr
+        .lines()
+        .find_map(|l| l.strip_prefix("oximg: gif-animation "))
+    {
+        report["gif_animation"] = serde_json::from_str(line)
+            .map_err(|e| CtlError::fail(format!("invalid GIF animation report: {e}"), None))?;
+    }
     if !ephemeral {
         report["out"] = json!(out_path.display().to_string());
     }

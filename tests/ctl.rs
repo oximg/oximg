@@ -2109,3 +2109,85 @@ fn strip_env_does_not_pick_the_executable() {
     assert_eq!(output.status.code(), Some(0), "{v}");
     assert_eq!(v["rotated"], 5, "{v}");
 }
+
+/// Decode work is source-side: neither a smaller output nor skipped encode
+/// frames can buy an expensive source back. The exact boundary is inclusive.
+#[test]
+fn gif_decode_budget_reports_the_decision_and_preserves_the_timeline() {
+    let src = fixture("anim.gif");
+    for (cap, step, width, outcome, frames, encode_work) in [
+        ("32400", "1", "100", "animated", 3, 22500),
+        ("32399", "1", "100", "decode_work_limit", 1, 22500),
+        ("32399", "2", "100", "decode_work_limit", 1, 15000),
+        ("32399", "1", "1", "decode_work_limit", 1, 3),
+        ("32400", "2", "100", "animated", 2, 15000),
+    ] {
+        let (code, v) = run(&[
+            "--env",
+            "OXIMG_TIMING=1",
+            "--env",
+            &format!("OXIMG_MAX_ANIM_DECODE_WORK={cap}"),
+            "--env",
+            &format!("OXIMG_ANIM_FRAME_STEP={step}"),
+            "resize",
+            &src,
+            width,
+            "100",
+            "-f",
+            "webp",
+        ]);
+        assert_eq!(code, 0, "{v}");
+        let report = &v["gif_animation"];
+        assert_eq!(report["outcome"], outcome, "{v}");
+        assert_eq!(report["source_frames"], 3, "{v}");
+        assert_eq!(report["decode_work"], 32400, "{v}");
+        assert_eq!(report["encode_work"], encode_work, "{v}");
+        assert_eq!(report["submitted_frames"], frames, "{v}");
+        if frames > 1 {
+            assert_eq!(v["probe"]["animation"]["frames"], frames, "{v}");
+            assert_eq!(v["probe"]["animation"]["duration_ms"], 1500, "{v}");
+            assert_eq!(v["probe"]["animation"]["loop_count"], 0, "{v}");
+        } else {
+            assert!(v["probe"].get("animation").is_none(), "{v}");
+        }
+    }
+}
+
+#[test]
+fn gif_reports_other_policies_without_scanning_when_disabled() {
+    let src = fixture("anim.gif");
+    for (knob, outcome, format, scanned) in [
+        ("OXIMG_GIF_ANIMATION=0", "disabled", "webp", false),
+        ("OXIMG_MAX_ANIM_FRAMES=2", "frame_limit", "webp", true),
+        ("OXIMG_MAX_ANIM_WORK=1", "encode_work_limit", "webp", true),
+        ("OXIMG_ANIM_FRAME_STEP=3", "frame_step", "webp", true),
+        ("OXIMG_MAX_ANIM_WORK=1", "target_still", "png", false),
+    ] {
+        let (code, v) = run(&[
+            "--env",
+            "OXIMG_TIMING=1",
+            "--env",
+            knob,
+            "resize",
+            &src,
+            "100",
+            "100",
+            "-f",
+            format,
+        ]);
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["gif_animation"]["outcome"], outcome, "{v}");
+        assert_eq!(
+            v["gif_animation"]["decode_work"].is_number(),
+            scanned,
+            "{v}"
+        );
+        assert!(v["probe"].get("animation").is_none(), "{v}");
+    }
+    let (code, v) = run(&["resize", &src, "100", "100", "-f", "webp"]);
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        v.get("gif_animation").is_none(),
+        "diagnostic is opt-in: {v}"
+    );
+}

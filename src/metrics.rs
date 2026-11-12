@@ -172,6 +172,18 @@ impl Metrics {
 
         let _ = writeln!(
             out,
+            "# HELP oximg_gif_output_total Successful GIF pipeline calls by output decision (not coalesced followers)."
+        );
+        let _ = writeln!(out, "# TYPE oximg_gif_output_total counter");
+        for (outcome, count) in oximg::pipeline::gif_output_counts() {
+            let _ = writeln!(
+                out,
+                "oximg_gif_output_total{{outcome=\"{outcome}\"}} {count}"
+            );
+        }
+
+        let _ = writeln!(
+            out,
             "# HELP oximg_requests_total Resize requests by status class and resolved output format."
         );
         let _ = writeln!(out, "# TYPE oximg_requests_total counter");

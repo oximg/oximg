@@ -121,14 +121,18 @@ pub(crate) struct Config {
     /// first frame instead of animated WebP).
     pub gif_animation: bool,
     /// OXIMG_MAX_ANIM_FRAMES: source frames an animation may carry
-    /// before it degrades to a still. Bounds the decode+composite half
-    /// of the work, which no output size reduces.
+    /// before it degrades to a still. The independent decode-work cap
+    /// also prices frame area, which output resizing cannot reduce.
     pub max_anim_frames: usize,
     /// OXIMG_MAX_ANIM_WORK: encoded frames x post-resize frame area, in
     /// pixels — the product that predicts encode time, which is what
     /// dominates an animation (docs/gif-evaluation.md §5). Over it, the
     /// request degrades to a still rather than failing.
     pub max_anim_work: u64,
+    /// OXIMG_MAX_ANIM_DECODE_WORK: sum of max(canvas area, frame
+    /// rectangle area) over every source frame. None leaves this CPU
+    /// work proxy uncapped; neither resizing nor frame stepping reduces it.
+    pub max_anim_decode_work: Option<u64>,
     /// OXIMG_ANIM_FRAME_STEP: encode every Nth frame (1 = all of them).
     /// Total duration is preserved, so decimation costs smoothness, not
     /// fidelity — off by default for that reason.
@@ -165,6 +169,7 @@ const KNOBS: &[&str] = &[
     "OXIMG_GIF_ANIMATION",
     "OXIMG_MAX_ANIM_FRAMES",
     "OXIMG_MAX_ANIM_WORK",
+    "OXIMG_MAX_ANIM_DECODE_WORK",
     "OXIMG_ANIM_FRAME_STEP",
     "OXIMG_MAX_DECODED_BYTES",
     "OXIMG_LOG_DECODED_BYTES_ABOVE",
@@ -325,6 +330,7 @@ pub(crate) fn validate() -> Result<(), String> {
     num("OXIMG_MAX_SRC_PIXELS", 1u64, u64::MAX)?;
     num("OXIMG_MAX_ANIM_FRAMES", 1u64, u64::MAX)?;
     num("OXIMG_MAX_ANIM_WORK", 1u64, u64::MAX)?;
+    num("OXIMG_MAX_ANIM_DECODE_WORK", 1u64, u64::MAX)?;
     // A step above the frame cap could only ever emit one frame, which
     // is a still with extra steps; 64 is far past any useful decimation.
     num("OXIMG_ANIM_FRAME_STEP", 1u64, 64)?;
@@ -408,6 +414,7 @@ pub(crate) fn config() -> &'static Config {
         // 517 ms, and its worst file overall (web_480x270_docu, ~34 Mpx)
         // at 3.2 s — which this refuses, serving a still instead.
         max_anim_work: parsed("OXIMG_MAX_ANIM_WORK").unwrap_or(8_000_000),
+        max_anim_decode_work: parsed("OXIMG_MAX_ANIM_DECODE_WORK"),
         anim_frame_step: parsed::<usize>("OXIMG_ANIM_FRAME_STEP")
             .filter(|s| *s >= 1)
             .unwrap_or(1),

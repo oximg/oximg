@@ -10,6 +10,22 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- Optional `OXIMG_MAX_ANIM_DECODE_WORK` (#41), unset by default: cap the
+  sum of max(canvas area, frame rectangle area) over every GIF source
+  frame before animation decoding. Oversized rectangles are priced before
+  clipping, and neither shrinking output nor frame stepping reduces the
+  work. Over-budget animations fall back to their first frame; ordinary
+  source pixel and memory limits still apply. Defaults preserve bytes.
+- GIF output decisions are observable: `OXIMG_TIMING` adds a dedicated
+  JSON diagnostic with a stable outcome code and decode/encode work;
+  `oximg-ctl resize` exposes it as `gif_animation`. `/metrics` adds
+  `oximg_gif_output_total{outcome}` for successful GIF pipeline calls,
+  including still sources and fallbacks, excluding errors and coalesced
+  followers. Disabled and non-WebP requests retain their cheap path and
+  report null source/work fields instead of scanning the whole animation.
+
 ## [0.20.0] - 2026-11-07
 
 `strip --auto-rotate` says why it left a JPEG tagged, as a stable code

@@ -180,6 +180,7 @@ mod tests {
             gif_animation: true,
             max_anim_frames: 200,
             max_anim_work: 8_000_000,
+            max_anim_decode_work: None,
             anim_frame_step: 1,
         }
     }

@@ -103,6 +103,8 @@ resize:
   JSON adds `peak_rss_bytes` (the child's peak RSS; null off Unix) and,
   when oximg printed an estimate (`--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`),
   `decoded_bytes`: {{format, total, terms: {{staged, ...}}}}.
+  Under `--env OXIMG_TIMING=1`, GIFs add `gif_animation`: output decision,
+  source_frames, decode_work, encode_work, submitted_frames.
 
 strip:
   --out PATH                Output file (default: a temp file)
