@@ -121,6 +121,7 @@ else
   step test any cargo test --release
   step test-avif avif cargo test --release --features avif
   step build-all-targets avif cargo build --release --all-targets --features avif
+  step s3-harness any ./target/release/examples/s3-harness check
   step examples-smoke any examples_smoke
   step examples-smoke-avif avif examples_smoke_avif
 fi
