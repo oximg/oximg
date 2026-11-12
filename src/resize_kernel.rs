@@ -1925,11 +1925,10 @@ mod tests {
             for out_size in 1..=64usize {
                 let w = Windows::new(in_size, out_size);
                 let cap = w.window_size.min(in_size).max(1);
-                for o in 0..out_size {
+                for (o, &size) in w.sizes.iter().enumerate().take(out_size) {
                     assert!(
-                        w.sizes[o] <= cap,
-                        "{in_size}->{out_size} window {o}: size {} > cap {cap}",
-                        w.sizes[o]
+                        size <= cap,
+                        "{in_size}->{out_size} window {o}: size {size} > cap {cap}",
                     );
                 }
                 // window ends must be non-decreasing for end-driven fill
