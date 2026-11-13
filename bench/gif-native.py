@@ -106,6 +106,12 @@ def generate(root, magick):
         dest = root / f"{kind}.gif"
         run([magick, "-delay", "10", *paths, "-loop", "0", "-layers", "Optimize", dest])
         sources.append(dest)
+    # Palette transparency becomes noisy 8-bit alpha after resizing: this
+    # stresses a different encoder allocation path from a smooth circle.
+    alpha_noise = root / "noise-alpha.gif"
+    run([magick, root / "large-noise.gif", "-coalesce", "-transparent", "black",
+         "-layers", "Optimize", alpha_noise])
+    sources.append(alpha_noise)
     return sorted(sources)
 
 
