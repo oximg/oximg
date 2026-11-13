@@ -51,7 +51,21 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+fn peak_rss() -> Result<u64> {
+    // Linux getrusage can retain the Python launcher's pre-exec RSS high-water
+    // mark. VmHWM belongs to this executable's mm, so small cells don't inherit
+    // a fictitious ~30 MiB floor from the orchestration process.
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let kb = status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|s| s.split_whitespace().next())
+        .context("missing VmHWM")?;
+    Ok(kb.parse::<u64>()? * 1024)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 fn peak_rss() -> Result<u64> {
     // SAFETY: getrusage initializes a writable rusage on success; read only
     // after checking its return. Fresh process per cell, no previous mode peak.
