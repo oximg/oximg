@@ -143,6 +143,11 @@ path = "bench/tools/resolve_bench.rs"
 required-features = ["bench-internals"]
 
 [[example]]
+name = "gif_native"
+path = "bench/tools/gif_native.rs"
+required-features = ["bench-internals", "server"]
+
+[[example]]
 name = "resize_bench"
 path = "bench/tools/resize_bench.rs"
 required-features = ["bench-internals"]
