@@ -1842,6 +1842,11 @@ pub fn bench_resolve(p: &Params) -> impl Sized {
     Resolved::new(p)
 }
 
+/// Experimental animation measurement surface, not a supported encoding API.
+#[cfg(feature = "bench-internals")]
+#[doc(hidden)]
+pub mod gif_bench;
+
 /// Targets that can carry an ICC profile — all of them when the avif
 /// feature is on (AVIF embeds via the container splice in
 /// `avif::embed_icc`).

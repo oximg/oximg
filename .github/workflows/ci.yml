@@ -75,6 +75,8 @@ jobs:
         run: cargo test --release
       - name: Test (avif)
         run: cargo test --release --features avif
+      - name: Native GIF benchmark correctness
+        run: cargo test --release --features bench-internals --test formats_gif
       - name: Build all targets
         run: cargo build --release --all-targets --features avif
       - name: S3 harness against the compiled control CLI
