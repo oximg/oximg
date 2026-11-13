@@ -753,3 +753,139 @@ sequential playback and hide/show seeking. Mixed should only graduate
 if its size/quality gains justify its measured encoding cost. No GIF
 encoder, automatic video output, or universal decode threshold follows
 from this experiment.
+
+## 12. Native animation mode experiment (2026-11-13)
+
+The decode budget and decision reports from §11 shipped in 0.21.0.
+The next question is whether alternative WebP modes justify a supported
+option. [bench/gif-native.py](../bench/gif-native.py) now drives oximg's
+own animation loop, rather than using `gif2webp` as a surrogate.
+
+### Scope and reproduction
+
+```sh
+cargo build --release --locked --features bench-internals --example gif_native
+python3 bench/gif-native.py --cpu 'YOUR CPU MODEL' --rounds 7
+# Reuse the exact input bytes on another machine:
+python3 bench/gif-native.py --cpu 'YOUR CPU MODEL' --corpus /path/to/gifs --rounds 7
+```
+
+`gif_native` and `pipeline::gif_bench` require `bench-internals`; neither
+the server nor the normal CLI has a mode switch. The benchmark shares
+the production scanner, admission budgets, compositor, duplicate-frame
+merging, resize, and libwebp import/add/assembly code. Lossy uses the
+production quality, effort and keyframe settings; lossless sets the
+lossless flag, and mixed enables per-frame mode selection. Both
+experimental modes set `exact=1`. No default changes.
+
+Each measurement uses a fresh process and a borrowed, already-read GIF.
+`pipeline_ms` includes setup and the animation loop but excludes file
+I/O, the ordinary caller's compressed-input rebuffering, and HTTP work.
+RSS includes the input, scratch and encoded output; it is not an HTTP
+server memory claim. On Linux use `/proc/self/status`'s `VmHWM`:
+`getrusage` can retain the Python parent's pre-exec high-water mark and
+create a fictitious floor for small cases. macOS uses `getrusage`.
+
+Warm each mode once, then interleave seven shuffled rounds per source
+and size. Retain all samples and report median time and maximum RSS;
+seven samples do not establish p95 latency. No quality capture runs
+until every timing cell has finished. Fingerprints identify the binary,
+source code and each GIF in the JSON results under `target/gif-native/`.
+
+The generated corpus has eight cases: the four 160x120 animations from
+§11, 512x512 noise and transparent motion (12 frames each), and a
+640x360 UI with bitmap digits, thin strokes and an animated progress
+bar (12 frames), plus a palette-transparent version of the large noise
+case to exercise noisy 8-bit alpha after resizing. Test native size and
+128x128 / 64x64 fit boxes. It is
+a reproducible stress/quality corpus, not a production traffic sample.
+`--corpus` accepts local GIFs without committing or publishing them.
+
+### Correctness and measurement limits
+
+A separate reference sink captures the exact RGBA canvases and start
+timestamps handed to the encoder. WebP output is decoded through
+libwebp and compared at matching time intervals, permitting frame
+merging while requiring identical canvas size, duration and total play
+count. Reference capture is limited to 256 MiB and never enters a
+timed/RSS cell. Short GIF delays use oximg's normal 0/1 cs → 100 ms rule.
+
+Lossless must have zero visible RGBA error against the **post-resize**
+reference. RGBA RMSE includes alpha and premultiplied RGB, weighted by
+duration. When `ssimulacra2` is available, score five matching timestamps
+on both black and white backgrounds, reporting the mean and minimum.
+Those sparse perceptual samples complement the full-timeline pixel
+comparison; they do not prove every lossy frame looks acceptable.
+
+The benchmark refuses a still fallback rather than timing it as an
+animation; batch results list policy refusals separately. It also
+refuses `OXIMG_MAX_DECODED_BYTES`: the current allocation model was
+calibrated for lossy encoding, not VP8L, mixed search, or retained raw
+reference frames. The driver clears inherited `OXIMG_*` settings to
+measure defaults consistently. A production mode needs a separately
+validated memory estimate before that restriction can be removed.
+
+CI runs the native-mode correctness cells on amd64 and arm64. They
+cover production-lossy byte parity, resized transparent pixels, finite
+and infinite loops, Background/Previous disposal, normalized short
+delays, duplicate merging and explicit refusal of still input.
+
+### Results and the next implementation
+
+Measured with Rust 1.99.1 on Apple M2 Max (macOS arm64, no CPU pinning)
+and Rust 1.99.0 on AMD Ryzen 7 8745HS (Linux amd64, pinned to CPU 0).
+Both use the committed `libwebp-sys 0.14.4` dependency and identical
+corpus bytes. The eight generated sources contribute 72 cells per
+architecture; one additional local operational GIF contributes nine.
+That input is not redistributed and is excluded from the table below.
+All 81 encoded outputs match across architectures. All 27 lossless
+cells per architecture have zero visible RGBA error; all modes preserve
+the reference timeline and loops. SSIMULACRA2 was run on arm64 outputs.
+
+Selected cells; times are medians in milliseconds, RSS is maximum MiB
+across seven fresh processes. `128` means a 128x128 fit box.
+
+| Case | Mode | Bytes | M2 Max ms / MiB | Ryzen 7 8745HS ms / MiB |
+|---|---|---:|---:|---:|
+| Alpha, native | lossy | 7,534 | 7.56 / 5.62 | 6.01 / 5.67 |
+| Alpha, native | lossless | 3,694 | 4.88 / 5.61 | 4.23 / 5.52 |
+| Alpha, 128 | lossy | 11,698 | 9.71 / 5.86 | 10.19 / 6.03 |
+| Alpha, 128 | lossless | 16,654 | 9.14 / 6.03 | 10.07 / 5.89 |
+| UI, 128 | lossy | 40,044 | 22.44 / 7.56 | 24.81 / 8.30 |
+| UI, 128 | lossless | 12,580 | 21.81 / 9.95 | 25.28 / 9.32 |
+| Photo pan, 128 | lossy | 39,356 | 20.20 / 3.70 | 19.34 / 5.40 |
+| Photo pan, 128 | lossless | 564,420 | 92.89 / 7.36 | 64.23 / 7.11 |
+| Large noise, native | lossless | 2,371,020 | 721.27 / 35.36 | 651.71 / 22.22 |
+| Large noise, native | mixed | 2,371,020 | 1010.16 / 35.30 | 874.77 / 22.15 |
+| Noisy alpha, 128 | lossy | 63,210 | 48.76 / 14.38 | 53.65 / 13.34 |
+| Noisy alpha, 128 | lossless | 470,846 | 56.42 / 16.48 | 62.61 / 13.66 |
+
+The UI case makes the argument for an explicit lossless option: 69%
+fewer bytes, exact pixels, and similar processing time. Its sampled
+lossy SSIMULACRA2 mean is 26.35, against 100 for lossless. Memory is
+not free: peak RSS rises from 7.56 to 9.95 MiB on M2 Max, and 8.30 to
+9.32 MiB on Ryzen. The photo pan makes the argument against a global
+switch: lossless grows to 14.3x the lossy bytes and costs 3.3–4.6x the
+time. The same alpha source flips from a lossless size win at native
+dimensions to a loss at 128, so input palette size alone cannot choose
+the mode after resampling.
+
+Mixed remains experimental. On large noise it produces the lossless
+bytes but takes 34–40% longer than explicit lossless. On resized noisy
+alpha it produces the lossy bytes. It may choose useful modes, but it
+is not a stable fidelity promise or a universal size improvement.
+
+Proceed next with an explicit, opt-in lossless mode shared by still
+WebP and GIF animation, including first-frame fallback, as part of #71.
+Keep lossy as the default; do not infer lossless from `quality=100`.
+Before enabling that mode in production, calibrate encoder and retained
+frame memory across size, alpha entropy, effort and quality settings;
+extend `tests/decoded_bytes.rs` on both architectures. A fixed pixel
+work budget also does not promise equal latency across codecs, as the
+photo timings demonstrate. Default policy changes, automatic mode
+selection and browser playback claims need broader workload evidence.
+
+The production sink refactor was separately checked against main
+`4c0375b`: `oximg-ctl parity` compared 48 GIF source/box/format cells
+on each architecture, with zero differences. This is distinct from
+the 81 cross-architecture experimental-output comparisons above.
