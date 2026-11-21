@@ -23,7 +23,7 @@
 //!
 //! Two things a GIF never carries, and so are absent here: an ICC
 //! profile (the palette has nowhere to put one) and an EXIF orientation
-//! (hence `fit_dims` directly, not `resize_pixels_oriented`).
+//! (hence `target_dims` directly, not `resize_pixels_oriented`).
 
 use super::*;
 // `super::gif` is *this* module, which shadows the crate of the same
@@ -177,7 +177,7 @@ fn process_gif_src(
     let t_dec = t0.elapsed();
 
     let t1 = crate::clock::Instant::now();
-    let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+    let (dst_w, dst_h) = target_dims(src_w, src_h, p);
     resize_pixels_to(s, channels, src_w, src_h, dst_w, dst_h, p)?;
     let t_resize = t1.elapsed();
 
@@ -244,7 +244,7 @@ fn first_frame_into_chunk8(
     let (src_w, src_h) = (dec.width() as usize, dec.height() as usize);
     anyhow::ensure!(src_w > 0 && src_h > 0, "GIF logical screen is empty");
     check_src_pixels(src_w, src_h)?;
-    let (out_w, out_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+    let (out_w, out_h) = target_dims(src_w, src_h, p);
     let mut cost = DecodeCost::staged(src_w, src_h, 4);
     // Two frame-sized buffers, not one: the decoder stages its own RGBA
     // frame next to the canvas that frame composites onto. The canvas is
@@ -483,7 +483,7 @@ pub(super) fn try_animated<E: AnimationSink>(
     // lower it. Budgeting the bound keeps every allocation and every
     // decision ahead of the first decoded pixel.
     let encoded = scan.frames.div_ceil(step);
-    let (out_w, out_h) = fit_dims(cw, ch, p.max_width, p.max_height);
+    let (out_w, out_h) = target_dims(cw, ch, p);
     let work = (encoded as u64).saturating_mul((out_w as u64).saturating_mul(out_h as u64));
     report.work = Some((scan.frames, scan.decode_work, work));
     // A single frame *is* the still path, and wrapping it in an

@@ -234,6 +234,14 @@ fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
     p
 }
 
+/// The resize target for a source of `src_w` x `src_h` (displayed
+/// orientation) under this request. Every path asks here rather than
+/// calling [`fit_dims`] with the request's box, so a request shape
+/// other than "fit within the box" changes one function.
+fn target_dims(src_w: usize, src_h: usize, p: &Resolved) -> (usize, usize) {
+    fit_dims(src_w, src_h, p.max_width, p.max_height)
+}
+
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).
 fn fit_dims(src_w: usize, src_h: usize, max_w: u32, max_h: u32) -> (usize, usize) {
     let scale = f64::min(

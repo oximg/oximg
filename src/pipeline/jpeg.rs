@@ -263,7 +263,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     // orientation — the rotation happens on the resized frame) is the
     // fitted box with its axes swapped back.
     let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
-    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
+    let (fit_w, fit_h) = target_dims(disp_w, disp_h, p);
     let (dst_w, dst_h) = if orientation.swaps_axes() {
         (fit_h, fit_w)
     } else {
