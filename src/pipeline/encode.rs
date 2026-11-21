@@ -857,9 +857,37 @@ pub(super) fn encode_output(
     p: &Resolved,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // Crop cuts the displayed frame here, after resize and rotation,
+    // so every path that ends in this function gets the same crop.
+    let (dst_w, dst_h) = match p.crop_box() {
+        Some((bw, bh)) => {
+            let (cw, ch, left, top) = super::crop_rect(dst_w, dst_h, bw, bh);
+            crop_out8(s, dst_w, channels, (cw, ch), (left, top));
+            (cw, ch)
+        }
+        None => (dst_w, dst_h),
+    };
     // By this point the input decoded fine: anything that fails now is
     // the server's problem, not the client's.
     encode_output_inner(s, dst_w, dst_h, channels, target, p, icc).context(ServerFault)
+}
+
+/// Move the `cw` x `ch` rectangle at `(left, top)` of the `w`-wide
+/// frame in `out8` to the start of `out8`, packed. Each row moves to an
+/// earlier or equal offset, so copying rows in order never overwrites
+/// one that is still to be read.
+fn crop_out8(
+    s: &mut Scratch,
+    w: usize,
+    channels: usize,
+    (cw, ch): (usize, usize),
+    (left, top): (usize, usize),
+) {
+    let row = cw * channels;
+    for y in 0..ch {
+        let from = ((top + y) * w + left) * channels;
+        s.out8.copy_within(from..from + row, y * row);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

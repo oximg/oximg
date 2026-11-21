@@ -118,6 +118,8 @@ fn streams_exact_jpeg<R>(
 ) -> bool {
     target == Some(ImageFormat::Jpeg)
         && orientation.is_upright()
+        // A crop happens in `encode_output`; the stream never reaches it.
+        && p.crop_box().is_none()
         && (!dec.has_multiple_scans()
             || (p.encoder == Encoder::Jpegli && jpegli_mode(w, h) == JpegMode::Streaming))
 }
@@ -883,7 +885,14 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             }
             Fuse::Pixels
         };
-        let fuse = if p.parallel > 1 || !overlap_gate() || crate::config::config().fir_backend {
+        let fuse = if p.parallel > 1
+            || !overlap_gate()
+            || crate::config::config().fir_backend
+            // A crop happens in `encode_output`. The jpegli and YUV fuses
+            // encode inside the worker and never reach it. The pixel fuse
+            // would, but Off keeps a crop on one path for now.
+            || p.crop_box().is_some()
+        {
             Fuse::Off
         } else if !orientation.is_upright() {
             // Rotation happens on the resized frame before the

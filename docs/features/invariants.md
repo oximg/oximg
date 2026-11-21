@@ -6,7 +6,10 @@ change and needs a changelog.
 ## Geometry
 
 - Never enlarges. The box is a bound, not a target.
-- Aspect ratio preserved. `0` on one axis leaves that axis free.
+- The content's aspect ratio is preserved. With no mode, the output
+  has the source's aspect ratio. `crop` cuts
+  the edges, so its output has the box's aspect ratio. `0` on one
+  axis leaves that axis free, and then every mode is the plain fit.
 - Target box applies to the **displayed** frame (after orientation).
 - WebP output is additionally scaled to fit the 16383 px side limit.
 - `tiny.jpg` (40×30) into 100×100 stays 40×30.

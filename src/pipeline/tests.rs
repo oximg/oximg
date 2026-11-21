@@ -3459,3 +3459,109 @@ fn a_capped_png_attempt_never_panics() {
     assert!(write_png(&mut out, full.len(), w, h, None, rgb, None, px, fast).unwrap());
     assert!(out == full);
 }
+
+#[test]
+fn crop_rect_keeps_the_box_shape_and_never_enlarges() {
+    // Large enough: exactly the box, centred, odd margin to the right.
+    assert_eq!(crop_rect(750, 500, 500, 500), (500, 500, 125, 0));
+    assert_eq!(crop_rect(451, 300, 300, 300), (300, 300, 75, 0));
+    // Smaller than the box on one axis: only cropped to the box's shape.
+    assert_eq!(crop_rect(1001, 200, 500, 500), (200, 200, 400, 0));
+    assert_eq!(crop_rect(200, 300, 500, 500), (200, 200, 0, 50));
+    // Smaller on both axes.
+    assert_eq!(crop_rect(300, 200, 500, 500), (200, 200, 50, 0));
+    assert_eq!(crop_rect(5, 7, 300, 200), (5, 3, 0, 2));
+    assert_eq!(crop_rect(1001, 667, 2000, 300), (1001, 150, 0, 258));
+}
+
+#[test]
+fn crop_target_fits_the_axis_that_covers_the_box() {
+    let crop = |w, h| {
+        Resolved::new(&Params {
+            max_width: w,
+            max_height: h,
+            resize_mode: ResizeMode::Crop,
+            ..Params::default()
+        })
+    };
+    // Wide source into a square: the height limits, the width overflows.
+    assert_eq!(target_dims(1001, 667, &crop(300, 300)), (450, 300));
+    // Tall box: the height covers, so the width overflows more.
+    assert_eq!(target_dims(1001, 667, &crop(100, 400)), (600, 400));
+    // Never enlarges.
+    assert_eq!(target_dims(300, 200, &crop(500, 500)), (300, 200));
+    // One axis free: crop is fit.
+    assert_eq!(target_dims(1001, 667, &crop(300, u32::MAX)), (300, 200));
+}
+
+/// With one axis free, crop is the plain fit, for every output format.
+/// WebP turns a free axis into its 16383 ceiling, which must not make
+/// the request look like a two-axis box.
+#[test]
+fn one_free_axis_is_fit_in_every_mode_and_format() {
+    let src = png_of(&noise_px(200, 150, 3, 5), 200, 150, 3, None);
+    for target in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+        for (w, h) in [(100, u32::MAX), (u32::MAX, 60)] {
+            let size = |mode| {
+                let (out, _) = process(
+                    &src,
+                    &Params {
+                        max_width: w,
+                        max_height: h,
+                        output: Some(target),
+                        resize_mode: mode,
+                        ..Params::default()
+                    },
+                )
+                .unwrap();
+                let (_, ow, oh) = probe(&out).unwrap();
+                (ow, oh)
+            };
+            let fit = size(ResizeMode::Inside);
+            assert_eq!(size(ResizeMode::Crop), fit, "crop {target:?} {w}x{h}");
+        }
+    }
+}
+
+/// A crop box past WebP's ceiling shrinks as a whole, so the output
+/// keeps the box's shape and matches the same request as PNG.
+#[test]
+fn crop_box_past_the_webp_ceiling_keeps_its_shape() {
+    let crop = |w, h, target| {
+        let p = Params {
+            max_width: w,
+            max_height: h,
+            output: Some(target),
+            resize_mode: ResizeMode::Crop,
+            ..Params::default()
+        };
+        let c = clamp_to_format(Resolved::new(&p), target);
+        (c.max_width, c.max_height)
+    };
+    assert_eq!(crop(20000, 100, ImageFormat::Webp), (16383, 82));
+    assert_eq!(crop(100, 20000, ImageFormat::Webp), (82, 16383));
+    assert_eq!(crop(30000, 30000, ImageFormat::Webp), (16383, 16383));
+    // Inside the ceiling, or another format: untouched.
+    assert_eq!(crop(8000, 100, ImageFormat::Webp), (8000, 100));
+    assert_eq!(crop(20000, 100, ImageFormat::Png), (20000, 100));
+
+    // End to end: the WebP output has the PNG output's size.
+    let src = png_of(&noise_px(1001, 667, 3, 11), 1001, 667, 3, None);
+    let size = |target| {
+        let (out, _) = process(
+            &src,
+            &Params {
+                max_width: 20000,
+                max_height: 100,
+                output: Some(target),
+                resize_mode: ResizeMode::Crop,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        let (_, w, h) = probe(&out).unwrap();
+        (w, h)
+    };
+    assert_eq!(size(ImageFormat::Png), (1001, 5));
+    assert_eq!(size(ImageFormat::Webp), (1001, 5));
+}

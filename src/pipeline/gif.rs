@@ -473,6 +473,12 @@ pub(super) fn try_animated<E: AnimationSink>(
         report.outcome = GifOutcome::Disabled;
         return Ok(None);
     }
+    // A crop on an animation serves its first frame, cropped, through
+    // the still path for now.
+    if p.crop_box().is_some() {
+        report.outcome = GifOutcome::Disabled;
+        return Ok(None);
+    }
     let Ok(scan) = scan_gif(src) else {
         return Ok(None);
     };

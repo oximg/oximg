@@ -6,7 +6,7 @@
 //! knob spread across three files. Config-only knobs (no per-call
 //! tier) keep their direct `config()` reads — see the struct doc.
 
-use super::{Encoder, Params, PngEffort};
+use super::{Encoder, Params, PngEffort, ResizeMode};
 use crate::config::Config;
 
 /// AVIF encode knobs, resolved as a group because the alpha default
@@ -56,6 +56,7 @@ pub(crate) struct Resolved {
     png_effort: Option<png::Compression>,
     #[cfg(feature = "avif")]
     pub avif: AvifKnobs,
+    pub resize_mode: ResizeMode,
 }
 
 impl Resolved {
@@ -107,7 +108,28 @@ impl Resolved {
             },
             #[cfg(feature = "avif")]
             avif,
+            // With an axis left free there is no shape to cover, so
+            // every mode is the plain fit. Decided here, before
+            // `clamp_to_format` turns a free axis into the format's
+            // ceiling and makes it look bounded.
+            resize_mode: if p.max_width == u32::MAX || p.max_height == u32::MAX {
+                ResizeMode::Inside
+            } else {
+                p.resize_mode
+            },
         }
+    }
+
+    /// The box that a crop request covers, or `None` for a
+    /// plain fit.
+    pub(crate) fn cover_box(&self) -> Option<(u32, u32)> {
+        (self.resize_mode != ResizeMode::Inside).then_some((self.max_width, self.max_height))
+    }
+
+    /// The box that a crop request cuts to. Only crop cuts, so only crop
+    /// has to stay off the paths that encode without `encode_output`.
+    pub(crate) fn crop_box(&self) -> Option<(u32, u32)> {
+        (self.resize_mode == ResizeMode::Crop).then_some((self.max_width, self.max_height))
     }
 
     /// The one knob that cannot flatten at resolve time: with no
