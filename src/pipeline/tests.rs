@@ -3460,6 +3460,27 @@ fn a_capped_png_attempt_never_panics() {
     assert!(out == full);
 }
 
+/// The crop rectangle for the reference side of the crop proofs,
+/// written apart from `crop_rect` so a mistake there cannot pass on
+/// both sides: scale the box by the largest factor up to 1 that fits it
+/// in the `w` x `h` frame, round each side half up in integers, and
+/// centre it with the offsets rounded down.
+pub(crate) fn reference_crop(w: usize, h: usize, bw: u32, bh: u32) -> (usize, usize, usize, usize) {
+    let (bw, bh) = (bw as u64, bh as u64);
+    let (w64, h64) = (w as u64, h as u64);
+    // Scale factor as a fraction num/den, the smallest of 1, w/bw, h/bh.
+    let (mut num, mut den) = (1u64, 1u64);
+    if w64 * den < num * bw {
+        (num, den) = (w64, bw);
+    }
+    if h64 * den < num * bh {
+        (num, den) = (h64, bh);
+    }
+    let side = |b: u64| ((b * num * 2 + den) / (2 * den)).max(1) as usize;
+    let (cw, ch) = (side(bw).min(w), side(bh).min(h));
+    (cw, ch, (w - cw) / 2, (h - ch) / 2)
+}
+
 #[test]
 fn crop_rect_keeps_the_box_shape_and_never_enlarges() {
     // Large enough: exactly the box, centred, odd margin to the right.
@@ -3472,6 +3493,26 @@ fn crop_rect_keeps_the_box_shape_and_never_enlarges() {
     assert_eq!(crop_rect(300, 200, 500, 500), (200, 200, 50, 0));
     assert_eq!(crop_rect(5, 7, 300, 200), (5, 3, 0, 2));
     assert_eq!(crop_rect(1001, 667, 2000, 300), (1001, 150, 0, 258));
+    // The same rectangle as the independent reference, over a grid of
+    // frames and boxes on both sides of the frame's size and shape.
+    for w in [1, 2, 5, 99, 300, 451, 1001] {
+        for h in [1, 3, 7, 150, 300, 667] {
+            for (bw, bh) in [
+                (1, 1),
+                (2, 1),
+                (300, 300),
+                (500, 333),
+                (77, 33),
+                (16383, 82),
+            ] {
+                assert_eq!(
+                    crop_rect(w, h, bw, bh),
+                    reference_crop(w, h, bw, bh),
+                    "{w}x{h} into {bw}x{bh}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -3564,4 +3605,76 @@ fn crop_box_past_the_webp_ceiling_keeps_its_shape() {
     };
     assert_eq!(size(ImageFormat::Png), (1001, 5));
     assert_eq!(size(ImageFormat::Webp), (1001, 5));
+}
+
+/// Crop must equal "fit on one axis, then crop" done with operations
+/// that already exist: the single-axis fit through the pipeline, and an
+/// exact centred crop of its pixels. This is the reference for every
+/// crop path; a faster path that changes a byte has to say why.
+#[test]
+fn crop_equals_single_axis_fit_then_crop() {
+    let photo = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/photo.jpg"
+    ))
+    .unwrap();
+    let sources: Vec<(&str, Vec<u8>)> = vec![
+        ("rgb", png_of(&noise_px(301, 199, 3, 7), 301, 199, 3, None)),
+        ("rgba", png_of(&noise_px(301, 199, 4, 8), 301, 199, 4, None)),
+        (
+            "rgb-o6",
+            png_of(&noise_px(301, 199, 3, 9), 301, 199, 3, Some(6)),
+        ),
+        (
+            "rgba-o3",
+            png_of(&noise_px(301, 199, 4, 10), 301, 199, 4, Some(3)),
+        ),
+        ("jpeg", photo),
+    ];
+    let boxes = [
+        (100, 100),
+        (150, 40),
+        (40, 150),
+        (64, 64),
+        (500, 500),
+        (250, 90),
+    ];
+    let png_out = |src: &[u8], w, h, resize_mode| {
+        let (out, _) = process(
+            src,
+            &Params {
+                max_width: w,
+                max_height: h,
+                output: Some(ImageFormat::Png),
+                resize_mode,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        png_pixels(&out)
+    };
+    for (name, src) in &sources {
+        let (dw, dh, _) = png_out(src, u32::MAX, u32::MAX, ResizeMode::Inside);
+        for &(bw, bh) in &boxes {
+            let axis = if bw as u64 * dh as u64 >= bh as u64 * dw as u64 {
+                (bw, u32::MAX)
+            } else {
+                (u32::MAX, bh)
+            };
+            let (iw, ih, mid) = png_out(src, axis.0, axis.1, ResizeMode::Inside);
+            let ch = mid.len() / (iw * ih);
+            let (cw, chh, left, top) = reference_crop(iw, ih, bw, bh);
+            let mut want = Vec::with_capacity(cw * chh * ch);
+            for y in top..top + chh {
+                let row = (y * iw + left) * ch;
+                want.extend_from_slice(&mid[row..row + cw * ch]);
+            }
+            let (gw, gh, got) = png_out(src, bw, bh, ResizeMode::Crop);
+            assert_eq!((gw, gh), (cw, chh), "{name} {bw}x{bh}: size");
+            assert!(
+                got == want,
+                "{name} {bw}x{bh}: pixels differ from fit-then-crop"
+            );
+        }
+    }
 }
