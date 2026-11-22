@@ -1994,6 +1994,56 @@ fn decode_cost_prices_each_png_arm() {
     assert_eq!(c.encode_bytes, 400 * 100 * 6 + 256 * 1024 + 3 * 100 * 3);
 }
 
+/// A crop on a JPEG with an EXIF orientation, to every output format.
+/// The oriented path picks its own fuse, and as AVIF it used to take
+/// one that encodes before `encode_output`, so the crop was skipped
+/// (found by review: 100x133 instead of 100x100). `process_jpeg` now
+/// refuses such a fuse for a crop, so an escape is an error here too.
+#[test]
+fn crop_reaches_every_output_format_from_an_oriented_jpeg() {
+    let rotated = {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&tiff_orientation(6));
+        let mut comp = Compress::new(ColorSpace::JCS_RGB);
+        comp.set_size(320, 240);
+        comp.set_quality(90.0);
+        let mut started = comp.start_compress(Vec::new()).unwrap();
+        started.write_marker(mozjpeg::Marker::APP(1), &exif);
+        started.write_scanlines(&noise_px(320, 240, 3, 7)).unwrap();
+        started.finish().unwrap()
+    };
+    let targets = [
+        ImageFormat::Png,
+        ImageFormat::Jpeg,
+        ImageFormat::Webp,
+        #[cfg(feature = "avif")]
+        ImageFormat::Avif,
+    ];
+    for target in targets {
+        for (bw, bh) in [(100, 100), (200, 50), (500, 500)] {
+            let (out, _) = process(
+                &rotated,
+                &Params {
+                    max_width: bw,
+                    max_height: bh,
+                    output: Some(target),
+                    resize_mode: ResizeMode::Crop,
+                    ..Params::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{target:?} {bw}x{bh}: {e}"));
+            let (_, w, h) = probe(&out).unwrap();
+            // Displayed 240x320; a box past it is only cut to its shape.
+            let want = if (bw, bh) == (500, 500) {
+                (240, 240)
+            } else {
+                (bw as usize, bh as usize)
+            };
+            assert_eq!((w, h), want, "{target:?} {bw}x{bh}");
+        }
+    }
+}
+
 /// A little-endian TIFF carrying only an Orientation tag.
 fn tiff_orientation(o: u16) -> Vec<u8> {
     let mut t = b"II*\0\x08\0\0\0".to_vec();
@@ -3605,6 +3655,61 @@ fn crop_box_past_the_webp_ceiling_keeps_its_shape() {
     };
     assert_eq!(size(ImageFormat::Png), (1001, 5));
     assert_eq!(size(ImageFormat::Webp), (1001, 5));
+}
+
+/// Crop takes the pixel fuse (decode ∥ resize into out8) where it
+/// used to take the serial path. The crop happens later, in
+/// `encode_output`, so the frame the fuse leaves in out8 has to be the
+/// serial path's frame byte for byte: baseline and progressive, color
+/// and gray, with and without the raw YCbCr decode.
+#[test]
+fn crop_frame_is_the_same_on_the_pixel_fuse() {
+    let crop = Resolved::new(&Params {
+        max_width: 150,
+        max_height: 150,
+        resize_mode: ResizeMode::Crop,
+        ..Params::default()
+    });
+    let frame = |jpeg: &[u8], fuse| {
+        let mut s = Scratch::default();
+        let dec = Decompress::new_mem(jpeg).unwrap();
+        match decode_resize(
+            &mut s,
+            dec,
+            &crop,
+            crate::meta::Orientation::UPRIGHT,
+            fuse,
+            None,
+            Some(ImageFormat::Png),
+        )
+        .unwrap()
+        {
+            Decoded::Pixels { dst_w, dst_h } => {
+                let ch = s.out8.len().min(dst_w * dst_h * 3) / (dst_w * dst_h);
+                ((dst_w, dst_h), s.out8[..dst_w * dst_h * ch].to_vec())
+            }
+            _ => panic!("crop must leave pixels for encode_output to crop"),
+        }
+    };
+    for (name, jpeg) in [
+        ("baseline", make_baseline_jpeg(641, 403, false)),
+        ("progressive", make_jpeg(641, 403, false, false)),
+        ("gray", make_baseline_jpeg(403, 641, true)),
+    ] {
+        for no_raw in [false, true] {
+            NO_RAW.with(|f| f.set(no_raw));
+            let (serial_dims, serial) = frame(&jpeg, Fuse::Off);
+            let (fused_dims, fused) = frame(&jpeg, Fuse::Pixels);
+            NO_RAW.with(|f| f.set(false));
+            // The covering frame, not the crop: 150 high from 641x403.
+            assert!(
+                serial_dims.0 >= 150 && serial_dims.1 >= 150,
+                "{name}: {serial_dims:?} does not cover the box"
+            );
+            assert_eq!(serial_dims, fused_dims, "{name} no_raw={no_raw}: size");
+            assert!(serial == fused, "{name} no_raw={no_raw}: pixels differ");
+        }
+    }
 }
 
 /// Crop must equal "fit on one axis, then crop" done with operations

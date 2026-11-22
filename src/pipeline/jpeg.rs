@@ -862,6 +862,11 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // What decode_resize consumes: the conversion profile on the
         // CMYK path, the fused-jpegli embed profile otherwise.
         let icc_dec = if cmyk { icc.as_deref() } else { icc_embed };
+        // A crop happens in `encode_output`. The jpegli and YUV fuses
+        // encode inside the worker and never reach it, so a crop takes
+        // the pixel fuse instead: decode ∥ resize into out8, then the
+        // crop and the one-shot encode, as on the serial path.
+        let crop = p.crop_box().is_some();
         // Fused decode overlap: on unless disabled (see
         // overlap_gate). Band-parallel resize keeps the serial
         // path so OXIMG_PAR semantics are unchanged. Jpegli
@@ -878,21 +883,14 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // these is what encodes the frame.
         let cross_fuse = || -> Fuse {
             #[cfg(feature = "avif")]
-            if target == ImageFormat::Avif {
+            if target == ImageFormat::Avif && !crop {
                 return Fuse::Yuv {
                     params: p.avif_params(),
                 };
             }
             Fuse::Pixels
         };
-        let fuse = if p.parallel > 1
-            || !overlap_gate()
-            || crate::config::config().fir_backend
-            // A crop happens in `encode_output`. The jpegli and YUV fuses
-            // encode inside the worker and never reach it. The pixel fuse
-            // would, but Off keeps a crop on one path for now.
-            || p.crop_box().is_some()
-        {
+        let fuse = if p.parallel > 1 || !overlap_gate() || crate::config::config().fir_backend {
             Fuse::Off
         } else if !orientation.is_upright() {
             // Rotation happens on the resized frame before the
@@ -911,7 +909,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             // across resized columns, a correctness minefield
             // for ~0.2ms.
             #[cfg(feature = "avif")]
-            if target == ImageFormat::Avif {
+            if target == ImageFormat::Avif && !crop {
                 Fuse::PixelsPreheat {
                     params: p.avif_params(),
                 }
@@ -921,7 +919,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             #[cfg(not(feature = "avif"))]
             Fuse::Pixels
         } else if target == ImageFormat::Jpeg {
-            if p.encoder == Encoder::Jpegli {
+            if p.encoder == Encoder::Jpegli && !crop {
                 Fuse::Jpegli { quality: p.quality }
             } else {
                 // mozjpeg presets have no incremental encoder,
@@ -933,6 +931,13 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         } else {
             cross_fuse()
         };
+        // Only Off and Pixels leave pixels for `encode_output`, where a
+        // crop happens. Any other fuse would encode the whole covering
+        // frame: refuse that loudly rather than serve the wrong shape.
+        anyhow::ensure!(
+            !crop || matches!(fuse, Fuse::Off | Fuse::Pixels),
+            "a crop must take a fuse that ends in encode_output"
+        );
         match decode_resize(s, dec, p, orientation, fuse, icc_dec, Some(target))? {
             Decoded::Encoded(out) => out,
             Decoded::Pixels { dst_w, dst_h } => {
