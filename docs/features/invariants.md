@@ -5,9 +5,13 @@ change and needs a changelog.
 
 ## Geometry
 
-- Never enlarges. The box is a bound, not a target.
-- The content's aspect ratio is preserved. With no mode, the output
-  has the source's aspect ratio. `crop` cuts
+- Never enlarges: no output side is longer than the source's.
+- The box is a bound, not a target. The exception is `outside`: its
+  longer side passes the box by design, up to 8192 px
+  (`OUTSIDE_MAX_SIDE`), so it is never larger than the fit
+  `/resize/8192/8192/…` gives.
+- The content's aspect ratio is preserved. With no mode and with
+  `outside`, the output has the source's aspect ratio. `crop` cuts
   the edges, so its output has the box's aspect ratio. `0` on one
   axis leaves that axis free, and then every mode is the plain fit.
 - Target box applies to the **displayed** frame (after orientation).

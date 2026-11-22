@@ -3585,9 +3585,10 @@ fn crop_target_fits_the_axis_that_covers_the_box() {
     assert_eq!(target_dims(1001, 667, &crop(300, u32::MAX)), (300, 200));
 }
 
-/// With one axis free, crop is the plain fit, for every output format.
-/// WebP turns a free axis into its 16383 ceiling, which must not make
-/// the request look like a two-axis box.
+/// With one axis free, every mode is the plain fit, for every output
+/// format. WebP turns a free axis into its 16383 ceiling, which must
+/// not make the request look like a two-axis box (found by review:
+/// crop gave 1x150 and outside 200x150 for 100x0 as WebP).
 #[test]
 fn one_free_axis_is_fit_in_every_mode_and_format() {
     let src = png_of(&noise_px(200, 150, 3, 5), 200, 150, 3, None);
@@ -3610,6 +3611,7 @@ fn one_free_axis_is_fit_in_every_mode_and_format() {
             };
             let fit = size(ResizeMode::Inside);
             assert_eq!(size(ResizeMode::Crop), fit, "crop {target:?} {w}x{h}");
+            assert_eq!(size(ResizeMode::Outside), fit, "outside {target:?} {w}x{h}");
         }
     }
 }
@@ -3709,6 +3711,120 @@ fn crop_frame_is_the_same_on_the_pixel_fuse() {
             assert_eq!(serial_dims, fused_dims, "{name} no_raw={no_raw}: size");
             assert!(serial == fused, "{name} no_raw={no_raw}: pixels differ");
         }
+    }
+}
+
+/// Outside is the frame crop cuts from: the single-axis fit that
+/// covers the box. It must be that fit byte for byte, on every path a
+/// fit takes (outside does not turn the fast paths off), and it must
+/// never enlarge.
+#[test]
+fn outside_equals_single_axis_fit() {
+    let photo = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/photo.jpg"
+    ))
+    .unwrap();
+    let sources: Vec<(&str, Vec<u8>)> = vec![
+        ("rgb", png_of(&noise_px(301, 199, 3, 7), 301, 199, 3, None)),
+        ("rgba", png_of(&noise_px(301, 199, 4, 8), 301, 199, 4, None)),
+        (
+            "rgb-o6",
+            png_of(&noise_px(301, 199, 3, 9), 301, 199, 3, Some(6)),
+        ),
+        ("jpeg", photo),
+    ];
+    let boxes = [(100, 100), (150, 40), (40, 150), (500, 500), (250, 90)];
+    let run = |src: &[u8], w, h, out, resize_mode| {
+        process(
+            src,
+            &Params {
+                max_width: w,
+                max_height: h,
+                output: Some(out),
+                resize_mode,
+                ..Params::default()
+            },
+        )
+        .unwrap()
+        .0
+    };
+    for (name, src) in &sources {
+        let (dw, dh, _) = png_pixels(&run(
+            src,
+            u32::MAX,
+            u32::MAX,
+            ImageFormat::Png,
+            ResizeMode::Inside,
+        ));
+        for &(bw, bh) in &boxes {
+            let axis = if bw as u64 * dh as u64 >= bh as u64 * dw as u64 {
+                (bw, u32::MAX)
+            } else {
+                (u32::MAX, bh)
+            };
+            for out in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+                let want = run(src, axis.0, axis.1, out, ResizeMode::Inside);
+                let got = run(src, bw, bh, out, ResizeMode::Outside);
+                assert!(
+                    got == want,
+                    "{name} {bw}x{bh} {out:?}: bytes differ from the fit"
+                );
+            }
+            let (gw, gh, _) = png_pixels(&run(src, bw, bh, ImageFormat::Png, ResizeMode::Outside));
+            assert!(gw <= dw && gh <= dh, "{name} {bw}x{bh}: enlarged");
+            assert!(
+                (gw >= bw as usize && gh >= bh as usize) || (gw, gh) == (dw, dh),
+                "{name} {bw}x{bh}: {gw}x{gh} neither covers the box nor is the source"
+            );
+        }
+    }
+}
+
+/// Outside lets one side overflow the box, up to `OUTSIDE_MAX_SIDE`.
+/// So an outside request is never larger than the largest fit a URL can
+/// already ask for, `/resize/8192/8192/...`: the mode adds no new
+/// maximum encode cost. The capped output may then not cover the box.
+#[test]
+fn outside_is_never_larger_than_the_largest_fit() {
+    let dims = |sw, sh, bw, bh, mode, target| {
+        let p = Params {
+            max_width: bw,
+            max_height: bh,
+            output: Some(target),
+            resize_mode: mode,
+            ..Params::default()
+        };
+        target_dims(sw, sh, &clamp_to_format(Resolved::new(&p), target))
+    };
+    let max = OUTSIDE_MAX_SIDE;
+    for target in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+        // A wide panorama: the overflow stops at 8192 and the output is
+        // exactly the largest fit, which no longer covers 300 high.
+        assert_eq!(
+            dims(30000, 1000, 300, 300, ResizeMode::Outside, target),
+            dims(30000, 1000, max, max, ResizeMode::Inside, target),
+        );
+        assert_eq!(
+            dims(30000, 1000, 300, 300, ResizeMode::Outside, target),
+            (8192, 273)
+        );
+        // Tall, and a box past the cap: the same bound.
+        assert_eq!(
+            dims(1000, 40000, 1000, 1000, ResizeMode::Outside, target),
+            (205, 8192)
+        );
+        // A box side past the cap is capped too (library and CLI boxes
+        // can be larger than the route's 8192; found by review).
+        assert_eq!(
+            dims(10000, 100, 10000, 50, ResizeMode::Outside, target),
+            (8192, 82)
+        );
+        // Under the cap nothing changes: 3000x100 overflows to 3000.
+        assert_eq!(
+            dims(3000, 100, 300, 300, ResizeMode::Outside, target),
+            (3000, 100)
+        );
     }
 }
 

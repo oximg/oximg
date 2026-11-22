@@ -57,6 +57,10 @@ pub(crate) struct Resolved {
     #[cfg(feature = "avif")]
     pub avif: AvifKnobs,
     pub resize_mode: ResizeMode,
+    /// The limit for the side that outside lets overflow the box:
+    /// `OUTSIDE_MAX_SIDE`, lowered by `clamp_to_format` to the output
+    /// format's ceiling when that is smaller.
+    pub outside_cap: u32,
 }
 
 impl Resolved {
@@ -117,10 +121,11 @@ impl Resolved {
             } else {
                 p.resize_mode
             },
+            outside_cap: super::OUTSIDE_MAX_SIDE,
         }
     }
 
-    /// The box that a crop request covers, or `None` for a
+    /// The box that a crop or outside request covers, or `None` for a
     /// plain fit.
     pub(crate) fn cover_box(&self) -> Option<(u32, u32)> {
         (self.resize_mode != ResizeMode::Inside).then_some((self.max_width, self.max_height))

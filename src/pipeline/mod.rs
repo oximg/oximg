@@ -71,6 +71,12 @@ pub enum ResizeMode {
     /// box's aspect ratio. A source smaller than the box on some axis
     /// is only cropped to the box's shape.
     Crop,
+    /// Scale until the box is covered, and keep the whole frame: one
+    /// side matches the box and the other is longer. This is the
+    /// frame before the crop, for a page that crops on its own. A
+    /// source smaller than the box comes back at its own size. The
+    /// longer side stops at [`OUTSIDE_MAX_SIDE`].
+    Outside,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -259,6 +265,12 @@ fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
         }
         return p;
     }
+    // Outside keeps the side that overflows the box, so that side needs
+    // the ceiling too. The output then may not cover the box, as a fit
+    // past the ceiling may not reach it.
+    if p.cover_box().is_some() {
+        p.outside_cap = p.outside_cap.min(cap);
+    }
     // Not counted anywhere: the box is `u32::MAX` on an unconstrained
     // axis, so "the box was tightened" fires on almost every WebP
     // request while "the output was actually reduced" is only knowable
@@ -269,20 +281,33 @@ fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
     p
 }
 
+/// The longest side [`ResizeMode::Outside`] lets overflow the box: the
+/// per-axis limit of the HTTP route. With it, an outside request never
+/// asks for a larger output than `/resize/8192/8192/...` already can,
+/// so the mode adds no new maximum encode cost.
+pub const OUTSIDE_MAX_SIDE: u32 = 8192;
+
 /// The resize target for a source of `src_w` x `src_h` (displayed
 /// orientation) under this request. Every path asks here rather than
 /// calling [`fit_dims`] with the request's box, so a request shape
 /// other than "fit within the box" changes one function.
 fn target_dims(src_w: usize, src_h: usize, p: &Resolved) -> (usize, usize) {
     match p.cover_box() {
-        // Crop: fit on the one axis that needs the larger scale, so the
-        // other axis covers the box. Crop then cuts in `encode_output`.
+        // Crop and outside: fit on the one axis that needs the larger
+        // scale, so the other axis covers the box. Crop then cuts in
+        // `encode_output`. Outside keeps the frame whole, so its cap
+        // bounds both sides: the one that overflows, and the box side
+        // too when a library or CLI box is larger than the cap.
         Some((w, h)) => {
+            let cap = match p.resize_mode {
+                ResizeMode::Outside => p.outside_cap,
+                _ => u32::MAX,
+            };
             let width_wins = u64::from(w) * src_h as u64 >= u64::from(h) * src_w as u64;
             if width_wins {
-                fit_dims(src_w, src_h, w, u32::MAX)
+                fit_dims(src_w, src_h, w.min(cap), cap)
             } else {
-                fit_dims(src_w, src_h, u32::MAX, h)
+                fit_dims(src_w, src_h, cap, h.min(cap))
             }
         }
         None => fit_dims(src_w, src_h, p.max_width, p.max_height),
