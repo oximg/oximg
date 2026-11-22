@@ -473,12 +473,6 @@ pub(super) fn try_animated<E: AnimationSink>(
         report.outcome = GifOutcome::Disabled;
         return Ok(None);
     }
-    // A crop on an animation serves its first frame, cropped, through
-    // the still path for now.
-    if p.crop_box().is_some() {
-        report.outcome = GifOutcome::Disabled;
-        return Ok(None);
-    }
     let Ok(scan) = scan_gif(src) else {
         return Ok(None);
     };
@@ -489,7 +483,15 @@ pub(super) fn try_animated<E: AnimationSink>(
     // lower it. Budgeting the bound keeps every allocation and every
     // decision ahead of the first decoded pixel.
     let encoded = scan.frames.div_ceil(step);
-    let (out_w, out_h) = target_dims(cw, ch, p);
+    // Crop resizes every frame to the covering size, then crops the
+    // same centred rectangle out of each, exactly as a still. The
+    // encoder and its budgets see only the cropped frame.
+    let (rw, rh) = target_dims(cw, ch, p);
+    let (out_w, out_h, left, top) = match p.crop_box() {
+        Some((bw, bh)) => crop_rect(rw, rh, bw, bh),
+        None => (rw, rh, 0, 0),
+    };
+    let cropped = (out_w, out_h) != (rw, rh);
     let work = (encoded as u64).saturating_mul((out_w as u64).saturating_mul(out_h as u64));
     report.work = Some((scan.frames, scan.decode_work, work));
     // A single frame *is* the still path, and wrapping it in an
@@ -548,8 +550,17 @@ pub(super) fn try_animated<E: AnimationSink>(
         .saturating_add(scan.max_frame_px.saturating_mul(4).max(canvas_bytes))
         .saturating_add(if scan.needs_previous { canvas_bytes } else { 0 });
     let mut cost = cost
-        .with_full_frame_resize((cw, ch), (out_w, out_h), 4, p)
+        .with_full_frame_resize((cw, ch), (rw, rh), 4, p)
         .with_compressed(src.len() + s.held_source_bytes);
+    // Unscaled, the canvas is encoded in place, so a crop needs a frame
+    // of its own. Scaled, the crop happens inside the resize output.
+    if cropped && (cw, ch) == (rw, rh) {
+        cost.output_bytes = cost.output_bytes.saturating_add(
+            (out_w as u64)
+                .saturating_mul(out_h as u64)
+                .saturating_mul(4),
+        );
+    }
     // libwebp retains every frame it has compressed until Assemble:
     // 0.11 B per encoded pixel across the corpus in
     // docs/gif-evaluation.md §5, but 4.5 on noise frames (issue #130),
@@ -581,6 +592,8 @@ pub(super) fn try_animated<E: AnimationSink>(
     // pixels until told otherwise.
     scratch_u8(&mut s.chunk8, canvas_len).fill(0);
     let mut enc = encoder(out_w, out_h, scan.loop_count, p).context(ServerFault)?;
+    #[cfg(test)]
+    capture::start(out_w, out_h, scan.loop_count);
     let mut ts = 0i32;
     let (mut index, mut emitted) = (0usize, 0usize);
     // The first frame always emits; after that only frames that changed
@@ -612,14 +625,21 @@ pub(super) fn try_animated<E: AnimationSink>(
             // consumes chunk8 (at exact size it becomes out8). Unscaled,
             // the canvas already is the straight-alpha frame: encode it
             // in place, which also skips a full-canvas copy per frame.
-            let frame_px = if (cw, ch) == (out_w, out_h) {
-                &s.chunk8[..canvas_len]
-            } else {
-                resize_pixels_to(s, 4, cw, ch, out_w, out_h, p)?;
+            let frame_px = if (cw, ch) != (rw, rh) {
+                resize_pixels_to(s, 4, cw, ch, rw, rh, p)?;
+                if cropped {
+                    crop_out8(s, rw, 4, (out_w, out_h), (left, top));
+                }
                 &s.out8[..out_w * out_h * 4]
+            } else if cropped {
+                crop_canvas(s, cw, (out_w, out_h), (left, top))
+            } else {
+                &s.chunk8[..canvas_len]
             };
             t_frames += t.elapsed();
             let t = crate::clock::Instant::now();
+            #[cfg(test)]
+            capture::frame(frame_px, ts);
             enc.add(frame_px, ts).context(ServerFault)?;
             t_encode += t.elapsed();
             emitted += 1;
@@ -656,6 +676,8 @@ pub(super) fn try_animated<E: AnimationSink>(
         return Ok(None);
     }
     let t = crate::clock::Instant::now();
+    #[cfg(test)]
+    capture::finish(ts);
     let out = enc.finish(ts).context(ServerFault)?;
     report.outcome = GifOutcome::Animated;
     report.submitted_frames = emitted;
@@ -671,6 +693,26 @@ pub(super) fn try_animated<E: AnimationSink>(
         );
     }
     Ok(Some(out))
+}
+
+/// Crop on an unscaled animation: the canvas persists across frames,
+/// so the crop goes to `out8` instead of happening in place. Kept out
+/// of line so the fit path through `try_animated` compiles as before.
+#[cold]
+#[inline(never)]
+fn crop_canvas(
+    s: &mut Scratch,
+    cw: usize,
+    (out_w, out_h): (usize, usize),
+    (left, top): (usize, usize),
+) -> &[u8] {
+    let row = out_w * 4;
+    let out = scratch_u8(&mut s.out8, row * out_h);
+    for (y, dst) in out.chunks_exact_mut(row).enumerate() {
+        let from = ((top + y) * cw + left) * 4;
+        dst.copy_from_slice(&s.chunk8[from..from + row]);
+    }
+    &s.out8[..row * out_h]
 }
 
 /// GIF's "restore to background" disposal, which in practice means
@@ -813,5 +855,144 @@ mod work_tests {
         assert_eq!(scan.frames, 3);
         assert_eq!(scan.max_frame_px, 30);
         assert_eq!(scan.decode_work, 30 + 12 + 21);
+    }
+}
+
+/// The exact frames handed to the animation encoder, so a test can
+/// compare encoder input. The output itself is lossy WebP and cannot
+/// prove pixels.
+#[cfg(test)]
+pub(super) mod capture {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Default)]
+    pub(crate) struct Capture {
+        pub size: (usize, usize),
+        pub loop_count: u32,
+        pub frames: Vec<(i32, Vec<u8>)>,
+        pub end: Option<i32>,
+    }
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Capture>> = const { RefCell::new(None) };
+    }
+
+    /// Run `f` and return what it handed the encoder, if anything.
+    pub(crate) fn record(f: impl FnOnce()) -> Option<Capture> {
+        CAPTURE.with(|c| *c.borrow_mut() = None);
+        f();
+        CAPTURE.with(|c| c.borrow_mut().take())
+    }
+
+    pub(super) fn start(w: usize, h: usize, loop_count: u32) {
+        CAPTURE.with(|c| {
+            *c.borrow_mut() = Some(Capture {
+                size: (w, h),
+                loop_count,
+                ..Capture::default()
+            })
+        });
+    }
+
+    pub(super) fn frame(px: &[u8], ts: i32) {
+        CAPTURE.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.frames.push((ts, px.to_vec()));
+            }
+        });
+    }
+
+    pub(super) fn finish(ts: i32) {
+        CAPTURE.with(|c| {
+            if let Some(c) = c.borrow_mut().as_mut() {
+                c.end = Some(ts);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    /// A noisy animation, so every resized frame differs, with uneven
+    /// delays and a finite loop count to carry through.
+    fn noisy_gif(w: u16, h: u16) -> Vec<u8> {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        };
+        let palette: Vec<u8> = (0..256 * 3).map(|_| next()).collect();
+        let mut bytes = Vec::new();
+        {
+            let mut enc = ::gif::Encoder::new(&mut bytes, w, h, &palette).unwrap();
+            enc.set_repeat(Repeat::Finite(3)).unwrap();
+            for (i, delay) in [4u16, 7, 2, 10].into_iter().enumerate() {
+                let px: Vec<u8> = (0..usize::from(w) * usize::from(h))
+                    .map(|_| next())
+                    .collect();
+                // A little transparency on one frame.
+                let transparent = (i == 2).then_some(0);
+                let mut f = Frame::from_indexed_pixels(w, h, px, transparent);
+                f.delay = delay;
+                enc.write_frame(&f).unwrap();
+            }
+        }
+        bytes
+    }
+
+    fn encoder_input(src: &[u8], w: u32, h: u32, resize_mode: ResizeMode) -> capture::Capture {
+        capture::record(|| {
+            process(
+                src,
+                &Params {
+                    max_width: w,
+                    max_height: h,
+                    output: Some(ImageFormat::Webp),
+                    resize_mode,
+                    ..Params::default()
+                },
+            )
+            .unwrap();
+        })
+        .expect("the animation reached the encoder")
+    }
+
+    /// Animated crop equals "fit on one axis, then crop" for every
+    /// frame the encoder sees, with the same timing and loop count.
+    #[test]
+    fn animated_crop_equals_single_axis_fit_then_crop() {
+        let (gw, gh) = (61usize, 40usize);
+        let src = noisy_gif(gw as u16, gh as u16);
+        // Downscaled, smaller than the box on one axis (unscaled crop),
+        // and an odd margin.
+        for (bw, bh) in [(20, 20), (30, 9), (9, 30), (100, 30), (25, 17)] {
+            let axis = if bw as u64 * gh as u64 >= bh as u64 * gw as u64 {
+                (bw, u32::MAX)
+            } else {
+                (u32::MAX, bh)
+            };
+            let fit = encoder_input(&src, axis.0, axis.1, ResizeMode::Inside);
+            let got = encoder_input(&src, bw, bh, ResizeMode::Crop);
+            let (iw, ih) = fit.size;
+            let (cw, ch, left, top) = crate::pipeline::tests::reference_crop(iw, ih, bw, bh);
+            assert_eq!(got.size, (cw, ch), "{bw}x{bh}: size");
+            assert_eq!(got.loop_count, fit.loop_count, "{bw}x{bh}: loop");
+            assert_eq!(got.end, fit.end, "{bw}x{bh}: total time");
+            assert!(got.end.is_some());
+            assert_eq!(got.frames.len(), fit.frames.len(), "{bw}x{bh}: frames");
+            for ((gts, gpx), (fts, fpx)) in got.frames.iter().zip(&fit.frames) {
+                assert_eq!(gts, fts, "{bw}x{bh}: timestamp");
+                let mut want = Vec::with_capacity(cw * ch * 4);
+                for y in top..top + ch {
+                    let row = (y * iw + left) * 4;
+                    want.extend_from_slice(&fpx[row..row + cw * 4]);
+                }
+                assert!(*gpx == want, "{bw}x{bh} at {gts} ms: pixels differ");
+            }
+        }
     }
 }

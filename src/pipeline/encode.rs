@@ -876,7 +876,7 @@ pub(super) fn encode_output(
 /// frame in `out8` to the start of `out8`, packed. Each row moves to an
 /// earlier or equal offset, so copying rows in order never overwrites
 /// one that is still to be read.
-fn crop_out8(
+pub(super) fn crop_out8(
     s: &mut Scratch,
     w: usize,
     channels: usize,
