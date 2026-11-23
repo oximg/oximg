@@ -23,6 +23,156 @@ mod common;
 use common::{dims_of, fixture, params};
 use oximg::pipeline::{self, ErrorKind, ImageFormat, Params};
 
+#[cfg(feature = "bench-internals")]
+mod native_modes {
+    use super::*;
+    use oximg::pipeline::gif_bench::{self, Mode};
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    // Parse the bench interchange independently, comparing by timestamps:
+    // libwebp may merge frames, so indices are not a fidelity oracle.
+    //
+    // Alpha must match in every mode: WebP codes it losslessly even beside
+    // lossy color, so a wrong disposal or a lost transparent region shows
+    // here whatever the mode. Visible RGB must be within `rgb_tolerance`
+    // (0 for lossless); `None` leaves it unchecked.
+    fn compare_visible(reference: &[u8], decoded: &[u8], rgb_tolerance: Option<u8>) {
+        assert_eq!(&reference[..20], &decoded[..20], "canvas/loop changed");
+        assert_eq!(u32_at(reference, 24), u32_at(decoded, 24));
+        let size = (u32_at(reference, 8) * u32_at(reference, 12) * 4) as usize;
+        let frames = |bytes: &[u8]| -> Vec<(u32, Vec<u8>)> {
+            bytes[28..]
+                .chunks_exact(size + 4)
+                .map(|f| (u32_at(f, 0), f[4..].to_vec()))
+                .collect()
+        };
+        let a = frames(reference);
+        let b = frames(decoded);
+        assert_eq!(a.len(), u32_at(reference, 20) as usize);
+        assert_eq!(b.len(), u32_at(decoded, 20) as usize);
+        for time in a.iter().chain(&b).map(|(t, _)| *t) {
+            let x = &a.iter().rfind(|(t, _)| *t <= time).unwrap().1;
+            let y = &b.iter().rfind(|(t, _)| *t <= time).unwrap().1;
+            for (x, y) in x.as_chunks::<4>().0.iter().zip(y.as_chunks::<4>().0) {
+                assert_eq!(x[3], y[3], "alpha at {time}");
+                if let Some(tolerance) = rgb_tolerance.filter(|_| x[3] != 0) {
+                    let near = (0..3).all(|c| x[c].abs_diff(y[c]) <= tolerance);
+                    assert!(near, "RGB at {time}: {y:?} is not {x:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_modes_keep_disposal_short_delays_loops_and_resized_alpha() {
+        let mut frames = vec![
+            anim_frame(8, 8, &[1; 64], 0, gif::DisposalMethod::Keep),
+            anim_frame(8, 8, &[1; 64], 1, gif::DisposalMethod::Keep),
+            frame(0, 0, 3, 3, &[2; 9], None),
+            frame(4, 4, 2, 2, &[2; 4], None),
+            anim_frame(8, 8, &[1; 64], 10, gif::DisposalMethod::Keep),
+        ];
+        frames[2].delay = 2;
+        frames[2].dispose = gif::DisposalMethod::Background;
+        frames[3].delay = 7;
+        frames[3].dispose = gif::DisposalMethod::Previous;
+        for repeat in [gif::Repeat::Infinite, gif::Repeat::Finite(2)] {
+            let src = build_gif_repeat(8, 8, repeat, frames.clone());
+            for width in [8, 5] {
+                let p = anim_params(width);
+                let reference = gif_bench::encode(&src, &p, Mode::Reference).unwrap().bytes;
+                assert_eq!(u32_at(&reference, 24), 390);
+                assert_eq!(u32_at(&reference, 20), 4, "duplicate should merge");
+                assert_eq!(
+                    u32_at(&reference, 16),
+                    if repeat == gif::Repeat::Infinite {
+                        0
+                    } else {
+                        3
+                    }
+                );
+                if width == 8 {
+                    assert_eq!(&reference[32..36], &RED);
+                    // At 220ms, Background has cleared the preceding 3x3.
+                    let offset = 28 + 2 * (4 + 8 * 8 * 4);
+                    assert_eq!(u32_at(&reference, offset), 220);
+                    assert_eq!(&reference[offset + 4..offset + 8], &CLEAR);
+                }
+                for mode in [Mode::Lossy, Mode::Lossless, Mode::Mixed] {
+                    let out = gif_bench::encode(&src, &p, mode).unwrap();
+                    if mode == Mode::Lossy {
+                        assert_eq!(out.bytes, pipeline::process(&src, &p).unwrap().0);
+                    }
+                    let decoded = gif_bench::decode_webp(&out.bytes).unwrap();
+                    let rgb_tolerance = match mode {
+                        Mode::Lossless => Some(0),
+                        // Unresized, lossy color lands within 1 of the
+                        // reference (q100, flat regions on whole chroma
+                        // blocks); 12 is the slack `assert_near` gives.
+                        _ if width == 8 => Some(12),
+                        // On the 5x5 canvas 4:2:0 chroma smears the
+                        // red/green edge by up to 104 levels over a
+                        // third of the pixels: no bound that passes
+                        // would tell a wrong frame from a right one, so
+                        // only alpha is checked there.
+                        _ => None,
+                    };
+                    compare_visible(&reference, &decoded, rgb_tolerance);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_bench_refuses_stills_instead_of_timing_a_fallback() {
+        for mode in [Mode::Lossy, Mode::Lossless, Mode::Mixed, Mode::Reference] {
+            let err = gif_bench::encode(&fixture("still.gif"), &anim_params(100), mode)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("single_frame"), "{err}");
+            assert!(gif_bench::encode(b"GIF89a", &anim_params(100), mode).is_err());
+        }
+    }
+
+    /// Two frames two gray levels apart: within libwebp's lossy
+    /// tolerance at the default quality, so it merges them and writes a
+    /// plain still with no animation container, while the decision
+    /// still reads `animated`. That is not an animation measurement
+    /// either, and is refused like a declined one, so the driver skips
+    /// the cell instead of timing it and failing later in the quality
+    /// pass. Lossless keeps both frames.
+    #[test]
+    fn native_bench_refuses_an_animation_the_encoder_merged_into_a_still() {
+        let mut src = Vec::new();
+        let mut enc = gif::Encoder::new(&mut src, 32, 32, &[100, 100, 100, 102, 102, 102]).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for index in [0u8, 1] {
+            let f = anim_frame(32, 32, &[index; 32 * 32], 10, gif::DisposalMethod::Keep);
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        // The default quality, as the bench driver runs: at the q100 of
+        // `anim_params` the two frames are told apart and both survive.
+        let p = params(32);
+
+        let reference = gif_bench::encode(&src, &p, Mode::Reference).unwrap().bytes;
+        assert_eq!(u32_at(&reference, 20), 2, "the source has two frames");
+        for mode in [Mode::Lossy, Mode::Mixed] {
+            let err = gif_bench::encode(&src, &p, mode).err().unwrap();
+            let text = err.to_string();
+            // The prefix is what bench/gif-native.py skips a cell on.
+            assert!(text.contains("animation declined:"), "{mode:?}: {text}");
+            assert!(text.contains("merged"), "{mode:?}: {text}");
+        }
+        let out = gif_bench::encode(&src, &p, Mode::Lossless).unwrap();
+        let decoded = gif_bench::decode_webp(&out.bytes).unwrap();
+        assert_eq!(u32_at(&decoded, 20), 2);
+    }
+}
+
 /// Palette shared by the hand-built sources: index 0 doubles as the
 /// transparent index where a frame declares one, 1 = red, 2 = green.
 const PAL: &[u8] = &[0, 0, 0, 255, 0, 0, 0, 255, 0];

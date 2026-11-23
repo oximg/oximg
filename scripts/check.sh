@@ -120,6 +120,7 @@ else
   step clippy-library-only avif cargo clippy --release --no-default-features --features avif -- -D warnings
   step test any cargo test --release
   step test-avif avif cargo test --release --features avif
+  step test-gif-bench any cargo test --release --features bench-internals --test formats_gif
   step build-all-targets avif cargo build --release --all-targets --features avif
   step examples-smoke any examples_smoke
   step examples-smoke-avif avif examples_smoke_avif

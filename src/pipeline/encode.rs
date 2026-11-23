@@ -367,10 +367,21 @@ impl AnimEncoder {
     /// `loop_count` is WebP's spelling: 0 = forever.
     // SAFETY: both Internal entry points are called with WEBP_MUX_ABI_VERSION and
     // their return values checked, so the zeroed options/config structs are only
-    // read after libwebp itself initialized them. On the config-init failure path
-    // the already-created encoder is deleted before returning, and on every other
-    // path it is owned by the returned value and freed exactly once in `drop`.
+    // read after libwebp itself initialized them. Configuration is validated
+    // before allocation; the returned encoder is freed exactly once in `drop`.
     pub(super) fn new(w: usize, h: usize, loop_count: u32, p: &Resolved) -> Result<Self> {
+        Self::configured(w, h, loop_count, p, |_, _| {})
+    }
+
+    // The benchmark changes only codec settings; allocation, import, add and
+    // assembly stay the production implementation. No process-global toggle.
+    pub(super) fn configured(
+        w: usize,
+        h: usize,
+        loop_count: u32,
+        p: &Resolved,
+        configure: impl FnOnce(&mut libwebp_sys::WebPAnimEncoderOptions, &mut libwebp_sys::WebPConfig),
+    ) -> Result<Self> {
         use libwebp_sys as wp;
         unsafe {
             let mut opts: wp::WebPAnimEncoderOptions = std::mem::zeroed();
@@ -394,6 +405,12 @@ impl AnimEncoder {
             // lossy or lossless per frame. Off, explicitly.
             opts.minimize_size = 0;
             opts.allow_mixed = 0;
+            let mut config: wp::WebPConfig = std::mem::zeroed();
+            anyhow::ensure!(wp::WebPInitConfig(&mut config), "libwebp ABI mismatch");
+            config.quality = p.webp_quality;
+            config.method = webp_effort().clamp(0, 6);
+            configure(&mut opts, &mut config);
+            anyhow::ensure!(wp::WebPValidateConfig(&config) != 0, "invalid WebP config");
             let enc = wp::WebPAnimEncoderNewInternal(
                 w as i32,
                 h as i32,
@@ -401,15 +418,6 @@ impl AnimEncoder {
                 wp::WEBP_MUX_ABI_VERSION as _,
             );
             anyhow::ensure!(!enc.is_null(), "webp animation encoder");
-            let mut config: wp::WebPConfig = std::mem::zeroed();
-            if !wp::WebPInitConfig(&mut config) {
-                wp::WebPAnimEncoderDelete(enc);
-                anyhow::bail!("libwebp ABI mismatch");
-            }
-            // The same quality and effort knobs as a still WebP: an
-            // animation is not a different product, just more frames.
-            config.quality = p.webp_quality;
-            config.method = webp_effort().clamp(0, 6);
             Ok(AnimEncoder { enc, config, w, h })
         }
     }

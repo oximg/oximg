@@ -74,7 +74,7 @@ pub fn gif_output_counts() -> impl Iterator<Item = (&'static str, u64)> {
         .map(|(&code, n)| (code, n.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
-struct GifReport {
+pub(super) struct GifReport {
     outcome: GifOutcome,
     // None means not scanned, rather than zero-cost input.
     work: Option<(usize, u64, u64)>,
@@ -82,6 +82,14 @@ struct GifReport {
 }
 
 impl GifReport {
+    pub(super) fn new() -> Self {
+        Self {
+            outcome: GifOutcome::TargetStill,
+            work: None,
+            submitted_frames: 1,
+        }
+    }
+
     fn record(&self) {
         GIF_OUTPUT_COUNTS[self.outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if crate::config::config().timing {
@@ -153,16 +161,12 @@ fn process_gif_src(
     target: ImageFormat,
     p: &Resolved,
 ) -> Result<Vec<u8>> {
-    let mut report = GifReport {
-        outcome: GifOutcome::TargetStill,
-        work: None,
-        submitted_frames: 1,
-    };
+    let mut report = GifReport::new();
     // WebP is the only target here that can carry an animation at all;
     // for the others the still path below is not a degradation, it is
     // the only thing the format can say.
     if target == ImageFormat::Webp
-        && let Some(out) = try_animated(s, src, p, &mut report)?
+        && let Some(out) = try_animated(s, src, p, &mut report, AnimEncoder::new)?
     {
         report.record();
         return Ok(out);
@@ -406,6 +410,23 @@ fn delay_ms(delay_cs: u16) -> u32 {
     }
 }
 
+// A monomorphized sink lets the benchmark capture the exact encoder input
+// in a separate run, without copies or retained reference frames in timed runs.
+pub(super) trait AnimationSink {
+    fn add(&mut self, rgba: &[u8], ts_ms: i32) -> Result<()>;
+    fn finish(self, total_ms: i32) -> Result<Vec<u8>>;
+}
+
+impl AnimationSink for AnimEncoder {
+    fn add(&mut self, rgba: &[u8], ts_ms: i32) -> Result<()> {
+        self.add(rgba, ts_ms)
+    }
+
+    fn finish(self, total_ms: i32) -> Result<Vec<u8>> {
+        self.finish(total_ms)
+    }
+}
+
 /// Animated GIF to animated WebP, or `None` to leave the request on the
 /// still path.
 ///
@@ -423,11 +444,12 @@ fn delay_ms(delay_cs: u16) -> u32 {
 /// part is estimated below (`ANIM_RETAINED_PER_PX` per encoded pixel,
 /// plus the encoder's canvases) and bounded by
 /// `OXIMG_MAX_ANIM_WORK`, not by the canvas.
-fn try_animated(
+pub(super) fn try_animated<E: AnimationSink>(
     s: &mut Scratch,
     src: &[u8],
     p: &Resolved,
     report: &mut GifReport,
+    encoder: impl FnOnce(usize, usize, u32, &Resolved) -> Result<E>,
 ) -> Result<Option<Vec<u8>>> {
     let cfg = crate::config::config();
     if !cfg.gif_animation {
@@ -535,7 +557,7 @@ fn try_animated(
     // covers shows through, and scratch holds the previous request's
     // pixels until told otherwise.
     scratch_u8(&mut s.chunk8, canvas_len).fill(0);
-    let mut enc = AnimEncoder::new(out_w, out_h, scan.loop_count, p).context(ServerFault)?;
+    let mut enc = encoder(out_w, out_h, scan.loop_count, p).context(ServerFault)?;
     let mut ts = 0i32;
     let (mut index, mut emitted) = (0usize, 0usize);
     // The first frame always emits; after that only frames that changed
