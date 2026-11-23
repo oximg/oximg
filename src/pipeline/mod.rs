@@ -916,6 +916,12 @@ pub struct Animation {
     /// after the first play instead, so this — like `duration_ms` — is
     /// what oximg would emit: a GIF asking for 3 repeats reports 4.
     pub loop_count: u32,
+    /// The figure `OXIMG_MAX_ANIM_DECODE_WORK` is compared against: the
+    /// sum over every source frame of max(logical screen area, frame
+    /// rectangle area), in pixels (#187). `None` for a format that
+    /// budget does not price — an animated WebP, which is served by its
+    /// first frame and never decoded as an animation.
+    pub decode_work: Option<u64>,
 }
 
 /// Animation summary from headers alone, the companion to [`probe`]:
@@ -939,6 +945,8 @@ pub struct Animation {
 /// let anim = pipeline::probe_animation(&bytes)?.expect("three frames");
 /// assert_eq!((anim.frames, anim.duration_ms), (3, 1500));
 /// assert_eq!(anim.loop_count, 0, "loops forever");
+/// // Three full-canvas frames of 120x90.
+/// assert_eq!(anim.decode_work, Some(3 * 120 * 90));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn probe_animation(bytes: &[u8]) -> Result<Option<Animation>, Error> {
@@ -957,6 +965,7 @@ fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
                 frames: scan.frames,
                 duration_ms: scan.duration_ms,
                 loop_count: scan.loop_count,
+                decode_work: Some(scan.decode_work),
             }))
         }
         ImageFormat::Webp => Ok(
@@ -964,6 +973,7 @@ fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
                 frames,
                 duration_ms,
                 loop_count,
+                decode_work: None,
             }),
         ),
         _ => Ok(None),

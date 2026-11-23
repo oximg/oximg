@@ -23,11 +23,15 @@ pub fn probe_value(bytes: &[u8]) -> Value {
                     frames,
                     duration_ms,
                     loop_count,
+                    decode_work,
                 })) => {
+                    // decode_work is null where no budget prices it
+                    // (an animated WebP).
                     v["animation"] = json!({
                         "frames": frames,
                         "duration_ms": duration_ms,
                         "loop_count": loop_count,
+                        "decode_work": decode_work,
                     });
                 }
                 Ok(None) => {}

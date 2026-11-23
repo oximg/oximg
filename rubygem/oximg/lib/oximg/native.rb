@@ -9,7 +9,9 @@ module Oximg
   #
   # Only the header read runs in-process. It reads a bounded prefix of
   # the source and decodes no pixels; resize stays a child process, for
-  # the memory and crash isolation a full decode wants.
+  # the memory and crash isolation a full decode wants. With
+  # +animation: true+ the whole source is read, to count its frames,
+  # still without decoding one.
   #
   # Resolution order, first hit wins:
   #
@@ -29,7 +31,7 @@ module Oximg
     BUNDLED = File.expand_path("native/#{LIBRARY}", __dir__)
 
     # The library's oximg_probe_abi_version this code was written for.
-    ABI_VERSION = 2
+    ABI_VERSION = 3
 
     # Statuses (ext/src/lib.rs).
     OK = 0
@@ -37,6 +39,13 @@ module Oximg
 
     # The byte count READ gives for "to the end".
     READ_ALL = 2**64 - 1
+
+    # What a call writes (ext/src/lib.rs): stored width, stored height
+    # and orientation; with the animation summary, also frames (0: not
+    # animated), duration_ms, loop_count, decode_work, and whether
+    # decode_work is priced.
+    HEADER_SLOTS = 3
+    ANIMATION_SLOTS = 8
 
     # Room for an error message; the library cuts a longer one at a
     # character boundary.
@@ -48,19 +57,22 @@ module Oximg
         !binding_module.nil?
       end
 
-      # Header of the file at +path+ (already expanded).
-      def probe_path(path)
+      # Header of the file at +path+ (already expanded); with
+      # +animation+, its animation summary too, which reads all of it.
+      def probe_path(path, animation: false)
         # Copied off the Ruby heap: the call runs without the GVL, while
         # other threads may run GC.
         bytes = FFI::MemoryPointer.from_string(path)
-        call { |dims, msg| binding_module.oximg_probe_path(bytes, path.bytesize, dims, msg, MESSAGE_BYTES) }
+        function = animation ? :oximg_probe_animation_path : :oximg_probe_path
+        call(animation) { |out, msg| binding_module.public_send(function, bytes, path.bytesize, out, msg, MESSAGE_BYTES) }
       end
 
       # Header of the open, readable regular +file+, read through its
       # descriptor from the start with positioned reads: what it holds,
       # whatever its name leads to by now, its position untouched.
-      def probe_file(file)
-        call { |dims, msg| binding_module.oximg_probe_fd(file.fileno, dims, msg, MESSAGE_BYTES) }
+      def probe_file(file, animation: false)
+        function = animation ? :oximg_probe_animation_fd : :oximg_probe_fd
+        call(animation) { |out, msg| binding_module.public_send(function, file.fileno, out, msg, MESSAGE_BYTES) }
       end
 
       # Header of +io+, read from its current position through
@@ -71,8 +83,18 @@ module Oximg
       # here, between calls, so the IO's code never runs under the
       # library's frames: whatever it raises, a Timeout or a Thread#kill
       # included, leaves the way it would leave any Ruby method.
-      def probe_io(io)
+      #
+      # With +animation+ there is nothing to decide: the IO is read to
+      # its end, here, and the library is handed all of it.
+      def probe_io(io, animation: false)
         prefix = String.new(encoding: Encoding::BINARY)
+        if animation
+          read_to(io, prefix, READ_ALL)
+          return call(true) do |out, msg|
+            binding_module.oximg_probe_animation_bytes(prefix, prefix.bytesize, out, msg, MESSAGE_BYTES)
+          end
+        end
+
         eof = false
         loop do
           want = nil
@@ -109,18 +131,26 @@ module Oximg
         false
       end
 
-      def call
-        # Stored width, stored height, orientation (ext/src/lib.rs).
-        dims = FFI::MemoryPointer.new(:uint64, 3)
+      def call(animation = false)
+        slots = animation ? ANIMATION_SLOTS : HEADER_SLOTS
+        out = FFI::MemoryPointer.new(:uint64, slots)
         msg = FFI::MemoryPointer.new(:char, MESSAGE_BYTES)
-        status = yield(dims, msg)
+        status = yield(out, msg)
         return if status == READ
 
         text = msg.read_string.force_encoding(Encoding::UTF_8)
         raise ProcessingError.new(text, 1) unless status == OK
 
-        width, height, orientation = dims.read_array_of_uint64(3)
-        Header.build(text, width, height, orientation)
+        width, height, orientation, frames, duration_ms, loop_count, decode_work, priced =
+          out.read_array_of_uint64(slots)
+        header = Header.build(text, width, height, orientation)
+        return header unless animation
+
+        summary = unless frames.zero?
+          {frames: frames, duration_ms: duration_ms, loop_count: loop_count,
+           decode_work: priced.zero? ? nil : decode_work}
+        end
+        header.merge(animation: summary)
       end
 
       # nil when there is no library to use. Memoized either way, so a
@@ -157,23 +187,32 @@ module Oximg
 
       def open_library(path)
         require "ffi"
-        mod = Module.new do
+        Module.new do
           extend FFI::Library
           ffi_lib path
           attach_function :oximg_probe_abi_version, [], :uint32
+          # Checked before the rest is bound: an older library lacks the
+          # newer entry points, and should be refused for its version
+          # rather than for a symbol.
+          abi = oximg_probe_abi_version
+          unless abi == ABI_VERSION
+            raise LoadError, "#{path} speaks probe ABI #{abi}; this gem speaks #{ABI_VERSION}"
+          end
+
           # A path or descriptor read blocks on the filesystem, so it runs
           # without the GVL. A step only parses bytes already in memory and
           # keeps it, which also keeps the prefix String where it is.
           attach_function :oximg_probe_path, %i[pointer size_t pointer pointer size_t], :int, blocking: true
           attach_function :oximg_probe_fd, %i[int pointer pointer size_t], :int, blocking: true
           attach_function :oximg_probe_step, %i[buffer_in size_t uint8 pointer pointer size_t], :int
+          # The same split for the whole-source reads: the library reads
+          # a path or a descriptor itself, without the GVL; bytes Ruby
+          # already read are walked under it (no pixel is decoded).
+          attach_function :oximg_probe_animation_path, %i[pointer size_t pointer pointer size_t], :int,
+            blocking: true
+          attach_function :oximg_probe_animation_fd, %i[int pointer pointer size_t], :int, blocking: true
+          attach_function :oximg_probe_animation_bytes, %i[buffer_in size_t pointer pointer size_t], :int
         end
-        abi = mod.oximg_probe_abi_version
-        unless abi == ABI_VERSION
-          raise LoadError, "#{path} speaks probe ABI #{abi}; this gem speaks #{ABI_VERSION}"
-        end
-
-        mod
       end
     end
   end

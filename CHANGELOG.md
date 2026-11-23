@@ -10,6 +10,35 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **The animation summary from the Ruby gem's `Oximg.probe`** (#187):
+  `Oximg.probe(source, animation: true)` adds `animation:` to the hash,
+  `{frames:, duration_ms:, loop_count:, decode_work:}` for an animated
+  source and `nil` for a still. `frames` and `decode_work` are the
+  figures `OXIMG_MAX_ANIM_FRAMES` and `OXIMG_MAX_ANIM_DECODE_WORK` are
+  compared against, so an app can tell before it builds a URL whether
+  a GIF will be served animated or as its first frame, without
+  re-deriving the server's pricing (`decode_work` is `nil` for an
+  animated WebP, which that budget does not price). Opt-in, because it
+  reads the whole source where the default probe reads a header; no
+  pixel is decoded. It runs in-process through the probe library, and
+  otherwise needs an `oximg` executable of this release or later.
+- `oximg probe <file> --json`: the probe line's fields as one JSON
+  object, plus `animation` (`null` for a still) with `decode_work`. The
+  line itself is unchanged.
+- `pipeline::Animation` gains `decode_work: Option<u64>`, and
+  `oximg-ctl probe` reports it under `probe.animation`.
+
+### Changed
+
+- `oximg probe` refuses an unknown option (`oximg probe --nope`) with
+  status 2, as `resize` and `strip` do, instead of reading it as a file
+  name.
+- The gem's probe library speaks ABI 3 (new entry points for the
+  animation summary). A platform gem bundles a matching one; an
+  `OXIMG_PROBE_LIB` built from an older checkout is refused by version.
+
 ### Fixed
 
 - url 2.5.9 fixes a stack overflow in `Url::origin()` on a URL nesting

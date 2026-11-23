@@ -78,6 +78,22 @@ module Oximg
       skip message
     end
 
+    # A two-frame GIF on a 2x2 logical screen whose second frame's
+    # rectangle is 3x3: larger than the screen, which a writer may do.
+    # Decode work prices each frame at the larger of the two, so it is
+    # 4 + 9, where frames x width x height says 8. Built here,
+    # independent of oximg.
+    def oversized_frame_gif
+      frame = lambda do |w, h|
+        # Image descriptor, no local palette; LZW minimum code size 2,
+        # one data sub-block, block terminator.
+        [0x2C, 0, 0, w, h, 0].pack("CvvvvC") + [2, 2, 0x4C, 0x01, 0].pack("C*")
+      end
+      # Logical screen 2x2 with a two-color global palette.
+      "GIF89a".b + [2, 2, 0x80, 0, 0].pack("vvCCC") + [0, 0, 0, 255, 255, 255].pack("C*") +
+        frame.call(2, 2) + frame.call(3, 3) + ";".b
+    end
+
     def with_env(name, value)
       previous = ENV[name]
       ENV[name] = value
