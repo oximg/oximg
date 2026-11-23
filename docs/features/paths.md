@@ -112,6 +112,43 @@ a new code, never a rename); `message` is for humans and may change.
 The library's `NotRotatedCode::as_str` is the spelling; the Ruby gem's
 `Oximg::Stripped#not_rotated` gives the code as a Symbol.
 
+### `oximg probe --json` and the animation summary
+
+`oximg probe <file> --json` prints one JSON object on stdout instead of
+the line; a failure is a non-zero exit with the reason on stderr.
+
+```json
+{"content_type": "image/gif", "width": 120, "height": 90, "stored_pixels": 10800,
+ "orientation": 1, "display_width": 120, "display_height": 90,
+ "animation": {"frames": 3, "duration_ms": 1500, "loop_count": 0, "decode_work": 32400}}
+```
+
+`animation` is null for a source that is not animated (a still, a
+one-frame GIF, an AVIF sequence). `frames` is what
+`OXIMG_MAX_ANIM_FRAMES` is compared against and `decode_work` what
+`OXIMG_MAX_ANIM_DECODE_WORK` is (sum over source frames of max(canvas
+area, frame rectangle area)); `decode_work` is null for an animated
+WebP, which that budget does not price. `duration_ms` and `loop_count`
+(0 = forever) are what oximg would emit. The encode budget
+(`OXIMG_MAX_ANIM_WORK`) depends on the output box, so it is not here:
+ceil(frames / `OXIMG_ANIM_FRAME_STEP`) × output width × output height.
+Counted from block headers, no
+LZW decode: a GIF cut off mid-stream reports the frames that arrived.
+
+`oximg-ctl probe` reports the same under `probe.animation` (absent, not
+null, for a still), and the gem's `Oximg.probe(source, animation:
+true)` returns it as `animation:` — in-process through the probe
+library, else from this JSON (an oximg before 0.22 is refused by name).
+The gem's default probe stays a header read; the summary reads the
+whole source.
+
+```sh
+oximg probe tests/fixtures/anim.gif --json        # animation.decode_work == 32400
+oximg probe tests/fixtures/animated.webp --json   # animation.decode_work == null
+oximg probe tests/fixtures/still.gif --json       # animation == null
+oximg-ctl probe tests/fixtures/anim.gif           # probe.animation.decode_work == 32400
+```
+
 ## Library (`oximg::pipeline`)
 
 ```sh
@@ -136,7 +173,8 @@ add the orientation (`Header {format, width, height, orientation}`,
 `display_width()`/`display_height()`), reading a WebP that flags an
 `EXIF` chunk through EOF; `probe_header_seek` answers the same from a
 seekable source but seeks over such a WebP's image data (the gem's
-path and descriptor probes); `probe_animation` reports frames for GIF/WebP. Embedders set
+path and descriptor probes); `probe_animation` reports `Animation {frames, duration_ms, loop_count,
+decode_work}` for GIF/WebP (`decode_work` is `None` for WebP). Embedders set
 `default-features = false` to drop the HTTP stack. Failures are
 `pipeline::Error`; match `kind()`, wildcard arm required (`ErrorKind`
 is `#[non_exhaustive]`).

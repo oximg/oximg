@@ -444,7 +444,16 @@ fn animated_gif_becomes_animated_webp() {
     // was written, and both on what the source said.
     let a = pipeline::probe_animation(&out).unwrap().expect("animated");
     assert_eq!((a.frames, a.duration_ms, a.loop_count), (3, 1500, 0));
-    assert_eq!(pipeline::probe_animation(&src).unwrap(), Some(a));
+    // Decode work is priced for the GIF source only (#187): the budget
+    // it is spent against never applies to a WebP.
+    assert_eq!(a.decode_work, None);
+    assert_eq!(
+        pipeline::probe_animation(&src).unwrap(),
+        Some(pipeline::Animation {
+            decode_work: Some(3 * 120 * 90),
+            ..a
+        })
+    );
 
     let (w, h, loops, frames) = webp_frames(&out);
     assert_eq!(((w, h), loops, frames.len()), ((120, 90), 0, 3));

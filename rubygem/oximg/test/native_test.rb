@@ -59,6 +59,87 @@ class Oximg::NativeTest < Oximg::Test
     end
   end
 
+  def spawned_with_animation(path)
+    outcome { Oximg::Header.from_json(JSON.parse(Oximg::Binary.run("probe", path, "--json").first)) }
+  end
+
+  # animation: true (#187) answers in-process what `oximg probe --json`
+  # answers, by path, by open File and by IO, on every fixture.
+  def test_reports_the_animation_like_the_executable_on_every_fixture
+    require_executable!
+    with_library do
+      fixtures = image_fixtures
+      if spawned(fixture("photo.avif")).is_a?(Hash)
+        fixtures = fixtures.reject { |path| path.end_with?(".avif") }
+      end
+      animated = 0
+      fixtures.each do |path|
+        want = spawned_with_animation(path)
+        animated += 1 if want.is_a?(Hash) && want[:animation]
+        assert_equal want, outcome { Oximg.probe(path, animation: true) }, File.basename(path)
+        from_file = File.open(path, "rb") { |file| outcome { Oximg.probe(file, animation: true) } }
+        assert_equal want, from_file, File.basename(path)
+        from_io = outcome { Oximg.probe(StringIO.new(File.binread(path)), animation: true) }
+        assert_equal want, from_io, File.basename(path)
+      end
+      assert_operator animated, :>=, 2
+    end
+  end
+
+  # The numbers themselves, so the test above cannot pass on two wrong
+  # answers that agree: three full 120x90 frames, and a WebP with no
+  # decode budget to price.
+  def test_reports_the_animation_summary
+    with_library do
+      assert_equal(
+        upright("image/gif", :gif, 120, 90)
+          .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}),
+        Oximg.probe(fixture("anim.gif"), animation: true)
+      )
+      assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil},
+        Oximg.probe(fixture("animated.webp"), animation: true)[:animation])
+      still = Oximg.probe(fixture("still.gif"), animation: true)
+      assert still.key?(:animation)
+      assert_nil still[:animation]
+      refute Oximg.probe(fixture("anim.gif")).key?(:animation)
+    end
+  end
+
+  # A frame rectangle larger than the logical screen is priced at its
+  # own area: 4 + 9, not frames x width x height = 8.
+  def test_prices_a_frame_larger_than_the_screen
+    with_library do
+      probed = Oximg.probe(StringIO.new(oversized_frame_gif), animation: true)
+      assert_equal [2, 13], probed[:animation].values_at(:frames, :decode_work)
+    end
+  end
+
+  # Counting frames takes the whole source: a stream is read to its
+  # end, where the header alone stops after a prefix. An open File is
+  # still read from its start, through its descriptor, its position
+  # untouched.
+  def test_reads_the_whole_source_for_the_animation
+    with_library do
+      bytes = File.binread(fixture("anim.gif"))
+      io = StringIO.new(bytes + ("\0".b * (1 << 20)))
+      assert_equal 3, Oximg.probe(io, animation: true)[:animation][:frames]
+      assert_predicate io, :eof?
+
+      File.open(fixture("anim.gif"), "rb") do |file|
+        file.read(100)
+        assert_equal 3, Oximg.probe(file, animation: true)[:animation][:frames]
+        assert_equal 100, file.pos
+      end
+    end
+  end
+
+  def test_reports_a_missing_file_for_the_animation
+    with_library do
+      error = assert_raises(Oximg::ProcessingError) { Oximg.probe(fixture("missing.gif"), animation: true) }
+      assert_match(/missing\.gif/, error.message)
+    end
+  end
+
   def test_reads_an_io_as_it_reads_the_path
     with_library do
       image_fixtures.each do |path|

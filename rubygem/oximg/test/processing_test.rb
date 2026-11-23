@@ -150,6 +150,47 @@ class Oximg::ProcessingTest < Oximg::Test
     assert_equal(upright("image/webp", :webp, 64, 48), probed)
   end
 
+  # animation: true adds the summary the server's animation budgets are
+  # spent against (#187), from `oximg probe --json`: frames, and the
+  # decode work of three full 120x90 frames. A WebP has no decode
+  # budget, a still no animation; without the option the hash is as it
+  # was.
+  def test_probe_reports_the_animation_summary
+    refute Oximg.in_process_probe?
+    assert_equal(
+      upright("image/gif", :gif, 120, 90)
+        .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}),
+      Oximg.probe(fixture("anim.gif"), animation: true)
+    )
+    assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil},
+      Oximg.probe(fixture("animated.webp"), animation: true)[:animation])
+    %w[still.gif photo.jpg].each do |name|
+      probed = Oximg.probe(fixture(name), animation: true)
+      assert probed.key?(:animation), name
+      assert_nil probed[:animation], name
+    end
+    refute Oximg.probe(fixture("anim.gif")).key?(:animation)
+    refute Oximg.probe(fixture("anim.gif"), animation: false).key?(:animation)
+  end
+
+  # An IO and an open File go through the same tempfile and name as
+  # without the option.
+  def test_probe_reports_the_animation_summary_of_an_io_and_a_file
+    want = Oximg.probe(fixture("anim.gif"), animation: true)
+    assert_equal want, Oximg.probe(StringIO.new(File.binread(fixture("anim.gif"))), animation: true)
+    File.open(fixture("anim.gif"), "rb") do |file|
+      assert_equal want, Oximg.probe(file, animation: true)
+    end
+  end
+
+  # A frame rectangle larger than the logical screen is priced at its
+  # own area: 4 + 9, not frames x width x height = 8.
+  def test_probe_prices_a_frame_larger_than_the_screen
+    probed = Oximg.probe(StringIO.new(oversized_frame_gif), animation: true)
+    assert_equal [2, 2], probed.values_at(:width, :height)
+    assert_equal [2, 13], probed[:animation].values_at(:frames, :decode_work)
+  end
+
   # GIF is decode-only, but it is still a content type the CLI emits,
   # so probe has to name it.
   def test_probe_names_gif_as_a_format

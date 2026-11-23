@@ -53,10 +53,16 @@ pub fn print_help() {
                                 stdout: bytes, content_type, removed,\n                             \
                                 orientation, rotated, not_rotated\n                             \
                                 {{code, message}} (see docs/features)\n  \
-           oximg probe <file>\n          \
+           oximg probe <file> [--json]\n          \
              Print the format and stored dimensions (header-only, no\n          \
              pixel decode), plus frame count, duration and loop count\n          \
-             when the source is animated.\n  \
+             when the source is animated.\n          \
+             --json             Print one JSON object on stdout instead:\n                             \
+                                content_type, width, height,\n                             \
+                                stored_pixels, orientation,\n                             \
+                                display_width, display_height, animation\n                             \
+                                {{frames, duration_ms, loop_count,\n                             \
+                                decode_work}} or null (see docs/features)\n  \
            oximg --version | --help",
         env!("CARGO_PKG_VERSION"),
         ImageFormat::output_token_hint().replace('|', " | "),
@@ -291,18 +297,35 @@ fn strip_json(s: &pipeline::Stripped) -> serde_json::Value {
     })
 }
 
-/// `oximg probe <file>` — the probe example as a shipped command.
+/// `oximg probe <file> [--json]` — the probe example as a shipped command.
 pub fn probe(args: &[String]) -> anyhow::Result<()> {
-    let [input] = args else {
-        usage_error("usage: oximg probe <file>");
-    };
-    if input == "-h" || input == "--help" {
-        print_help();
-        return Ok(());
+    const USAGE: &str = "usage: oximg probe <file> [--json]";
+    let mut positional: Vec<&str> = Vec::new();
+    let mut json = false;
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            "--json" => json = true,
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                usage_error(&format!("unknown option {flag:?}"))
+            }
+            p => positional.push(p),
+        }
     }
+    let [input] = positional[..] else {
+        usage_error(USAGE);
+    };
     let bytes = std::fs::read(input).with_context(|| format!("read {input}"))?;
     let header = pipeline::probe_header(&bytes)?;
     let (format, w, h) = (header.format, header.width, header.height);
+    let animation = pipeline::probe_animation(&bytes)?;
+    if json {
+        println!("{}", probe_json(&header, animation.as_ref()));
+        return Ok(());
+    }
     // A non-upright source names its orientation and the frame a viewer
     // shows. First after the comma, ahead of the animation summary, so
     // the gem reads it at a fixed place; omitted at 1, so an upright
@@ -318,7 +341,7 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
     // Frame count and duration are what the animation budgets
     // (OXIMG_MAX_ANIM_FRAMES / OXIMG_MAX_ANIM_WORK) are spent against,
     // so an operator can price a source here before serving it.
-    let anim = match pipeline::probe_animation(&bytes)? {
+    let anim = match animation {
         Some(a) => format!(
             ", {} frames, {}ms, {}",
             a.frames,
@@ -337,6 +360,33 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
         w as u64 * h as u64
     );
     Ok(())
+}
+
+/// The `--json` report (#187): what the line says, plus the figure the
+/// line leaves out. `animation` is null for a source that is not
+/// animated; its `decode_work` is what `OXIMG_MAX_ANIM_DECODE_WORK` is
+/// compared against, null where that budget prices nothing (an
+/// animated WebP). The Ruby gem's `Oximg.probe(animation: true)` reads
+/// this when it has no probe library.
+fn probe_json(
+    header: &pipeline::Header,
+    animation: Option<&pipeline::Animation>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "content_type": header.format.content_type(),
+        "width": header.width,
+        "height": header.height,
+        "stored_pixels": header.width as u64 * header.height as u64,
+        "orientation": header.orientation,
+        "display_width": header.display_width(),
+        "display_height": header.display_height(),
+        "animation": animation.map(|a| serde_json::json!({
+            "frames": a.frames,
+            "duration_ms": a.duration_ms,
+            "loop_count": a.loop_count,
+            "decode_work": a.decode_work,
+        })),
+    })
 }
 
 /// Map an output filename's extension to a format the same way the
