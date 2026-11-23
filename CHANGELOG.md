@@ -10,6 +10,36 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Resize modes that cover the box and never enlarge**:
+  `GET /resize/crop/{w}/{h}/{file}` covers the box and crops the
+  centre to the box's aspect ratio, and
+  `GET /resize/outside/{w}/{h}/{file}` covers the box and keeps the
+  whole image, one side matching the box and the other longer. A
+  source smaller than the box is not enlarged: `crop` only cuts it to
+  the box's shape, and `outside` returns it at its own size. The
+  longer side of `outside` stops at 8192 px, so it is never larger
+  than the fit `/resize/8192/8192/…` already gives. An animated GIF
+  keeps its animation under `crop`: every frame is cut to the same
+  rectangle, and the encode budget counts the cut frame. The mode word
+  is part of the signed path. A mode needs both axes, and a `0` axis
+  is refused with a 400. The same modes are `oximg resize ... --crop`
+  and `--outside` (a `0` axis, or both flags, is a usage error),
+  `oximg-ctl resize --crop` and `--outside`, and `mode: :crop` or
+  `mode: :outside` in the Ruby gems' `Oximg.resize` and
+  `Oximg::Server.url_for`.
+- `pipeline::ResizeMode`, set with `Params::resize_mode`: `Inside`
+  (the default, the fit as before), `Crop` and `Outside`. It is
+  `#[non_exhaustive]`. With one axis free, the library treats every
+  mode as the fit.
+
+### Changed
+
+- `Params` gained a public field, `resize_mode`. Code that builds
+  `Params` with a struct literal and no `..Default::default()` no
+  longer compiles; add `..Default::default()`.
+
 ## [0.23.0] - 2026-11-23
 
 Probe can tell a damaged upload from a whole one (#191): a probe that
