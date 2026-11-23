@@ -326,7 +326,9 @@ module Oximg
     # animated WebP, which that budget does not price). +duration_ms+
     # and +loop_count+ (0: forever) are what oximg would emit. The
     # encode budget, OXIMG_MAX_ANIM_WORK, depends on the output size:
-    # frames x output width x output height.
+    # frames encoded x output width x output height, where the frames
+    # encoded are +frames+ divided by the server's OXIMG_ANIM_FRAME_STEP
+    # (1 unless set), rounded up.
     #
     # It is opt-in because of its cost: counting frames walks the whole
     # source, so all of it is read (and held in memory for the call)

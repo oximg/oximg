@@ -131,7 +131,8 @@ area, frame rectangle area)); `decode_work` is null for an animated
 WebP, which that budget does not price. `duration_ms` and `loop_count`
 (0 = forever) are what oximg would emit. The encode budget
 (`OXIMG_MAX_ANIM_WORK`) depends on the output box, so it is not here:
-frames × output width × output height. Counted from block headers, no
+ceil(frames / `OXIMG_ANIM_FRAME_STEP`) × output width × output height.
+Counted from block headers, no
 LZW decode: a GIF cut off mid-stream reports the frames that arrived.
 
 `oximg-ctl probe` reports the same under `probe.animation` (absent, not
