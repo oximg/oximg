@@ -161,15 +161,20 @@ def main():
             samples, hashes = {m: [] for m in ("lossy", "lossless", "mixed")}, {}
             def encode(mode):
                 return json.loads(run([args.bin.resolve(), source.resolve(), w, h, mode, folder / f"{mode}.webp"], env=env))
-            try:
-                for mode in samples:
+            # A refusal belongs to its mode: libwebp can merge a lossy or mixed
+            # animation into a still (refused) where lossless keeps every
+            # frame, and that cell is still a measurement.
+            for mode in list(samples):
+                try:
                     encode(mode)
                     hashes[mode] = sha(folder / f"{mode}.webp")
-            except subprocess.CalledProcessError as error:
-                if b"animation declined:" not in error.stderr:
-                    raise
-                result["skipped"].append({"source": source.name, "box": [w, h],
-                                          "reason": error.stderr.decode().strip()})
+                except subprocess.CalledProcessError as error:
+                    if b"animation declined:" not in error.stderr:
+                        raise
+                    result["skipped"].append({"source": source.name, "box": [w, h], "mode": mode,
+                                              "reason": error.stderr.decode().strip()})
+                    del samples[mode]
+            if not samples:
                 continue
             for round_no in range(args.rounds):
                 order = list(samples)
