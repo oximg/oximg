@@ -10,6 +10,18 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-23
+
+Probe can tell a damaged upload from a whole one (#191): a probe that
+reads the whole source reports `complete`, false for a GIF or WebP cut
+short, animated or not — including a GIF cut inside its first frame,
+which used to read as a healthy still and is then refused by the
+server. An animated WebP cut short no longer reads as a still.
+
+Defaults preserve bytes. On an Apple M2 Max, `oximg-ctl parity`
+against 0.22.0 finds all 352 fixture cells byte-identical (every
+fixture × 100x100, 333x0, 64x64, 10x200 × source, png, webp, jpeg).
+
 ### Added
 
 - **Truncated GIF and WebP sources are reported** (#191): a probe that
@@ -2464,7 +2476,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.22.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/oximg/oximg/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/oximg/oximg/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/oximg/oximg/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/oximg/oximg/compare/v0.19.0...v0.20.0
