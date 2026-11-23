@@ -119,6 +119,41 @@ mod native_modes {
             assert!(gif_bench::encode(b"GIF89a", &anim_params(100), mode).is_err());
         }
     }
+
+    /// Two frames two gray levels apart: within libwebp's lossy
+    /// tolerance at the default quality, so it merges them and writes a
+    /// plain still with no animation container, while the decision
+    /// still reads `animated`. That is not an animation measurement
+    /// either, and is refused like a declined one, so the driver skips
+    /// the cell instead of timing it and failing later in the quality
+    /// pass. Lossless keeps both frames.
+    #[test]
+    fn native_bench_refuses_an_animation_the_encoder_merged_into_a_still() {
+        let mut src = Vec::new();
+        let mut enc = gif::Encoder::new(&mut src, 32, 32, &[100, 100, 100, 102, 102, 102]).unwrap();
+        enc.set_repeat(gif::Repeat::Infinite).unwrap();
+        for index in [0u8, 1] {
+            let f = anim_frame(32, 32, &[index; 32 * 32], 10, gif::DisposalMethod::Keep);
+            enc.write_frame(&f).unwrap();
+        }
+        drop(enc);
+        // The default quality, as the bench driver runs: at the q100 of
+        // `anim_params` the two frames are told apart and both survive.
+        let p = params(32);
+
+        let reference = gif_bench::encode(&src, &p, Mode::Reference).unwrap().bytes;
+        assert_eq!(u32_at(&reference, 20), 2, "the source has two frames");
+        for mode in [Mode::Lossy, Mode::Mixed] {
+            let err = gif_bench::encode(&src, &p, mode).err().unwrap();
+            let text = err.to_string();
+            // The prefix is what bench/gif-native.py skips a cell on.
+            assert!(text.contains("animation declined:"), "{mode:?}: {text}");
+            assert!(text.contains("merged"), "{mode:?}: {text}");
+        }
+        let out = gif_bench::encode(&src, &p, Mode::Lossless).unwrap();
+        let decoded = gif_bench::decode_webp(&out.bytes).unwrap();
+        assert_eq!(u32_at(&decoded, 20), 2);
+    }
 }
 
 /// Palette shared by the hand-built sources: index 0 doubles as the

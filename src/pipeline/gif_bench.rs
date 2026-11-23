@@ -53,10 +53,17 @@ pub fn encode(src: &[u8], params: &Params, mode: Mode) -> Result<Output> {
             })?
         };
         let decision = report.to_string();
-        Ok(Output {
-            bytes: out.with_context(|| format!("animation declined: {decision}"))?,
-            decision,
-        })
+        let bytes = out.with_context(|| format!("animation declined: {decision}"))?;
+        // libwebp merges frames it finds near enough (lossy tolerance), and
+        // when every frame merges it writes a plain still with no animation
+        // container, while the decision above still says `animated`. That is
+        // not an animation measurement either: refuse it under the prefix
+        // the driver skips a cell on.
+        anyhow::ensure!(
+            mode == Mode::Reference || webp_animation(&bytes).is_some(),
+            "animation declined: encoder merged every frame into a still: {decision}"
+        );
+        Ok(Output { bytes, decision })
     })
 }
 
@@ -113,8 +120,10 @@ impl AnimationSink for Capture {
     }
 }
 
-/// Decode the actual WebP container, including a single frame if libwebp
-/// merged the animation. Its timeline must still match the reference.
+/// Decode the actual WebP animation container. libwebp may have merged
+/// frames, so there can be fewer than the reference has, but each must
+/// last: a plain still (every frame merged, which [`encode`] refuses) has
+/// no duration and is an error here. The timeline must match the reference.
 pub fn decode_webp(bytes: &[u8]) -> Result<Vec<u8>> {
     use libwebp_sys as wp;
     struct Decoder(*mut wp::WebPAnimDecoder);
