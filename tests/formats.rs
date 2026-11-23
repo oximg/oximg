@@ -86,6 +86,44 @@ fn animated_webp_renders_first_frame() {
     assert_eq!(dims_of(&out), (32, 24), "cross-format first frame");
 }
 
+/// An animated WebP cut short (#191) keeps its animation summary — the
+/// frames whose `ANMF` header arrived, `complete: false` — instead of
+/// reading as a still, which is what a strict demux made of it. A cut
+/// before the first frame has nothing to summarize; only the whole file,
+/// every byte its RIFF header declares, is complete.
+#[test]
+fn truncated_animated_webp_probes_incomplete() {
+    let src = fixture("animated.webp");
+    let full = pipeline::probe_animation(&src).unwrap().unwrap();
+    assert_eq!(
+        (full.frames, full.duration_ms, full.complete),
+        (2, 200, true)
+    );
+
+    let mut seen = std::collections::BTreeSet::new();
+    for cut in 1..src.len() {
+        match pipeline::probe_animation(&src[..cut]) {
+            Ok(Some(a)) => {
+                assert!(!a.complete, "cut at {cut}/{}: {a:?}", src.len());
+                assert!(a.frames <= full.frames, "cut at {cut}: {a:?}");
+                assert_eq!(a.decode_work, None, "cut at {cut}");
+                seen.insert(a.frames);
+            }
+            // Before the first frame, or before VP8X: no summary, and a
+            // cut inside the 12-byte RIFF header is an error.
+            Ok(None) => {}
+            Err(e) => assert!(cut < 12, "cut at {cut}: {e:#}"),
+        }
+    }
+    // The second frame's ANMF chunk runs to the last byte, so every cut
+    // that keeps a summary keeps exactly the first frame.
+    assert_eq!(seen, [1].into(), "{seen:?}");
+    // Past the declared size is still complete: libwebp reads to
+    // riff_end and no further.
+    let padded = [&src[..], b"junk"].concat();
+    assert_eq!(pipeline::probe_animation(&padded).unwrap(), Some(full));
+}
+
 #[test]
 fn garbage_and_truncation_error_instead_of_panicking() {
     // A signature no decoder here claims (BMP), and empty input. GIF used

@@ -338,6 +338,10 @@ pub(super) struct GifScan {
     /// Total plays, in WebP's spelling: 0 = forever. Converted from
     /// GIF's own counting — see [`scan_gif`].
     pub loop_count: u32,
+    /// Whether the walk ended at the trailer (`0x3B`) rather than at a
+    /// parse error (#191). Reporting only: the budgets are priced by
+    /// `frames` either way, so a truncated GIF costs what arrived.
+    pub complete: bool,
 }
 
 /// Walk every frame header. Cheap by construction: `skip_frame_decoding`
@@ -364,7 +368,19 @@ pub(super) fn scan_gif(src: &[u8]) -> Result<GifScan> {
         height: dec.height() as usize,
         ..Default::default()
     };
-    while let Ok(Some(f)) = dec.next_frame_info() {
+    // gif 0.14 answers `Ok(None)` only once it has read the trailer
+    // block; a source that runs out first is `UnexpectedEof`, and
+    // garbage mid-stream a format error. Both end the walk the same way,
+    // so `complete` is "trailer seen", not "not truncated".
+    loop {
+        let f = match dec.next_frame_info() {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                scan.complete = true;
+                break;
+            }
+            Err(_) => break,
+        };
         scan.frames += 1;
         scan.duration_ms += u64::from(delay_ms(f.delay));
         scan.needs_previous |= f.dispose == DisposalMethod::Previous;

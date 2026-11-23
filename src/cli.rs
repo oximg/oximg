@@ -62,7 +62,8 @@ pub fn print_help() {
                                 stored_pixels, orientation,\n                             \
                                 display_width, display_height, animation\n                             \
                                 {{frames, duration_ms, loop_count,\n                             \
-                                decode_work}} or null (see docs/features)\n  \
+                                decode_work, complete}} or null (see\n                             \
+                                docs/features)\n  \
            oximg --version | --help",
         env!("CARGO_PKG_VERSION"),
         ImageFormat::output_token_hint().replace('|', " | "),
@@ -343,14 +344,17 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
     // so an operator can price a source here before serving it.
     let anim = match animation {
         Some(a) => format!(
-            ", {} frames, {}ms, {}",
+            ", {} frames, {}ms, {}{}",
             a.frames,
             a.duration_ms,
             match a.loop_count {
                 0 => "looping forever".to_string(),
                 1 => "playing once".to_string(),
                 n => format!("playing {n} times"),
-            }
+            },
+            // Last, so every earlier field stays where a reader of the
+            // line finds it (#191).
+            if a.complete { "" } else { ", incomplete" }
         ),
         None => String::new(),
     };
@@ -366,7 +370,8 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
 /// line leaves out. `animation` is null for a source that is not
 /// animated; its `decode_work` is what `OXIMG_MAX_ANIM_DECODE_WORK` is
 /// compared against, null where that budget prices nothing (an
-/// animated WebP). The Ruby gem's `Oximg.probe(animation: true)` reads
+/// animated WebP); its `complete` is false for a source cut short
+/// (#191). The Ruby gem's `Oximg.probe(animation: true)` reads
 /// this when it has no probe library.
 fn probe_json(
     header: &pipeline::Header,
@@ -385,6 +390,7 @@ fn probe_json(
             "duration_ms": a.duration_ms,
             "loop_count": a.loop_count,
             "decode_work": a.decode_work,
+            "complete": a.complete,
         })),
     })
 }
