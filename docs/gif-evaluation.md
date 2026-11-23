@@ -6,8 +6,9 @@ each costs. It was written when `ImageFormat::sniff` deliberately
 returned `None` for `GIF89a`. Every number below was measured on
 an AMD Ryzen 7 8745HS (Arch Linux) on 2026-08-18 with a
 purpose-built POC that links oximg's own crate graph. Nothing here is
-quoted from an encoder's documentation. Section 11 is a separate
-2026-11-12 follow-up with current sources and a reproducible mode study.
+quoted from an encoder's documentation. Sections 11 and 12 are separate
+follow-ups (2026-11-12 and 2026-11-13) with current sources, reproducible
+mode studies, and their own hardware, named where their numbers are.
 
 **Status (2026-08-18): Tiers 0 and 1 are shipped**, so the sections
 below are the reasoning behind the code, not a plan. One deliberate
