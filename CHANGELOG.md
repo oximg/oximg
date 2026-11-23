@@ -10,6 +10,18 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-23
+
+The Ruby gem's `Oximg.probe` can report what an animation costs the
+server, priced the way the server prices it (#187), so an app can tell
+before it builds a URL whether a GIF will be served animated or as its
+first frame. `oximg probe` gains `--json`, and a dependency update
+fixes RUSTSEC-2026-0592.
+
+Defaults preserve bytes. On an Apple M2 Max, `oximg-ctl parity`
+against 0.21.0 finds all 352 fixture cells byte-identical (every
+fixture × 100x100, 333x0, 64x64, 10x200 × source, png, webp, jpeg).
+
 ### Added
 
 - **The animation summary from the Ruby gem's `Oximg.probe`** (#187):
@@ -2424,7 +2436,8 @@ did, in any output format.
   concurrency pinned to the core count — published to crates.io via
   Trusted Publishing.
 
-[unreleased]: https://github.com/oximg/oximg/compare/v0.21.0...HEAD
+[unreleased]: https://github.com/oximg/oximg/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/oximg/oximg/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/oximg/oximg/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/oximg/oximg/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/oximg/oximg/compare/v0.18.1...v0.19.0
