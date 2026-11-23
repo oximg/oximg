@@ -26,6 +26,7 @@ that picks the scan layout is proved.
 oximg-ctl probe tests/fixtures/photo.jpg   # probe.{orientation,display_width,display_height}
 oximg-ctl resize tests/fixtures/photo.jpg 100 100 --out /tmp/out.jpg
 oximg-ctl resize tests/fixtures/anim.gif 100 100 -f webp --out /tmp/out.webp
+oximg-ctl resize tests/fixtures/photo.jpg 100 100 --crop      # probe 100x100
 oximg-ctl strip tests/fixtures/animated.webp --out /tmp/out.webp
 oximg-ctl strip rotated.jpg --auto-rotate   # rotated, not_rotated{code,message}, rotation{...}
 ```
@@ -38,8 +39,9 @@ RSS) and, under `--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`,
 `decoded_bytes.{format,total,terms}` — the estimate beside what the
 process held. Under `--env OXIMG_TIMING=1`, successful GIF resizes also
 carry `gif_animation` with the [output decision and work estimates](formats.md#gif-animation-decisions).
-`--icc keep|strip` and `--[no-]auto-rotate` pass through
-in the CLI's spelling; `icc_bytes` is the output's embedded profile
+`--icc keep|strip`, `--[no-]auto-rotate`, `--crop` and `--outside`
+pass through in the CLI's spelling. `--crop` or `--outside` with a
+`0` axis is a usage error, and so is the pair; `icc_bytes` is the output's embedded profile
 block (payload plus framing), null when there is none, and
 `probe.{width,height}` shows whether the orientation was applied.
 

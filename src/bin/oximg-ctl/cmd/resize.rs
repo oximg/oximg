@@ -21,6 +21,7 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
         preset,
         icc,
         auto_rotate,
+        modes,
     } = a;
     let format = format.as_deref();
     let quality = quality.as_deref();
@@ -31,6 +32,7 @@ pub fn run(opts: &Opts, a: &ResizeArgs) -> Result<(), CtlError> {
         preset,
         icc: icc.as_deref(),
         auto_rotate: *auto_rotate,
+        modes,
     };
     let bin = resolve_bin(opts.bin.as_deref())?;
     let ephemeral = out.is_none();
@@ -209,6 +211,7 @@ struct Flags<'a> {
     preset: Option<&'a str>,
     icc: Option<&'a str>,
     auto_rotate: Option<bool>,
+    modes: &'a [String],
 }
 
 fn resize_argv(input: &Path, w: &str, h: &str, out: &Path, f: &Flags) -> Vec<String> {
@@ -218,6 +221,7 @@ fn resize_argv(input: &Path, w: &str, h: &str, out: &Path, f: &Flags) -> Vec<Str
         preset,
         icc,
         auto_rotate,
+        modes,
     } = *f;
     let mut v = vec![
         "oximg".into(),
@@ -248,6 +252,7 @@ fn resize_argv(input: &Path, w: &str, h: &str, out: &Path, f: &Flags) -> Vec<Str
         Some(false) => v.push("--no-auto-rotate".into()),
         None => {}
     }
+    v.extend(modes.iter().cloned());
     v
 }
 
@@ -280,6 +285,7 @@ mod tests {
                 preset: Some("fast"),
                 icc: Some("strip"),
                 auto_rotate: Some(false),
+                modes: &["--crop".into()],
             },
         );
         assert_eq!(
@@ -299,7 +305,8 @@ mod tests {
                 "fast",
                 "--icc",
                 "strip",
-                "--no-auto-rotate"
+                "--no-auto-rotate",
+                "--crop"
             ]
         );
     }

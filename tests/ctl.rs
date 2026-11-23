@@ -2237,3 +2237,21 @@ fn gif_reports_other_policies_without_scanning_when_disabled() {
         "diagnostic is opt-in: {v}"
     );
 }
+
+/// The resize modes through the control plane: `--crop` and `--outside`
+/// reach `oximg resize`, the JSON reports the shape each one promises,
+/// and a 0 axis comes back as the CLI's usage error. photo.jpg is
+/// 200x150.
+#[test]
+fn resize_modes_pass_through() {
+    let dims = |v: &Value| (v["probe"]["width"].as_u64(), v["probe"]["height"].as_u64());
+    let (code, v) = run(&["resize", &fixture("photo.jpg"), "100", "100", "--crop"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(dims(&v), (Some(100), Some(100)));
+    let (code, v) = run(&["resize", &fixture("photo.jpg"), "100", "100", "--outside"]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(dims(&v), (Some(133), Some(100)));
+    let (code, v) = run(&["resize", &fixture("photo.jpg"), "100", "0", "--crop"]);
+    assert_eq!(code, 2, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("need both"), "{v}");
+}

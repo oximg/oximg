@@ -100,6 +100,7 @@ resize:
   -f, --format FMT          {}
   -q, --quality N           JPEG quality 1-100
   --preset P                jpegli | fast | small
+  --crop, --outside         Passed through: the resize mode
   JSON adds `peak_rss_bytes` (the child's peak RSS; null off Unix) and,
   when oximg printed an estimate (`--env OXIMG_LOG_DECODED_BYTES_ABOVE=1`),
   `decoded_bytes`: {{format, total, terms: {{staged, ...}}}}.

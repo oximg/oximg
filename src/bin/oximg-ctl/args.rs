@@ -56,6 +56,10 @@ pub struct ResizeArgs {
     pub icc: Option<String>,
     /// `Some(false)` is `--no-auto-rotate`, `Some(true)` `--auto-rotate`.
     pub auto_rotate: Option<bool>,
+    /// `--crop` / `--outside` in the order given, passed through
+    /// unvalidated: the CLI's refusal of a pair, or of a 0 axis, is part
+    /// of what gets proved.
+    pub modes: Vec<String>,
 }
 
 pub struct StripArgs {
@@ -346,6 +350,7 @@ fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
     let mut preset = None;
     let mut icc = None;
     let mut auto_rotate = None;
+    let mut modes = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -364,6 +369,7 @@ fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
             }
             "--auto-rotate" => auto_rotate = Some(true),
             "--no-auto-rotate" => auto_rotate = Some(false),
+            "--crop" | "--outside" => modes.push(a.clone()),
             "-f" | "--format" => {
                 format = Some(
                     it.next()
@@ -394,7 +400,7 @@ fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
     let [input, w, h] = positional.as_slice() else {
         return Err(CtlError::usage(
             "usage: oximg-ctl resize <in> <max_w> <max_h> [--out PATH] [-f fmt] [-q N] \
-             [--preset P] [--icc keep|strip] [--[no-]auto-rotate]",
+             [--preset P] [--icc keep|strip] [--[no-]auto-rotate] [--crop|--outside]",
         ));
     };
     Ok(ResizeArgs {
@@ -407,6 +413,7 @@ fn parse_resize(args: &[String]) -> Result<ResizeArgs, CtlError> {
         preset,
         icc,
         auto_rotate,
+        modes,
     })
 }
 
