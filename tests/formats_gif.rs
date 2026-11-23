@@ -34,7 +34,12 @@ mod native_modes {
 
     // Parse the bench interchange independently, comparing by timestamps:
     // libwebp may merge frames, so indices are not a fidelity oracle.
-    fn compare_visible(reference: &[u8], decoded: &[u8], exact: bool) {
+    //
+    // Alpha must match in every mode: WebP codes it losslessly even beside
+    // lossy color, so a wrong disposal or a lost transparent region shows
+    // here whatever the mode. Visible RGB must be within `rgb_tolerance`
+    // (0 for lossless); `None` leaves it unchecked.
+    fn compare_visible(reference: &[u8], decoded: &[u8], rgb_tolerance: Option<u8>) {
         assert_eq!(&reference[..20], &decoded[..20], "canvas/loop changed");
         assert_eq!(u32_at(reference, 24), u32_at(decoded, 24));
         let size = (u32_at(reference, 8) * u32_at(reference, 12) * 4) as usize;
@@ -51,12 +56,11 @@ mod native_modes {
         for time in a.iter().chain(&b).map(|(t, _)| *t) {
             let x = &a.iter().rfind(|(t, _)| *t <= time).unwrap().1;
             let y = &b.iter().rfind(|(t, _)| *t <= time).unwrap().1;
-            if exact {
-                for (x, y) in x.as_chunks::<4>().0.iter().zip(y.as_chunks::<4>().0) {
-                    assert_eq!(x[3], y[3], "alpha at {time}");
-                    if x[3] != 0 {
-                        assert_eq!(&x[..3], &y[..3], "RGB at {time}");
-                    }
+            for (x, y) in x.as_chunks::<4>().0.iter().zip(y.as_chunks::<4>().0) {
+                assert_eq!(x[3], y[3], "alpha at {time}");
+                if let Some(tolerance) = rgb_tolerance.filter(|_| x[3] != 0) {
+                    let near = (0..3).all(|c| x[c].abs_diff(y[c]) <= tolerance);
+                    assert!(near, "RGB at {time}: {y:?} is not {x:?}");
                 }
             }
         }
@@ -103,7 +107,20 @@ mod native_modes {
                         assert_eq!(out.bytes, pipeline::process(&src, &p).unwrap().0);
                     }
                     let decoded = gif_bench::decode_webp(&out.bytes).unwrap();
-                    compare_visible(&reference, &decoded, mode == Mode::Lossless);
+                    let rgb_tolerance = match mode {
+                        Mode::Lossless => Some(0),
+                        // Unresized, lossy color lands within 1 of the
+                        // reference (q100, flat regions on whole chroma
+                        // blocks); 12 is the slack `assert_near` gives.
+                        _ if width == 8 => Some(12),
+                        // On the 5x5 canvas 4:2:0 chroma smears the
+                        // red/green edge by up to 104 levels over a
+                        // third of the pixels: no bound that passes
+                        // would tell a wrong frame from a right one, so
+                        // only alpha is checked there.
+                        _ => None,
+                    };
+                    compare_visible(&reference, &decoded, rgb_tolerance);
                 }
             }
         }
