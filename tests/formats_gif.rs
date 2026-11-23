@@ -759,63 +759,111 @@ fn probe_animation_reports_only_real_animations() {
     );
 }
 
-/// `complete` (#191) is the one field that tells a cut animation from a
-/// whole one: every cut that still has a summary reports the frames that
-/// arrived — and prices them, unchanged — with `complete: false`, and
-/// only the whole file says `true`. Exhaustive over every cut, because
-/// the boundary that matters is the last one: losing only the trailer
-/// byte keeps all three frames.
+/// `complete` (#191) is the one field that tells a cut GIF from a whole
+/// one, animated or not. Every cut either fails to parse or reports
+/// `complete: false`; only the whole file says `true`. Exhaustive over
+/// every cut, for two boundaries: a cut inside the first frame — the
+/// commonest damaged upload — has no animation summary and otherwise
+/// reads as a healthy still, and losing only the trailer byte keeps all
+/// three frames. Pricing is the frames that arrived, unchanged.
 #[test]
 fn probe_is_complete_only_once_the_trailer_arrives() {
-    let src = fixture("anim.gif");
-    let full = pipeline::probe_animation(&src).unwrap().unwrap();
-    assert!(full.complete, "{full:?}");
-    assert_eq!(*src.last().unwrap(), 0x3B, "the last byte is the trailer");
-
-    let mut seen = std::collections::BTreeSet::new();
-    let mut last = 0;
-    for cut in 1..src.len() {
-        let Ok(Some(a)) = pipeline::probe_animation(&src[..cut]) else {
-            continue;
-        };
-        assert!(!a.complete, "cut at {cut}/{}: {a:?}", src.len());
-        assert!(a.frames >= last, "cut at {cut}: frames went backwards");
-        last = a.frames;
-        // Priced by what arrived, exactly as before #191: anim.gif's
-        // frames are full 120x90 canvases of 50 cs each.
+    for name in ["anim.gif", "still.gif"] {
+        let src = fixture(name);
         assert_eq!(
-            a.decode_work,
-            Some(a.frames as u64 * 120 * 90),
-            "cut at {cut}"
+            *src.last().unwrap(),
+            0x3B,
+            "{name}: the last byte is the trailer"
         );
-        assert_eq!(a.duration_ms, a.frames as u64 * 500, "cut at {cut}");
-        assert_eq!(a.loop_count, full.loop_count, "cut at {cut}");
-        seen.insert(a.frames);
-    }
-    assert_eq!(
-        seen,
-        [2, 3].into(),
-        "two and three frames both survive a cut"
-    );
-    // Only the trailer missing: the whole summary, but for `complete`.
-    assert_eq!(
-        pipeline::probe_animation(&src[..src.len() - 1]).unwrap(),
-        Some(pipeline::Animation {
-            complete: false,
-            ..full
-        })
-    );
+        let whole = pipeline::probe_source(&src).unwrap();
+        assert_eq!(whole.complete, Some(true), "{name}");
 
-    // Bytes after the trailer are not read at all.
-    let padded = [&src[..], b"\0trailing junk"].concat();
-    assert_eq!(pipeline::probe_animation(&padded).unwrap(), Some(full));
-    // "Trailer seen", not merely "not truncated": an unknown block where
-    // the trailer belongs ends the walk with all three frames, and is
-    // no more complete than a cut.
-    let mut corrupt = src.clone();
-    *corrupt.last_mut().unwrap() = 0x99;
-    let a = pipeline::probe_animation(&corrupt).unwrap().unwrap();
-    assert_eq!((a.frames, a.complete), (3, false));
+        let mut seen = std::collections::BTreeSet::new();
+        for cut in 1..src.len() {
+            let Ok(p) = pipeline::probe_source(&src[..cut]) else {
+                continue;
+            };
+            assert_eq!(p.complete, Some(false), "{name} cut at {cut}/{}", src.len());
+            if let Some(a) = p.animation {
+                // anim.gif's frames are full 120x90 canvases of 50 cs.
+                assert_eq!(
+                    a.decode_work,
+                    Some(a.frames as u64 * 120 * 90),
+                    "cut at {cut}"
+                );
+                assert_eq!(a.duration_ms, a.frames as u64 * 500, "cut at {cut}");
+            }
+            seen.insert(p.animation.map(|a| a.frames));
+        }
+        let want: Vec<Option<usize>> = if whole.animation.is_some() {
+            vec![None, Some(2), Some(3)]
+        } else {
+            vec![None]
+        };
+        assert_eq!(seen, want.into_iter().collect(), "{name}");
+        // Only the trailer missing: the whole summary, but incomplete.
+        let last = pipeline::probe_source(&src[..src.len() - 1]).unwrap();
+        assert_eq!(
+            (last.animation, last.complete),
+            (whole.animation, Some(false))
+        );
+        // Bytes after the trailer are not read at all.
+        let padded = [&src[..], b"\0trailing junk"].concat();
+        assert_eq!(pipeline::probe_source(&padded).unwrap(), whole, "{name}");
+        // "Trailer seen", not merely "not truncated": an unknown block
+        // where the trailer belongs ends the walk with every frame.
+        let mut corrupt = src.clone();
+        *corrupt.last_mut().unwrap() = 0x99;
+        let p = pipeline::probe_source(&corrupt).unwrap();
+        assert_eq!((p.animation, p.complete), (whole.animation, Some(false)));
+    }
+}
+
+/// The two damaged shapes the issue's reporter found that are not a cut
+/// frame: bytes after the signature that never form a block (the
+/// "dimensions" are whatever sat at offsets 6-9), and a well-formed file
+/// with no image in it. Both probe — the header is what the server's
+/// size gate reads too — and neither is complete.
+#[test]
+fn a_gif_with_no_frame_is_not_complete() {
+    let ascii = b"GIF89aHello, world!!".to_vec();
+    let p = pipeline::probe_source(&ascii).unwrap();
+    assert_eq!((p.animation, p.complete), (None, Some(false)));
+
+    let empty = build_gif(4, 4, vec![]);
+    assert_eq!(*empty.last().unwrap(), 0x3B);
+    let p = pipeline::probe_source(&empty).unwrap();
+    assert_eq!((p.animation, p.complete), (None, Some(false)));
+}
+
+/// No false alarm on a whole GIF, whatever its writer put in it: local
+/// palettes, interlacing, transparency, frames off the screen origin,
+/// and the loop extension (#191).
+#[test]
+fn whole_gifs_of_every_shape_probe_complete() {
+    let mut local = frame(1, 1, 2, 2, &[0, 1, 1, 0], Some(0));
+    local.palette = Some(vec![9, 9, 9, 200, 100, 50]);
+    let mut interlaced = frame(0, 0, 4, 4, &[1; 16], None);
+    interlaced.interlaced = true;
+    let gifs = [
+        build_gif(4, 4, vec![frame(0, 0, 4, 4, &[1; 16], None)]),
+        build_gif(4, 4, vec![local.clone()]),
+        build_gif(4, 4, vec![interlaced.clone()]),
+        build_gif(4, 4, vec![interlaced, local]),
+        build_gif_repeat(
+            4,
+            4,
+            gif::Repeat::Finite(2),
+            vec![frame(0, 0, 4, 4, &[1; 16], None); 3],
+        ),
+    ];
+    for (i, g) in gifs.iter().enumerate() {
+        assert_eq!(
+            pipeline::probe_source(g).unwrap().complete,
+            Some(true),
+            "gif {i}"
+        );
+    }
 }
 
 /// Truncation shows what arrived, as on the still path: whichever frames

@@ -223,8 +223,8 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
                 "duration_ms": 1500,
                 "loop_count": 0,
                 "decode_work": 32400,
-                "complete": true,
             },
+            "complete": true,
         })
     );
     assert_eq!(
@@ -234,14 +234,23 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
             "duration_ms": 200,
             "loop_count": 0,
             "decode_work": null,
-            "complete": true,
         })
     );
-    // Present and null, not absent: a still is an answer too.
-    for still in ["still.gif", "photo.jpg"] {
+    // Present and null, not absent: a still is an answer too. A GIF
+    // or WebP still is checked whole; a JPEG is not checked (#191).
+    for (still, complete) in [
+        ("still.gif", serde_json::json!(true)),
+        ("photo.webp", serde_json::json!(true)),
+        ("photo.jpg", serde_json::Value::Null),
+    ] {
         let v = probe(still);
-        assert!(v.as_object().unwrap().contains_key("animation"), "{v}");
+        let o = v.as_object().unwrap();
+        assert!(
+            o.contains_key("animation") && o.contains_key("complete"),
+            "{v}"
+        );
         assert!(v["animation"].is_null(), "{v}");
+        assert_eq!(v["complete"], complete, "{v}");
     }
     // The flag may come first; any other option is refused, as resize
     // and strip refuse one.
@@ -258,13 +267,13 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option \"--yaml\""));
 }
 
-/// A source cut short says so (#191), in both shapes: the frames that
-/// arrived, `complete: false` in the JSON, and `, incomplete` last on
-/// the line, where the gem's `PROBE_LINE` tolerates it. anim.gif loses
-/// only its trailer byte and keeps all three frames; cut to 318 bytes,
-/// two; animated.webp cut to 200 bytes is still an animation.
+/// A source cut short says so (#191), in both shapes: top-level
+/// `complete: false` in the JSON, and `, incomplete` last on the line,
+/// where the gem's `PROBE_LINE` tolerates it. On an animation the
+/// summary keeps the frames that arrived; on a GIF cut inside its first
+/// frame — or a still — there is no summary, and this is the only sign.
 #[test]
-fn probe_reports_a_truncated_animation_as_incomplete() {
+fn probe_reports_a_truncated_source_as_incomplete() {
     let probe = |name: &str, len: usize, json: bool| {
         let bytes = std::fs::read(fixture(name)).unwrap();
         let path = tmp(&format!("cut-{len}-{name}"));
@@ -283,36 +292,50 @@ fn probe_reports_a_truncated_animation_as_incomplete() {
         );
         (path, String::from_utf8(output.stdout).unwrap())
     };
-    let anim = |name: &str, len: usize| -> serde_json::Value {
+    let json = |name: &str, len: usize| -> (serde_json::Value, serde_json::Value) {
         let (_, out) = probe(name, len, true);
-        serde_json::from_str::<serde_json::Value>(&out).unwrap()["animation"].clone()
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        (v["animation"].clone(), v["complete"].clone())
     };
+    let no = serde_json::json!(false);
     assert_eq!(
-        anim("anim.gif", 476),
-        serde_json::json!({
-            "frames": 3, "duration_ms": 1500, "loop_count": 0,
-            "decode_work": 32400, "complete": false,
-        })
+        json("anim.gif", 476),
+        (
+            serde_json::json!({"frames": 3, "duration_ms": 1500, "loop_count": 0, "decode_work": 32400}),
+            no.clone()
+        )
     );
     assert_eq!(
-        anim("anim.gif", 318),
-        serde_json::json!({
-            "frames": 2, "duration_ms": 1000, "loop_count": 0,
-            "decode_work": 21600, "complete": false,
-        })
+        json("anim.gif", 318),
+        (
+            serde_json::json!({"frames": 2, "duration_ms": 1000, "loop_count": 0, "decode_work": 21600}),
+            no.clone()
+        )
     );
     assert_eq!(
-        anim("animated.webp", 200),
-        serde_json::json!({
-            "frames": 1, "duration_ms": 100, "loop_count": 0,
-            "decode_work": null, "complete": false,
-        })
+        json("animated.webp", 200),
+        (
+            serde_json::json!({"frames": 1, "duration_ms": 100, "loop_count": 0, "decode_work": null}),
+            no.clone()
+        )
     );
+    // Cut inside the first frame: no summary, and still incomplete.
+    assert_eq!(json("anim.gif", 120), (serde_json::Value::Null, no.clone()));
+    assert_eq!(json("still.gif", 600), (serde_json::Value::Null, no));
+
     let (path, line) = probe("anim.gif", 476, false);
     assert_eq!(
         line,
         format!(
             "{}: image/gif 120x90 (10800 stored pixels), 3 frames, 1500ms, looping forever, incomplete\n",
+            path.display()
+        )
+    );
+    let (path, line) = probe("still.gif", 600, false);
+    assert_eq!(
+        line,
+        format!(
+            "{}: image/gif 240x180 (43200 stored pixels), incomplete\n",
             path.display()
         )
     );

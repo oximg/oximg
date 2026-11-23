@@ -35,11 +35,11 @@ want.each do |name, expected|
 end
 # The whole-source read (animation: true), by the same three routes.
 anim = File.join(fixtures, "anim.gif")
-summary = {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: true}
+summary = [{frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}, true]
 got = [
   Oximg.probe(anim, animation: true),
   File.open(anim, "rb") { |file| Oximg.probe(file, animation: true) },
   Oximg.probe(StringIO.new(File.binread(anim)), animation: true)
-].map { |probed| probed[:animation] }
+].map { |probed| probed.values_at(:animation, :complete) }
 abort "anim.gif animation: #{got.inspect}, want #{summary.inspect}" unless got.uniq == [summary]
 puts "ok: #{File.basename(library)} probes in-process on #{RUBY_PLATFORM} (ruby #{RUBY_VERSION})"

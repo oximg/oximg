@@ -93,29 +93,44 @@ class Oximg::NativeTest < Oximg::Test
     with_library do
       assert_equal(
         upright("image/gif", :gif, 120, 90)
-          .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: true}),
+          .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}, complete: true),
         Oximg.probe(fixture("anim.gif"), animation: true)
       )
-      assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil, complete: true},
+      assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil},
         Oximg.probe(fixture("animated.webp"), animation: true)[:animation])
       still = Oximg.probe(fixture("still.gif"), animation: true)
       assert still.key?(:animation)
       assert_nil still[:animation]
+      assert_equal true, still[:complete]
+      # The ninth slot's zero: not checked, never "whole".
+      jpeg = Oximg.probe(fixture("photo.jpg"), animation: true)
+      assert jpeg.key?(:complete)
+      assert_nil jpeg[:complete]
       refute Oximg.probe(fixture("anim.gif")).key?(:animation)
     end
   end
 
-  # A source cut short (#191), through the library: the ninth slot.
-  def test_reports_a_truncated_animation
+  # A source cut short (#191), through the library: the ninth slot,
+  # the same answers as the spawned probe gives.
+  def test_reports_a_truncated_source
     with_library do
       gif = File.binread(fixture("anim.gif"))
-      assert_equal({frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: false},
-        Oximg.probe(StringIO.new(gif.byteslice(0, gif.bytesize - 1)), animation: true)[:animation])
-      assert_equal({frames: 2, duration_ms: 1000, loop_count: 0, decode_work: 21_600, complete: false},
-        Oximg.probe(StringIO.new(gif.byteslice(0, 318)), animation: true)[:animation])
+      still = File.binread(fixture("still.gif"))
       webp = File.binread(fixture("animated.webp"))
-      assert_equal({frames: 1, duration_ms: 100, loop_count: 0, decode_work: nil, complete: false},
-        Oximg.probe(StringIO.new(webp.byteslice(0, 200)), animation: true)[:animation])
+      photo = File.binread(fixture("photo.webp"))
+      {
+        gif.byteslice(0, gif.bytesize - 1) => {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400},
+        gif.byteslice(0, 318) => {frames: 2, duration_ms: 1000, loop_count: 0, decode_work: 21_600},
+        # Cut inside the first frame, and a still: no summary, and
+        # complete: false is the only sign.
+        gif.byteslice(0, 120) => nil,
+        still.byteslice(0, 600) => nil,
+        webp.byteslice(0, 200) => {frames: 1, duration_ms: 100, loop_count: 0, decode_work: nil},
+        photo.byteslice(0, photo.bytesize / 2) => nil
+      }.each do |bytes, summary|
+        probed = Oximg.probe(StringIO.new(bytes), animation: true)
+        assert_equal [summary, false], probed.values_at(:animation, :complete), "#{bytes.bytesize} bytes"
+      end
     end
   end
 

@@ -125,33 +125,49 @@ fn probe_anim_gif_reports_frames() {
     // Three full-canvas 120x90 frames: what OXIMG_MAX_ANIM_DECODE_WORK
     // is compared against (#187).
     assert_eq!(v["probe"]["animation"]["decode_work"], 32400);
-    assert_eq!(v["probe"]["animation"]["complete"], true);
+    assert_eq!(v["probe"]["complete"], true);
     // An animated WebP has frames but no decode budget to price.
     let (code, v) = run(&["probe", &fixture("animated.webp")]);
     assert_eq!(code, 0, "{v}");
     assert_eq!(v["probe"]["animation"]["frames"], 2);
     assert!(v["probe"]["animation"]["decode_work"].is_null(), "{v}");
-    assert_eq!(v["probe"]["animation"]["complete"], true);
+    assert_eq!(v["probe"]["complete"], true);
 }
 
-/// A truncated upload is told from a whole one (#191): anim.gif without
-/// its trailer byte keeps its three frames — and the decode work they
-/// are priced at — and reports `complete: false`.
+/// A truncated upload is told from a whole one (#191). anim.gif
+/// without its trailer byte keeps its three frames — and the decode
+/// work they are priced at — and reports `probe.complete: false`; cut
+/// inside its first frame it has no summary and says the same. A JPEG
+/// is not checked: null.
 #[test]
-fn probe_reports_a_gif_without_its_trailer_as_incomplete() {
+fn probe_reports_a_truncated_gif_as_incomplete() {
     let bytes = std::fs::read(fixture("anim.gif")).unwrap();
-    let path = std::env::temp_dir().join(format!("oximg-ctl-{}-cut.gif", std::process::id()));
-    std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
-    let (code, v) = run(&["probe", path.to_str().unwrap()]);
-    std::fs::remove_file(&path).ok();
+    for len in [bytes.len() - 1, 120] {
+        let path =
+            std::env::temp_dir().join(format!("oximg-ctl-{}-cut{len}.gif", std::process::id()));
+        std::fs::write(&path, &bytes[..len]).unwrap();
+        let (code, v) = run(&["probe", path.to_str().unwrap()]);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(code, 0, "{v}");
+        assert_eq!(v["probe"]["complete"], false, "{v}");
+        let a = &v["probe"]["animation"];
+        if len == 120 {
+            assert!(a.is_null(), "{v}");
+        } else {
+            assert_eq!(
+                (&a["frames"], &a["decode_work"]),
+                (&3.into(), &32400.into()),
+                "{v}"
+            );
+        }
+    }
+    let (code, v) = run(&["probe", &fixture("photo.jpg")]);
     assert_eq!(code, 0, "{v}");
-    let a = &v["probe"]["animation"];
-    assert_eq!(
-        (&a["frames"], &a["decode_work"]),
-        (&3.into(), &32400.into()),
+    assert!(
+        v["probe"].as_object().unwrap().contains_key("complete"),
         "{v}"
     );
-    assert_eq!(a["complete"], false, "{v}");
+    assert!(v["probe"]["complete"].is_null(), "{v}");
 }
 
 #[test]

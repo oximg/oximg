@@ -62,7 +62,7 @@ pub fn print_help() {
                                 stored_pixels, orientation,\n                             \
                                 display_width, display_height, animation\n                             \
                                 {{frames, duration_ms, loop_count,\n                             \
-                                decode_work, complete}} or null (see\n                             \
+                                decode_work}} or null, complete (see\n                             \
                                 docs/features)\n  \
            oximg --version | --help",
         env!("CARGO_PKG_VERSION"),
@@ -322,9 +322,9 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {input}"))?;
     let header = pipeline::probe_header(&bytes)?;
     let (format, w, h) = (header.format, header.width, header.height);
-    let animation = pipeline::probe_animation(&bytes)?;
+    let source = pipeline::probe_source(&bytes)?;
     if json {
-        println!("{}", probe_json(&header, animation.as_ref()));
+        println!("{}", probe_json(&header, &source));
         return Ok(());
     }
     // A non-upright source names its orientation and the frame a viewer
@@ -342,24 +342,29 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
     // Frame count and duration are what the animation budgets
     // (OXIMG_MAX_ANIM_FRAMES / OXIMG_MAX_ANIM_WORK) are spent against,
     // so an operator can price a source here before serving it.
-    let anim = match animation {
+    let anim = match source.animation {
         Some(a) => format!(
-            ", {} frames, {}ms, {}{}",
+            ", {} frames, {}ms, {}",
             a.frames,
             a.duration_ms,
             match a.loop_count {
                 0 => "looping forever".to_string(),
                 1 => "playing once".to_string(),
                 n => format!("playing {n} times"),
-            },
-            // Last, so every earlier field stays where a reader of the
-            // line finds it (#191).
-            if a.complete { "" } else { ", incomplete" }
+            }
         ),
         None => String::new(),
     };
+    // Last, so every earlier field stays where a reader of the line
+    // finds it, and on a still too: a GIF cut inside its first frame
+    // has no summary to hang it on (#191).
+    let incomplete = if source.complete == Some(false) {
+        ", incomplete"
+    } else {
+        ""
+    };
     println!(
-        "{input}: {} {w}x{h} ({} stored pixels){orientation}{anim}",
+        "{input}: {} {w}x{h} ({} stored pixels){orientation}{anim}{incomplete}",
         format.content_type(),
         w as u64 * h as u64
     );
@@ -370,13 +375,11 @@ pub fn probe(args: &[String]) -> anyhow::Result<()> {
 /// line leaves out. `animation` is null for a source that is not
 /// animated; its `decode_work` is what `OXIMG_MAX_ANIM_DECODE_WORK` is
 /// compared against, null where that budget prices nothing (an
-/// animated WebP); its `complete` is false for a source cut short
-/// (#191). The Ruby gem's `Oximg.probe(animation: true)` reads
-/// this when it has no probe library.
-fn probe_json(
-    header: &pipeline::Header,
-    animation: Option<&pipeline::Animation>,
-) -> serde_json::Value {
+/// animated WebP). `complete` is false for a GIF or WebP cut short,
+/// animated or not, and null for a format the walk does not check
+/// (#191). The Ruby gem's `Oximg.probe(animation: true)` reads this
+/// when it has no probe library.
+fn probe_json(header: &pipeline::Header, source: &pipeline::SourceProbe) -> serde_json::Value {
     serde_json::json!({
         "content_type": header.format.content_type(),
         "width": header.width,
@@ -385,13 +388,13 @@ fn probe_json(
         "orientation": header.orientation,
         "display_width": header.display_width(),
         "display_height": header.display_height(),
-        "animation": animation.map(|a| serde_json::json!({
+        "animation": source.animation.map(|a| serde_json::json!({
             "frames": a.frames,
             "duration_ms": a.duration_ms,
             "loop_count": a.loop_count,
             "decode_work": a.decode_work,
-            "complete": a.complete,
         })),
+        "complete": source.complete,
     })
 }
 

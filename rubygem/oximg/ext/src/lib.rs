@@ -20,7 +20,7 @@ use std::ffi::c_int;
 
 use std::panic::catch_unwind;
 
-use oximg::pipeline::{self, Animation, Header, ProbeStep};
+use oximg::pipeline::{self, Header, ProbeStep, SourceProbe};
 
 /// The header parsed.
 pub const OK: c_int = 0;
@@ -40,7 +40,7 @@ pub const READ: c_int = 3;
 /// 3: the `oximg_probe_animation_*` entry points (#187). No older
 /// signature changed; the bump is so a gem that needs them names the
 /// version it wants instead of failing on a missing symbol.
-/// 4: the animation summary grew a ninth slot, `complete` (#191). A
+/// 4: the whole-source reads grew a ninth slot, `complete` (#191). A
 /// gem of ABI 3 would hand over eight slots for nine to be written.
 #[unsafe(no_mangle)]
 pub extern "C" fn oximg_probe_abi_version() -> u32 {
@@ -51,9 +51,18 @@ pub extern "C" fn oximg_probe_abi_version() -> u32 {
 /// three slots, then `frames` (0: the source is not animated, and the
 /// rest are 0 too), `duration_ms`, `loop_count` (0: forever),
 /// `decode_work`, and whether `decode_work` is priced at all (1 or 0:
-/// it is not for an animated WebP), and `complete` (1 or 0: 0 for a
-/// source cut short). As `pipeline::Animation`.
+/// it is not for an animated WebP). As `pipeline::Animation`. The ninth
+/// is `complete` whatever the animation, as `pipeline::SourceProbe`:
+/// [`NOT_CHECKED`], [`INCOMPLETE`] or [`COMPLETE`].
 pub const ANIMATION_SLOTS: usize = 9;
+
+/// The `complete` slot for a format the walk does not check (JPEG, PNG,
+/// AVIF). Zero, so it is never read as "whole" by mistake.
+pub const NOT_CHECKED: u64 = 0;
+/// The `complete` slot for a GIF or WebP cut short.
+pub const INCOMPLETE: u64 = 1;
+/// The `complete` slot for a GIF or WebP that arrived whole.
+pub const COMPLETE: u64 = 2;
 
 /// Probe the file at `path[..path_len]` (raw bytes, as the OS spells the
 /// name; no NUL needed), reading only as much of it as the header
@@ -274,12 +283,12 @@ pub unsafe extern "C" fn oximg_probe_animation_bytes(
     unsafe { finish_animation(result, out, msg, msg_cap) }
 }
 
-/// The header and the animation summary of a source held whole, as
-/// `oximg probe --json` reads them.
-fn probe_whole(bytes: &[u8]) -> Result<(Header, Option<Animation>), String> {
+/// The header, the animation summary and completeness of a source held
+/// whole, as `oximg probe --json` reads them.
+fn probe_whole(bytes: &[u8]) -> Result<(Header, SourceProbe), String> {
     let header = pipeline::probe_header(bytes).map_err(|e| format!("{e:#}"))?;
-    let animation = pipeline::probe_animation(bytes).map_err(|e| format!("{e:#}"))?;
-    Ok((header, animation))
+    let source = pipeline::probe_source(bytes).map_err(|e| format!("{e:#}"))?;
+    Ok((header, source))
 }
 
 type Probed = Result<Header, String>;
@@ -294,26 +303,31 @@ unsafe fn finish(
 }
 
 unsafe fn finish_animation(
-    result: std::thread::Result<Result<(Header, Option<Animation>), String>>,
+    result: std::thread::Result<Result<(Header, SourceProbe), String>>,
     out: *mut u64,
     msg: *mut u8,
     msg_cap: usize,
 ) -> c_int {
     unsafe {
-        report(result, msg, msg_cap, |(header, animation)| {
+        report(result, msg, msg_cap, |(header, source)| {
             let format = write_header(&header, out);
-            let slots = match animation {
+            let summary = match source.animation {
                 Some(a) => [
                     a.frames as u64,
                     a.duration_ms,
                     u64::from(a.loop_count),
                     a.decode_work.unwrap_or(0),
                     u64::from(a.decode_work.is_some()),
-                    u64::from(a.complete),
                 ],
-                None => [0; 6],
+                None => [0; 5],
             };
-            std::ptr::copy_nonoverlapping(slots.as_ptr(), out.add(3), slots.len());
+            let complete = match source.complete {
+                None => NOT_CHECKED,
+                Some(false) => INCOMPLETE,
+                Some(true) => COMPLETE,
+            };
+            std::ptr::copy_nonoverlapping(summary.as_ptr(), out.add(3), summary.len());
+            *out.add(ANIMATION_SLOTS - 1) = complete;
             format
         })
     }

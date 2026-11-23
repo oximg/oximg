@@ -47,6 +47,10 @@ module Oximg
     HEADER_SLOTS = 3
     ANIMATION_SLOTS = 9
 
+    # The complete slot (ext/src/lib.rs): 0 is a format the walk does
+    # not check, so a zeroed buffer never reads as "whole".
+    COMPLETE_VALUES = [nil, false, true].freeze
+
     # Room for an error message; the library cuts a longer one at a
     # character boundary.
     MESSAGE_BYTES = 1024
@@ -148,9 +152,9 @@ module Oximg
 
         summary = unless frames.zero?
           {frames: frames, duration_ms: duration_ms, loop_count: loop_count,
-           decode_work: priced.zero? ? nil : decode_work, complete: !complete.zero?}
+           decode_work: priced.zero? ? nil : decode_work}
         end
-        header.merge(animation: summary)
+        header.merge(animation: summary, complete: COMPLETE_VALUES.fetch(complete))
       end
 
       # nil when there is no library to use. Memoized either way, so a

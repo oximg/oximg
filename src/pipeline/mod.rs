@@ -907,7 +907,7 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Animation {
     /// Frames the container carries: for a source cut short (see
-    /// `complete`), the ones whose headers arrived.
+    /// [`SourceProbe::complete`]), the ones whose headers arrived.
     pub frames: usize,
     /// Total play time in milliseconds. For GIF this is the duration
     /// oximg would *emit*, not a verbatim sum: delays of 0 or 1
@@ -923,23 +923,74 @@ pub struct Animation {
     /// budget does not price — an animated WebP, which is served by its
     /// first frame and never decoded as an animation.
     pub decode_work: Option<u64>,
-    /// Whether the whole file arrived (#191). For GIF: the frame walk
-    /// reached the trailer (`0x3B`) instead of ending at a parse error.
-    /// For WebP: every byte the RIFF header declares is present. A
-    /// truncated source still reports the frames that did arrive — and a
-    /// GIF is still priced by them — so `false` is the only sign it was
-    /// cut. A single-frame GIF has no summary, so nothing says it there.
-    pub complete: bool,
+}
+
+/// What one walk over a whole source finds: its animation summary, and
+/// whether the file is structurally whole. See [`probe_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SourceProbe {
+    /// As [`probe_animation`] answers.
+    pub animation: Option<Animation>,
+    /// Whether the whole file arrived (#191), for the formats whose walk
+    /// can tell; `None` for the rest (JPEG, PNG, AVIF), meaning "not
+    /// checked", never "whole".
+    ///
+    /// - GIF: the block walk reached the trailer (`0x3B`), having seen
+    ///   at least one frame, instead of ending at a parse error —
+    ///   truncation or garbage alike.
+    /// - WebP: every byte the RIFF header declares is present and parses
+    ///   (libwebp's `WEBP_DEMUX_DONE`).
+    ///
+    /// Structural only: no pixel is decoded, so `true` does not promise
+    /// the LZW or VP8 data decodes. It is reported whether or not the
+    /// source is animated, because the commonest damaged upload — a GIF
+    /// cut inside its first frame — has no animation summary at all and
+    /// otherwise reads as a healthy still, which the server then answers
+    /// with a 422. Reporting only: budgets still price what arrived.
+    pub complete: Option<bool>,
+}
+
+/// Animation summary and completeness from one walk over the whole
+/// source — block headers for GIF, the RIFF chunk table for WebP, no
+/// pixel decoded. [`probe_animation`] is this, less `complete`.
+///
+/// # Examples
+///
+/// ```
+/// use oximg::pipeline;
+///
+/// let fixture = |name: &str| {
+///     std::fs::read(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR")))
+/// };
+/// let gif = fixture("anim.gif")?;
+/// let whole = pipeline::probe_source(&gif)?;
+/// assert_eq!(whole.animation.map(|a| a.frames), Some(3));
+/// assert_eq!(whole.complete, Some(true));
+///
+/// // Cut short, it reports the frames that arrived, and says so.
+/// let cut = pipeline::probe_source(&gif[..gif.len() - 1])?;
+/// assert_eq!((cut.animation.map(|a| a.frames), cut.complete), (Some(3), Some(false)));
+///
+/// // A still is checked too; a JPEG is not checked at all.
+/// let still = fixture("still.gif")?;
+/// assert_eq!(pipeline::probe_source(&still[..600])?.complete, Some(false));
+/// assert_eq!(pipeline::probe_source(&fixture("photo.jpg")?)?.complete, None);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn probe_source(bytes: &[u8]) -> Result<SourceProbe, Error> {
+    probe_source_inner(bytes).map_err(|e| Error::classify(e, false))
 }
 
 /// Animation summary from headers alone, the companion to [`probe`]:
 /// the frame count and duration that the `OXIMG_MAX_ANIM_*` budgets are
 /// spent against, so what a request will cost is inspectable before it
-/// is served.
+/// is served. Whether the source arrived whole is [`probe_source`].
 ///
 /// `None` means "no animation here": a GIF with a single frame, a WebP
-/// with no `ANIM` chunk (or cut before its first frame), or any other format — including an AVIF image
-/// sequence, which this build decodes as a still and so does not report.
+/// with no `ANIM` chunk (or cut before its first frame), or any other
+/// format — including an AVIF image sequence, which this build decodes
+/// as a still and so does not report.
 ///
 /// # Examples
 ///
@@ -955,18 +1006,13 @@ pub struct Animation {
 /// assert_eq!(anim.loop_count, 0, "loops forever");
 /// // Three full-canvas frames of 120x90.
 /// assert_eq!(anim.decode_work, Some(3 * 120 * 90));
-/// assert!(anim.complete, "the walk reached the trailer");
-///
-/// // Cut short, it reports the frames that arrived, and says so.
-/// let cut = pipeline::probe_animation(&bytes[..bytes.len() - 1])?.unwrap();
-/// assert_eq!((cut.frames, cut.complete), (3, false));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn probe_animation(bytes: &[u8]) -> Result<Option<Animation>, Error> {
-    probe_animation_inner(bytes).map_err(|e| Error::classify(e, false))
+    probe_source(bytes).map(|s| s.animation)
 }
 
-fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
+fn probe_source_inner(bytes: &[u8]) -> Result<SourceProbe> {
     let mut header = [0u8; 12];
     anyhow::ensure!(bytes.len() >= 12, "source too short");
     header.copy_from_slice(&bytes[..12]);
@@ -974,16 +1020,29 @@ fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
     match format {
         ImageFormat::Gif => {
             let scan = scan_gif(bytes)?;
-            Ok((scan.frames > 1).then_some(Animation {
-                frames: scan.frames,
-                duration_ms: scan.duration_ms,
-                loop_count: scan.loop_count,
-                decode_work: Some(scan.decode_work),
-                complete: scan.complete,
-            }))
+            Ok(SourceProbe {
+                animation: (scan.frames > 1).then_some(Animation {
+                    frames: scan.frames,
+                    duration_ms: scan.duration_ms,
+                    loop_count: scan.loop_count,
+                    decode_work: Some(scan.decode_work),
+                }),
+                // A trailer with no frame before it is a well-formed
+                // file with no image in it, which nothing can serve.
+                complete: Some(scan.complete && scan.frames > 0),
+            })
         }
-        ImageFormat::Webp => Ok(webp_animation(bytes)),
-        _ => Ok(None),
+        ImageFormat::Webp => {
+            let (animation, complete) = webp_scan(bytes);
+            Ok(SourceProbe {
+                animation,
+                complete: Some(complete),
+            })
+        }
+        _ => Ok(SourceProbe {
+            animation: None,
+            complete: None,
+        }),
     }
 }
 
