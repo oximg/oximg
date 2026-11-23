@@ -122,6 +122,14 @@ fn probe_anim_gif_reports_frames() {
     assert_eq!(v["probe"]["content_type"], "image/gif");
     assert_eq!(v["probe"]["animation"]["frames"], 3);
     assert_eq!(v["probe"]["animation"]["duration_ms"], 1500);
+    // Three full-canvas 120x90 frames: what OXIMG_MAX_ANIM_DECODE_WORK
+    // is compared against (#187).
+    assert_eq!(v["probe"]["animation"]["decode_work"], 32400);
+    // An animated WebP has frames but no decode budget to price.
+    let (code, v) = run(&["probe", &fixture("animated.webp")]);
+    assert_eq!(code, 0, "{v}");
+    assert_eq!(v["probe"]["animation"]["frames"], 2);
+    assert!(v["probe"]["animation"]["decode_work"].is_null(), "{v}");
 }
 
 #[test]

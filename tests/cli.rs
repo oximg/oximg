@@ -189,6 +189,73 @@ fn probe_prints_the_animation_summary_after_the_fields_the_gem_reads() {
     );
 }
 
+/// `probe --json` is the other contract with the Ruby gem (#187): what
+/// `Oximg.probe(animation: true)` reads when it spawns. Pinned whole, so
+/// a renamed or dropped field fails here. `decode_work` is the figure
+/// `OXIMG_MAX_ANIM_DECODE_WORK` is compared against — three full 120x90
+/// frames — and null for a WebP, which that budget does not price.
+#[test]
+fn probe_json_reports_the_header_and_the_animation_summary() {
+    let probe = |name: &str| -> serde_json::Value {
+        let output = bin()
+            .args(["probe", &fixture(name), "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("one JSON object on stdout")
+    };
+    assert_eq!(
+        probe("anim.gif"),
+        serde_json::json!({
+            "content_type": "image/gif",
+            "width": 120,
+            "height": 90,
+            "stored_pixels": 10800,
+            "orientation": 1,
+            "display_width": 120,
+            "display_height": 90,
+            "animation": {
+                "frames": 3,
+                "duration_ms": 1500,
+                "loop_count": 0,
+                "decode_work": 32400,
+            },
+        })
+    );
+    assert_eq!(
+        probe("animated.webp")["animation"],
+        serde_json::json!({
+            "frames": 2,
+            "duration_ms": 200,
+            "loop_count": 0,
+            "decode_work": null,
+        })
+    );
+    // Present and null, not absent: a still is an answer too.
+    for still in ["still.gif", "photo.jpg"] {
+        let v = probe(still);
+        assert!(v.as_object().unwrap().contains_key("animation"), "{v}");
+        assert!(v["animation"].is_null(), "{v}");
+    }
+    // The flag may come first; any other option is refused, as resize
+    // and strip refuse one.
+    let output = bin()
+        .args(["probe", "--json", &fixture("still.gif")])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = bin()
+        .args(["probe", &fixture("still.gif"), "--yaml"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option \"--yaml\""));
+}
+
 /// A non-upright source prints its orientation and displayed size
 /// first after the comma, where the gem reads it (#163); an upright one
 /// prints the line above, unchanged.

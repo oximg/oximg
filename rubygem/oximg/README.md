@@ -153,6 +153,46 @@ lays out at 3000x4000. A WebP keeps its EXIF after the image data, so
 probing one that has it reads the whole source. An `oximg` executable
 older than this gem reports every source as orientation 1.
 
+### Animation summary
+
+```ruby
+Oximg.probe("loop.gif", animation: true)
+#=> {content_type: "image/gif", format: :gif, width: 1521, height: 627,
+#    orientation: 1, display_width: 1521, display_height: 627,
+#    animation: {frames: 45, duration_ms: 9000, loop_count: 0, decode_work: 42_915_015}}
+```
+
+`animation: true` adds what the oximg server's animation budgets are
+spent against, so an app can decide per image, before it builds a URL,
+whether a GIF will come back animated or as its first frame (a server
+over budget answers 200 with the first frame, which a CDN then caches).
+
+- `frames` is compared with `OXIMG_MAX_ANIM_FRAMES`.
+- `decode_work` is compared with `OXIMG_MAX_ANIM_DECODE_WORK`: the sum,
+  over every source frame, of the larger of the canvas area and that
+  frame's own rectangle. A frame may be larger than the canvas, so this
+  is not always `frames * width * height`. It is `nil` for an animated
+  WebP, which that budget does not price.
+- `duration_ms` and `loop_count` (0 means forever) are what oximg would
+  emit: very short GIF delays are normalized, and a GIF asking for 3
+  repeats reports 4 plays.
+- The encode budget, `OXIMG_MAX_ANIM_WORK`, depends on the output size,
+  so it is yours to compute: `frames * output_width * output_height`.
+
+`animation:` is `nil` for a source that is not animated: a still, a GIF
+with one frame, an AVIF image sequence. Without the option the key is
+absent and `probe` is the header read described above.
+
+It is opt-in because it costs more. Counting a GIF's frames means
+walking every block to its end, so the whole source is read and held in
+memory for the call (no pixel is decoded), and a stream is read to its
+end. The frames counted are the ones present: a GIF cut off mid-stream
+reports those that arrived, and does not raise. Without the probe
+library this needs an `oximg` executable of 0.22 or later; an older one
+raises `ProcessingError` naming the version it found.
+
+### Sources
+
 A String is always a path, so bytes already in memory go in as a `StringIO`. An open `File` is
 read from its start, its position untouched, and it is the file you
 hold that is read, even if its name has since been replaced, renamed,

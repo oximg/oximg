@@ -112,7 +112,8 @@ module Oximg
   # comma (its absence means 1; the displayed size is derived here from
   # it, not read). Everything after
   # the comma — the animation summary, printed for an animated source
-  # only — is information the gem does not expose, and is deliberately
+  # only — is not read from this line (probe's <tt>animation: true</tt>
+  # asks the CLI for JSON instead), and is deliberately
   # left unparsed rather than matched: a pattern that stopped at
   # `pixels)` is what broke probe when the CLI added that summary, and a
   # pattern that spelled the summary out would break again on the next
@@ -137,6 +138,17 @@ module Oximg
         display_width: swapped ? height : width,
         display_height: swapped ? width : height
       }
+    end
+
+    # The hash for <tt>animation: true</tt>, from the object
+    # <tt>oximg probe --json</tt> prints (src/cli.rs).
+    def self.from_json(json)
+      summary = json.fetch("animation")&.then do |a|
+        {frames: a.fetch("frames"), duration_ms: a.fetch("duration_ms"),
+         loop_count: a.fetch("loop_count"), decode_work: a.fetch("decode_work")}
+      end
+      build(json.fetch("content_type"), json.fetch("width"), json.fetch("height"), json.fetch("orientation"))
+        .merge(animation: summary)
     end
   end
 
@@ -301,18 +313,40 @@ module Oximg
     # of the source as the header takes (see in_process_probe?). Without it,
     # it spawns <tt>oximg probe</tt>, which reads the whole source, and an
     # IO is copied to a tempfile first. The answer is the same.
-    def probe(source)
-      return probe_open_file(source) if open_regular_file?(source)
+    #
+    # <tt>animation: true</tt> adds +animation:+ to the hash: nil for a
+    # source that is not animated (a still, a one-frame GIF), else
+    # <tt>{frames:, duration_ms:, loop_count:, decode_work:}</tt> — what
+    # the server's animation budgets are spent against, so a caller can
+    # tell before building a URL whether a GIF will come back animated
+    # or as its first frame. +frames+ is compared with
+    # OXIMG_MAX_ANIM_FRAMES and +decode_work+ with
+    # OXIMG_MAX_ANIM_DECODE_WORK (the sum, over every frame, of the
+    # larger of the canvas and the frame's own rectangle; nil for an
+    # animated WebP, which that budget does not price). +duration_ms+
+    # and +loop_count+ (0: forever) are what oximg would emit. The
+    # encode budget, OXIMG_MAX_ANIM_WORK, depends on the output size:
+    # frames x output width x output height.
+    #
+    # It is opt-in because of its cost: counting frames walks the whole
+    # source, so all of it is read (and held in memory for the call)
+    # where the header alone takes a prefix, and a stream is read to its
+    # end. No pixel is decoded. Without the probe library it needs an
+    # oximg executable of 0.22 or later.
+    def probe(source, animation: false)
+      boolean(animation, "animation")
+      return probe_open_file(source, animation) if open_regular_file?(source)
 
       if stream?(source)
-        return Native.available? ? Native.probe_io(source) : probe_spawned_io(source)
+        return Native.probe_io(source, animation: animation) if Native.available?
+
+        return probe_spawned_io(source, animation)
       end
 
       path = expand(source, "source")
-      return Native.probe_path(path) if Native.available?
+      return Native.probe_path(path, animation: animation) if Native.available?
 
-      out, = Binary.run("probe", path)
-      parse_probe(out)
+      probe_spawned(path, animation)
     end
 
     # True when probe runs in-process, through the probe library (see
@@ -355,17 +389,16 @@ module Oximg
     # process has since left). Positioned reads leave its position
     # alone. A write-only File cannot be read that way, and is read by
     # its name.
-    def probe_open_file(file)
+    def probe_open_file(file, animation)
       readable = (file.fcntl(Fcntl::F_GETFL) & Fcntl::O_ACCMODE) != Fcntl::O_WRONLY
-      return Native.probe_file(file) if readable && Native.available?
+      return Native.probe_file(file, animation: animation) if readable && Native.available?
 
       # A File made from a descriptor (File.for_fd) has no name.
       name = file.path.to_s.empty? ? nil : File.expand_path(file.path)
       if name && (!readable || File.identical?(file, name))
-        return Native.probe_path(name) if Native.available?
+        return Native.probe_path(name, animation: animation) if Native.available?
 
-        out, = Binary.run("probe", name)
-        return parse_probe(out)
+        return probe_spawned(name, animation)
       end
       raise IOError, "a write-only File with no name cannot be probed" unless readable
 
@@ -382,9 +415,31 @@ module Oximg
           break
         end
         copy.flush
-        out, = Binary.run("probe", copy.path)
-        parse_probe(out)
+        probe_spawned(copy.path, animation)
       end
+    end
+
+    # The executable's answer for the file at +path+: its line, or with
+    # +animation+ its JSON. An oximg older than 0.22 has no
+    # <tt>probe --json</tt> and refuses the extra argument with its
+    # usage, before reading anything. Its line has no decode work, so
+    # there is nothing to fall back to: say what is missing.
+    def probe_spawned(path, animation)
+      unless animation
+        out, = Binary.run("probe", path)
+        return parse_probe(out)
+      end
+
+      begin
+        out, = Binary.run("probe", path, "--json")
+      rescue ProcessingError => e
+        raise unless e.status == 2 && e.message.include?("usage: oximg probe <file> (try --help)")
+
+        raise ProcessingError.new(
+          "probe(animation: true) needs oximg 0.22 or later; #{Binary.path} is #{Binary.version}", 2
+        )
+      end
+      Header.from_json(JSON.parse(out))
     end
 
     # Whether probe reads +source+ through #read rather than opening it
@@ -407,15 +462,14 @@ module Oximg
     # goes through a tempfile. It is read through #read(n) alone, as the
     # library reads it, so probe takes the same IO either way
     # (IO.copy_stream would also pass #read a buffer).
-    def probe_spawned_io(io)
+    def probe_spawned_io(io, animation)
       Tempfile.create("oximg-probe") do |file|
         file.binmode
         while (chunk = io.read(1 << 20)) && !chunk.empty?
           file.write(chunk)
         end
         file.flush
-        out, = Binary.run("probe", file.path)
-        parse_probe(out)
+        probe_spawned(file.path, animation)
       end
     end
 
