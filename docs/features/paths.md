@@ -112,7 +112,7 @@ a new code, never a rename); `message` is for humans and may change.
 The library's `NotRotatedCode::as_str` is the spelling; the Ruby gem's
 `Oximg::Stripped#not_rotated` gives the code as a Symbol.
 
-### `oximg probe --json` and the animation summary
+### `oximg probe --json`, the animation summary and `complete`
 
 `oximg probe <file> --json` prints one JSON object on stdout instead of
 the line; a failure is a non-zero exit with the reason on stderr.
@@ -120,8 +120,8 @@ the line; a failure is a non-zero exit with the reason on stderr.
 ```json
 {"content_type": "image/gif", "width": 120, "height": 90, "stored_pixels": 10800,
  "orientation": 1, "display_width": 120, "display_height": 90,
- "animation": {"frames": 3, "duration_ms": 1500, "loop_count": 0, "decode_work": 32400,
-               "complete": true}}
+ "animation": {"frames": 3, "duration_ms": 1500, "loop_count": 0, "decode_work": 32400},
+ "complete": true}
 ```
 
 `animation` is null for a source that is not animated (a still, a
@@ -136,31 +136,48 @@ ceil(frames / `OXIMG_ANIM_FRAME_STEP`) × output width × output height.
 Counted from block headers, no
 LZW decode: a GIF cut off mid-stream reports the frames that arrived.
 
-`complete` (#191) is false for a source cut short, which otherwise
-reads as a whole animation with fewer frames: for GIF, the frame walk
-ended at a parse error instead of the trailer (`0x3B`) — truncation or
-corruption alike; for WebP, the file is shorter than its RIFF header
-declares (libwebp's `WEBP_DEMUX_DONE` not reached). It is reporting
-only: `frames` and `decode_work` stay what arrived, and the server
-prices and serves a truncated GIF by them exactly as before. A WebP cut
-before its first frame, like any one-frame GIF, has `animation: null`,
-so a truncated one-frame GIF is not flagged. The line adds
-`, incomplete` after the loop count.
+`complete` (#191) says whether the source arrived whole, and is there
+for every image, animated or not: the commonest damaged upload, a GIF
+cut inside its first frame, has `animation: null` and otherwise reads
+as a healthy still, which the server then answers with a 422.
+
+| format | `complete: false` when | `true` when |
+|---|---|---|
+| GIF | the block walk ends at a parse error (truncation or garbage alike), or reaches the trailer having seen no frame | it reaches the trailer (`0x3B`) after at least one frame |
+| WebP | the file is shorter than its RIFF header declares, or does not parse (libwebp's `WEBP_DEMUX_DONE` not reached) | every declared byte is present and parses |
+| JPEG, PNG, AVIF | — (`complete: null`: not checked, never "whole") | — |
+
+Structural only: no pixel is decoded, so `true` does not promise the
+LZW or VP8 data decodes. Reporting only: a truncated animation's
+`frames` and `decode_work` are what arrived, and the server prices and
+serves it by them exactly as before. Bytes after a GIF's trailer or
+past a WebP's RIFF size are not read. A GIF whose bytes after the
+signature never form a block probes (its "dimensions" are what sat at
+offsets 6-9, the same the server's size gate reads) with
+`complete: false`. The line appends `, incomplete` last, after the
+animation summary if there is one.
 
 `oximg-ctl probe` reports the same under `probe.animation` (absent, not
-null, for a still), and the gem's `Oximg.probe(source, animation:
-true)` returns it as `animation:` — in-process through the probe
-library, else from this JSON (an oximg before 0.22 is refused by name).
-The gem's default probe stays a header read; the summary reads the
-whole source.
+null, for a still) and `probe.complete` (present, null where not
+checked), and so does every `probe` it attaches to an HTTP body. The
+gem's `Oximg.probe(source, animation: true)` returns them as
+`animation:` and `complete:` — in-process through the probe library,
+else from this JSON (an oximg before 0.22 is refused by name; 0.22
+prints no `complete`, which the gem reads as `nil`). The gem's default
+probe stays a header read and carries neither; these read the whole
+source.
 
 ```sh
 oximg probe tests/fixtures/anim.gif --json        # animation.decode_work == 32400
 oximg probe tests/fixtures/animated.webp --json   # animation.decode_work == null
 oximg probe tests/fixtures/still.gif --json       # animation == null
 oximg-ctl probe tests/fixtures/anim.gif           # probe.animation.decode_work == 32400
+oximg probe tests/fixtures/photo.jpg --json       # complete == null
 head -c 476 tests/fixtures/anim.gif > /tmp/cut.gif  # drop the trailer byte
-oximg probe /tmp/cut.gif --json                   # animation.frames == 3, animation.complete == false
+oximg probe /tmp/cut.gif --json                   # animation.frames == 3, complete == false
+head -c 120 tests/fixtures/anim.gif > /tmp/cut.gif  # cut inside the first frame
+oximg probe /tmp/cut.gif --json                   # animation == null, complete == false
+oximg-ctl probe /tmp/cut.gif                      # probe.complete == false
 ```
 
 ## Library (`oximg::pipeline`)
@@ -188,8 +205,10 @@ add the orientation (`Header {format, width, height, orientation}`,
 `EXIF` chunk through EOF; `probe_header_seek` answers the same from a
 seekable source but seeks over such a WebP's image data (the gem's
 path and descriptor probes); `probe_animation` reports `Animation {frames, duration_ms, loop_count,
-decode_work, complete}` for GIF/WebP (`decode_work` is `None` for WebP;
-`complete` is false for a source cut short). Embedders set
+decode_work}` for GIF/WebP (`decode_work` is `None` for WebP), and
+`probe_source` is the same walk returning `SourceProbe {animation,
+complete: Option<bool>}` (`#[non_exhaustive]`; `complete` as above,
+`None` where not checked). Embedders set
 `default-features = false` to drop the HTTP stack. Failures are
 `pipeline::Error`; match `kind()`, wildcard arm required (`ErrorKind`
 is `#[non_exhaustive]`).

@@ -339,8 +339,9 @@ pub(super) struct GifScan {
     /// GIF's own counting — see [`scan_gif`].
     pub loop_count: u32,
     /// Whether the walk ended at the trailer (`0x3B`) rather than at a
-    /// parse error (#191). Reporting only: the budgets are priced by
-    /// `frames` either way, so a truncated GIF costs what arrived.
+    /// parse error (#191), however many frames it saw. Reporting only:
+    /// the budgets are priced by `frames` either way, so a truncated GIF
+    /// costs what arrived.
     pub complete: bool,
 }
 

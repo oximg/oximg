@@ -12,28 +12,31 @@ HTTP interface without notice.
 
 ### Added
 
-- **Truncated animations are reported** (#191): the animation summary
-  gains `complete`, false for a source cut short — a GIF whose frame
-  walk ends before the trailer, a WebP shorter than its RIFF header
-  declares — so a truncated upload can be told from a whole one.
-  Reporting only: the frames that arrived are counted and priced as
-  before. It is in `pipeline::Animation`, `oximg probe --json` and
-  `oximg-ctl probe` (`animation.complete`), the probe line
-  (`, incomplete`), and the gem's `Oximg.probe(source, animation: true)`
-  (`nil` when spawned on an oximg 0.22 executable).
+- **Truncated GIF and WebP sources are reported** (#191): a probe that
+  reads the whole source gains `complete`, false for a GIF whose block
+  walk ends before its trailer and a WebP shorter than its RIFF header
+  declares, animated or not, so a truncated upload can be told from a
+  whole one. That includes the commonest case, a GIF cut inside its
+  first frame, which reads as a healthy still and is then refused by the
+  server with a 422. `null` for JPEG, PNG and AVIF, which are not
+  checked. Structural only: no pixel is decoded. Reporting only: the
+  frames that arrived are counted and priced as before. It is in
+  `pipeline::probe_source` (`SourceProbe {animation, complete}`),
+  `oximg probe --json` and `oximg-ctl probe` (top-level `complete`), the
+  probe line (`, incomplete`), and the gem's `Oximg.probe(source,
+  animation: true)` (`complete:`, `nil` when spawned on an oximg 0.22
+  executable).
 
 ### Changed
 
-- `pipeline::Animation` has a new public field, `complete`, so code
-  that builds or exhaustively destructures it needs updating.
-- The gem's probe library speaks ABI 4: the animation summary grew a
+- The gem's probe library speaks ABI 4: the whole-source reads write a
   ninth slot. A gem refuses a library of another ABI by name.
 
 ### Fixed
 
 - `probe_animation` on an animated WebP cut short reported `None`, as
   though the file were a still; it now reports the frames whose `ANMF`
-  header arrived, with `complete: false`.
+  header arrived.
 
 ## [0.22.0] - 2026-11-23
 

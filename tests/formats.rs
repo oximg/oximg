@@ -86,42 +86,80 @@ fn animated_webp_renders_first_frame() {
     assert_eq!(dims_of(&out), (32, 24), "cross-format first frame");
 }
 
-/// An animated WebP cut short (#191) keeps its animation summary — the
-/// frames whose `ANMF` header arrived, `complete: false` — instead of
-/// reading as a still, which is what a strict demux made of it. A cut
-/// before the first frame has nothing to summarize; only the whole file,
-/// every byte its RIFF header declares, is complete.
+/// A WebP cut short (#191) says so, animated or not, and nothing whole
+/// does. An animated one keeps its summary — the frames whose `ANMF`
+/// header arrived — instead of reading as a still, which is what a
+/// strict demux made of it; a still has no summary, and `complete` is
+/// the only sign. Exhaustive over every cut: every one is either refused
+/// or incomplete.
 #[test]
-fn truncated_animated_webp_probes_incomplete() {
-    let src = fixture("animated.webp");
-    let full = pipeline::probe_animation(&src).unwrap().unwrap();
-    assert_eq!(
-        (full.frames, full.duration_ms, full.complete),
-        (2, 200, true)
-    );
-
-    let mut seen = std::collections::BTreeSet::new();
-    for cut in 1..src.len() {
-        match pipeline::probe_animation(&src[..cut]) {
-            Ok(Some(a)) => {
-                assert!(!a.complete, "cut at {cut}/{}: {a:?}", src.len());
-                assert!(a.frames <= full.frames, "cut at {cut}: {a:?}");
-                assert_eq!(a.decode_work, None, "cut at {cut}");
-                seen.insert(a.frames);
+fn truncated_webp_probes_incomplete() {
+    for name in ["animated.webp", "photo.webp"] {
+        let src = fixture(name);
+        let whole = pipeline::probe_source(&src).unwrap();
+        assert_eq!(whole.complete, Some(true), "{name}");
+        let full = whole.animation;
+        let mut seen = std::collections::BTreeSet::new();
+        for cut in 1..src.len() {
+            match pipeline::probe_source(&src[..cut]) {
+                Ok(p) => {
+                    assert_eq!(p.complete, Some(false), "{name} cut at {cut}/{}", src.len());
+                    if let Some(a) = p.animation {
+                        assert!(
+                            a.frames <= full.unwrap().frames,
+                            "{name} cut at {cut}: {a:?}"
+                        );
+                        assert_eq!(a.decode_work, None, "{name} cut at {cut}");
+                    }
+                    seen.insert(p.animation.map(|a| a.frames));
+                }
+                // Only a cut inside the 12-byte RIFF header is refused.
+                Err(e) => assert!(cut < 12, "{name} cut at {cut}: {e:#}"),
             }
-            // Before the first frame, or before VP8X: no summary, and a
-            // cut inside the 12-byte RIFF header is an error.
-            Ok(None) => {}
-            Err(e) => assert!(cut < 12, "cut at {cut}: {e:#}"),
         }
+        // animated.webp's second ANMF chunk runs to the last byte, so a
+        // cut keeps the first frame or, before it, no summary at all.
+        let want = if full.is_some() {
+            vec![None, Some(1)]
+        } else {
+            vec![None]
+        };
+        assert_eq!(seen, want.into_iter().collect(), "{name}");
+        // Past the declared size is still whole: libwebp reads to
+        // riff_end and no further.
+        let padded = [&src[..], b"junk"].concat();
+        assert_eq!(pipeline::probe_source(&padded).unwrap(), whole, "{name}");
     }
-    // The second frame's ANMF chunk runs to the last byte, so every cut
-    // that keeps a summary keeps exactly the first frame.
-    assert_eq!(seen, [1].into(), "{seen:?}");
-    // Past the declared size is still complete: libwebp reads to
-    // riff_end and no further.
-    let padded = [&src[..], b"junk"].concat();
-    assert_eq!(pipeline::probe_animation(&padded).unwrap(), Some(full));
+}
+
+/// No false alarm on what oximg itself writes: every WebP the encoder
+/// produces from the fixtures — lossy, with alpha, with an ICC profile
+/// (VP8X), and animated — probes whole (#191). A `complete: false` on a
+/// good upload is the failure this field must never have.
+#[test]
+fn every_webp_oximg_writes_probes_complete() {
+    let p = Params {
+        output: Some(ImageFormat::Webp),
+        ..params(64)
+    };
+    let mut checked = 0;
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).unwrap()
+    {
+        let path = entry.unwrap().path();
+        let Ok((out, fmt)) = pipeline::process(&std::fs::read(&path).unwrap(), &p) else {
+            continue;
+        };
+        assert_eq!(fmt, ImageFormat::Webp, "{}", path.display());
+        let probed = pipeline::probe_source(&out).unwrap();
+        assert_eq!(
+            probed.complete,
+            Some(true),
+            "{}: {probed:?}",
+            path.display()
+        );
+        checked += 1;
+    }
+    assert!(checked >= 10, "only {checked} fixtures encoded");
 }
 
 #[test]

@@ -18,26 +18,28 @@ pub fn probe_value(bytes: &[u8]) -> Value {
                 "display_width": header.display_width(),
                 "display_height": header.display_height(),
             });
-            match pipeline::probe_animation(bytes) {
-                Ok(Some(Animation {
-                    frames,
-                    duration_ms,
-                    loop_count,
-                    decode_work,
-                    complete,
-                })) => {
-                    // decode_work is null where no budget prices it
-                    // (an animated WebP); complete is false for a
-                    // source cut short (#191).
-                    v["animation"] = json!({
-                        "frames": frames,
-                        "duration_ms": duration_ms,
-                        "loop_count": loop_count,
-                        "decode_work": decode_work,
-                        "complete": complete,
-                    });
+            match pipeline::probe_source(bytes) {
+                Ok(source) => {
+                    if let Some(Animation {
+                        frames,
+                        duration_ms,
+                        loop_count,
+                        decode_work,
+                    }) = source.animation
+                    {
+                        // decode_work is null where no budget prices it
+                        // (an animated WebP).
+                        v["animation"] = json!({
+                            "frames": frames,
+                            "duration_ms": duration_ms,
+                            "loop_count": loop_count,
+                            "decode_work": decode_work,
+                        });
+                    }
+                    // Present for every image: false for a GIF or WebP
+                    // cut short, null where nothing checks (#191).
+                    v["complete"] = json!(source.complete);
                 }
-                Ok(None) => {}
                 Err(e) => {
                     v["error"] = json!(e.to_string());
                     v["animation_error"] = json!(e.to_string());
@@ -159,13 +161,21 @@ mod tests {
         let v = probe_value(&fixture("anim.gif"));
         assert_eq!(v["animation"]["frames"], 3);
         assert_eq!(v["animation"]["duration_ms"], 1500);
-        assert_eq!(v["animation"]["complete"], true);
+        assert_eq!(v["complete"], true);
         // Without its trailer byte the same three frames arrive, and
-        // the summary says the file did not (#191).
+        // the probe says the file did not (#191).
         let bytes = fixture("anim.gif");
         let v = probe_value(&bytes[..bytes.len() - 1]);
         assert_eq!(v["animation"]["frames"], 3);
-        assert_eq!(v["animation"]["complete"], false);
+        assert_eq!(v["complete"], false);
+        // Cut inside its first frame there is no summary, and that is
+        // the case `complete` is for.
+        let v = probe_value(&bytes[..120]);
+        assert!(v.get("animation").is_none(), "{v}");
+        assert_eq!(v["complete"], false, "{v}");
+        // A JPEG is not checked: null, not true.
+        let v = probe_value(&fixture("photo.jpg"));
+        assert!(v["complete"].is_null(), "{v}");
     }
 
     #[test]

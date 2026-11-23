@@ -60,7 +60,7 @@ pub fn encode(src: &[u8], params: &Params, mode: Mode) -> Result<Output> {
         // not an animation measurement either: refuse it under the prefix
         // the driver skips a cell on.
         anyhow::ensure!(
-            mode == Mode::Reference || webp_animation(&bytes).is_some_and(|a| a.complete),
+            mode == Mode::Reference || matches!(webp_scan(&bytes), (Some(_), true)),
             "animation declined: encoder merged every frame into a still: {decision}"
         );
         Ok(Output { bytes, decision })
