@@ -31,7 +31,7 @@ module Oximg
     BUNDLED = File.expand_path("native/#{LIBRARY}", __dir__)
 
     # The library's oximg_probe_abi_version this code was written for.
-    ABI_VERSION = 3
+    ABI_VERSION = 4
 
     # Statuses (ext/src/lib.rs).
     OK = 0
@@ -42,10 +42,10 @@ module Oximg
 
     # What a call writes (ext/src/lib.rs): stored width, stored height
     # and orientation; with the animation summary, also frames (0: not
-    # animated), duration_ms, loop_count, decode_work, and whether
-    # decode_work is priced.
+    # animated), duration_ms, loop_count, decode_work, whether
+    # decode_work is priced, and whether the source is complete.
     HEADER_SLOTS = 3
-    ANIMATION_SLOTS = 8
+    ANIMATION_SLOTS = 9
 
     # Room for an error message; the library cuts a longer one at a
     # character boundary.
@@ -141,14 +141,14 @@ module Oximg
         text = msg.read_string.force_encoding(Encoding::UTF_8)
         raise ProcessingError.new(text, 1) unless status == OK
 
-        width, height, orientation, frames, duration_ms, loop_count, decode_work, priced =
+        width, height, orientation, frames, duration_ms, loop_count, decode_work, priced, complete =
           out.read_array_of_uint64(slots)
         header = Header.build(text, width, height, orientation)
         return header unless animation
 
         summary = unless frames.zero?
           {frames: frames, duration_ms: duration_ms, loop_count: loop_count,
-           decode_work: priced.zero? ? nil : decode_work}
+           decode_work: priced.zero? ? nil : decode_work, complete: !complete.zero?}
         end
         header.merge(animation: summary)
       end

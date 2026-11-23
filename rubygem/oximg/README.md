@@ -159,7 +159,8 @@ older than this gem reports every source as orientation 1.
 Oximg.probe("loop.gif", animation: true)
 #=> {content_type: "image/gif", format: :gif, width: 1521, height: 627,
 #    orientation: 1, display_width: 1521, display_height: 627,
-#    animation: {frames: 45, duration_ms: 9000, loop_count: 0, decode_work: 42_915_015}}
+#    animation: {frames: 45, duration_ms: 9000, loop_count: 0, decode_work: 42_915_015,
+#                complete: true}}
 ```
 
 `animation: true` adds what the oximg server's animation budgets are
@@ -181,6 +182,11 @@ over budget answers 200 with the first frame, which a CDN then caches).
   output_height`, where `step` is the server's `OXIMG_ANIM_FRAME_STEP`
   (1 unless set: every frame) and the output size is the display size
   fitted within the requested box, never enlarged.
+- `complete` is `false` for a source cut short: a GIF that ends before
+  its trailer byte, or a WebP shorter than its RIFF header declares. Use
+  it to reject a truncated upload, which otherwise looks like a whole
+  animation with fewer frames. It is `nil` when `probe` spawns an
+  `oximg` executable of 0.22, which does not report it.
 
 `animation:` is `nil` for a source that is not animated: a still, a GIF
 with one frame, an AVIF image sequence. Without the option the key is
@@ -190,7 +196,8 @@ It is opt-in because it costs more. Counting a GIF's frames means
 walking every block to its end, so the whole source is read and held in
 memory for the call (no pixel is decoded), and a stream is read to its
 end. The frames counted are the ones present: a GIF cut off mid-stream
-reports those that arrived, and does not raise. Without the probe
+reports those that arrived, with `complete: false`, and does not raise.
+A one-frame GIF has no summary, so a truncated one is not flagged. Without the probe
 library this needs an `oximg` executable of 0.22 or later; an older one
 raises `ProcessingError` naming the version it found.
 

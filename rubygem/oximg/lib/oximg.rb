@@ -145,7 +145,10 @@ module Oximg
     def self.from_json(json)
       summary = json.fetch("animation")&.then do |a|
         {frames: a.fetch("frames"), duration_ms: a.fetch("duration_ms"),
-         loop_count: a.fetch("loop_count"), decode_work: a.fetch("decode_work")}
+         loop_count: a.fetch("loop_count"), decode_work: a.fetch("decode_work"),
+         # nil, not a guess, from an executable that predates the field
+         # (0.22): this path runs whatever oximg is on PATH.
+         complete: a.fetch("complete", nil)}
       end
       build(json.fetch("content_type"), json.fetch("width"), json.fetch("height"), json.fetch("orientation"))
         .merge(animation: summary)
@@ -316,7 +319,7 @@ module Oximg
     #
     # <tt>animation: true</tt> adds +animation:+ to the hash: nil for a
     # source that is not animated (a still, a one-frame GIF), else
-    # <tt>{frames:, duration_ms:, loop_count:, decode_work:}</tt> — what
+    # <tt>{frames:, duration_ms:, loop_count:, decode_work:, complete:}</tt> — what
     # the server's animation budgets are spent against, so a caller can
     # tell before building a URL whether a GIF will come back animated
     # or as its first frame. +frames+ is compared with
@@ -328,7 +331,12 @@ module Oximg
     # encode budget, OXIMG_MAX_ANIM_WORK, depends on the output size:
     # frames encoded x output width x output height, where the frames
     # encoded are +frames+ divided by the server's OXIMG_ANIM_FRAME_STEP
-    # (1 unless set), rounded up.
+    # (1 unless set), rounded up. +complete+ is false for a source cut
+    # short — a GIF that ends before its trailer, a WebP shorter than its
+    # RIFF header declares — whose +frames+ are the ones that arrived,
+    # and which is priced by them; nil when the probe was spawned on an
+    # oximg executable of 0.22, which does not report it. A one-frame
+    # GIF has no summary, so a truncated one is not flagged.
     #
     # It is opt-in because of its cost: counting frames walks the whole
     # source, so all of it is read (and held in memory for the call)

@@ -24,10 +24,11 @@ class Oximg::ProbeTest < Oximg::Test
   def test_reads_the_json_of_an_animated_source
     json = {"content_type" => "image/gif", "width" => 120, "height" => 90, "stored_pixels" => 10_800,
             "orientation" => 1, "display_width" => 120, "display_height" => 90,
-            "animation" => {"frames" => 3, "duration_ms" => 1500, "loop_count" => 0, "decode_work" => 32_400}}
+            "animation" => {"frames" => 3, "duration_ms" => 1500, "loop_count" => 0, "decode_work" => 32_400,
+                             "complete" => true}}
     assert_equal(
       upright("image/gif", :gif, 120, 90)
-        .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}),
+        .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: true}),
       Oximg::Header.from_json(json)
     )
   end
@@ -44,9 +45,18 @@ class Oximg::ProbeTest < Oximg::Test
     assert_equal [6, 2000, 3000], probed.values_at(:orientation, :display_width, :display_height)
 
     webp = still.merge("content_type" => "image/webp", "animation" =>
-      {"frames" => 2, "duration_ms" => 200, "loop_count" => 1, "decode_work" => nil})
-    assert_equal({frames: 2, duration_ms: 200, loop_count: 1, decode_work: nil},
+      {"frames" => 2, "duration_ms" => 200, "loop_count" => 1, "decode_work" => nil, "complete" => false})
+    assert_equal({frames: 2, duration_ms: 200, loop_count: 1, decode_work: nil, complete: false},
       Oximg::Header.from_json(webp)[:animation])
+  end
+
+  # oximg 0.22 prints the summary without "complete" (#191): the gem
+  # still reads it, and says nil rather than guessing either way.
+  def test_reads_the_json_of_an_executable_that_predates_complete
+    json = {"content_type" => "image/gif", "width" => 120, "height" => 90, "orientation" => 1,
+            "animation" => {"frames" => 3, "duration_ms" => 1500, "loop_count" => 0, "decode_work" => 32_400}}
+    assert_equal({frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: nil},
+      Oximg::Header.from_json(json)[:animation])
   end
 
   # An object missing a field is not read as nil.
