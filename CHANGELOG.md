@@ -39,6 +39,13 @@ HTTP interface without notice.
   animation summary). A platform gem bundles a matching one; an
   `OXIMG_PROBE_LIB` built from an older checkout is refused by version.
 
+### Fixed
+
+- url 2.5.9 fixes a stack overflow in `Url::origin()` on a URL nesting
+  many `blob:` prefixes (RUSTSEC-2026-0592). oximg does not call it
+  itself; the crate comes in through reqwest, which the remote-source
+  fetches use.
+
 ## [0.21.0] - 2026-11-12
 
 Animated GIF sources get an optional budget for the decode half
