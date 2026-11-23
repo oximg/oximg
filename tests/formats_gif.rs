@@ -759,6 +759,65 @@ fn probe_animation_reports_only_real_animations() {
     );
 }
 
+/// `complete` (#191) is the one field that tells a cut animation from a
+/// whole one: every cut that still has a summary reports the frames that
+/// arrived — and prices them, unchanged — with `complete: false`, and
+/// only the whole file says `true`. Exhaustive over every cut, because
+/// the boundary that matters is the last one: losing only the trailer
+/// byte keeps all three frames.
+#[test]
+fn probe_is_complete_only_once_the_trailer_arrives() {
+    let src = fixture("anim.gif");
+    let full = pipeline::probe_animation(&src).unwrap().unwrap();
+    assert!(full.complete, "{full:?}");
+    assert_eq!(*src.last().unwrap(), 0x3B, "the last byte is the trailer");
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last = 0;
+    for cut in 1..src.len() {
+        let Ok(Some(a)) = pipeline::probe_animation(&src[..cut]) else {
+            continue;
+        };
+        assert!(!a.complete, "cut at {cut}/{}: {a:?}", src.len());
+        assert!(a.frames >= last, "cut at {cut}: frames went backwards");
+        last = a.frames;
+        // Priced by what arrived, exactly as before #191: anim.gif's
+        // frames are full 120x90 canvases of 50 cs each.
+        assert_eq!(
+            a.decode_work,
+            Some(a.frames as u64 * 120 * 90),
+            "cut at {cut}"
+        );
+        assert_eq!(a.duration_ms, a.frames as u64 * 500, "cut at {cut}");
+        assert_eq!(a.loop_count, full.loop_count, "cut at {cut}");
+        seen.insert(a.frames);
+    }
+    assert_eq!(
+        seen,
+        [2, 3].into(),
+        "two and three frames both survive a cut"
+    );
+    // Only the trailer missing: the whole summary, but for `complete`.
+    assert_eq!(
+        pipeline::probe_animation(&src[..src.len() - 1]).unwrap(),
+        Some(pipeline::Animation {
+            complete: false,
+            ..full
+        })
+    );
+
+    // Bytes after the trailer are not read at all.
+    let padded = [&src[..], b"\0trailing junk"].concat();
+    assert_eq!(pipeline::probe_animation(&padded).unwrap(), Some(full));
+    // "Trailer seen", not merely "not truncated": an unknown block where
+    // the trailer belongs ends the walk with all three frames, and is
+    // no more complete than a cut.
+    let mut corrupt = src.clone();
+    *corrupt.last_mut().unwrap() = 0x99;
+    let a = pipeline::probe_animation(&corrupt).unwrap().unwrap();
+    assert_eq!((a.frames, a.complete), (3, false));
+}
+
 /// Truncation shows what arrived, as on the still path: whichever frames
 /// are complete are kept, never more than the source claimed, and a cut
 /// that leaves only the first frame degrades to a still rather than

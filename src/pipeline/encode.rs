@@ -503,31 +503,39 @@ impl Drop for AnimEncoder {
     }
 }
 
-/// Animation summary of a WebP container: (frames, total duration in ms,
-/// loop count) — demux only, no frame is decoded. `None` when the file
-/// carries no `ANIM` chunk (or does not parse).
+/// Animation summary of a WebP container — demux only, no frame is
+/// decoded. `None` when the file carries no `ANIM` chunk, does not
+/// parse as far as its `VP8X` header, or ends before its first frame.
+///
+/// Demuxed with `allow_partial`, so a truncated animation still reports
+/// the frames whose `ANMF` header arrived (as a GIF does), with
+/// `complete: false`; without it libwebp refuses the whole file and a
+/// cut-off animation would read as a still (#191). `complete` is
+/// libwebp's `WEBP_DEMUX_DONE`: every byte the RIFF header declares is
+/// present and parsed — a different test from GIF's trailer, for the
+/// same question.
 // SAFETY: the demuxer borrows `srcbuf` (copy_data=0) and is deleted exactly once,
 // after every read of it. A zeroed WebPIterator is the documented pre-GetFrame
 // state, and each successfully fetched iterator is released before the next.
-pub(super) fn webp_animation(srcbuf: &[u8]) -> Option<(usize, u64, u32)> {
+// `state` is written by WebPDemuxInternal with one of the enum's own values.
+pub(super) fn webp_animation(srcbuf: &[u8]) -> Option<super::Animation> {
     use libwebp_sys as wp;
     unsafe {
         let data = wp::WebPData {
             bytes: srcbuf.as_ptr(),
             size: srcbuf.len(),
         };
-        let dmux = wp::WebPDemuxInternal(
-            &data,
-            0,
-            std::ptr::null_mut(),
-            wp::WEBP_DEMUX_ABI_VERSION as _,
-        );
+        let mut state = wp::WebPDemuxState::WEBP_DEMUX_PARSE_ERROR;
+        let dmux = wp::WebPDemuxInternal(&data, 1, &mut state, wp::WEBP_DEMUX_ABI_VERSION as _);
         if dmux.is_null() {
             return None;
         }
         let flags = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FORMAT_FLAGS);
-        let out = (flags & ANIMATION_FLAG != 0).then(|| {
-            let frames = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FRAME_COUNT);
+        let frames = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_FRAME_COUNT);
+        // A file cut before its first `ANMF` has no frame to summarize:
+        // `None`, as a GIF cut inside its first frame has none, and so
+        // frames == 0 keeps meaning "not animated" to every caller.
+        let out = (flags & ANIMATION_FLAG != 0 && frames > 0).then(|| {
             let loops = wp::WebPDemuxGetI(dmux, wp::WebPFormatFeature::WEBP_FF_LOOP_COUNT);
             // Durations live per frame, so the total is a walk over the
             // frame table — still no pixel work.
@@ -539,7 +547,15 @@ pub(super) fn webp_animation(srcbuf: &[u8]) -> Option<(usize, u64, u32)> {
                     wp::WebPDemuxReleaseIterator(&mut iter);
                 }
             }
-            (frames as usize, duration, loops)
+            super::Animation {
+                frames: frames as usize,
+                duration_ms: duration,
+                loop_count: loops,
+                // An animated WebP is served by its first frame and
+                // never decoded as an animation: no budget prices it.
+                decode_work: None,
+                complete: state == wp::WebPDemuxState::WEBP_DEMUX_DONE,
+            }
         });
         wp::WebPDemuxDelete(dmux);
         out

@@ -8,7 +8,7 @@
 //! NUL-terminated and cut at a UTF-8 boundary to fit `msg_cap`.
 //!
 //! The `oximg_probe_animation_*` entry points (#187) read the whole
-//! source rather than its header, and write eight slots: the three
+//! source rather than its header, and write nine slots: the three
 //! above, then the animation summary (see [`ANIMATION_SLOTS`]).
 //!
 //! Nothing may unwind into the caller: Ruby's frames are C frames, and
@@ -40,17 +40,20 @@ pub const READ: c_int = 3;
 /// 3: the `oximg_probe_animation_*` entry points (#187). No older
 /// signature changed; the bump is so a gem that needs them names the
 /// version it wants instead of failing on a missing symbol.
+/// 4: the animation summary grew a ninth slot, `complete` (#191). A
+/// gem of ABI 3 would hand over eight slots for nine to be written.
 #[unsafe(no_mangle)]
 pub extern "C" fn oximg_probe_abi_version() -> u32 {
-    3
+    4
 }
 
 /// What an `oximg_probe_animation_*` call writes to `out`: the header's
 /// three slots, then `frames` (0: the source is not animated, and the
 /// rest are 0 too), `duration_ms`, `loop_count` (0: forever),
 /// `decode_work`, and whether `decode_work` is priced at all (1 or 0:
-/// it is not for an animated WebP). As `pipeline::Animation`.
-pub const ANIMATION_SLOTS: usize = 8;
+/// it is not for an animated WebP), and `complete` (1 or 0: 0 for a
+/// source cut short). As `pipeline::Animation`.
+pub const ANIMATION_SLOTS: usize = 9;
 
 /// Probe the file at `path[..path_len]` (raw bytes, as the OS spells the
 /// name; no NUL needed), reading only as much of it as the header
@@ -306,8 +309,9 @@ unsafe fn finish_animation(
                     u64::from(a.loop_count),
                     a.decode_work.unwrap_or(0),
                     u64::from(a.decode_work.is_some()),
+                    u64::from(a.complete),
                 ],
-                None => [0; 5],
+                None => [0; 6],
             };
             std::ptr::copy_nonoverlapping(slots.as_ptr(), out.add(3), slots.len());
             format

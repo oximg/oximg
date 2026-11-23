@@ -35,7 +35,7 @@ want.each do |name, expected|
 end
 # The whole-source read (animation: true), by the same three routes.
 anim = File.join(fixtures, "anim.gif")
-summary = {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}
+summary = {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: true}
 got = [
   Oximg.probe(anim, animation: true),
   File.open(anim, "rb") { |file| Oximg.probe(file, animation: true) },

@@ -93,15 +93,29 @@ class Oximg::NativeTest < Oximg::Test
     with_library do
       assert_equal(
         upright("image/gif", :gif, 120, 90)
-          .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400}),
+          .merge(animation: {frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: true}),
         Oximg.probe(fixture("anim.gif"), animation: true)
       )
-      assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil},
+      assert_equal({frames: 2, duration_ms: 200, loop_count: 0, decode_work: nil, complete: true},
         Oximg.probe(fixture("animated.webp"), animation: true)[:animation])
       still = Oximg.probe(fixture("still.gif"), animation: true)
       assert still.key?(:animation)
       assert_nil still[:animation]
       refute Oximg.probe(fixture("anim.gif")).key?(:animation)
+    end
+  end
+
+  # A source cut short (#191), through the library: the ninth slot.
+  def test_reports_a_truncated_animation
+    with_library do
+      gif = File.binread(fixture("anim.gif"))
+      assert_equal({frames: 3, duration_ms: 1500, loop_count: 0, decode_work: 32_400, complete: false},
+        Oximg.probe(StringIO.new(gif.byteslice(0, gif.bytesize - 1)), animation: true)[:animation])
+      assert_equal({frames: 2, duration_ms: 1000, loop_count: 0, decode_work: 21_600, complete: false},
+        Oximg.probe(StringIO.new(gif.byteslice(0, 318)), animation: true)[:animation])
+      webp = File.binread(fixture("animated.webp"))
+      assert_equal({frames: 1, duration_ms: 100, loop_count: 0, decode_work: nil, complete: false},
+        Oximg.probe(StringIO.new(webp.byteslice(0, 200)), animation: true)[:animation])
     end
   end
 

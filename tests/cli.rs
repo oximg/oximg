@@ -223,6 +223,7 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
                 "duration_ms": 1500,
                 "loop_count": 0,
                 "decode_work": 32400,
+                "complete": true,
             },
         })
     );
@@ -233,6 +234,7 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
             "duration_ms": 200,
             "loop_count": 0,
             "decode_work": null,
+            "complete": true,
         })
     );
     // Present and null, not absent: a still is an answer too.
@@ -254,6 +256,66 @@ fn probe_json_reports_the_header_and_the_animation_summary() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option \"--yaml\""));
+}
+
+/// A source cut short says so (#191), in both shapes: the frames that
+/// arrived, `complete: false` in the JSON, and `, incomplete` last on
+/// the line, where the gem's `PROBE_LINE` tolerates it. anim.gif loses
+/// only its trailer byte and keeps all three frames; cut to 318 bytes,
+/// two; animated.webp cut to 200 bytes is still an animation.
+#[test]
+fn probe_reports_a_truncated_animation_as_incomplete() {
+    let probe = |name: &str, len: usize, json: bool| {
+        let bytes = std::fs::read(fixture(name)).unwrap();
+        let path = tmp(&format!("cut-{len}-{name}"));
+        std::fs::write(&path, &bytes[..len]).unwrap();
+        let mut cmd = bin();
+        cmd.arg("probe").arg(&path);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (path, String::from_utf8(output.stdout).unwrap())
+    };
+    let anim = |name: &str, len: usize| -> serde_json::Value {
+        let (_, out) = probe(name, len, true);
+        serde_json::from_str::<serde_json::Value>(&out).unwrap()["animation"].clone()
+    };
+    assert_eq!(
+        anim("anim.gif", 476),
+        serde_json::json!({
+            "frames": 3, "duration_ms": 1500, "loop_count": 0,
+            "decode_work": 32400, "complete": false,
+        })
+    );
+    assert_eq!(
+        anim("anim.gif", 318),
+        serde_json::json!({
+            "frames": 2, "duration_ms": 1000, "loop_count": 0,
+            "decode_work": 21600, "complete": false,
+        })
+    );
+    assert_eq!(
+        anim("animated.webp", 200),
+        serde_json::json!({
+            "frames": 1, "duration_ms": 100, "loop_count": 0,
+            "decode_work": null, "complete": false,
+        })
+    );
+    let (path, line) = probe("anim.gif", 476, false);
+    assert_eq!(
+        line,
+        format!(
+            "{}: image/gif 120x90 (10800 stored pixels), 3 frames, 1500ms, looping forever, incomplete\n",
+            path.display()
+        )
+    );
 }
 
 /// A non-upright source prints its orientation and displayed size

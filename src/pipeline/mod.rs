@@ -906,7 +906,8 @@ fn probe_inner(bytes: &[u8]) -> Result<(ImageFormat, usize, usize)> {
 /// What a source's animation is, for the formats that have one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Animation {
-    /// Frames the container declares.
+    /// Frames the container carries: for a source cut short (see
+    /// `complete`), the ones whose headers arrived.
     pub frames: usize,
     /// Total play time in milliseconds. For GIF this is the duration
     /// oximg would *emit*, not a verbatim sum: delays of 0 or 1
@@ -922,6 +923,13 @@ pub struct Animation {
     /// budget does not price — an animated WebP, which is served by its
     /// first frame and never decoded as an animation.
     pub decode_work: Option<u64>,
+    /// Whether the whole file arrived (#191). For GIF: the frame walk
+    /// reached the trailer (`0x3B`) instead of ending at a parse error.
+    /// For WebP: every byte the RIFF header declares is present. A
+    /// truncated source still reports the frames that did arrive — and a
+    /// GIF is still priced by them — so `false` is the only sign it was
+    /// cut. A single-frame GIF has no summary, so nothing says it there.
+    pub complete: bool,
 }
 
 /// Animation summary from headers alone, the companion to [`probe`]:
@@ -930,7 +938,7 @@ pub struct Animation {
 /// is served.
 ///
 /// `None` means "no animation here": a GIF with a single frame, a WebP
-/// with no `ANIM` chunk, or any other format — including an AVIF image
+/// with no `ANIM` chunk (or cut before its first frame), or any other format — including an AVIF image
 /// sequence, which this build decodes as a still and so does not report.
 ///
 /// # Examples
@@ -947,6 +955,11 @@ pub struct Animation {
 /// assert_eq!(anim.loop_count, 0, "loops forever");
 /// // Three full-canvas frames of 120x90.
 /// assert_eq!(anim.decode_work, Some(3 * 120 * 90));
+/// assert!(anim.complete, "the walk reached the trailer");
+///
+/// // Cut short, it reports the frames that arrived, and says so.
+/// let cut = pipeline::probe_animation(&bytes[..bytes.len() - 1])?.unwrap();
+/// assert_eq!((cut.frames, cut.complete), (3, false));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn probe_animation(bytes: &[u8]) -> Result<Option<Animation>, Error> {
@@ -966,16 +979,10 @@ fn probe_animation_inner(bytes: &[u8]) -> Result<Option<Animation>> {
                 duration_ms: scan.duration_ms,
                 loop_count: scan.loop_count,
                 decode_work: Some(scan.decode_work),
+                complete: scan.complete,
             }))
         }
-        ImageFormat::Webp => Ok(
-            webp_animation(bytes).map(|(frames, duration_ms, loop_count)| Animation {
-                frames,
-                duration_ms,
-                loop_count,
-                decode_work: None,
-            }),
-        ),
+        ImageFormat::Webp => Ok(webp_animation(bytes)),
         _ => Ok(None),
     }
 }

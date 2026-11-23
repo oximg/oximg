@@ -10,6 +10,31 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **Truncated animations are reported** (#191): the animation summary
+  gains `complete`, false for a source cut short — a GIF whose frame
+  walk ends before the trailer, a WebP shorter than its RIFF header
+  declares — so a truncated upload can be told from a whole one.
+  Reporting only: the frames that arrived are counted and priced as
+  before. It is in `pipeline::Animation`, `oximg probe --json` and
+  `oximg-ctl probe` (`animation.complete`), the probe line
+  (`, incomplete`), and the gem's `Oximg.probe(source, animation: true)`
+  (`nil` when spawned on an oximg 0.22 executable).
+
+### Changed
+
+- `pipeline::Animation` has a new public field, `complete`, so code
+  that builds or exhaustively destructures it needs updating.
+- The gem's probe library speaks ABI 4: the animation summary grew a
+  ninth slot. A gem refuses a library of another ABI by name.
+
+### Fixed
+
+- `probe_animation` on an animated WebP cut short reported `None`, as
+  though the file were a still; it now reports the frames whose `ANMF`
+  header arrived, with `complete: false`.
+
 ## [0.22.0] - 2026-11-23
 
 The Ruby gem's `Oximg.probe` can report what an animation costs the

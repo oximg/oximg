@@ -24,14 +24,17 @@ pub fn probe_value(bytes: &[u8]) -> Value {
                     duration_ms,
                     loop_count,
                     decode_work,
+                    complete,
                 })) => {
                     // decode_work is null where no budget prices it
-                    // (an animated WebP).
+                    // (an animated WebP); complete is false for a
+                    // source cut short (#191).
                     v["animation"] = json!({
                         "frames": frames,
                         "duration_ms": duration_ms,
                         "loop_count": loop_count,
                         "decode_work": decode_work,
+                        "complete": complete,
                     });
                 }
                 Ok(None) => {}
@@ -156,6 +159,13 @@ mod tests {
         let v = probe_value(&fixture("anim.gif"));
         assert_eq!(v["animation"]["frames"], 3);
         assert_eq!(v["animation"]["duration_ms"], 1500);
+        assert_eq!(v["animation"]["complete"], true);
+        // Without its trailer byte the same three frames arrive, and
+        // the summary says the file did not (#191).
+        let bytes = fixture("anim.gif");
+        let v = probe_value(&bytes[..bytes.len() - 1]);
+        assert_eq!(v["animation"]["frames"], 3);
+        assert_eq!(v["animation"]["complete"], false);
     }
 
     #[test]
