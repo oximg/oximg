@@ -27,11 +27,16 @@ Oximg::Server.url_for("photos/a.jpg", width: 750)
 
 Oximg::Server.url_for("photos/a.jpg", width: 750, height: 500, format: :webp)
 #=> ".../resize/750/500/photos/a.jpg@webp"
+
+Oximg::Server.url_for("photos/a.jpg", width: 300, height: 300, mode: :crop)
+#=> ".../resize/crop/300/300/photos/a.jpg"
 ```
 
 The source is fitted within the box and never enlarged. A zero axis is
 unconstrained, so `width: 750` alone is exactly what an `srcset` `w`
-descriptor and a Next.js loader mean.
+descriptor and a Next.js loader mean. `mode: :crop` covers the box and
+crops the centre to its shape, and `mode: :outside` covers it and keeps
+the whole image; both need `width` and `height`.
 
 Every setting defaults from the environment, and three of the four
 variables are the ones the server itself reads — so an app deployed

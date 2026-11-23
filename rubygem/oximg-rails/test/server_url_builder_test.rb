@@ -25,6 +25,27 @@ class Oximg::ServerUrlBuilderTest < Oximg::Test
       unsigned.resize("photos/a.jpg", height: 500)
   end
 
+  def test_puts_the_mode_word_before_the_box
+    assert_equal "https://img.example.com/resize/crop/300/300/photos/a.jpg",
+      unsigned.resize("photos/a.jpg", width: 300, height: 300, mode: :crop)
+    assert_equal "https://img.example.com/resize/outside/300/300/photos/a.jpg@webp",
+      unsigned.resize("photos/a.jpg", width: 300, height: 300, mode: "outside", format: :webp)
+  end
+
+  # The server refuses a mode with a zero axis; so does the builder,
+  # before a URL that can only answer 400 reaches a page.
+  def test_rejects_a_mode_with_a_zero_axis_or_an_unknown_mode
+    assert_raises(ArgumentError) { unsigned.resize("a.jpg", width: 300, mode: :crop) }
+    assert_raises(ArgumentError) { unsigned.resize("a.jpg", width: 300, height: 300, mode: :fill) }
+  end
+
+  # The mode word is signed with the rest of the path. Same vector as
+  # the server's signed_urls_cover_the_mode test.
+  def test_signs_the_mode_word
+    assert_equal "https://img.example.com/3AyHmK5z7nHqx_BsjPBFZ-9czpx602PUq6W0IOdJROk/resize/crop/100/100/photo.jpg",
+      signed.resize("photo.jpg", width: 100, height: 100, mode: :crop)
+  end
+
   def test_appends_the_format_token
     assert_equal "https://img.example.com/resize/750/0/photos/a.jpg@webp",
       unsigned.resize("photos/a.jpg", width: 750, format: :webp)
