@@ -26,6 +26,10 @@ and level on AVIF on x86-64 (see [Benchmarks](#benchmarks)).
   what `srcset` `w` descriptors and Next.js loaders emit), and
   `{file}` may span directories, so S3-style prefixes and nested trees
   are addressable as-is. Optional imgproxy-style HMAC URL signing.
+  A mode word asks for another shape: `/resize/crop/300/300/…`
+  covers the box and crops the centre, and `/resize/outside/300/300/…`
+  covers it and keeps the whole image, up to 8192 px on the longer
+  side. Neither enlarges, and both need both axes.
 - **Cloudflare Images URL compatibility**: mount a second route
   (`OXIMG_OPTIONS_PREFIX`) speaking the option-list grammar —
   `/image/width=750,quality=80/path/to/photo.png` — so URLs built for
@@ -340,8 +344,9 @@ gate, the Ruby gems, license compliance, fuzzing — is in
 ## Serving
 
 **URL grammars.** The positional route is
-`/resize/{w}/{h}/{file}[@fmt]`; `0` leaves an axis unconstrained, and
-`{file}` may span directories. Setting `OXIMG_OPTIONS_PREFIX` mounts a
+`/resize/[{mode}/]{w}/{h}/{file}[@fmt]`; `0` leaves an axis
+unconstrained, `{mode}` is `crop` or `outside` (no word is the plain
+fit), and `{file}` may span directories. Setting `OXIMG_OPTIONS_PREFIX` mounts a
 second route speaking the Cloudflare Images option grammar at that
 prefix:
 

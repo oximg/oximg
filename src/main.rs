@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use tokio::sync::{Semaphore, watch};
 
-use oximg::pipeline::ImageFormat;
+use oximg::pipeline::{ImageFormat, ResizeMode};
 
 // The format is the one *resolved* before keying (explicit @fmt token,
 // else Accept negotiation, else None = source format), never the raw
@@ -31,7 +31,16 @@ use oximg::pipeline::ImageFormat;
 // at one extra flight per hot (w, h, file). The quality slot is the
 // per-request override (None = the process-wide QUALITY default) —
 // different qualities are different bytes and must never coalesce.
-type FlightKey = (u32, u32, String, Option<ImageFormat>, Option<u8>);
+// The resize mode is part of the key for the same reason: a crop and a
+// fit of one file in flight together are different outputs.
+type FlightKey = (
+    u32,
+    u32,
+    ResizeMode,
+    String,
+    Option<ImageFormat>,
+    Option<u8>,
+);
 type FlightResult = Result<(Bytes, &'static str), (StatusCode, String)>;
 type FlightMap = Mutex<HashMap<FlightKey, watch::Receiver<Option<FlightResult>>>>;
 
@@ -477,6 +486,26 @@ async fn async_main(workers: usize, fetch_limit: usize) -> anyhow::Result<()> {
             "/{sig}/resize/{w}/{h}/{*file}",
             get(handle_signed_resize).options(handle_preflight),
         );
+    // One fixed word per resize mode, ahead of the box. A word is not a
+    // number, so these never take a URL the positional route accepts,
+    // and the router prefers the static segment over `{w}`. A
+    // `/resize/{mode}/...` parameter instead would read
+    // /resize/300/200/a/b.jpg two ways. The mode is part of the signed
+    // path, so a signature for /resize/300/300/x.jpg does not authorize
+    // /resize/crop/300/300/x.jpg.
+    for (word, mode) in MODE_WORDS {
+        router = router
+            .route(
+                &format!("/resize/{word}/{{w}}/{{h}}/{{*file}}"),
+                get(move |app, path, accept| handle_resize_mode(app, path, accept, mode))
+                    .options(handle_preflight),
+            )
+            .route(
+                &format!("/{{sig}}/resize/{word}/{{w}}/{{h}}/{{*file}}"),
+                get(move |app, path, accept| handle_signed_resize_mode(app, path, accept, mode))
+                    .options(handle_preflight),
+            );
+    }
     if let Some(prefix) = app.options_prefix.as_deref() {
         eprintln!("oximg: options route enabled at {prefix}/{{options}}/{{file}}");
         router = router
@@ -721,21 +750,13 @@ async fn handle_signed_resize(
     Path((sig, w, h, file)): Path<(String, u32, u32, String)>,
     accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let Some(signing) = app.signing.as_ref() else {
-        metrics::METRICS.record_request(404, metrics::FormatLabel::Unresolved);
-        return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
-    };
-    // Signed material is the raw file capture, so an explicit @fmt token
-    // is covered by the signature: photo.jpg's signature does not
-    // authorize photo.jpg@avif and its heavier encode. The capture spans
-    // path separators; the canonical form clients must sign is the
-    // percent-DECODED multi-segment path.
-    let path = format!("/resize/{w}/{h}/{file}");
-    if !signing.verify(&sig, &path) {
-        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
-        return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
-    }
-    serve_resize(app, w, h, file, accept).await
+    handle_signed_resize_mode(
+        State(app),
+        Path((sig, w, h, file)),
+        accept,
+        ResizeMode::Inside,
+    )
+    .await
 }
 
 async fn handle_resize(
@@ -743,11 +764,7 @@ async fn handle_resize(
     Path((w, h, file)): Path<(u32, u32, String)>,
     accept: AcceptHeader,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    if app.signing.is_some() {
-        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
-        return Err((StatusCode::FORBIDDEN, "signature required".into()));
-    }
-    serve_resize(app, w, h, file, accept).await
+    handle_resize_mode(State(app), Path((w, h, file)), accept, ResizeMode::Inside).await
 }
 
 /// The options route (OXIMG_OPTIONS_PREFIX): Cloudflare Images-style
@@ -806,6 +823,7 @@ async fn serve_options(
     let task = ResizeTask {
         w: parsed.width,
         h: parsed.height,
+        mode: ResizeMode::Inside,
         file,
         quality: parsed.quality,
         spec: FormatSpec::Explicit(parsed.format),
@@ -932,6 +950,7 @@ enum FormatSpec {
 struct ResizeTask {
     w: u32,
     h: u32,
+    mode: ResizeMode,
     file: String,
     quality: Option<u8>,
     spec: FormatSpec,
@@ -940,19 +959,79 @@ struct ResizeTask {
     path: String,
 }
 
-/// The positional route: /resize/{w}/{h}/{file}. Thin adapter over the
-/// shared serving path.
+/// The URL word for each resize mode other than the default.
+/// `/resize/{word}/{w}/{h}/{file}` asks for that mode; a URL with no
+/// word is [`ResizeMode::Inside`].
+const MODE_WORDS: [(&str, ResizeMode); 2] =
+    [("crop", ResizeMode::Crop), ("outside", ResizeMode::Outside)];
+
+/// The positional path for a request: the signed material on the signed
+/// routes, and the display path in logs.
+fn positional_path(mode: ResizeMode, w: u32, h: u32, file: &str) -> String {
+    match mode_word(mode) {
+        Some(word) => format!("/resize/{word}/{w}/{h}/{file}"),
+        None => format!("/resize/{w}/{h}/{file}"),
+    }
+}
+
+/// The URL word for `mode`; `None` for the default.
+fn mode_word(mode: ResizeMode) -> Option<&'static str> {
+    MODE_WORDS
+        .iter()
+        .find(|(_, m)| *m == mode)
+        .map(|(word, _)| *word)
+}
+
+async fn handle_signed_resize_mode(
+    State(app): State<App>,
+    Path((sig, w, h, file)): Path<(String, u32, u32, String)>,
+    accept: AcceptHeader,
+    mode: ResizeMode,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let Some(signing) = app.signing.as_ref() else {
+        metrics::METRICS.record_request(404, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::NOT_FOUND, "signing not configured".into()));
+    };
+    // Signed material is the raw file capture, so an explicit @fmt token
+    // is covered by the signature: photo.jpg's signature does not
+    // authorize photo.jpg@avif and its heavier encode. The capture spans
+    // path separators; the canonical form clients must sign is the
+    // percent-DECODED multi-segment path. The mode word is part of it.
+    if !signing.verify(&sig, &positional_path(mode, w, h, &file)) {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::FORBIDDEN, "invalid signature".into()));
+    }
+    serve_resize(app, mode, w, h, file, accept).await
+}
+
+async fn handle_resize_mode(
+    State(app): State<App>,
+    Path((w, h, file)): Path<(u32, u32, String)>,
+    accept: AcceptHeader,
+    mode: ResizeMode,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if app.signing.is_some() {
+        metrics::METRICS.record_request(403, metrics::FormatLabel::Unresolved);
+        return Err((StatusCode::FORBIDDEN, "signature required".into()));
+    }
+    serve_resize(app, mode, w, h, file, accept).await
+}
+
+/// The positional route: /resize/[{mode}/]{w}/{h}/{file}. Thin adapter
+/// over the shared serving path.
 async fn serve_resize(
     app: App,
+    mode: ResizeMode,
     w: u32,
     h: u32,
     file: String,
     accept: AcceptHeader,
 ) -> Result<Response, (StatusCode, String)> {
-    let path = format!("/resize/{w}/{h}/{file}");
+    let path = positional_path(mode, w, h, &file);
     let task = ResizeTask {
         w,
         h,
+        mode,
         file,
         quality: None,
         spec: FormatSpec::FromSuffix,
@@ -1002,6 +1081,7 @@ async fn serve_resize_inner(
     let ResizeTask {
         w,
         h,
+        mode,
         file,
         quality,
         spec,
@@ -1018,6 +1098,17 @@ async fn serve_resize_inner(
     // way.)
     if (w == 0 && h == 0) || w > 8192 || h > 8192 {
         return Err((StatusCode::BAD_REQUEST, "invalid dimensions".into()));
+    }
+    // A mode is a shape, and a free axis leaves no shape to cover. The
+    // library treats it as a plain fit; over a URL that is more likely
+    // a missing value, so refuse it.
+    if let Some(word) = mode_word(mode)
+        && (w == 0 || h == 0)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("{word} needs both width and height"),
+        ));
     }
     validate_source_path(&file)?;
     // The @fmt suffix belongs to the positional route's grammar only:
@@ -1042,7 +1133,7 @@ async fn serve_resize_inner(
     *fmt = metrics::FormatLabel::Resolved(target);
     let vary_accept = !app.auto_format.is_empty();
 
-    let (out, content_type) = singleflight(&app, (w, h, file, target, quality)).await?;
+    let (out, content_type) = singleflight(&app, (w, h, mode, file, target, quality)).await?;
     let headers = [
         (header::CONTENT_TYPE, content_type),
         (header::CACHE_CONTROL, "public, max-age=31536000"),
@@ -1203,7 +1294,7 @@ fn verify_within_root(
 }
 
 async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
-    let (w, h, file, output, quality) = key;
+    let (w, h, mode, file, output, quality) = key;
     let path = app.images_dir.join(file);
 
     // Resolve the fetch target before anything blocks: the URL for
@@ -1310,6 +1401,7 @@ async fn process_one(app: &App, key: &FlightKey) -> FlightResult {
         // light-load latency.
         parallel: app.resize_threads,
         output: *output,
+        resize_mode: *mode,
         // Override fields stay None: the server's knobs are the
         // process-global OXIMG_* environment, validated at startup —
         // except a per-request quality below.

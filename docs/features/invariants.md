@@ -13,8 +13,9 @@ change and needs a changelog.
 - The content's aspect ratio is preserved. With no mode and with
   `outside`, the output has the source's aspect ratio. `crop` cuts
   the edges, so its output has the box's aspect ratio.
-- A mode needs both axes. The CLI refuses a mode with a `0` axis
-  (usage error). The library treats it as the plain fit.
+- A mode needs both axes. Over HTTP and the CLI a mode with a `0`
+  axis is refused (400, usage error). The library treats it as the
+  plain fit.
 - Target box applies to the **displayed** frame (after orientation).
 - WebP output is additionally scaled to fit the 16383 px side limit.
 - `tiny.jpg` (40×30) into 100×100 stays 40×30.
@@ -26,9 +27,10 @@ change and needs a changelog.
 oximg-ctl get /resize/100/100/photo.jpg   # 200×150 source → 100×75
 oximg-ctl get /resize/100/100/tiny.jpg    # stays 40×30
 oximg-ctl get /resize/400/400/rgba.png    # 200×150, same RGBA bytes
-oximg-ctl resize tests/fixtures/photo.jpg 100 100 --crop     # 100×100
-oximg-ctl resize tests/fixtures/photo.jpg 400 400 --crop     # 150×150, not enlarged
-oximg-ctl resize tests/fixtures/photo.jpg 100 100 --outside  # 133×100
+oximg-ctl get /resize/crop/100/100/photo.jpg     # 100×100
+oximg-ctl get /resize/crop/400/400/photo.jpg     # 150×150, not enlarged
+oximg-ctl get /resize/outside/100/100/photo.jpg  # 133×100
+oximg-ctl get /resize/crop/100/0/photo.jpg --expect 400
 ```
 
 ## Color and samples

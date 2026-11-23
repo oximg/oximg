@@ -60,9 +60,9 @@ fn back_lut() -> &'static [u8; 65536] {
 /// mode keeps the content's aspect ratio and never enlarges; they
 /// differ in what happens to the part of the source that does not
 /// match the box's shape. Bounded on one axis only, every mode is
-/// [`ResizeMode::Inside`] here; the CLI refuses that request
-/// instead.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// [`ResizeMode::Inside`] here; the HTTP route and the CLI refuse
+/// that request instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 #[non_exhaustive]
 pub enum ResizeMode {
     /// Scale to fit inside the box. The default.
