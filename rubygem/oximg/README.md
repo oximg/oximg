@@ -177,7 +177,7 @@ over budget answers 200 with the first frame, which a CDN then caches).
   emit: very short GIF delays are normalized, and a GIF asking for 3
   repeats reports 4 plays.
 - The encode budget, `OXIMG_MAX_ANIM_WORK`, depends on the output size,
-  so it is yours to compute: `(frames / step).ceil * output_width *
+  so it is yours to compute: `frames.fdiv(step).ceil * output_width *
   output_height`, where `step` is the server's `OXIMG_ANIM_FRAME_STEP`
   (1 unless set: every frame) and the output size is the display size
   fitted within the requested box, never enlarged.
