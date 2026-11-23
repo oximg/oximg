@@ -33,14 +33,16 @@ the name does not say, and `:gif` is not a `format:` you can ask for.
 ```ruby
 Oximg.resize(source, destination, width: 0, height: 0,
              quality: nil, format: nil, preset: nil,
-             icc: nil, auto_rotate: nil)
+             icc: nil, auto_rotate: nil, mode: nil)
 ```
 
 The source is fitted within `width` x `height` and **never enlarged**. A
 zero axis is unconstrained, so `width: 750` alone is width-only — what
 an `srcset` `w` descriptor means — and the default `0 x 0` re-encodes at
 the source's own size, which is how you ask for compression without a
-resize:
+resize. `mode: :crop` covers the box and crops the centre to its shape,
+and `mode: :outside` covers it and keeps the whole image; both need
+`width` and `height`:
 
 ```ruby
 Oximg.resize("photo.jpg", "smaller.jpg", quality: 70)
