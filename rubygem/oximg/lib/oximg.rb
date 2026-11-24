@@ -50,6 +50,10 @@ module Oximg
   # What `resize` and `strip` may do with an embedded colour profile.
   ICC_MODES = %i[keep strip].freeze
 
+  # Resize modes other than the default fit, spelled as the CLI's
+  # --crop and --outside.
+  MODES = %i[crop outside].freeze
+
   # The OXIMG_* pipeline knobs an +env:+ may set for one call. Pinned to
   # the binary's own inventory (KNOBS in src/config.rs) by a test there,
   # so a knob the binary gains or drops cannot drift from this list.
@@ -189,6 +193,11 @@ module Oximg
     # extension, else the source's own format. Returns the destination
     # path.
     #
+    # +mode:+ asks for another shape. :crop covers the box and crops
+    # the centre to the box's shape; :outside covers the box and keeps
+    # the whole image, up to 8192 px on the longer side. Neither
+    # enlarges, and both need +width+ and +height+.
+    #
     # +icc:+ (:keep or :strip) and +auto_rotate:+ (true or false)
     # override the binary's OXIMG_ICC and OXIMG_AUTO_ROTATE for this
     # call only; nil leaves them to the environment (default: keep the
@@ -200,11 +209,11 @@ module Oximg
     # threaded job runner. Names must be in KNOBS; nil unsets a name
     # for the call. The binary validates the values, fail-closed.
     def resize(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
-      icc: nil, auto_rotate: nil, env: nil)
+      icc: nil, auto_rotate: nil, mode: nil, env: nil)
       output = expand(destination, "destination")
       argv = resize_argv(source, output,
         width: width, height: height, quality: quality, format: format, preset: preset,
-        icc: icc, auto_rotate: auto_rotate)
+        icc: icc, auto_rotate: auto_rotate, mode: mode)
       Binary.run(*argv, env: knob_env(env))
       output
     end
@@ -376,7 +385,7 @@ module Oximg
     # it is the honest way to see what a call turns into — and the way
     # to test that without a binary present.
     def resize_argv(source, destination, width: 0, height: 0, quality: nil, format: nil, preset: nil,
-      icc: nil, auto_rotate: nil)
+      icc: nil, auto_rotate: nil, mode: nil)
       argv = [
         "resize",
         expand(source, "source"),
@@ -389,6 +398,15 @@ module Oximg
       argv.push("--preset", token(preset, PRESETS, "preset")) unless preset.nil?
       argv.push("--icc", token(icc, ICC_MODES, "icc")) unless icc.nil?
       argv.push(boolean(auto_rotate, "auto_rotate") ? "--auto-rotate" : "--no-auto-rotate") unless auto_rotate.nil?
+      unless mode.nil?
+        name = token(mode, MODES, "mode")
+        # A mode is a shape, and a zero axis leaves none: the CLI refuses
+        # it, and saying so here names the Ruby argument.
+        if width.zero? || height.zero?
+          raise ArgumentError, "mode: :#{name} needs both width and height"
+        end
+        argv.push("--#{name}")
+      end
       argv
     end
 

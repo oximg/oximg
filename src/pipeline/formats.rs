@@ -137,7 +137,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
     // is in the header, so it is decided before the estimate, which
     // then prices the arm that will run.
     let fused = {
-        let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        let (dst_w, dst_h) = target_dims(src_w, src_h, p);
         ct != png::ColorType::Indexed
             && bits == png::BitDepth::Eight
             && !png_reader.info().interlaced
@@ -155,7 +155,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
     // Whether the fused arm streams rows into the row kernel instead of
     // staging `src16`: decided once, for the estimate and the decode.
     let stream = fused && {
-        let (_, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        let (_, dst_h) = target_dims(src_w, src_h, p);
         bands_use_stream_kernel(px, p.parallel, dst_h)
     };
     {
@@ -200,7 +200,7 @@ pub(super) fn process_png<R: std::io::BufRead>(
         )?;
     }
     if fused {
-        let (dst_w, dst_h) = fit_dims(src_w, src_h, p.max_width, p.max_height);
+        let (dst_w, dst_h) = target_dims(src_w, src_h, p);
         let bufs = LinearBufs {
             src16: &mut s.src16,
             dst16: &mut s.dst16,
@@ -466,7 +466,7 @@ pub(super) fn oriented_fit(
     p: &Resolved,
 ) -> (usize, usize) {
     let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
-    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
+    let (fit_w, fit_h) = target_dims(disp_w, disp_h, p);
     if orientation.swaps_axes() {
         (fit_h, fit_w)
     } else {

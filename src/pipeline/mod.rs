@@ -56,6 +56,30 @@ fn back_lut() -> &'static [u8; 65536] {
     })
 }
 
+/// How the source maps onto the `max_width` x `max_height` box. Every
+/// mode keeps the content's aspect ratio and never enlarges; they
+/// differ in what happens to the part of the source that does not
+/// match the box's shape. Bounded on one axis only, every mode is
+/// [`ResizeMode::Inside`] here; the HTTP route and the CLI refuse
+/// that request instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[non_exhaustive]
+pub enum ResizeMode {
+    /// Scale to fit inside the box. The default.
+    #[default]
+    Inside,
+    /// Scale until the box is covered, then crop the centre to the
+    /// box's aspect ratio. A source smaller than the box on some axis
+    /// is only cropped to the box's shape.
+    Crop,
+    /// Scale until the box is covered, and keep the whole frame: one
+    /// side matches the box and the other is longer. This is the
+    /// frame before the crop, for a page that crops on its own. A
+    /// source smaller than the box comes back at its own size. The
+    /// longer side stops at [`OUTSIDE_MAX_SIDE`].
+    Outside,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Encoder {
     /// jpegli: trellis-class compression at roughly half the CPU of
@@ -169,6 +193,8 @@ pub struct Params {
     /// AVIF encode quality (`OXIMG_AVIF_QUALITY`, default 55).
     #[cfg(feature = "avif")]
     pub avif_quality: Option<u8>,
+    /// How the source maps onto the box (default [`ResizeMode::Inside`]).
+    pub resize_mode: ResizeMode,
 }
 
 impl Default for Params {
@@ -195,6 +221,7 @@ impl Default for Params {
             linear_light: None,
             #[cfg(feature = "avif")]
             avif_quality: None,
+            resize_mode: ResizeMode::Inside,
         }
     }
 }
@@ -224,6 +251,27 @@ fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
     let Some(cap) = format_max_dimension(target) else {
         return p;
     };
+    // Crop promises the box's shape, so a box past the ceiling shrinks
+    // as a whole. Capping each side alone would turn 20000x100 into
+    // 16383x100 and change the crop's aspect ratio.
+    if let Some((w, h)) = p.crop_box() {
+        let long = w.max(h);
+        if long > cap {
+            let side = |v: u32| {
+                ((u64::from(v) * u64::from(cap) + u64::from(long) / 2) / u64::from(long)).max(1)
+                    as u32
+            };
+            p.max_width = side(w);
+            p.max_height = side(h);
+        }
+        return p;
+    }
+    // Outside keeps the side that overflows the box, so that side needs
+    // the ceiling too. The output then may not cover the box, as a fit
+    // past the ceiling may not reach it.
+    if p.cover_box().is_some() {
+        p.outside_cap = p.outside_cap.min(cap);
+    }
     // Not counted anywhere: the box is `u32::MAX` on an unconstrained
     // axis, so "the box was tightened" fires on almost every WebP
     // request while "the output was actually reduced" is only knowable
@@ -232,6 +280,63 @@ fn clamp_to_format(mut p: Resolved, target: ImageFormat) -> Resolved {
     p.max_width = p.max_width.min(cap);
     p.max_height = p.max_height.min(cap);
     p
+}
+
+/// The longest side [`ResizeMode::Outside`] lets overflow the box: the
+/// per-axis limit of the HTTP route. With it, an outside request never
+/// asks for a larger output than `/resize/8192/8192/...` already can,
+/// so the mode adds no new maximum encode cost.
+pub const OUTSIDE_MAX_SIDE: u32 = 8192;
+
+/// The resize target for a source of `src_w` x `src_h` (displayed
+/// orientation) under this request. Every path asks here rather than
+/// calling [`fit_dims`] with the request's box, so a request shape
+/// other than "fit within the box" changes one function.
+fn target_dims(src_w: usize, src_h: usize, p: &Resolved) -> (usize, usize) {
+    match p.cover_box() {
+        // Crop and outside: fit on the one axis that needs the larger
+        // scale, so the other axis covers the box. Crop then cuts in
+        // `encode_output`. Outside keeps the frame whole, so its cap
+        // bounds both sides: the one that overflows, and the box side
+        // too when a library or CLI box is larger than the cap.
+        Some((w, h)) => {
+            let cap = match p.resize_mode {
+                ResizeMode::Outside => p.outside_cap,
+                _ => u32::MAX,
+            };
+            let width_wins = u64::from(w) * src_h as u64 >= u64::from(h) * src_w as u64;
+            if width_wins {
+                fit_dims(src_w, src_h, w.min(cap), cap)
+            } else {
+                fit_dims(src_w, src_h, cap, h.min(cap))
+            }
+        }
+        None => fit_dims(src_w, src_h, p.max_width, p.max_height),
+    }
+}
+
+/// The centred rectangle that crop cuts from a resized `w` x `h` frame for
+/// a `box_w` x `box_h` box: the largest rectangle with the box's aspect
+/// ratio that fits in both the frame and the box. Returns
+/// `(crop_w, crop_h, left, top)`. An odd margin leaves the extra pixel
+/// on the right or bottom (offsets round down).
+fn crop_rect(w: usize, h: usize, box_w: u32, box_h: u32) -> (usize, usize, usize, usize) {
+    let (bw, bh) = (box_w as usize, box_h as usize);
+    let (cw, ch) = if w >= bw && h >= bh {
+        (bw, bh)
+    } else if (w as u64) * (bh as u64) <= (h as u64) * (bw as u64) {
+        // Relatively taller than the box: the width limits.
+        (
+            w,
+            ((w as f64 * bh as f64 / bw as f64).round() as usize).clamp(1, h),
+        )
+    } else {
+        (
+            ((h as f64 * bw as f64 / bh as f64).round() as usize).clamp(1, w),
+            h,
+        )
+    };
+    (cw, ch, (w - cw) / 2, (h - ch) / 2)
 }
 
 /// Proportionally shrink to fit within max_w x max_h (never enlarges).

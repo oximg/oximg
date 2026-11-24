@@ -1072,6 +1072,111 @@ fn resize_auto_rotate_flags_override_the_knob() {
     }
     std::fs::remove_file(&src).ok();
 }
+
+/// `--crop` covers the box and crops to its shape, never enlarging:
+/// a source smaller than the box keeps only the box's shape. Pixels
+/// are pinned in the library test `crop_equals_single_axis_fit_then_crop`;
+/// this pins the flag.
+#[test]
+fn resize_crop_covers_the_box_without_enlarging() {
+    for (src, w, h, want) in [
+        ("photo.jpg", "100", "100", "100x100"),
+        ("photo.jpg", "120", "40", "120x40"),
+        // 200x150 source, larger box: cropped to 1:1, not enlarged.
+        ("photo.jpg", "400", "400", "150x150"),
+        // 40x30 into a 2:1 box larger than the source.
+        ("tiny.jpg", "100", "50", "40x20"),
+    ] {
+        let out = tmp("crop-out.png");
+        let output = bin()
+            .arg("resize")
+            .arg(fixture(src))
+            .args([w, h])
+            .arg(&out)
+            .arg("--crop")
+            .output()
+            .unwrap();
+        std::fs::remove_file(&out).ok();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{src} {w}x{h}: {stderr}");
+        assert!(
+            stderr.contains(&format!(", {want}, ")),
+            "{src} {w}x{h}: want {want}, got {stderr}"
+        );
+    }
+}
+
+/// `--outside` covers the box and keeps the whole image: one side
+/// matches the box, the other is longer. It never enlarges. Bytes are
+/// pinned in the library test
+/// `outside_equals_single_axis_fit`; this pins the flag.
+#[test]
+fn resize_outside_keeps_the_whole_image() {
+    for (src, w, h, want) in [
+        // 200x150 source into a square: the height covers.
+        ("photo.jpg", "100", "100", "133x100"),
+        ("photo.jpg", "120", "40", "120x90"),
+        // Larger box: not enlarged.
+        ("photo.jpg", "400", "400", "200x150"),
+        ("tiny.jpg", "100", "50", "40x30"),
+    ] {
+        let out = tmp("outside-out.png");
+        let output = bin()
+            .arg("resize")
+            .arg(fixture(src))
+            .args([w, h])
+            .arg(&out)
+            .arg("--outside")
+            .output()
+            .unwrap();
+        std::fs::remove_file(&out).ok();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{src} {w}x{h}: {stderr}");
+        assert!(
+            stderr.contains(&format!(", {want}, ")),
+            "{src} {w}x{h}: want {want}, got {stderr}"
+        );
+    }
+}
+
+/// `--crop` and `--outside` ask for different shapes; together they are
+/// a usage error, not "the last one wins".
+#[test]
+fn resize_rejects_crop_with_outside() {
+    let out = tmp("crop-outside-out.png");
+    let output = bin()
+        .arg("resize")
+        .arg(fixture("photo.jpg"))
+        .args(["100", "100"])
+        .arg(&out)
+        .args(["--crop", "--outside"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!out.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined"));
+}
+
+/// A mode is a shape, and a free axis leaves none: `--crop` or
+/// `--outside` with a 0 axis is a usage error, not a plain fit.
+#[test]
+fn resize_rejects_a_mode_with_a_free_axis() {
+    for (w, h, flag) in [("100", "0", "--crop"), ("0", "100", "--outside")] {
+        let out = tmp("mode-free-axis-out.png");
+        let output = bin()
+            .arg("resize")
+            .arg(fixture("photo.jpg"))
+            .args([w, h])
+            .arg(&out)
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{flag} {w}x{h}");
+        assert!(!out.exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("need both"));
+    }
+}
+
 /// #163: `oximg strip --auto-rotate` says what it did with a rotated
 /// JPEG: turned upright (a transpose of photo.jpg moves whole blocks
 /// only), or kept the tag, with the reason (a quarter turn would move

@@ -26,6 +26,17 @@ class Oximg::ProcessingTest < Oximg::Test
     end
   end
 
+  # photo.jpg is 200x150.
+  def test_crop_and_outside_reach_the_binary
+    in_tmpdir do |dir|
+      out = File.join(dir, "out.jpg")
+      Oximg.resize(fixture("photo.jpg"), out, width: 100, height: 100, mode: :crop)
+      assert_equal [100, 100], Oximg.probe(out).values_at(:width, :height)
+      Oximg.resize(fixture("photo.jpg"), out, width: 100, height: 100, mode: :outside)
+      assert_equal [133, 100], Oximg.probe(out).values_at(:width, :height)
+    end
+  end
+
   def test_a_zero_axis_is_unconstrained
     in_tmpdir do |dir|
       out = File.join(dir, "out.jpg")

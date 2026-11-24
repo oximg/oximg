@@ -31,6 +31,18 @@ class Oximg::ArgvTest < Oximg::Test
   # Issue #128: the per-call overrides of OXIMG_ICC and
   # OXIMG_AUTO_ROTATE, in the CLI's spelling; nil emits nothing, so the
   # environment decides.
+  def test_passes_the_resize_mode
+    assert_equal ["--crop"], argv("/a.jpg", "/b.jpg", width: 100, height: 100, mode: :crop)[5..]
+    assert_equal ["--outside"], argv("/a.jpg", "/b.jpg", width: 100, height: 100, mode: "OUTSIDE")[5..]
+    assert_equal 5, argv("/a.jpg", "/b.jpg", width: 100, height: 100, mode: nil).size
+  end
+
+  def test_rejects_a_mode_with_a_zero_axis_or_an_unknown_mode
+    assert_raises(ArgumentError) { argv("/a.jpg", "/b.jpg", width: 100, mode: :crop) }
+    assert_raises(ArgumentError) { argv("/a.jpg", "/b.jpg", height: 100, mode: :outside) }
+    assert_raises(ArgumentError) { argv("/a.jpg", "/b.jpg", width: 100, height: 100, mode: :fill) }
+  end
+
   def test_passes_the_icc_and_rotation_overrides
     assert_equal ["--icc", "strip", "--no-auto-rotate"],
       argv("/a.jpg", "/b.jpg", icc: :strip, auto_rotate: false)[5..]

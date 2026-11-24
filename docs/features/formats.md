@@ -64,7 +64,7 @@ pixel/decoded-bytes limits. A still source is unaffected by this cap.
 Under `OXIMG_TIMING`, `oximg-ctl resize` adds `gif_animation` from the
 child's dedicated JSON diagnostic. The fields are `outcome`,
 `source_frames`, `decode_work`, `encode_work` (potential encoded frames ×
-output area), and `submitted_frames` (one for a still, otherwise frames
+output area; for `crop`, the cropped area), and `submitted_frames` (one for a still, otherwise frames
 submitted to the final encoder before any further merging). Source/work fields are
 null when policy skips the scan. The scan skips LZW payloads, so its frame
 count is metadata parsed, not a guarantee all those frames decode.

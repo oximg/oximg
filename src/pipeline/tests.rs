@@ -1994,6 +1994,56 @@ fn decode_cost_prices_each_png_arm() {
     assert_eq!(c.encode_bytes, 400 * 100 * 6 + 256 * 1024 + 3 * 100 * 3);
 }
 
+/// A crop on a JPEG with an EXIF orientation, to every output format.
+/// The oriented path picks its own fuse, and as AVIF it used to take
+/// one that encodes before `encode_output`, so the crop was skipped
+/// (found by review: 100x133 instead of 100x100). `process_jpeg` now
+/// refuses such a fuse for a crop, so an escape is an error here too.
+#[test]
+fn crop_reaches_every_output_format_from_an_oriented_jpeg() {
+    let rotated = {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&tiff_orientation(6));
+        let mut comp = Compress::new(ColorSpace::JCS_RGB);
+        comp.set_size(320, 240);
+        comp.set_quality(90.0);
+        let mut started = comp.start_compress(Vec::new()).unwrap();
+        started.write_marker(mozjpeg::Marker::APP(1), &exif);
+        started.write_scanlines(&noise_px(320, 240, 3, 7)).unwrap();
+        started.finish().unwrap()
+    };
+    let targets = [
+        ImageFormat::Png,
+        ImageFormat::Jpeg,
+        ImageFormat::Webp,
+        #[cfg(feature = "avif")]
+        ImageFormat::Avif,
+    ];
+    for target in targets {
+        for (bw, bh) in [(100, 100), (200, 50), (500, 500)] {
+            let (out, _) = process(
+                &rotated,
+                &Params {
+                    max_width: bw,
+                    max_height: bh,
+                    output: Some(target),
+                    resize_mode: ResizeMode::Crop,
+                    ..Params::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{target:?} {bw}x{bh}: {e}"));
+            let (_, w, h) = probe(&out).unwrap();
+            // Displayed 240x320; a box past it is only cut to its shape.
+            let want = if (bw, bh) == (500, 500) {
+                (240, 240)
+            } else {
+                (bw as usize, bh as usize)
+            };
+            assert_eq!((w, h), want, "{target:?} {bw}x{bh}");
+        }
+    }
+}
+
 /// A little-endian TIFF carrying only an Orientation tag.
 fn tiff_orientation(o: u16) -> Vec<u8> {
     let mut t = b"II*\0\x08\0\0\0".to_vec();
@@ -3458,4 +3508,394 @@ fn a_capped_png_attempt_never_panics() {
     let mut out = Vec::new();
     assert!(write_png(&mut out, full.len(), w, h, None, rgb, None, px, fast).unwrap());
     assert!(out == full);
+}
+
+/// The crop rectangle for the reference side of the crop proofs,
+/// written apart from `crop_rect` so a mistake there cannot pass on
+/// both sides: scale the box by the largest factor up to 1 that fits it
+/// in the `w` x `h` frame, round each side half up in integers, and
+/// centre it with the offsets rounded down.
+pub(crate) fn reference_crop(w: usize, h: usize, bw: u32, bh: u32) -> (usize, usize, usize, usize) {
+    let (bw, bh) = (bw as u64, bh as u64);
+    let (w64, h64) = (w as u64, h as u64);
+    // Scale factor as a fraction num/den, the smallest of 1, w/bw, h/bh.
+    let (mut num, mut den) = (1u64, 1u64);
+    if w64 * den < num * bw {
+        (num, den) = (w64, bw);
+    }
+    if h64 * den < num * bh {
+        (num, den) = (h64, bh);
+    }
+    let side = |b: u64| ((b * num * 2 + den) / (2 * den)).max(1) as usize;
+    let (cw, ch) = (side(bw).min(w), side(bh).min(h));
+    (cw, ch, (w - cw) / 2, (h - ch) / 2)
+}
+
+#[test]
+fn crop_rect_keeps_the_box_shape_and_never_enlarges() {
+    // Large enough: exactly the box, centred, odd margin to the right.
+    assert_eq!(crop_rect(750, 500, 500, 500), (500, 500, 125, 0));
+    assert_eq!(crop_rect(451, 300, 300, 300), (300, 300, 75, 0));
+    // Smaller than the box on one axis: only cropped to the box's shape.
+    assert_eq!(crop_rect(1001, 200, 500, 500), (200, 200, 400, 0));
+    assert_eq!(crop_rect(200, 300, 500, 500), (200, 200, 0, 50));
+    // Smaller on both axes.
+    assert_eq!(crop_rect(300, 200, 500, 500), (200, 200, 50, 0));
+    assert_eq!(crop_rect(5, 7, 300, 200), (5, 3, 0, 2));
+    assert_eq!(crop_rect(1001, 667, 2000, 300), (1001, 150, 0, 258));
+    // The same rectangle as the independent reference, over a grid of
+    // frames and boxes on both sides of the frame's size and shape.
+    for w in [1, 2, 5, 99, 300, 451, 1001] {
+        for h in [1, 3, 7, 150, 300, 667] {
+            for (bw, bh) in [
+                (1, 1),
+                (2, 1),
+                (300, 300),
+                (500, 333),
+                (77, 33),
+                (16383, 82),
+            ] {
+                assert_eq!(
+                    crop_rect(w, h, bw, bh),
+                    reference_crop(w, h, bw, bh),
+                    "{w}x{h} into {bw}x{bh}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn crop_target_fits_the_axis_that_covers_the_box() {
+    let crop = |w, h| {
+        Resolved::new(&Params {
+            max_width: w,
+            max_height: h,
+            resize_mode: ResizeMode::Crop,
+            ..Params::default()
+        })
+    };
+    // Wide source into a square: the height limits, the width overflows.
+    assert_eq!(target_dims(1001, 667, &crop(300, 300)), (450, 300));
+    // Tall box: the height covers, so the width overflows more.
+    assert_eq!(target_dims(1001, 667, &crop(100, 400)), (600, 400));
+    // Never enlarges.
+    assert_eq!(target_dims(300, 200, &crop(500, 500)), (300, 200));
+    // One axis free: crop is fit.
+    assert_eq!(target_dims(1001, 667, &crop(300, u32::MAX)), (300, 200));
+}
+
+/// With one axis free, every mode is the plain fit, for every output
+/// format. WebP turns a free axis into its 16383 ceiling, which must
+/// not make the request look like a two-axis box (found by review:
+/// crop gave 1x150 and outside 200x150 for 100x0 as WebP).
+#[test]
+fn one_free_axis_is_fit_in_every_mode_and_format() {
+    let src = png_of(&noise_px(200, 150, 3, 5), 200, 150, 3, None);
+    for target in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+        for (w, h) in [(100, u32::MAX), (u32::MAX, 60)] {
+            let size = |mode| {
+                let (out, _) = process(
+                    &src,
+                    &Params {
+                        max_width: w,
+                        max_height: h,
+                        output: Some(target),
+                        resize_mode: mode,
+                        ..Params::default()
+                    },
+                )
+                .unwrap();
+                let (_, ow, oh) = probe(&out).unwrap();
+                (ow, oh)
+            };
+            let fit = size(ResizeMode::Inside);
+            assert_eq!(size(ResizeMode::Crop), fit, "crop {target:?} {w}x{h}");
+            assert_eq!(size(ResizeMode::Outside), fit, "outside {target:?} {w}x{h}");
+        }
+    }
+}
+
+/// A crop box past WebP's ceiling shrinks as a whole, so the output
+/// keeps the box's shape and matches the same request as PNG.
+#[test]
+fn crop_box_past_the_webp_ceiling_keeps_its_shape() {
+    let crop = |w, h, target| {
+        let p = Params {
+            max_width: w,
+            max_height: h,
+            output: Some(target),
+            resize_mode: ResizeMode::Crop,
+            ..Params::default()
+        };
+        let c = clamp_to_format(Resolved::new(&p), target);
+        (c.max_width, c.max_height)
+    };
+    assert_eq!(crop(20000, 100, ImageFormat::Webp), (16383, 82));
+    assert_eq!(crop(100, 20000, ImageFormat::Webp), (82, 16383));
+    assert_eq!(crop(30000, 30000, ImageFormat::Webp), (16383, 16383));
+    // Inside the ceiling, or another format: untouched.
+    assert_eq!(crop(8000, 100, ImageFormat::Webp), (8000, 100));
+    assert_eq!(crop(20000, 100, ImageFormat::Png), (20000, 100));
+
+    // End to end: the WebP output has the PNG output's size.
+    let src = png_of(&noise_px(1001, 667, 3, 11), 1001, 667, 3, None);
+    let size = |target| {
+        let (out, _) = process(
+            &src,
+            &Params {
+                max_width: 20000,
+                max_height: 100,
+                output: Some(target),
+                resize_mode: ResizeMode::Crop,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        let (_, w, h) = probe(&out).unwrap();
+        (w, h)
+    };
+    assert_eq!(size(ImageFormat::Png), (1001, 5));
+    assert_eq!(size(ImageFormat::Webp), (1001, 5));
+}
+
+/// Crop takes the pixel fuse (decode ∥ resize into out8) where it
+/// used to take the serial path. The crop happens later, in
+/// `encode_output`, so the frame the fuse leaves in out8 has to be the
+/// serial path's frame byte for byte: baseline and progressive, color
+/// and gray, with and without the raw YCbCr decode.
+#[test]
+fn crop_frame_is_the_same_on_the_pixel_fuse() {
+    let crop = Resolved::new(&Params {
+        max_width: 150,
+        max_height: 150,
+        resize_mode: ResizeMode::Crop,
+        ..Params::default()
+    });
+    let frame = |jpeg: &[u8], fuse| {
+        let mut s = Scratch::default();
+        let dec = Decompress::new_mem(jpeg).unwrap();
+        match decode_resize(
+            &mut s,
+            dec,
+            &crop,
+            crate::meta::Orientation::UPRIGHT,
+            fuse,
+            None,
+            Some(ImageFormat::Png),
+        )
+        .unwrap()
+        {
+            Decoded::Pixels { dst_w, dst_h } => {
+                let ch = s.out8.len().min(dst_w * dst_h * 3) / (dst_w * dst_h);
+                ((dst_w, dst_h), s.out8[..dst_w * dst_h * ch].to_vec())
+            }
+            _ => panic!("crop must leave pixels for encode_output to crop"),
+        }
+    };
+    for (name, jpeg) in [
+        ("baseline", make_baseline_jpeg(641, 403, false)),
+        ("progressive", make_jpeg(641, 403, false, false)),
+        ("gray", make_baseline_jpeg(403, 641, true)),
+    ] {
+        for no_raw in [false, true] {
+            NO_RAW.with(|f| f.set(no_raw));
+            let (serial_dims, serial) = frame(&jpeg, Fuse::Off);
+            let (fused_dims, fused) = frame(&jpeg, Fuse::Pixels);
+            NO_RAW.with(|f| f.set(false));
+            // The covering frame, not the crop: 150 high from 641x403.
+            assert!(
+                serial_dims.0 >= 150 && serial_dims.1 >= 150,
+                "{name}: {serial_dims:?} does not cover the box"
+            );
+            assert_eq!(serial_dims, fused_dims, "{name} no_raw={no_raw}: size");
+            assert!(serial == fused, "{name} no_raw={no_raw}: pixels differ");
+        }
+    }
+}
+
+/// Outside is the frame crop cuts from: the single-axis fit that
+/// covers the box. It must be that fit byte for byte, on every path a
+/// fit takes (outside does not turn the fast paths off), and it must
+/// never enlarge.
+#[test]
+fn outside_equals_single_axis_fit() {
+    let photo = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/photo.jpg"
+    ))
+    .unwrap();
+    let sources: Vec<(&str, Vec<u8>)> = vec![
+        ("rgb", png_of(&noise_px(301, 199, 3, 7), 301, 199, 3, None)),
+        ("rgba", png_of(&noise_px(301, 199, 4, 8), 301, 199, 4, None)),
+        (
+            "rgb-o6",
+            png_of(&noise_px(301, 199, 3, 9), 301, 199, 3, Some(6)),
+        ),
+        ("jpeg", photo),
+    ];
+    let boxes = [(100, 100), (150, 40), (40, 150), (500, 500), (250, 90)];
+    let run = |src: &[u8], w, h, out, resize_mode| {
+        process(
+            src,
+            &Params {
+                max_width: w,
+                max_height: h,
+                output: Some(out),
+                resize_mode,
+                ..Params::default()
+            },
+        )
+        .unwrap()
+        .0
+    };
+    for (name, src) in &sources {
+        let (dw, dh, _) = png_pixels(&run(
+            src,
+            u32::MAX,
+            u32::MAX,
+            ImageFormat::Png,
+            ResizeMode::Inside,
+        ));
+        for &(bw, bh) in &boxes {
+            let axis = if bw as u64 * dh as u64 >= bh as u64 * dw as u64 {
+                (bw, u32::MAX)
+            } else {
+                (u32::MAX, bh)
+            };
+            for out in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+                let want = run(src, axis.0, axis.1, out, ResizeMode::Inside);
+                let got = run(src, bw, bh, out, ResizeMode::Outside);
+                assert!(
+                    got == want,
+                    "{name} {bw}x{bh} {out:?}: bytes differ from the fit"
+                );
+            }
+            let (gw, gh, _) = png_pixels(&run(src, bw, bh, ImageFormat::Png, ResizeMode::Outside));
+            assert!(gw <= dw && gh <= dh, "{name} {bw}x{bh}: enlarged");
+            assert!(
+                (gw >= bw as usize && gh >= bh as usize) || (gw, gh) == (dw, dh),
+                "{name} {bw}x{bh}: {gw}x{gh} neither covers the box nor is the source"
+            );
+        }
+    }
+}
+
+/// Outside lets one side overflow the box, up to `OUTSIDE_MAX_SIDE`.
+/// So an outside request is never larger than the largest fit a URL can
+/// already ask for, `/resize/8192/8192/...`: the mode adds no new
+/// maximum encode cost. The capped output may then not cover the box.
+#[test]
+fn outside_is_never_larger_than_the_largest_fit() {
+    let dims = |sw, sh, bw, bh, mode, target| {
+        let p = Params {
+            max_width: bw,
+            max_height: bh,
+            output: Some(target),
+            resize_mode: mode,
+            ..Params::default()
+        };
+        target_dims(sw, sh, &clamp_to_format(Resolved::new(&p), target))
+    };
+    let max = OUTSIDE_MAX_SIDE;
+    for target in [ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Webp] {
+        // A wide panorama: the overflow stops at 8192 and the output is
+        // exactly the largest fit, which no longer covers 300 high.
+        assert_eq!(
+            dims(30000, 1000, 300, 300, ResizeMode::Outside, target),
+            dims(30000, 1000, max, max, ResizeMode::Inside, target),
+        );
+        assert_eq!(
+            dims(30000, 1000, 300, 300, ResizeMode::Outside, target),
+            (8192, 273)
+        );
+        // Tall, and a box past the cap: the same bound.
+        assert_eq!(
+            dims(1000, 40000, 1000, 1000, ResizeMode::Outside, target),
+            (205, 8192)
+        );
+        // A box side past the cap is capped too (library and CLI boxes
+        // can be larger than the route's 8192; found by review).
+        assert_eq!(
+            dims(10000, 100, 10000, 50, ResizeMode::Outside, target),
+            (8192, 82)
+        );
+        // Under the cap nothing changes: 3000x100 overflows to 3000.
+        assert_eq!(
+            dims(3000, 100, 300, 300, ResizeMode::Outside, target),
+            (3000, 100)
+        );
+    }
+}
+
+/// Crop must equal "fit on one axis, then crop" done with operations
+/// that already exist: the single-axis fit through the pipeline, and an
+/// exact centred crop of its pixels. This is the reference for every
+/// crop path; a faster path that changes a byte has to say why.
+#[test]
+fn crop_equals_single_axis_fit_then_crop() {
+    let photo = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/photo.jpg"
+    ))
+    .unwrap();
+    let sources: Vec<(&str, Vec<u8>)> = vec![
+        ("rgb", png_of(&noise_px(301, 199, 3, 7), 301, 199, 3, None)),
+        ("rgba", png_of(&noise_px(301, 199, 4, 8), 301, 199, 4, None)),
+        (
+            "rgb-o6",
+            png_of(&noise_px(301, 199, 3, 9), 301, 199, 3, Some(6)),
+        ),
+        (
+            "rgba-o3",
+            png_of(&noise_px(301, 199, 4, 10), 301, 199, 4, Some(3)),
+        ),
+        ("jpeg", photo),
+    ];
+    let boxes = [
+        (100, 100),
+        (150, 40),
+        (40, 150),
+        (64, 64),
+        (500, 500),
+        (250, 90),
+    ];
+    let png_out = |src: &[u8], w, h, resize_mode| {
+        let (out, _) = process(
+            src,
+            &Params {
+                max_width: w,
+                max_height: h,
+                output: Some(ImageFormat::Png),
+                resize_mode,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        png_pixels(&out)
+    };
+    for (name, src) in &sources {
+        let (dw, dh, _) = png_out(src, u32::MAX, u32::MAX, ResizeMode::Inside);
+        for &(bw, bh) in &boxes {
+            let axis = if bw as u64 * dh as u64 >= bh as u64 * dw as u64 {
+                (bw, u32::MAX)
+            } else {
+                (u32::MAX, bh)
+            };
+            let (iw, ih, mid) = png_out(src, axis.0, axis.1, ResizeMode::Inside);
+            let ch = mid.len() / (iw * ih);
+            let (cw, chh, left, top) = reference_crop(iw, ih, bw, bh);
+            let mut want = Vec::with_capacity(cw * chh * ch);
+            for y in top..top + chh {
+                let row = (y * iw + left) * ch;
+                want.extend_from_slice(&mid[row..row + cw * ch]);
+            }
+            let (gw, gh, got) = png_out(src, bw, bh, ResizeMode::Crop);
+            assert_eq!((gw, gh), (cw, chh), "{name} {bw}x{bh}: size");
+            assert!(
+                got == want,
+                "{name} {bw}x{bh}: pixels differ from fit-then-crop"
+            );
+        }
+    }
 }

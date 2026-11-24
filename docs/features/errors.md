@@ -10,7 +10,7 @@ and turns a crawler into origin load.
 |---|---|---|
 | 200 | success, including animation that degraded to a still | image bytes |
 | 204 | `OPTIONS` preflight | empty, `Allow: GET, HEAD, OPTIONS` |
-| 400 | bad dimensions (`0/0`, >8192); path traversal syntax; `@gif`/`@jxl`; `@avif` when the build lacks avif; unknown options-route key; source key the origin will not serve (400/414, over-length) | names the cause when it is the client's grammar |
+| 400 | bad dimensions (`0/0`, >8192, a mode word with a `0` axis); path traversal syntax; `@gif`/`@jxl`; `@avif` when the build lacks avif; unknown options-route key; source key the origin will not serve (400/414, over-length) | names the cause when it is the client's grammar |
 | 403 | signing on, missing or wrong signature | |
 | 404 | missing object; path escaping `IMAGES_DIR`; unknown `@bogus` kept as a filename (404 only if that file is absent) | `image not found` |
 | 405 | method other than GET/HEAD/OPTIONS | |
@@ -23,6 +23,7 @@ and turns a crawler into origin load.
 
 ```sh
 oximg-ctl get /resize/0/0/photo.jpg --expect 400
+oximg-ctl get /resize/crop/100/0/photo.jpg --expect 400
 oximg-ctl get /resize/100/100/missing.jpg --expect 404
 oximg-ctl get /resize/100/100/photo.jpg@gif --expect 400
 oximg-ctl get /resize/100/100/photo.jpg@bogus --expect 404

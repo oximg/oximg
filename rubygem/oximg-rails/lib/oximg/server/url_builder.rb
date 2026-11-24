@@ -20,6 +20,9 @@ module Oximg
       # is not offered here.
       FORMATS = %w[jpg jpeg png webp avif].freeze
 
+      # The words of the server's resize modes, +/resize/{mode}/...+.
+      MODES = %w[crop outside].freeze
+
       # The options route additionally understands format=auto, which
       # means "negotiate, else the source's own format".
       OPTION_FORMATS = (FORMATS + %w[auto]).freeze
@@ -39,18 +42,31 @@ module Oximg
       # unconstrained — <tt>width: 750</tt> alone is exactly what an
       # +srcset+ +w+ descriptor means.
       #
+      # +mode:+ asks for another shape: :crop covers the box and crops
+      # the centre to its shape, :outside covers it and keeps the whole
+      # image. Both need +width+ and +height+, as the server does.
+      #
       #   builder.resize("photos/a.jpg", width: 750)
       #   builder.resize("photos/a.jpg", width: 750, height: 500, format: :webp)
-      def resize(source, width: 0, height: 0, format: nil)
+      #   builder.resize("photos/a.jpg", width: 300, height: 300, mode: :crop)
+      def resize(source, width: 0, height: 0, format: nil, mode: nil)
         w = dimension(width, "width")
         h = dimension(height, "height")
         if w.zero? && h.zero?
           raise ArgumentError, "at least one of width/height must be non-zero"
         end
 
+        route = "/resize/"
+        unless mode.nil?
+          name = token(mode, MODES, "mode")
+          if w.zero? || h.zero?
+            raise ArgumentError, "mode: :#{name} needs both width and height"
+          end
+          route = "/resize/#{name}/"
+        end
         file = source_path(source)
         file = "#{file}@#{token(format, FORMATS, "format")}" unless format.nil?
-        build("/resize/#{w}/#{h}/", file)
+        build("#{route}#{w}/#{h}/", file)
       end
 
       # The Cloudflare-Images-compatible options route,

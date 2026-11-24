@@ -118,6 +118,8 @@ fn streams_exact_jpeg<R>(
 ) -> bool {
     target == Some(ImageFormat::Jpeg)
         && orientation.is_upright()
+        // A crop happens in `encode_output`; the stream never reaches it.
+        && p.crop_box().is_none()
         && (!dec.has_multiple_scans()
             || (p.encoder == Encoder::Jpegli && jpegli_mode(w, h) == JpegMode::Streaming))
 }
@@ -263,7 +265,7 @@ pub(super) fn decode_resize<R: std::io::BufRead>(
     // orientation — the rotation happens on the resized frame) is the
     // fitted box with its axes swapped back.
     let (disp_w, disp_h) = orientation.display_dims(src_w, src_h);
-    let (fit_w, fit_h) = fit_dims(disp_w, disp_h, p.max_width, p.max_height);
+    let (fit_w, fit_h) = target_dims(disp_w, disp_h, p);
     let (dst_w, dst_h) = if orientation.swaps_axes() {
         (fit_h, fit_w)
     } else {
@@ -860,6 +862,11 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // What decode_resize consumes: the conversion profile on the
         // CMYK path, the fused-jpegli embed profile otherwise.
         let icc_dec = if cmyk { icc.as_deref() } else { icc_embed };
+        // A crop happens in `encode_output`. The jpegli and YUV fuses
+        // encode inside the worker and never reach it, so a crop takes
+        // the pixel fuse instead: decode ∥ resize into out8, then the
+        // crop and the one-shot encode, as on the serial path.
+        let crop = p.crop_box().is_some();
         // Fused decode overlap: on unless disabled (see
         // overlap_gate). Band-parallel resize keeps the serial
         // path so OXIMG_PAR semantics are unchanged. Jpegli
@@ -876,7 +883,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         // these is what encodes the frame.
         let cross_fuse = || -> Fuse {
             #[cfg(feature = "avif")]
-            if target == ImageFormat::Avif {
+            if target == ImageFormat::Avif && !crop {
                 return Fuse::Yuv {
                     params: p.avif_params(),
                 };
@@ -902,7 +909,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             // across resized columns, a correctness minefield
             // for ~0.2ms.
             #[cfg(feature = "avif")]
-            if target == ImageFormat::Avif {
+            if target == ImageFormat::Avif && !crop {
                 Fuse::PixelsPreheat {
                     params: p.avif_params(),
                 }
@@ -912,7 +919,7 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
             #[cfg(not(feature = "avif"))]
             Fuse::Pixels
         } else if target == ImageFormat::Jpeg {
-            if p.encoder == Encoder::Jpegli {
+            if p.encoder == Encoder::Jpegli && !crop {
                 Fuse::Jpegli { quality: p.quality }
             } else {
                 // mozjpeg presets have no incremental encoder,
@@ -924,6 +931,13 @@ pub(super) fn process_jpeg<R: std::io::BufRead>(
         } else {
             cross_fuse()
         };
+        // Only Off and Pixels leave pixels for `encode_output`, where a
+        // crop happens. Any other fuse would encode the whole covering
+        // frame: refuse that loudly rather than serve the wrong shape.
+        anyhow::ensure!(
+            !crop || matches!(fuse, Fuse::Off | Fuse::Pixels),
+            "a crop must take a fuse that ends in encode_output"
+        );
         match decode_resize(s, dec, p, orientation, fuse, icc_dec, Some(target))? {
             Decoded::Encoded(out) => out,
             Decoded::Pixels { dst_w, dst_h } => {

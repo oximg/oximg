@@ -10,7 +10,7 @@
 //! and encodes as if unset, since effort never changes what is made.
 
 use anyhow::Context;
-use oximg::pipeline::{self, Encoder, ImageFormat, Params};
+use oximg::pipeline::{self, Encoder, ImageFormat, Params, ResizeMode};
 
 pub fn print_help() {
     println!(
@@ -35,7 +35,16 @@ pub fn print_help() {
                                 or OXIMG_ICC)\n          \
              --no-auto-rotate   Keep the stored orientation instead of\n                             \
                                 applying EXIF/irot (--auto-rotate forces\n                             \
-                                it on; default OXIMG_AUTO_ROTATE, else on)\n  \
+                                it on; default OXIMG_AUTO_ROTATE, else on)\n          \
+             --crop             Cover the box and crop the centre to\n                             \
+                                its shape, instead of fitting inside it.\n                             \
+                                Never enlarges: a smaller source is only\n                             \
+                                cropped to the box's shape. Needs both\n                             \
+                                axes: a 0 axis is a usage error\n          \
+             --outside          Cover the box and keep the whole image:\n                             \
+                                one side matches the box, the other is\n                             \
+                                longer, up to 8192 px. Never enlarges.\n                             \
+                                Needs both axes, as --crop\n  \
            oximg strip <in> <out> [--icc keep|strip] [--auto-rotate] [--json]\n          \
              Remove EXIF (GPS, camera, timestamps), XMP, IPTC, comments\n          \
              and other non-rendering metadata from a JPEG, PNG or WebP\n          \
@@ -76,7 +85,7 @@ fn usage_error(msg: &str) -> ! {
 }
 
 const RESIZE_USAGE: &str = "usage: oximg resize <in> <max_w> <max_h> <out> [-q N] [-f fmt] \
-     [--preset P] [--icc keep|strip] [--[no-]auto-rotate]";
+     [--preset P] [--icc keep|strip] [--[no-]auto-rotate] [--crop|--outside]";
 
 /// `--icc keep|strip`, shared by resize and strip: `Some(true)` keeps.
 fn icc_flag(it: &mut std::slice::Iter<'_, String>) -> Option<bool> {
@@ -107,6 +116,7 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
     // differently without touching the process environment.
     let mut icc = None;
     let mut auto_rotate = None;
+    let mut resize_mode = ResizeMode::Inside;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -152,6 +162,17 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
             "--icc" => icc = icc_flag(&mut it),
             "--auto-rotate" => auto_rotate = Some(true),
             "--no-auto-rotate" => auto_rotate = Some(false),
+            "--crop" | "--outside" => {
+                let mode = if arg == "--crop" {
+                    ResizeMode::Crop
+                } else {
+                    ResizeMode::Outside
+                };
+                if resize_mode != ResizeMode::Inside && resize_mode != mode {
+                    usage_error("--crop and --outside cannot be combined");
+                }
+                resize_mode = mode;
+            }
             flag if flag.starts_with('-') && flag.len() > 1 => {
                 usage_error(&format!("unknown option {flag:?}"))
             }
@@ -172,9 +193,16 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
             Err(_) => usage_error(&format!("invalid {name} {v:?}")),
         }
     };
+    let (max_width, max_height) = (dim(max_w, "max_w"), dim(max_h, "max_h"));
+    // A mode is a shape, and a free axis leaves no shape to cover. The
+    // library treats it as a plain fit; a request that asks for a mode
+    // and gets a fit is more likely a missing argument, so refuse it.
+    if resize_mode != ResizeMode::Inside && (max_width == u32::MAX || max_height == u32::MAX) {
+        usage_error("--crop and --outside need both max_w and max_h");
+    }
     let params = Params {
-        max_width: dim(max_w, "max_w"),
-        max_height: dim(max_h, "max_h"),
+        max_width,
+        max_height,
         quality,
         encoder,
         // Precedence mirrors the server URL grammar: explicit flag >
@@ -182,6 +210,7 @@ pub fn resize(args: &[String]) -> anyhow::Result<()> {
         output: explicit.or_else(|| format_from_ext(output)),
         icc,
         auto_rotate,
+        resize_mode,
         ..Default::default()
     };
     let (bytes, format) = pipeline::process_path(std::path::Path::new(input), &params)

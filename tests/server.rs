@@ -767,6 +767,107 @@ fn signed_urls_cover_the_format_token() {
     );
 }
 
+/// `/resize/{mode}/{w}/{h}/{file}`: one fixed word per mode ahead of
+/// the box. photo.jpg is 200x150. The pipeline tests prove the pixels
+/// (`crop_equals_single_axis_fit_then_crop`, `outside_equals_single_axis_fit`);
+/// these pin the routes.
+#[test]
+fn resize_modes_by_url() {
+    let s = Server::start(&[]);
+    let dims = |path: &str| {
+        let (status, _, body) = s.get(path).unwrap();
+        assert_eq!(status, 200, "{path}");
+        let (_, w, h) = oximg::pipeline::probe(&body).unwrap();
+        (w, h)
+    };
+    assert_eq!(dims("/resize/crop/100/100/photo.jpg"), (100, 100));
+    // Never enlarges: a smaller source is only cut to the box's shape.
+    assert_eq!(dims("/resize/crop/300/300/photo.jpg"), (150, 150));
+    assert_eq!(dims("/resize/outside/100/100/photo.jpg"), (133, 100));
+    // Outside is the fit on the covering axis, byte for byte.
+    assert_eq!(
+        s.get("/resize/outside/100/100/photo.jpg").unwrap().2,
+        s.get("/resize/0/100/photo.jpg").unwrap().2
+    );
+    let (_, ct, _) = s.get("/resize/crop/100/100/photo.jpg@webp").unwrap();
+    assert_eq!(ct, "image/webp");
+    // The plain route is untouched, and an unknown word is not a mode:
+    // it reaches the positional route, where it is not a number.
+    assert_eq!(dims("/resize/100/100/photo.jpg"), (100, 75));
+    assert_eq!(s.status_of("/resize/pad/100/100/photo.jpg"), 400);
+    assert_eq!(s.status_of("/resize/crop/0/0/photo.jpg"), 400);
+    // A mode is a shape: a free axis leaves none, so it is refused
+    // rather than served as a plain fit.
+    for path in [
+        "/resize/crop/100/0/photo.jpg",
+        "/resize/crop/0/100/photo.jpg@webp",
+        "/resize/outside/100/0/photo.jpg",
+    ] {
+        assert_eq!(s.status_of(path), 400, "{path}");
+    }
+    assert_eq!(s.status_of("/resize/crop/9000/100/photo.jpg"), 400);
+}
+
+/// The mode word is part of the signed path: one signature buys one
+/// mode. Vectors from `oximg-ctl sign`, checked against python hmac.
+#[test]
+fn signed_urls_cover_the_mode() {
+    let key = "deadbeef".repeat(8);
+    let salt = "cafebabe".repeat(8);
+    let s = Server::start(&[("OXIMG_KEY", key), ("OXIMG_SALT", salt)]);
+    let crop = "3AyHmK5z7nHqx_BsjPBFZ-9czpx602PUq6W0IOdJROk";
+    let outside = "kb0Bh2BDU6wreaT7AfDUyOyP33scb3--FnJD1ymjO7k";
+    let plain = "t-jKRoyvzhs4dEBnGGBUS_t6Uh_HE6WysfGYvs8UaTo";
+    assert_eq!(
+        s.status_of(&format!("/{crop}/resize/crop/100/100/photo.jpg")),
+        200
+    );
+    assert_eq!(
+        s.status_of(&format!("/{outside}/resize/outside/100/100/photo.jpg")),
+        200
+    );
+    assert_eq!(
+        s.status_of(&format!("/{plain}/resize/crop/100/100/photo.jpg")),
+        403
+    );
+    assert_eq!(
+        s.status_of(&format!("/{crop}/resize/outside/100/100/photo.jpg")),
+        403
+    );
+    assert_eq!(
+        s.status_of(&format!("/{crop}/resize/100/100/photo.jpg")),
+        403
+    );
+    assert_eq!(s.status_of("/resize/crop/100/100/photo.jpg"), 403);
+}
+
+/// The mode is in the singleflight key: a crop and a fit of one file in
+/// flight together must not share a result.
+#[test]
+fn concurrent_requests_in_different_modes_do_not_coalesce() {
+    let s = Server::start(&[]);
+    let paths = [
+        "/resize/100/100/photo.jpg",
+        "/resize/crop/100/100/photo.jpg",
+        "/resize/outside/100/100/photo.jpg",
+    ];
+    let solo: Vec<Vec<u8>> = paths.iter().map(|p| s.get(p).unwrap().2).collect();
+    let together: Vec<(usize, Vec<u8>)> = std::thread::scope(|sc| {
+        (0..12)
+            .map(|i| {
+                let s = &s;
+                sc.spawn(move || (i % 3, s.get(paths[i % 3]).unwrap().2))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect()
+    });
+    for (i, body) in together {
+        assert_eq!(body, solo[i], "{}", paths[i]);
+    }
+}
+
 #[test]
 fn accept_negotiation_and_vary() {
     // Negotiation off (default): no Vary header, format follows source.

@@ -23,6 +23,33 @@ oximg-ctl get /resize/100/100/photo.jpg@webp
 oximg-ctl sign /resize/100/100/photo.jpg --key "$OXIMG_KEY" --salt "$OXIMG_SALT"
 ```
 
+### Resize modes
+
+`GET /resize/{mode}/{w}/{h}/{*file}`, where `{mode}` is a fixed word.
+A URL without a word is the fit above. There is no `inside` word.
+
+| Word | Output |
+|---|---|
+| `crop` | Cover the box, then crop the centre to the box's shape. A source smaller than the box is only cut to the box's shape. |
+| `outside` | Cover the box and keep the whole image. One side matches the box, the other is longer, up to 8192 px. A source smaller than the box keeps its size. |
+
+- No mode enlarges.
+- A mode needs both axes: a `0` axis → 400 (`crop needs both width
+  and height`).
+- Any other word is not a mode. It reaches the route above, where it
+  is not a number → 400.
+- `@{fmt}`, the axis limits and `{file}` work as above.
+- The word is part of the signed path: `/{sig}/resize/crop/{w}/{h}/{*file}`.
+  A signature for `/resize/100/100/x.jpg` does not authorize
+  `/resize/crop/100/100/x.jpg`.
+
+```sh
+oximg-ctl get /resize/crop/100/100/photo.jpg      # 200×150 source → 100×100
+oximg-ctl get /resize/crop/300/300/photo.jpg      # → 150×150, never enlarges
+oximg-ctl get /resize/outside/100/100/photo.jpg   # → 133×100
+oximg-ctl get /resize/crop/100/0/photo.jpg --expect 400
+```
+
 ## Options (Cloudflare Images grammar)
 
 Mounted only when `OXIMG_OPTIONS_PREFIX` is set (e.g. `/image`,
