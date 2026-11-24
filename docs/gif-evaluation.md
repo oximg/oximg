@@ -464,15 +464,18 @@ CLI before anything is served.
 **Merge duplicate adjacent frames** before encoding, summing their
 delays — no knob, always on. It is the one thing imgproxy does better
 than the POC (§8.2 finding 4): identical output, fewer frames encoded,
-1.6x cheaper on the worst file in the corpus. Do this before the
-`frames × pixels` budget check, so the budget is spent on frames that
-actually differ.
+1.6x cheaper on the worst file in the corpus. The `frames × pixels`
+budget is checked first, on the scanned frame count after the frame
+step, before any frame is decoded. The merge happens later, in the
+frame loop, and can only lower that count, so the budget is an upper
+bound on the frames encoded.
 
 **Defaults, from the measurements.** A `frames × pixels` budget in the
-neighborhood of 8–10 Mpx of total frame area keeps the worst request
-near 100 ms after resize (`hd_1280x720_mars` at box 512 is 26 × ~0.26 Mpx
-≈ 6.8 Mpx → 517 ms; `web_480x270_docu` at box 512 is 265 × ~0.13 Mpx
-≈ 34 Mpx → 3220 ms). The exact figure should be set against the target
+neighborhood of 8–10 Mpx of total frame area (the shipped default is
+8 Mpx) admits the corpus' worst in-budget file and refuses its worst
+overall (`hd_1280x720_mars` at box 512 is 26 × ~0.26 Mpx ≈ 6.8 Mpx →
+517 ms; `web_480x270_docu` at box 512 is 265 × ~0.13 Mpx ≈ 34 Mpx →
+3220 ms). The exact figure should be set against the target
 deployment's CPU budget, but the shape is clear: budget the *product*,
 apply the resize before the encode, and degrade rather than fail.
 
