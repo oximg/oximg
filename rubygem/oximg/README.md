@@ -258,8 +258,8 @@ Oximg.in_process_probe?  #=> true on a platform gem
 
 ```ruby
 Oximg.available?  #=> true
-Oximg.executable  #=> "/…/gems/oximg-0.22.0-arm64-darwin/exe/oximg"
-Oximg.version     #=> "0.22.0"   # the binary's version, not the gem's
+Oximg.executable  #=> "/…/gems/oximg-0.23.0-arm64-darwin/exe/oximg"
+Oximg.version     #=> "0.23.0"   # the binary's version, not the gem's
 ```
 
 `resize` shells out to that binary — one process per image, which is
