@@ -78,6 +78,28 @@ images as a read-only volume at `/images` (the default `IMAGES_DIR`)
 — a `ro` PVC, an NFS mount, or an init container that syncs from
 object storage.
 
+## A private S3 bucket on EKS
+
+With `OXIMG_SOURCE_BASE_URL=s3://bucket[/prefix]` and `AWS_REGION`,
+oximg reads the bucket with the pod's IAM role. Put no keys in the
+manifest. Both EKS mechanisms work:
+
+- **EKS Pod Identity**: associate the role with the service account
+  (`aws eks create-pod-identity-association`). EKS sets
+  `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` in the pod, and oximg asks
+  the node's Pod Identity Agent for keys.
+- **IAM roles for service accounts (IRSA)**: annotate the service
+  account with `eks.amazonaws.com/role-arn`. EKS sets
+  `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`, and oximg trades the
+  token for keys with STS.
+
+Either way, the token file is read again each time keys are fetched,
+because EKS rotates it. Keys are cached and fetched again five minutes
+before they expire. The role needs `s3:GetObject` on the objects, and
+`s3:ListBucket` on the bucket if a missing object should answer 404
+rather than 500.
+
 ## Sizing and scaling
 
 - **CPU**: oximg saturates whatever it is given — an internal
