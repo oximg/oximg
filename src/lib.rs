@@ -1,3 +1,36 @@
+//! oximg resizes and re-encodes images. The same pipeline runs in three
+//! ways: an HTTP server (the `oximg` binary), CLI one-shots
+//! (`oximg resize`, `oximg probe`), and this library.
+//!
+//! The library API is the [`pipeline`] module:
+//!
+//! - [`pipeline::process`] and [`pipeline::process_path`] take a
+//!   [`pipeline::Params`] and return the re-encoded bytes and their
+//!   format.
+//! - [`pipeline::Params`] also carries per-call overrides for the knobs
+//!   that are otherwise process-wide `OXIMG_*` environment variables.
+//!   `None` keeps the environment setting, and `Some` wins for that
+//!   call, so one process can run different settings side by side.
+//! - [`pipeline::probe`] reads only the header, and
+//!   [`pipeline::probe_header`] adds the EXIF orientation and the
+//!   displayed size. [`pipeline::probe_animation`] reports frame count,
+//!   play time and loop count without decoding pixels.
+//! - Every entry point returns [`pipeline::Error`]. Match on its
+//!   [`kind()`](pipeline::Error::kind), not on the message.
+//!   [`pipeline::ErrorKind`] is `#[non_exhaustive]`, so keep a wildcard
+//!   arm for kinds added later.
+//!
+//! # Features
+//!
+//! - `server` (default): the HTTP server and the remote-source
+//!   functions (`fetch_url`, `fetch_gcs`, `fetch_s3`, and the matching
+//!   `process_*`). Build with `default-features = false` to drop the
+//!   HTTP stack when you only need the pipeline.
+//! - `avif`: AVIF decode and encode.
+//!
+//! The [README](https://github.com/oximg/oximg#readme) covers the
+//! server, the CLI and every `OXIMG_*` setting.
+
 mod panic_guard;
 pub mod pipeline;
 
