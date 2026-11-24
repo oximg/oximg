@@ -322,7 +322,7 @@ pub enum ImageFormat {
     Webp,
     Avif,
     /// Decode-only. No GIF encoder ships here — a GIF source with no
-    /// requested output becomes WebP (see [`default_target`]) — but the
+    /// requested output becomes WebP (see `default_target`) — but the
     /// variant is a real format everywhere else: `sniff` returns it,
     /// `probe` reports it, and `content_type` names it.
     Gif,
@@ -354,7 +354,7 @@ impl ImageFormat {
     pub const REFUSED_OUTPUT_TOKENS: &[&str] = &["gif", "jxl"];
 
     /// Pipe-separated tokens for CLI / ctl usage errors, derived from
-    /// [`OUTPUT_TOKENS`] so a new format cannot land in `from_token`
+    /// [`OUTPUT_TOKENS`](Self::OUTPUT_TOKENS) so a new format cannot land in `from_token`
     /// while the hint still lists the old set.
     pub fn output_token_hint() -> String {
         Self::OUTPUT_TOKENS
