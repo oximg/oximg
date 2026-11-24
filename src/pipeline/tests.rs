@@ -1501,7 +1501,8 @@ fn encode_cost_follows_what_the_encoder_holds() {
     }
 
     // PNG holds up to twice the raw frame plus its chunk buffer and three
-    // rows; quantization (RGB only) adds quantette's working set.
+    // rows; quantization adds quantette's working set, and RGBA is priced
+    // for it too: an all-255 alpha is dropped and quantized (#70).
     let rows = |ch: u64| 256 * 1024 + 3 * 4000 * ch;
     assert_eq!(
         encode_cost(ImageFormat::Png, 4000, 3000, 3, &def),
@@ -1521,7 +1522,7 @@ fn encode_cost_follows_what_the_encoder_holds() {
     );
     assert_eq!(
         encode_cost(ImageFormat::Png, 4000, 3000, 4, &quant),
-        px * 8 + rows(4)
+        px * 20 + rows(4)
     );
 
     // WebP alpha is VP8L-coded, several times the RGB cost at any

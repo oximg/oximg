@@ -185,6 +185,11 @@ impl Inputs {
         let n = (N * N) as usize;
         write_png(&dir.join("noise.png"), &noise(n * 3, 0x9E37_79B9), 3);
         write_png(&dir.join("noise_rgba.png"), &noise(n * 4, 0x85EB_CA6B), 4);
+        let opaque: Vec<u8> = noise(n * 3, 0x9E37_79B9)
+            .chunks(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect();
+        write_png(&dir.join("noise_opaque.png"), &opaque, 4);
         let photo: Vec<u8> = (0..n)
             .flat_map(|i| {
                 let (x, y) = ((i % N as usize) as u32, (i / N as usize) as u32);
@@ -402,6 +407,17 @@ const CELLS: &[Cell] = &[
     (
         "png quantized",
         "noise.png",
+        "0",
+        "0",
+        "png",
+        &["OXIMG_PNG_QUANTIZE=1"],
+        1.5,
+    ),
+    // An all-255 alpha is dropped before the encode and the frame
+    // quantizes (#70), so RGBA PNG output is priced for quantette too.
+    (
+        "png opaque rgba quantized",
+        "noise_opaque.png",
         "0",
         "0",
         "png",
