@@ -10,6 +10,13 @@ HTTP interface without notice.
 
 ## [Unreleased]
 
+### Added
+
+- **docs.rs front page**: the crate and the `pipeline` module now have
+  their own pages, with the entry points, the per-call overrides in
+  `Params`, and the features. Two broken intra-doc links are fixed, so
+  `cargo doc` passes with `-D warnings`.
+
 ## [0.23.0] - 2026-11-23
 
 Probe can tell a damaged upload from a whole one (#191): a probe that
