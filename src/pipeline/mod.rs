@@ -1,3 +1,10 @@
+//! Decode, resize and encode: the library API.
+//!
+//! Start with [`process`] (bytes in, bytes out) or [`process_path`],
+//! configured by [`Params`]. [`probe`], [`probe_header`] and
+//! [`probe_animation`] read a source without decoding its pixels.
+//! Errors are [`Error`], classified by [`ErrorKind`].
+
 use anyhow::{Context, Result};
 use fast_image_resize::images::Image;
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
